@@ -7,7 +7,7 @@ hand-rolled.
 ## Roadmap
 
 - [x] **Phase 1** — Bencode parser + exact-byte SHA-1 InfoHash (`src/bencode.rs`, `src/torrent.rs`)
-- [ ] **Phase 2** — Tracker communication (HTTP/UDP announce, compact peer list parsing)
+- [x] **Phase 2** — Tracker communication (`src/tracker/`) — HTTP GET announce over raw `TcpStream`, UDP announce (BEP 15) over raw `UdpSocket`, compact peer decoding (BEP 23)
 - [ ] **Phase 3** — Wire protocol handshake + peer message state machine
 - [ ] **Phase 4** — BEP 10 extension handshake + BEP 9 metadata exchange (magnet links)
 - [ ] **Phase 5** — Concurrent piece downloader / work queue
@@ -28,6 +28,28 @@ where a re-encoded dict doesn't byte-match the source.
 ```sh
 cargo test                              # 25 unit tests
 cargo run --bin infohash -- file.torrent
+```
+
+## Phase 2
+
+`src/tracker/mod.rs` — shared `AnnounceRequest`/`AnnounceResponse`, RFC 3986
+percent-encoding for raw `info_hash`/`peer_id` bytes (not UTF-8 safe, so this
+operates on `&[u8]`), and `parse_compact_peers` (BEP 23: 6 bytes/peer, 4-byte
+big-endian IPv4 + 2-byte big-endian port) shared by both transports.
+
+`src/tracker/http.rs` — HTTP GET announce hand-rolled over `TcpStream`: no
+`reqwest`/`hyper`. Builds the request line + headers manually, parses the
+response's status line, handles both `Content-Length` and
+`Transfer-Encoding: chunked`, then bencode-decodes the body. HTTPS trackers
+return `TrackerError::UnsupportedScheme` (no TLS implementation here).
+
+`src/tracker/udp.rs` — BEP 15 UDP tracker: 16-byte connect request/response
+to obtain a `connection_id`, then a 98-byte IPv4 announce packet. Retries
+use BEP 15's exponential backoff (`15 * 2^n` seconds). All fields are packed
+with explicit `to_be_bytes()`/`from_be_bytes()` — no serde, no `byteorder`.
+
+```sh
+cargo test                              # 47 unit tests
 ```
 
 ## License
