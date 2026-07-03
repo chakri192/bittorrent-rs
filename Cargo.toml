@@ -1,0 +1,11 @@
+[package]
+name = "bittorrent-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sha1 = "0.10"
+
+[lib]
+name = "bittorrent_rs"
+path = "src/lib.rs"
