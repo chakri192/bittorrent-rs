@@ -8,7 +8,7 @@ hand-rolled.
 
 - [x] **Phase 1** — Bencode parser + exact-byte SHA-1 InfoHash (`src/bencode.rs`, `src/torrent.rs`)
 - [x] **Phase 2** — Tracker communication (`src/tracker/`) — HTTP GET announce over raw `TcpStream`, UDP announce (BEP 15) over raw `UdpSocket`, compact peer decoding (BEP 23)
-- [ ] **Phase 3** — Wire protocol handshake + peer message state machine
+- [x] **Phase 3** — Wire protocol handshake + peer message state machine (`src/peer/`)
 - [ ] **Phase 4** — BEP 10 extension handshake + BEP 9 metadata exchange (magnet links)
 - [ ] **Phase 5** — Concurrent piece downloader / work queue
 
@@ -50,6 +50,20 @@ with explicit `to_be_bytes()`/`from_be_bytes()` — no serde, no `byteorder`.
 
 ```sh
 cargo test                              # 47 unit tests
+```
+
+## Phase 3
+
+`src/peer/handshake.rs` — the 68-byte handshake (`pstrlen + pstr + reserved(8) + info_hash(20) + peer_id(20)`). BEP 10 support is signaled by `reserved[5] |= 0x10`.
+
+`src/peer/message.rs` — length-prefixed message framing (`Read`/`Write` generic, so it's tested against in-memory `Cursor`s, no live peer needed). Zero-length prefix = keep-alive. Payload length is capped at 1 MiB to bound memory use against a hostile length prefix. `Extended { id, payload }` carries BEP 10 messages as opaque bytes for Phase 4 to parse.
+
+`src/peer/state.rs` — `PeerState` (am_choking/am_interested/peer_choking/peer_interested + the peer's piece bitfield), starting choked/not-interested per spec. `apply_message` is pure state transition, no I/O — returns `false` (not an error) for message types it doesn't own (Request/Piece/Cancel/Port/Extended), leaving those to Phases 4-5.
+
+`src/peer/connection.rs` — thin `TcpStream` wrapper: `connect_and_handshake` sends ours first, validates the peer's `info_hash` matches, and hands back the stream + parsed peer handshake.
+
+```sh
+cargo test                              # 82 unit tests
 ```
 
 ## License
