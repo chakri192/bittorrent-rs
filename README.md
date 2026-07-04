@@ -9,7 +9,7 @@ hand-rolled.
 - [x] **Phase 1** — Bencode parser + exact-byte SHA-1 InfoHash (`src/bencode.rs`, `src/torrent.rs`)
 - [x] **Phase 2** — Tracker communication (`src/tracker/`) — HTTP GET announce over raw `TcpStream`, UDP announce (BEP 15) over raw `UdpSocket`, compact peer decoding (BEP 23)
 - [x] **Phase 3** — Wire protocol handshake + peer message state machine (`src/peer/`)
-- [ ] **Phase 4** — BEP 10 extension handshake + BEP 9 metadata exchange (magnet links)
+- [x] **Phase 4** — BEP 10 extension handshake + BEP 9 metadata exchange (`src/peer/extension.rs`, `src/metadata.rs`, `src/magnet.rs`)
 - [ ] **Phase 5** — Concurrent piece downloader / work queue
 
 ## Phase 1
@@ -64,6 +64,18 @@ cargo test                              # 47 unit tests
 
 ```sh
 cargo test                              # 82 unit tests
+```
+
+## Phase 4
+
+`src/magnet.rs` — magnet URI parsing. `xt=urn:btih:` accepts both 40-char hex and 32-char base32 (RFC 4648, hand-rolled decoder — 32 chars × 5 bits = 160 bits = 20 bytes exactly, no padding). `dn`/`tr` go through a percent-decoder that, unlike form-encoding, leaves `+` literal (tracker URLs can contain one).
+
+`src/peer/extension.rs` — BEP 10 extended handshake (`Message::Extended { id: 0, .. }`). Parses the peer's `m` dict to learn *their* chosen id for `ut_metadata` (`peer_ut_metadata_id()`), plus `metadata_size` if they have it. Added a minimal bencode *encoder* here (the Phase 1 decoder had no inverse) since handshakes and metadata messages both need to produce bencode, not just consume it.
+
+`src/metadata.rs` — the actual BEP 9 exchange: `MetadataMessage::{Request, Data, Reject}`, where `Data` is a bencoded header immediately followed by raw (non-bencoded) piece bytes — decoded by tracking how many bytes `Decoder::decode_value_with_span` consumed and treating the rest as the raw chunk. `MetadataAssembler` collects 16 KiB pieces (validating each piece's exact expected length, including the shorter final piece), and `assemble_and_verify` is the trust boundary: it SHA-1s the reassembled info dict and refuses to return it unless the hash matches the magnet link's InfoHash.
+
+```sh
+cargo test                              # 112 unit tests
 ```
 
 ## License
