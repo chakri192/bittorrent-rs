@@ -1,7 +1,9 @@
 pub mod bencode;
 pub mod downloader;
 pub mod magnet;
+pub mod magnet_fetch;
 pub mod metadata;
 pub mod peer;
 pub mod torrent;
 pub mod tracker;
+pub mod tracker_discovery;
