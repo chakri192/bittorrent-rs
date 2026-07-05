@@ -178,6 +178,27 @@ pub fn info_hash_hex(hash: &[u8; 20]) -> String {
     hash.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+impl TorrentFile {
+    /// Sum of every file's length -- the total number of bytes the torrent
+    /// contains, which the last piece's length is derived from.
+    pub fn total_length(&self) -> u64 {
+        self.files.iter().map(|(_, len)| *len as u64).sum()
+    }
+
+    /// Length of piece `index` in bytes. Every piece is `piece_length`
+    /// except the last, which is whatever remains
+    /// (`total_length - piece_length * (num_pieces - 1)`).
+    pub fn piece_len(&self, index: usize) -> u64 {
+        let num_pieces = self.pieces.len() as u64;
+        let last_index = num_pieces.saturating_sub(1);
+        if index as u64 == last_index {
+            self.total_length() - self.piece_length as u64 * last_index
+        } else {
+            self.piece_length as u64
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +273,23 @@ mod tests {
         h[0] = 0xDE;
         h[1] = 0xAD;
         assert!(info_hash_hex(&h).starts_with("dead"));
+    }
+
+    #[test]
+    fn piece_len_returns_piece_length_for_all_but_last() {
+        // 3 pieces, piece_length 16384, total 40000 -> last piece = 40000 - 32768 = 7232
+        let bytes = b"d4:infod6:lengthi40000e4:name1:a12:piece lengthi16384e6:pieces60:000000000000000000001111111111111111111122222222222222222222ee".to_vec();
+        let t = parse_torrent_file(&bytes).unwrap();
+        assert_eq!(t.pieces.len(), 3);
+        assert_eq!(t.piece_len(0), 16384);
+        assert_eq!(t.piece_len(1), 16384);
+        assert_eq!(t.piece_len(2), 40000 - 16384 * 2);
+    }
+
+    #[test]
+    fn total_length_sums_multi_file_torrent() {
+        let bytes = b"d4:infod5:filesld6:lengthi100e4:pathl3:dir5:a.txteed6:lengthi200e4:pathl5:b.txteee4:name3:dir12:piece lengthi16384e6:pieces20:00000000000000000000ee".to_vec();
+        let t = parse_torrent_file(&bytes).unwrap();
+        assert_eq!(t.total_length(), 300);
     }
 }
