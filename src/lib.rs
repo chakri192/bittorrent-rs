@@ -1,4 +1,5 @@
 pub mod bencode;
+pub mod downloader;
 pub mod magnet;
 pub mod metadata;
 pub mod peer;
