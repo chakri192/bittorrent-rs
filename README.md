@@ -1,8 +1,29 @@
 # bittorrent-rs
 
-From-scratch BitTorrent client in Rust. No `torrent`/`libtorrent`-style crates —
-bencode parsing, wire protocol, tracker comms, and piece assembly are all
-hand-rolled.
+A working BitTorrent client in Rust, built from scratch. No `libtorrent`-style
+crate anywhere — bencode parsing, wire protocol, tracker comms, BEP 10/9
+magnet support, and piece assembly are all hand-rolled. The only dependency
+is `sha1`.
+
+```sh
+cargo run --bin download -- file.torrent --out ./downloads
+cargo run --bin download -- "magnet:?xt=urn:btih:...&tr=..." --out ./downloads
+```
+
+## Does it actually work?
+
+```sh
+cargo run --bin e2e_harness
+```
+
+This spins up a fake tracker and a fake peer on `127.0.0.1` (no real
+internet needed), then runs the *actual* `download` binary against them
+as a subprocess and diffs the result byte-for-byte against the source
+data. It's the strongest proof available in an environment with no
+reachable BitTorrent trackers/peers: the full pipeline — HTTP tracker
+announce, handshake, bitfield, pipelined block requests, per-piece SHA-1
+verification, multi-piece disk writes — runs for real, just against a
+peer/tracker this repo also controls instead of the live internet.
 
 ## Roadmap
 
@@ -11,6 +32,7 @@ hand-rolled.
 - [x] **Phase 3** — Wire protocol handshake + peer message state machine (`src/peer/`)
 - [x] **Phase 4** — BEP 10 extension handshake + BEP 9 metadata exchange (`src/peer/extension.rs`, `src/metadata.rs`, `src/magnet.rs`)
 - [x] **Phase 5** — Concurrent piece downloader / work queue (`src/downloader/`)
+- [x] **Integration** — magnet metadata bootstrap (`src/magnet_fetch.rs`), multi-tracker announce dispatch (`src/tracker_discovery.rs`), end-to-end CLI (`src/bin/download.rs`)
 
 ## Phase 1
 
@@ -93,6 +115,30 @@ cargo test                              # 112 unit tests
 ```sh
 cargo test                              # 136 unit tests, incl. loopback integration tests
 ```
+
+## Integration: making it a real client
+
+`src/torrent.rs::from_info_dict_bytes` — the magnet ↔ `.torrent` adapter promised at the end of Phase 5. A magnet-derived info dict and a `.torrent` file's info dict build the identical `TorrentFile` through the same shared `build_torrent_from_info`, so `build_work_queue` and everything downstream never needs to know which one it's holding. Re-checks the SHA-1 against the expected InfoHash on its own, independent of whatever check the caller already did.
+
+`src/magnet_fetch.rs` — the piece that was scaffolded in Phase 4 but not wired up: connects to a peer, does the BEP 3 + BEP 10 handshakes, requests every `ut_metadata` piece in sequence, and returns the verified info dict. **Tested end-to-end** against a mock peer that deliberately uses a *different* extension id than ours, to prove the BEP 10 id-remapping (you send peer X, they respond with your id) is actually implemented correctly and not just assumed.
+
+`src/tracker_discovery.rs` — announces to every tracker URL a torrent lists (mixing `http://` and `udp://`), merges and dedupes the peer lists, and treats a single bad tracker as a warning, not a fatal error (only *all* trackers failing is fatal — that's the actual "no peers findable" case).
+
+`src/bin/download.rs` — the real CLI: `.torrent` file or magnet link in, verified file(s) on disk out. Bounds concurrent peer connections (`--peers`, default 30), never panics on bad input (bad file paths, malformed torrents, magnet links with no trackers, unrecognized flags all exit cleanly with a message), and requeues any piece a peer fails to deliver correctly for another peer to try.
+
+`src/bin/e2e_harness.rs` — described above; the thing that actually proves all of this fits together.
+
+### Known limitations
+
+Stated plainly rather than glossed over:
+
+- **No DHT or PEX.** Peer discovery is tracker-only. A magnet link with no `tr=` trackers has no way to find a single peer in this client.
+- **No seeding/uploading.** This is a downloader. `PeerState::am_choking`/`am_interested` exist but nothing drives them the other direction.
+- **Single upfront tracker announce.** Real clients re-announce periodically (per the tracker's returned `interval`) and report `completed`/`stopped` events. This client announces once and never again.
+- **No resume support.** Every run starts from piece 0; there's no on-disk state tracking what was already verified from a prior run.
+- **Peer failure handling is coarse.** A peer that fails a piece gets that piece taken away and is not retried further this run, but there's no reputation tracking across peers/pieces beyond that.
+
+None of these were required by the original five-phase spec, so they weren't built, but a "complete" client built further from this base would need them.
 
 ## License
 
