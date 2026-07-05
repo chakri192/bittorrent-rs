@@ -10,7 +10,7 @@ hand-rolled.
 - [x] **Phase 2** — Tracker communication (`src/tracker/`) — HTTP GET announce over raw `TcpStream`, UDP announce (BEP 15) over raw `UdpSocket`, compact peer decoding (BEP 23)
 - [x] **Phase 3** — Wire protocol handshake + peer message state machine (`src/peer/`)
 - [x] **Phase 4** — BEP 10 extension handshake + BEP 9 metadata exchange (`src/peer/extension.rs`, `src/metadata.rs`, `src/magnet.rs`)
-- [ ] **Phase 5** — Concurrent piece downloader / work queue
+- [x] **Phase 5** — Concurrent piece downloader / work queue (`src/downloader/`)
 
 ## Phase 1
 
@@ -76,6 +76,22 @@ cargo test                              # 82 unit tests
 
 ```sh
 cargo test                              # 112 unit tests
+```
+
+## Phase 5
+
+`src/downloader/piece_assembler.rs` — `PieceAssembler` tracks one piece's 16 KiB blocks: `next_requests(n)` hands out fresh `(index, begin, length)` tuples without repeats (pipelining), `record_block` accepts blocks out of order, `finish()` is the trust boundary — SHA-1-checks against the torrent's piece hash before returning bytes.
+
+`src/downloader/queue.rs` — `WorkQueue`, a `Mutex<VecDeque<PieceWork>>` shared via `Arc` across worker threads. Tested with 8 real threads draining 200 pieces to confirm no piece is dropped or duplicated.
+
+`src/downloader/file_writer.rs` — maps global torrent byte offsets to on-disk files (`FileSpan`), writes pieces that straddle a file boundary in multi-file torrents, creates nested directories on demand.
+
+`src/downloader/worker.rs` — the real per-peer loop: handshake, send `Interested`, wait for unchoke, pipeline requests up to `pipeline_depth` (default 5, the long-standing mainline/libtorrent convention), assemble + verify + write each piece, requeue on hash mismatch or failure. **Tested end-to-end** against a mock peer on loopback (`127.0.0.1`, no outbound network needed) that performs a real handshake, bitfield, unchoke, and serves `Request`s with matching `Piece` responses — confirms the full pipeline including the on-disk bytes, not just the isolated units.
+
+`src/downloader/mod.rs::build_work_queue` — the `TorrentFile` ↔ `PieceWork` adapter: works unmodified whether `TorrentFile` came from a `.torrent` file (Phase 1) or from a magnet-derived info dict (Phase 4's `MetadataAssembler::assemble_and_verify` output, once run through `parse_torrent_file`-equivalent construction). No separate magnet-specific downloader needed.
+
+```sh
+cargo test                              # 136 unit tests, incl. loopback integration tests
 ```
 
 ## License
