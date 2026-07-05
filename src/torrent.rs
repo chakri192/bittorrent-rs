@@ -24,6 +24,7 @@ pub enum TorrentError {
     MissingKey(&'static str),
     WrongType(&'static str),
     PiecesLengthNotMultipleOf20,
+    InfoHashMismatch,
 }
 
 impl From<DecodeError> for TorrentError {
@@ -40,6 +41,7 @@ impl std::fmt::Display for TorrentError {
             TorrentError::MissingKey(k) => write!(f, "missing required key: {}", k),
             TorrentError::WrongType(k) => write!(f, "key has wrong type: {}", k),
             TorrentError::PiecesLengthNotMultipleOf20 => write!(f, "'pieces' length is not a multiple of 20"),
+            TorrentError::InfoHashMismatch => write!(f, "assembled info dict's SHA-1 does not match the expected InfoHash"),
         }
     }
 }
@@ -98,9 +100,6 @@ pub fn parse_torrent_file(data: &[u8]) -> Result<TorrentFile, TorrentError> {
     // *original* buffer and SHA-1 it directly.
     let (info_start, info_end) = find_key_span(data, b"info")?;
     let raw_info = &data[info_start..info_end];
-    let mut hasher = Sha1::new();
-    hasher.update(raw_info);
-    let info_hash: [u8; 20] = hasher.finalize().into();
 
     let announce = dict
         .get(b"announce".as_slice())
@@ -118,6 +117,40 @@ pub fn parse_torrent_file(data: &[u8]) -> Result<TorrentFile, TorrentError> {
                 .collect()
         })
         .unwrap_or_default();
+
+    build_torrent_from_info(info, raw_info, announce, announce_list)
+}
+
+/// Builds a `TorrentFile` from a magnet link's assembled+verified info
+/// dict (BEP 9, Phase 4's `MetadataAssembler::assemble_and_verify` output).
+/// `raw_info` here IS the whole buffer -- unlike `parse_torrent_file`,
+/// there's no outer `.torrent` dict to find "info" inside; the metadata
+/// exchange only ever transfers the info dict itself.
+///
+/// `expected_info_hash` is re-checked here (SHA-1 of `raw_info`) even
+/// though the caller almost certainly already ran it through
+/// `assemble_and_verify` -- cheap, and this function has no other way to
+/// know the hash wasn't tampered with between that check and this call.
+pub fn from_info_dict_bytes(raw_info: &[u8], expected_info_hash: [u8; 20], announce: Option<String>, announce_list: Vec<Vec<String>>) -> Result<TorrentFile, TorrentError> {
+    let mut hasher = Sha1::new();
+    hasher.update(raw_info);
+    let actual: [u8; 20] = hasher.finalize().into();
+    if actual != expected_info_hash {
+        return Err(TorrentError::InfoHashMismatch);
+    }
+
+    let info = bencode::decode(raw_info)?;
+    build_torrent_from_info(info, raw_info, announce, announce_list)
+}
+
+/// Shared construction logic: given a parsed info dict value and the raw
+/// bytes it was decoded from (for the InfoHash), builds the rest of
+/// `TorrentFile`'s fields identically regardless of whether the info dict
+/// came from a `.torrent` file or a magnet metadata exchange.
+fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<String>, announce_list: Vec<Vec<String>>) -> Result<TorrentFile, TorrentError> {
+    let mut hasher = Sha1::new();
+    hasher.update(raw_info);
+    let info_hash: [u8; 20] = hasher.finalize().into();
 
     let piece_length = info
         .get("piece length")
@@ -291,5 +324,32 @@ mod tests {
         let bytes = b"d4:infod5:filesld6:lengthi100e4:pathl3:dir5:a.txteed6:lengthi200e4:pathl5:b.txteee4:name3:dir12:piece lengthi16384e6:pieces20:00000000000000000000ee".to_vec();
         let t = parse_torrent_file(&bytes).unwrap();
         assert_eq!(t.total_length(), 300);
+    }
+
+    #[test]
+    fn from_info_dict_bytes_matches_parse_torrent_file_for_the_same_info() {
+        let full = single_file_torrent_bytes();
+        let via_file = parse_torrent_file(&full).unwrap();
+
+        // Extract just the raw info dict bytes the way a ut_metadata
+        // exchange would deliver them (see metadata.rs / magnet_fetch.rs).
+        let marker = b"4:info";
+        let marker_pos = full.windows(marker.len()).position(|w| w == marker).unwrap();
+        let info_start = marker_pos + marker.len();
+        let info_end = full.len() - 1;
+        let raw_info = &full[info_start..info_end];
+
+        let via_magnet = from_info_dict_bytes(raw_info, via_file.info_hash, None, vec![]).unwrap();
+        assert_eq!(via_magnet.info_hash, via_file.info_hash);
+        assert_eq!(via_magnet.name, via_file.name);
+        assert_eq!(via_magnet.pieces, via_file.pieces);
+        assert_eq!(via_magnet.files, via_file.files);
+    }
+
+    #[test]
+    fn from_info_dict_bytes_rejects_hash_mismatch() {
+        let raw_info = b"d6:lengthi5e4:name1:a12:piece lengthi5e6:pieces20:00000000000000000000e";
+        let wrong_hash = [0xFFu8; 20];
+        assert!(matches!(from_info_dict_bytes(raw_info, wrong_hash, None, vec![]), Err(TorrentError::InfoHashMismatch)));
     }
 }
