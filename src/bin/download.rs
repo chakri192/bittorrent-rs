@@ -176,8 +176,10 @@ fn run(args: Args) -> Result<(), String> {
         for f in &failures {
             eprintln!("warning: tracker {} failed: {}", f.url, f.error);
         }
-        if let Some(secs) = interval {
-            reannounce_wait = Duration::from_secs(secs as u64).max(MIN_REANNOUNCE);
+        if args.reannounce_override.is_none() {
+            if let Some(secs) = interval {
+                reannounce_wait = Duration::from_secs(secs as u64).max(MIN_REANNOUNCE);
+            }
         }
         initial_peers.extend(peers.into_iter().map(SocketAddr::V4));
     }
@@ -268,8 +270,10 @@ fn run(args: Args) -> Result<(), String> {
             for f in &failures {
                 eprintln!("warning: tracker {} failed: {}", f.url, f.error);
             }
-            if let Some(secs) = interval {
-                reannounce_wait = Duration::from_secs(secs as u64).max(MIN_REANNOUNCE);
+            if args.reannounce_override.is_none() {
+                if let Some(secs) = interval {
+                    reannounce_wait = Duration::from_secs(secs as u64).max(MIN_REANNOUNCE);
+                }
             }
             let new_addrs: Vec<SocketAddr> = peers.into_iter().map(SocketAddr::V4).collect();
             let spawned = spawn_new_workers(new_addrs, &mut attempted, &mut handles, args.max_peers, &queue, &spans, &config, piece_length, &tx);
