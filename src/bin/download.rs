@@ -16,15 +16,16 @@ use bittorrent_rs::magnet::parse_magnet_uri;
 use bittorrent_rs::magnet_fetch::fetch_metadata_from_peer;
 use bittorrent_rs::torrent::{self, TorrentFile};
 use bittorrent_rs::tracker::generate_peer_id;
-use bittorrent_rs::tracker_discovery::{announce_to_all, build_started_request};
+use bittorrent_rs::tracker_discovery::{announce_to_all, build_regular_request, build_started_request};
+use std::collections::HashSet;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Conventional BitTorrent port. We never actually bind/listen on it --
 /// this client is outbound-only (no seeding) -- but trackers expect a
@@ -33,6 +34,20 @@ const ANNOUNCE_PORT: u16 = 6881;
 const DEFAULT_MAX_PEERS: usize = 30;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PIPELINE_DEPTH: usize = 5;
+/// Floor on re-announce spacing regardless of what a tracker requests --
+/// guards against a misbehaving tracker asking for an unreasonably tight
+/// loop and this client happily hammering it.
+const MIN_REANNOUNCE: Duration = Duration::from_secs(30);
+/// Ceiling used only when no tracker told us an interval at all.
+const DEFAULT_REANNOUNCE: Duration = Duration::from_secs(120);
+/// How often the main loop wakes up to check queue/handle state between
+/// re-announces -- just a responsiveness tick, not a network operation.
+const POLL_TICK: Duration = Duration::from_secs(2);
+/// Give up only after this many consecutive re-announce rounds produced
+/// zero new peers *and* every worker thread had already exited -- bounds
+/// the "keep trying forever" behavior to a finite (if generous) window
+/// instead of hanging indefinitely against a genuinely dead swarm.
+const MAX_FRUITLESS_ROUNDS: u32 = 5;
 
 struct Args {
     source: String,
@@ -86,6 +101,45 @@ fn main() -> ExitCode {
     }
 }
 
+/// Spawns a worker thread for each address in `peers` not already in
+/// `attempted`, up to `max_peers` total ever spawned this run. Mutates
+/// both `attempted` and `handles` in place; returns how many new threads
+/// were actually started (0 is a normal, expected outcome when a
+/// re-announce returns only peers we've already tried).
+#[allow(clippy::too_many_arguments)]
+fn spawn_new_workers(
+    peers: Vec<SocketAddr>,
+    attempted: &mut HashSet<SocketAddr>,
+    handles: &mut Vec<thread::JoinHandle<()>>,
+    max_peers: usize,
+    queue: &Arc<WorkQueue>,
+    spans: &Arc<Vec<bittorrent_rs::downloader::FileSpan>>,
+    config: &Arc<WorkerConfig>,
+    piece_length: u64,
+    tx: &Sender<bittorrent_rs::downloader::PieceResult>,
+) -> usize {
+    let mut spawned = 0;
+    for addr in peers {
+        if attempted.len() >= max_peers {
+            break;
+        }
+        if !attempted.insert(addr) {
+            continue; // already tried this address earlier in the run
+        }
+        let queue = Arc::clone(queue);
+        let spans = Arc::clone(spans);
+        let config = Arc::clone(config);
+        let tx = tx.clone();
+        handles.push(thread::spawn(move || {
+            if let Err(e) = run_worker(addr, &config, &queue, &spans, piece_length, &tx) {
+                eprintln!("peer {} disconnected: {:?}", addr, e);
+            }
+        }));
+        spawned += 1;
+    }
+    spawned
+}
+
 fn run(args: Args) -> Result<(), String> {
     let our_peer_id = generate_peer_id();
 
@@ -99,16 +153,21 @@ fn run(args: Args) -> Result<(), String> {
 
     println!("torrent: {} ({} bytes, {} pieces)", torrent.name, torrent.total_length(), torrent.pieces.len());
 
+    let tracker_urls = collect_tracker_urls(&torrent);
+
     // Real announce now that we know the true size (`left`). This is
     // additive to any peers already found while bootstrapping a magnet
     // link -- a failure here doesn't strand us if that bootstrap already
     // found peers.
-    let tracker_urls = collect_tracker_urls(&torrent);
+    let mut reannounce_wait = DEFAULT_REANNOUNCE;
     if !tracker_urls.is_empty() {
         let req = build_started_request(torrent.info_hash, our_peer_id, ANNOUNCE_PORT, torrent.total_length());
-        let (peers, failures) = announce_to_all(&tracker_urls, &req);
+        let (peers, failures, interval) = announce_to_all(&tracker_urls, &req);
         for f in &failures {
             eprintln!("warning: tracker {} failed: {}", f.url, f.error);
+        }
+        if let Some(secs) = interval {
+            reannounce_wait = Duration::from_secs(secs as u64).max(MIN_REANNOUNCE);
         }
         initial_peers.extend(peers.into_iter().map(SocketAddr::V4));
     }
@@ -124,31 +183,84 @@ fn run(args: Args) -> Result<(), String> {
     let spans = Arc::new(build_file_spans(&base_dir, &torrent.files));
     let queue = Arc::new(WorkQueue::new(build_work_queue(&torrent)));
     let total_pieces = torrent.pieces.len();
+    let total_length = torrent.total_length();
     let piece_length = torrent.piece_length as u64;
 
     let (tx, rx) = mpsc::channel();
     let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: PIPELINE_DEPTH, connect_timeout: CONNECT_TIMEOUT });
 
+    let mut attempted: HashSet<SocketAddr> = HashSet::new();
     let mut handles = Vec::new();
-    for addr in initial_peers.into_iter().take(args.max_peers) {
-        let queue = Arc::clone(&queue);
-        let spans = Arc::clone(&spans);
-        let config = Arc::clone(&config);
-        let tx = tx.clone();
-        handles.push(thread::spawn(move || {
-            if let Err(e) = run_worker(addr, &config, &queue, &spans, piece_length, &tx) {
-                eprintln!("peer {} disconnected: {:?}", addr, e);
-            }
-        }));
-    }
-    drop(tx); // so rx below ends once every worker's clone is dropped
+    spawn_new_workers(initial_peers, &mut attempted, &mut handles, args.max_peers, &queue, &spans, &config, piece_length, &tx);
 
     let mut verified = 0usize;
-    for result in rx {
-        verified += 1;
-        println!("piece {} verified ({}/{})", result.index, verified, total_pieces);
+    let mut last_announce = Instant::now();
+    let mut fruitless_rounds = 0u32;
+
+    loop {
+        match rx.recv_timeout(POLL_TICK) {
+            Ok(result) => {
+                verified += 1;
+                println!("piece {} verified ({}/{})", result.index, verified, total_pieces);
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break, // every worker (and our own clone) is gone
+        }
+
+        if queue.is_empty() {
+            break;
+        }
+
+        handles.retain(|h| !h.is_finished());
+
+        if attempted.len() >= args.max_peers && handles.is_empty() {
+            // Every peer slot we're willing to use has been tried and
+            // none are still running -- re-announcing would only ever
+            // return addresses we've already exhausted.
+            break;
+        }
+
+        if last_announce.elapsed() < reannounce_wait {
+            continue;
+        }
+        last_announce = Instant::now();
+
+        if tracker_urls.is_empty() {
+            // No trackers to re-announce to at all (can happen for a
+            // magnet-only run with a single tracker that only ever
+            // appeared in the bootstrap phase and is now in
+            // `tracker_urls` anyway -- but guard regardless).
+            fruitless_rounds += 1;
+        } else {
+            println!("{} piece(s) remaining, re-announcing to trackers...", queue.len());
+            let req = build_regular_request(torrent.info_hash, our_peer_id, ANNOUNCE_PORT, total_length);
+            let (peers, failures, interval) = announce_to_all(&tracker_urls, &req);
+            for f in &failures {
+                eprintln!("warning: tracker {} failed: {}", f.url, f.error);
+            }
+            if let Some(secs) = interval {
+                reannounce_wait = Duration::from_secs(secs as u64).max(MIN_REANNOUNCE);
+            }
+            let new_addrs: Vec<SocketAddr> = peers.into_iter().map(SocketAddr::V4).collect();
+            let spawned = spawn_new_workers(new_addrs, &mut attempted, &mut handles, args.max_peers, &queue, &spans, &config, piece_length, &tx);
+            if spawned == 0 && handles.is_empty() {
+                fruitless_rounds += 1;
+                println!("no new peers found ({}/{} fruitless rounds)", fruitless_rounds, MAX_FRUITLESS_ROUNDS);
+            } else {
+                fruitless_rounds = 0;
+                if spawned > 0 {
+                    println!("connected {} new peer(s)", spawned);
+                }
+            }
+        }
+
+        if fruitless_rounds >= MAX_FRUITLESS_ROUNDS {
+            break;
+        }
     }
 
+    drop(tx);
     for h in handles {
         let _ = h.join();
     }
@@ -157,7 +269,7 @@ fn run(args: Args) -> Result<(), String> {
         println!("download complete: {} -> {}", torrent.name, base_dir.display());
         Ok(())
     } else {
-        Err(format!("incomplete: {} piece(s) never downloaded (ran out of usable peers)", queue.len()))
+        Err(format!("incomplete: {} piece(s) never downloaded (ran out of usable peers across {} re-announce attempt(s))", queue.len(), fruitless_rounds))
     }
 }
 
@@ -176,7 +288,7 @@ fn resolve_magnet(uri: &str, our_peer_id: [u8; 20]) -> Result<(TorrentFile, Vec<
     }
 
     let bootstrap_req = build_started_request(magnet.info_hash, our_peer_id, ANNOUNCE_PORT, 1);
-    let (peers, failures) = announce_to_all(&magnet.trackers, &bootstrap_req);
+    let (peers, failures, _interval) = announce_to_all(&magnet.trackers, &bootstrap_req);
     for f in &failures {
         eprintln!("warning: tracker {} failed: {}", f.url, f.error);
     }

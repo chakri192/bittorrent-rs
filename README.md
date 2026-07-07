@@ -137,9 +137,9 @@ Stated plainly rather than glossed over:
 
 - **No DHT or PEX.** Peer discovery is tracker-only. A magnet link with no `tr=` trackers has no way to find a single peer in this client.
 - **No seeding/uploading.** This is a downloader. `PeerState::am_choking`/`am_interested` exist but nothing drives them the other direction.
-- **Single upfront tracker announce.** Real clients re-announce periodically (per the tracker's returned `interval`) and report `completed`/`stopped` events. This client announces once and never again.
 - **No resume support.** Every run starts from piece 0; there's no on-disk state tracking what was already verified from a prior run.
-- **Peer failure handling is coarse.** A peer that fails a piece gets that piece taken away and is not retried further this run, but there's no reputation tracking across peers/pieces beyond that.
+- **Peer failure handling is coarse.** A peer that fails a piece gets that piece taken away and won't be retried on the *same* connection again, but there's no reputation tracking across peers/pieces beyond that -- a peer that flakes once is still eligible to be reconnected to on a later re-announce round if the tracker offers it again.
+- **Re-announce is time-bound, not indefinite.** The client re-announces periodically (honoring the tracker's requested `interval`, floored at 30s so a misbehaving tracker can't be hammered) as peers drop, but gives up after 5 consecutive rounds that found zero new peers with zero active connections -- it won't hang forever against a genuinely dead swarm, but also won't retry forever against a slow-to-recover one.
 
 None of these were required by the original five-phase spec, so they weren't built, but a "complete" client built further from this base would need them.
 
