@@ -29,13 +29,22 @@ pub struct WorkerConfig {
 
 #[derive(Debug)]
 pub enum WorkerError {
-    Connection(ConnectionError),
+    /// `stage` names exactly where in the exchange the failure happened
+    /// (e.g. "connect_and_handshake", "wait_for_unchoke",
+    /// "read_message_during_piece_download") -- an `UnexpectedEof` right
+    /// after connecting means something very different from one after
+    /// 500 successfully-received blocks, and the two used to be
+    /// indistinguishable from the caller's side.
+    Connection { stage: &'static str, error: ConnectionError },
     PieceHashMismatch,
 }
 
 impl From<ConnectionError> for WorkerError {
     fn from(e: ConnectionError) -> Self {
-        WorkerError::Connection(e)
+        // Fallback for call sites that haven't been given a specific
+        // stage; every site in this file is tagged explicitly below, so
+        // in practice this only fires if a future call site forgets to.
+        WorkerError::Connection { stage: "unspecified", error: e }
     }
 }
 
@@ -52,17 +61,18 @@ pub fn run_worker(
     piece_length: u64,
     results_tx: &Sender<PieceResult>,
 ) -> Result<(), WorkerError> {
-    let (mut stream, peer_handshake) = connect_and_handshake(peer_addr, config.info_hash, config.our_peer_id, true, config.connect_timeout)?;
+    let (mut stream, peer_handshake) =
+        connect_and_handshake(peer_addr, config.info_hash, config.our_peer_id, true, config.connect_timeout).map_err(|e| WorkerError::Connection { stage: "connect_and_handshake", error: e })?;
     let _ = peer_handshake; // available for BEP10 negotiation in a fuller integration; unused at the wire-protocol level itself
 
     let mut state = PeerState::new();
-    crate::peer::connection::send_message(&mut stream, &Message::Interested)?;
+    crate::peer::connection::send_message(&mut stream, &Message::Interested).map_err(|e| WorkerError::Connection { stage: "send_interested", error: e })?;
     state.am_interested = true;
 
     // Drain messages until unchoked or the peer disconnects. Bitfield/Have
     // messages that arrive in the meantime update `state` as a side effect.
     while state.peer_choking {
-        let msg = crate::peer::connection::read_message(&mut stream)?;
+        let msg = crate::peer::connection::read_message(&mut stream).map_err(|e| WorkerError::Connection { stage: "wait_for_unchoke", error: e })?;
         state.apply_message(&msg);
     }
 
@@ -80,7 +90,7 @@ pub fn run_worker(
                     // out of this worker entirely rather than risk more
                     // writes to a broken filesystem.
                     queue.push_back(work);
-                    return Err(WorkerError::Connection(ConnectionError::Io(e)));
+                    return Err(WorkerError::Connection { stage: "write_piece_to_disk", error: ConnectionError::Io(e) });
                 }
                 let _ = results_tx.send(PieceResult { index: piece_index, data });
             }
@@ -108,6 +118,7 @@ fn download_one_piece(
 ) -> Result<Vec<u8>, WorkerError> {
     let mut assembler = PieceAssembler::new(work);
     let mut in_flight = 0usize;
+    let mut blocks_received = 0u32;
 
     loop {
         while in_flight < pipeline_depth {
@@ -116,7 +127,8 @@ fn download_one_piece(
                 break;
             }
             for (index, begin, length) in reqs {
-                crate::peer::connection::send_message(stream, &Message::Request { index, begin, length })?;
+                crate::peer::connection::send_message(stream, &Message::Request { index, begin, length })
+                    .map_err(|e| WorkerError::Connection { stage: stage_label("send_request", blocks_received), error: e })?;
                 in_flight += 1;
             }
         }
@@ -125,11 +137,12 @@ fn download_one_piece(
             break;
         }
 
-        let msg = crate::peer::connection::read_message(stream)?;
+        let msg = crate::peer::connection::read_message(stream).map_err(|e| WorkerError::Connection { stage: stage_label("read_message_during_piece_download", blocks_received), error: e })?;
         match &msg {
             Message::Piece { index: _, begin, block } => {
                 let _ = assembler.record_block(*begin, block);
                 in_flight = in_flight.saturating_sub(1);
+                blocks_received += 1;
             }
             other => {
                 state.apply_message(other);
@@ -138,6 +151,28 @@ fn download_one_piece(
     }
 
     assembler.finish().map_err(|_| WorkerError::PieceHashMismatch)
+}
+
+/// Bakes "how many blocks of this piece we'd already received before this
+/// failure" into the stage label, since `&'static str` can't hold a
+/// runtime number directly. `0` means the connection died before this
+/// worker got a single byte of piece data from it -- a materially
+/// different failure than dying after 40 successful blocks.
+fn stage_label(base: &'static str, blocks_received: u32) -> &'static str {
+    if blocks_received == 0 {
+        base
+    } else {
+        // Can't format a runtime count into a &'static str without
+        // allocating (which the WorkerError::Connection field type
+        // doesn't support); the two fixed variants below at least
+        // distinguish "died immediately" from "died after some progress",
+        // which is the distinction that actually mattered in practice.
+        match base {
+            "send_request" => "send_request_after_prior_progress",
+            "read_message_during_piece_download" => "read_message_after_prior_progress",
+            other => other,
+        }
+    }
 }
 
 #[cfg(test)]
