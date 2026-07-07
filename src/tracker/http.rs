@@ -2,8 +2,9 @@
 //! no `reqwest`/`hyper`/`curl`. This only needs a GET, a handful of request
 //! headers, and just enough response parsing (status line, headers,
 //! Content-Length OR chunked transfer-encoding) to get the bencoded body.
-//! It intentionally does not support HTTPS (no TLS implementation here);
-//! `announce` on an `https://` tracker returns `UnsupportedScheme`.
+//! `https://` trackers are handled by `tracker::https`, which reuses
+//! everything here except the transport (TLS-wrapped stream instead of a
+//! bare `TcpStream`) via `perform_request_and_parse`.
 
 use super::{percent_encode_bytes, parse_compact_peers, AnnounceRequest, AnnounceResponse, TrackerError};
 use crate::bencode::{self, Bencode};
@@ -11,39 +12,45 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-/// Bare-bones parsed `http://host[:port]/path[?query]` URL. No userinfo,
+/// Bare-bones parsed `scheme://host[:port]/path[?query]` URL. No userinfo,
 /// no fragment -- trackers don't use them.
-struct ParsedUrl {
-    host: String,
-    port: u16,
-    path_and_query: String,
+pub(crate) struct ParsedUrl {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) path_and_query: String,
 }
 
 fn parse_http_url(url: &str) -> Result<ParsedUrl, TrackerError> {
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| TrackerError::UnsupportedScheme(url.split("://").next().unwrap_or(url).to_string()))?;
+    parse_authority_and_path(url, rest, 80)
+}
 
+/// Shared by `http.rs` and `https.rs`: both are the same `host[:port]/path`
+/// grammar, differing only in the scheme prefix already stripped by the
+/// caller and the default port when none is given.
+pub(crate) fn parse_authority_and_path(full_url: &str, rest: &str, default_port: u16) -> Result<ParsedUrl, TrackerError> {
     let (authority, path_and_query) = match rest.find('/') {
         Some(idx) => (&rest[..idx], rest[idx..].to_string()),
         None => (rest, "/".to_string()),
     };
     if authority.is_empty() {
-        return Err(TrackerError::BadUrl(url.to_string()));
+        return Err(TrackerError::BadUrl(full_url.to_string()));
     }
 
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => {
-            let port: u16 = p.parse().map_err(|_| TrackerError::BadUrl(url.to_string()))?;
+            let port: u16 = p.parse().map_err(|_| TrackerError::BadUrl(full_url.to_string()))?;
             (h.to_string(), port)
         }
-        None => (authority.to_string(), 80),
+        None => (authority.to_string(), default_port),
     };
 
     Ok(ParsedUrl { host, port, path_and_query })
 }
 
-fn build_query(req: &AnnounceRequest) -> String {
+pub(crate) fn build_query(req: &AnnounceRequest) -> String {
     let mut q = String::new();
     q.push_str("info_hash=");
     q.push_str(&percent_encode_bytes(&req.info_hash));
@@ -68,8 +75,10 @@ fn build_query(req: &AnnounceRequest) -> String {
 /// received, and returns just the body bytes. Handles `Content-Length`
 /// and `Transfer-Encoding: chunked`; falls back to "read until EOF" if
 /// neither header is present (valid for `Connection: close` responses,
-/// which is what we always request).
-fn read_http_response_body(stream: &mut TcpStream) -> Result<Vec<u8>, TrackerError> {
+/// which is what we always request). Generic over `Read` so the same
+/// logic serves both a plain `TcpStream` (this module) and a TLS-wrapped
+/// stream (`tracker::https`).
+pub(crate) fn read_http_response_body<S: Read>(stream: &mut S) -> Result<Vec<u8>, TrackerError> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -142,20 +151,26 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// bencoded response into an `AnnounceResponse`.
 pub fn announce(tracker_url: &str, req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
     let url = parse_http_url(tracker_url)?;
+    let mut stream = TcpStream::connect((url.host.as_str(), url.port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+    perform_request_and_parse(&mut stream, &url, req)
+}
+
+/// Sends the GET request and parses the response over any already-connected
+/// `Read + Write` transport -- a bare `TcpStream` here, or a TLS-wrapped
+/// stream in `tracker::https`. Both schemes speak identical HTTP/1.1 once
+/// the transport is set up; only `parse_*_url` and the transport differ.
+pub(crate) fn perform_request_and_parse<S: Read + Write>(stream: &mut S, url: &ParsedUrl, req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
     let query = build_query(req);
     let separator = if url.path_and_query.contains('?') { "&" } else { "?" };
-
     let request = format!(
         "GET {}{}{} HTTP/1.1\r\nHost: {}\r\nUser-Agent: bittorrent-rs/0.1\r\nConnection: close\r\nAccept: */*\r\n\r\n",
         url.path_and_query, separator, query, url.host
     );
-
-    let mut stream = TcpStream::connect((url.host.as_str(), url.port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(15)))?;
     stream.write_all(request.as_bytes())?;
 
-    let body = read_http_response_body(&mut stream)?;
+    let body = read_http_response_body(stream)?;
     parse_announce_body(&body)
 }
 

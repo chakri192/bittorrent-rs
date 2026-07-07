@@ -4,6 +4,7 @@
 //! wire encoding differs (URL query string vs. fixed-width binary packets).
 
 pub mod http;
+pub mod https;
 pub mod udp;
 
 use std::fmt;
@@ -57,6 +58,7 @@ pub enum TrackerError {
     MalformedResponse(&'static str),
     TrackerFailure(String),
     Timeout,
+    Tls(String),
 }
 
 impl From<std::io::Error> for TrackerError {
@@ -81,6 +83,7 @@ impl fmt::Display for TrackerError {
             TrackerError::MalformedResponse(s) => write!(f, "malformed tracker response: {}", s),
             TrackerError::TrackerFailure(s) => write!(f, "tracker returned failure reason: {}", s),
             TrackerError::Timeout => write!(f, "tracker request timed out"),
+            TrackerError::Tls(s) => write!(f, "TLS error: {}", s),
         }
     }
 }

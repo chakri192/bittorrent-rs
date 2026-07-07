@@ -5,6 +5,12 @@ edition = "2021"
 
 [dependencies]
 sha1 = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+webpki-roots = "0.26"
+# Pinned below the version that requires edition2024 (Cargo 1.85+ / rustc
+# 1.85+): this repo is also built/tested in a sandbox running rustc 1.75.
+# Remove this pin freely on a newer toolchain.
+zeroize = "=1.8.1"
 
 [lib]
 name = "bittorrent_rs"

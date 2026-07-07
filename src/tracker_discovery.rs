@@ -3,7 +3,7 @@
 //! unreachable tracker doesn't abort the whole discovery -- we only fail
 //! if *every* tracker fails, which is the actual "no peers findable" case.
 
-use crate::tracker::{http, udp, AnnounceRequest, Event};
+use crate::tracker::{http, https, udp, AnnounceRequest, Event};
 use std::collections::HashSet;
 use std::net::SocketAddrV4;
 
@@ -28,6 +28,8 @@ pub fn announce_to_all(tracker_urls: &[String], req: &AnnounceRequest) -> (Vec<S
             // path segment (no meaning for UDP trackers) -- strip it.
             let host_port = host_port.split('/').next().unwrap_or(host_port);
             udp::announce(host_port, req).map_err(|e| e.to_string())
+        } else if url.starts_with("https://") {
+            https::announce(url, req).map_err(|e| e.to_string())
         } else if url.starts_with("http://") {
             http::announce(url, req).map_err(|e| e.to_string())
         } else {

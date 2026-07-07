@@ -2,8 +2,9 @@
 
 A working BitTorrent client in Rust, built from scratch. No `libtorrent`-style
 crate anywhere — bencode parsing, wire protocol, tracker comms, BEP 10/9
-magnet support, and piece assembly are all hand-rolled. The only dependency
-is `sha1`.
+magnet support, and piece assembly are all hand-rolled. Dependencies:
+`sha1`, and `rustls`+`webpki-roots` for HTTPS tracker support (TLS itself
+is deliberately not hand-rolled — see below).
 
 ```sh
 cargo run --bin download -- file.torrent --out ./downloads
@@ -113,7 +114,7 @@ cargo test                              # 112 unit tests
 `src/downloader/mod.rs::build_work_queue` — the `TorrentFile` ↔ `PieceWork` adapter: works unmodified whether `TorrentFile` came from a `.torrent` file (Phase 1) or from a magnet-derived info dict (Phase 4's `MetadataAssembler::assemble_and_verify` output, once run through `parse_torrent_file`-equivalent construction). No separate magnet-specific downloader needed.
 
 ```sh
-cargo test                              # 136 unit tests, incl. loopback integration tests
+cargo test                              # 147 unit tests, incl. loopback integration tests
 ```
 
 ## Integration: making it a real client
@@ -122,7 +123,9 @@ cargo test                              # 136 unit tests, incl. loopback integra
 
 `src/magnet_fetch.rs` — the piece that was scaffolded in Phase 4 but not wired up: connects to a peer, does the BEP 3 + BEP 10 handshakes, requests every `ut_metadata` piece in sequence, and returns the verified info dict. **Tested end-to-end** against a mock peer that deliberately uses a *different* extension id than ours, to prove the BEP 10 id-remapping (you send peer X, they respond with your id) is actually implemented correctly and not just assumed.
 
-`src/tracker_discovery.rs` — announces to every tracker URL a torrent lists (mixing `http://` and `udp://`), merges and dedupes the peer lists, and treats a single bad tracker as a warning, not a fatal error (only *all* trackers failing is fatal — that's the actual "no peers findable" case).
+`src/tracker_discovery.rs` — announces to every tracker URL a torrent lists (mixing `http://`, `https://`, and `udp://`), merges and dedupes the peer lists, and treats a single bad tracker as a warning, not a fatal error (only *all* trackers failing is fatal — that's the actual "no peers findable" case).
+
+`src/tracker/https.rs` — most public trackers today (Ubuntu's included) only offer `https://` announce URLs, so `http`-only support wasn't actually "complete." TLS is provided by `rustls` (pure Rust, `ring` crypto backend, no OpenSSL/system-TLS dependency) — this is deliberately *not* hand-rolled like everything else, because implementing TLS yourself is a well-known way to introduce catastrophic security bugs, and "from scratch" doesn't mean "don't use a cryptography library reviewed by people who specialize in exactly that." Certificate validation is never overridable — rustls's API doesn't expose a way to disable it. Everything *around* the TLS session (the HTTP request line, response parsing, bencode decoding) is the same code `tracker::http` uses; only the transport differs.
 
 `src/bin/download.rs` — the real CLI: `.torrent` file or magnet link in, verified file(s) on disk out. Bounds concurrent peer connections (`--peers`, default 30), never panics on bad input (bad file paths, malformed torrents, magnet links with no trackers, unrecognized flags all exit cleanly with a message), and requeues any piece a peer fails to deliver correctly for another peer to try.
 
