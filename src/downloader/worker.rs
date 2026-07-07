@@ -84,11 +84,16 @@ pub fn run_worker(
                 }
                 let _ = results_tx.send(PieceResult { index: piece_index, data });
             }
-            Err(_) => {
+            Err(e) => {
                 // Hash mismatch or wire error on this piece: give another
-                // peer a chance rather than trusting this connection further.
+                // peer a chance rather than trusting this connection
+                // further. Previously this returned Ok(()), which silently
+                // discarded the reason and made a single-peer failure look
+                // like a clean, silent no-op to the caller -- now the
+                // caller (e.g. `download.rs`'s per-thread error print)
+                // actually sees why this peer was dropped.
                 queue.push_back(work);
-                return Ok(());
+                return Err(e);
             }
         }
     }
@@ -266,7 +271,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let config = WorkerConfig { info_hash, our_peer_id: [0x22; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5) };
 
-        run_worker(addr, &config, &queue, &spans, 16384, &tx).unwrap();
+        let result = run_worker(addr, &config, &queue, &spans, 16384, &tx);
+        assert!(matches!(result, Err(WorkerError::PieceHashMismatch)));
         let _ = mock.join();
 
         // The piece went back on the queue for another peer to try.
