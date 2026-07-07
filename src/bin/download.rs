@@ -53,6 +53,11 @@ struct Args {
     source: String,
     out_dir: PathBuf,
     max_peers: usize,
+    /// Overrides the tracker's requested re-announce interval. Still
+    /// floored at `MIN_REANNOUNCE` even when explicitly set -- an
+    /// override is for impatient manual testing, not for ignoring the
+    /// floor that exists to avoid hammering a tracker.
+    reannounce_override: Option<u64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -64,6 +69,7 @@ fn parse_args() -> Result<Args, String> {
 
     let mut out_dir = PathBuf::from("downloads");
     let mut max_peers = DEFAULT_MAX_PEERS;
+    let mut reannounce_override = None;
 
     while let Some(flag) = argv.next() {
         match flag.as_str() {
@@ -72,15 +78,19 @@ fn parse_args() -> Result<Args, String> {
                 let n = argv.next().ok_or("--peers requires a number argument")?;
                 max_peers = n.parse().map_err(|_| format!("--peers: not a number: {}", n))?;
             }
+            "--reannounce" => {
+                let n = argv.next().ok_or("--reannounce requires a number of seconds")?;
+                reannounce_override = Some(n.parse().map_err(|_| format!("--reannounce: not a number: {}", n))?);
+            }
             other => return Err(format!("unrecognized argument: {}", other)),
         }
     }
 
-    Ok(Args { source, out_dir, max_peers })
+    Ok(Args { source, out_dir, max_peers, reannounce_override })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--reannounce SECONDS]".to_string()
 }
 
 fn main() -> ExitCode {
@@ -171,6 +181,9 @@ fn run(args: Args) -> Result<(), String> {
         }
         initial_peers.extend(peers.into_iter().map(SocketAddr::V4));
     }
+    if let Some(secs) = args.reannounce_override {
+        reannounce_wait = Duration::from_secs(secs).max(MIN_REANNOUNCE);
+    }
     initial_peers.sort_by_key(|a| a.to_string());
     initial_peers.dedup();
 
@@ -178,6 +191,7 @@ fn run(args: Args) -> Result<(), String> {
         return Err("no peers found from any tracker".to_string());
     }
     println!("found {} peer(s), connecting up to {}", initial_peers.len(), args.max_peers);
+    println!("re-announce interval: {}s{}", reannounce_wait.as_secs(), if args.reannounce_override.is_some() { " (overridden via --reannounce)" } else { " (tracker-requested, floored at 30s)" });
 
     let base_dir = if torrent.files.len() > 1 { args.out_dir.join(&torrent.name) } else { args.out_dir.clone() };
     let spans = Arc::new(build_file_spans(&base_dir, &torrent.files));
@@ -195,6 +209,7 @@ fn run(args: Args) -> Result<(), String> {
 
     let mut verified = 0usize;
     let mut last_announce = Instant::now();
+    let mut last_heartbeat = Instant::now();
     let mut fruitless_rounds = 0u32;
 
     loop {
@@ -202,6 +217,7 @@ fn run(args: Args) -> Result<(), String> {
             Ok(result) => {
                 verified += 1;
                 println!("piece {} verified ({}/{})", result.index, verified, total_pieces);
+                last_heartbeat = Instant::now(); // a real download event counts as activity too
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -222,6 +238,19 @@ fn run(args: Args) -> Result<(), String> {
         }
 
         if last_announce.elapsed() < reannounce_wait {
+            // Waiting is normal (honoring the tracker's interval), but
+            // waiting *silently* looks identical to hung from a terminal.
+            // Print a heartbeat periodically so it's visibly still alive.
+            if last_heartbeat.elapsed() >= Duration::from_secs(15) {
+                let remaining = reannounce_wait.saturating_sub(last_announce.elapsed()).as_secs();
+                println!(
+                    "waiting: {} active connection(s), {} piece(s) remaining, next re-announce in {}s",
+                    handles.len(),
+                    queue.len(),
+                    remaining
+                );
+                last_heartbeat = Instant::now();
+            }
             continue;
         }
         last_announce = Instant::now();
