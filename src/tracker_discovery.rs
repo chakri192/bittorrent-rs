@@ -4,19 +4,40 @@
 //! only fail if *every* tracker fails, which is the actual "no peers
 //! findable" case.
 //!
-//! Trackers are queried in parallel (one thread each), not serially. A
-//! magnet link routinely lists several `udp://` trackers, each of which
-//! can take tens of seconds to time out (BEP 15's exponential backoff)
-//! if unresponsive; querying them one after another means the total wait
-//! is the *sum* of every tracker's timeout, which for 3+ dead UDP
-//! trackers can be several minutes of complete silence. Querying them
-//! concurrently means the wait is the *max* of any one tracker's
-//! timeout instead.
+//! Trackers are queried in parallel (one thread each) with an overall
+//! deadline, rather than waiting for every tracker to individually finish
+//! or time out. Two reasons this matters:
+//!
+//!  - A magnet link routinely lists several `udp://` trackers; querying
+//!    them one after another (not just launching them one after another,
+//!    but *waiting* for each before starting the next) means the total
+//!    wait is the *sum* of every tracker's timeout.
+//!  - Even with all trackers launched concurrently, a single `udp://`
+//!    tracker that silently drops packets (rather than actively
+//!    rejecting) can retry with BEP 15's exponential backoff for several
+//!    minutes on its own before giving up -- waiting for *that one
+//!    straggler* before returning any result at all would still make an
+//!    otherwise-healthy announce feel hung.
+//!
+//! The fix for both: launch every tracker query on its own thread
+//! immediately, then collect whatever responses arrive within
+//! `OVERALL_ANNOUNCE_DEADLINE`, using an mpsc channel with
+//! `recv_timeout` rather than joining threads one at a time. Slow
+//! stragglers keep running in the background and are simply not waited
+//! on; their result (if any) is just never used for this particular call.
 
 use crate::tracker::{http, https, udp, AnnounceRequest, Event};
 use std::collections::HashSet;
 use std::net::SocketAddrV4;
+use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
+
+/// Generous enough for every real-world tracker this client has been
+/// tested against to respond well within it (typically well under 2s),
+/// but bounded enough that "a tracker is silently dropping packets"
+/// doesn't turn into "this program looks hung for a quarter of an hour."
+const OVERALL_ANNOUNCE_DEADLINE: Duration = Duration::from_secs(20);
 
 #[derive(Debug)]
 pub struct TrackerAttempt {
@@ -26,9 +47,9 @@ pub struct TrackerAttempt {
 
 /// Announces to every URL in `tracker_urls` concurrently, returning the
 /// deduplicated union of all peers any tracker returned, the list of
-/// trackers that failed (for diagnostics -- not fatal unless *all* of
-/// them are in this list), and the re-announce interval to wait before
-/// trying again.
+/// trackers that failed *or didn't answer within the deadline* (for
+/// diagnostics -- not fatal unless *all* of them are in this list), and
+/// the re-announce interval to wait before trying again.
 ///
 /// The interval is the *maximum* `interval` (or `min_interval` if a
 /// tracker sent one) across every tracker that responded -- i.e. the most
@@ -37,43 +58,70 @@ pub struct TrackerAttempt {
 /// the max rather than the min means we never violate the slowest
 /// tracker's request just because a faster one also happened to answer.
 pub fn announce_to_all(tracker_urls: &[String], req: &AnnounceRequest) -> (Vec<SocketAddrV4>, Vec<TrackerAttempt>, Option<u32>) {
-    let handles: Vec<_> = tracker_urls
-        .iter()
-        .map(|url| {
-            let url = url.clone();
-            let req = req.clone();
-            thread::spawn(move || {
-                let result = if let Some(host_port) = url.strip_prefix("udp://") {
-                    // udp:// tracker URLs sometimes have a trailing
-                    // "/announce" path segment (no meaning for UDP
-                    // trackers) -- strip it.
-                    let host_port = host_port.split('/').next().unwrap_or(host_port).to_string();
-                    udp::announce(&host_port, &req).map_err(|e| e.to_string())
-                } else if url.starts_with("https://") {
-                    https::announce(&url, &req).map_err(|e| e.to_string())
-                } else if url.starts_with("http://") {
-                    http::announce(&url, &req).map_err(|e| e.to_string())
-                } else {
-                    Err(format!("unsupported tracker scheme: {}", url))
-                };
-                (url, result)
-            })
-        })
-        .collect();
+    let (tx, rx) = mpsc::channel();
+
+    for url in tracker_urls {
+        let url = url.clone();
+        let req = req.clone();
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let result = if let Some(host_port) = url.strip_prefix("udp://") {
+                // udp:// tracker URLs sometimes have a trailing
+                // "/announce" path segment (no meaning for UDP
+                // trackers) -- strip it.
+                let host_port = host_port.split('/').next().unwrap_or(host_port).to_string();
+                udp::announce(&host_port, &req).map_err(|e| e.to_string())
+            } else if url.starts_with("https://") {
+                https::announce(&url, &req).map_err(|e| e.to_string())
+            } else if url.starts_with("http://") {
+                http::announce(&url, &req).map_err(|e| e.to_string())
+            } else {
+                Err(format!("unsupported tracker scheme: {}", url))
+            };
+            // Ignore send errors: they only happen if the receiver
+            // (below) already gave up waiting and dropped `rx`, which is
+            // exactly the "this thread became a straggler" case this
+            // whole function exists to not block on.
+            let _ = tx.send((url, result));
+        });
+    }
+    drop(tx); // our own copy; the loop above holds the rest via clones
 
     let mut peers = HashSet::new();
     let mut failures = Vec::new();
     let mut max_interval: Option<u32> = None;
+    let mut answered: HashSet<String> = HashSet::new();
 
-    for handle in handles {
-        let (url, result) = handle.join().unwrap_or_else(|_| ("<unknown>".to_string(), Err("tracker query thread panicked".to_string())));
-        match result {
-            Ok(resp) => {
-                peers.extend(resp.peers);
-                let wait = resp.min_interval.unwrap_or(resp.interval);
-                max_interval = Some(max_interval.map_or(wait, |cur| cur.max(wait)));
+    let deadline = Instant::now() + OVERALL_ANNOUNCE_DEADLINE;
+    while answered.len() < tracker_urls.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok((url, result)) => {
+                answered.insert(url.clone());
+                match result {
+                    Ok(resp) => {
+                        peers.extend(resp.peers);
+                        let wait = resp.min_interval.unwrap_or(resp.interval);
+                        max_interval = Some(max_interval.map_or(wait, |cur| cur.max(wait)));
+                    }
+                    Err(e) => failures.push(TrackerAttempt { url, error: e }),
+                }
             }
-            Err(e) => failures.push(TrackerAttempt { url, error: e }),
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break, // shouldn't happen while any sender clone is alive, but don't hang if it does
+        }
+    }
+
+    // Anything that never answered within the deadline is reported as a
+    // failure too, distinctly from an active rejection, so `download.rs`'s
+    // "warning: tracker X failed: ..." output tells the truth about what
+    // happened instead of silently omitting slow trackers.
+    for url in tracker_urls {
+        if !answered.contains(url) {
+            failures.push(TrackerAttempt { url: url.clone(), error: format!("no response within {}s", OVERALL_ANNOUNCE_DEADLINE.as_secs()) });
         }
     }
 
