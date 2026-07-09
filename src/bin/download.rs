@@ -67,7 +67,7 @@ fn parse_args() -> Result<Args, String> {
         return Err(usage());
     }
 
-    let mut out_dir = PathBuf::from("downloads");
+    let mut out_dir = default_downloads_dir();
     let mut max_peers = DEFAULT_MAX_PEERS;
     let mut reannounce_override = None;
 
@@ -91,6 +91,14 @@ fn parse_args() -> Result<Args, String> {
 
 fn usage() -> String {
     "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--reannounce SECONDS]".to_string()
+}
+
+/// Default `--out`: the user's actual `~/Downloads`, not a `./downloads`
+/// created wherever the binary happens to be invoked from. Falls back to
+/// `./downloads` only if `$HOME` isn't set at all (e.g. some minimal
+/// containers) -- better than panicking over a missing default.
+fn default_downloads_dir() -> PathBuf {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads")).unwrap_or_else(|| PathBuf::from("downloads"))
 }
 
 fn main() -> ExitCode {

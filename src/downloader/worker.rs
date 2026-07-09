@@ -9,7 +9,7 @@
 use crate::downloader::file_writer::{write_piece, FileSpan};
 use crate::downloader::piece_assembler::PieceAssembler;
 use crate::downloader::queue::{PieceResult, WorkQueue};
-use crate::peer::{connect_and_handshake, ConnectionError, Message, PeerState, WireError};
+use crate::peer::{connect_and_handshake, ConnectionError, Message, PeerState};
 use std::net::SocketAddr;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -78,14 +78,8 @@ pub fn run_worker(
 
     while let Some(work) = queue.pop() {
         let piece_index = work.index;
-        if !state.peer_has_pieces.get(piece_index as usize).copied().unwrap_or(false) {
+        if !state.peer_has_pieces.is_empty() && !state.peer_has_pieces.get(piece_index as usize).copied().unwrap_or(false) {
             queue.push_back(work);
-            match crate::peer::connection::read_message(&mut stream) {
-                Ok(msg) => { state.apply_message(&msg); },
-                Err(ConnectionError::Wire(WireError::Io(ref e)))
-                    if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(e) => return Err(WorkerError::Connection { stage: "wait_for_relevant_have", error: e }),
-            }
             continue;
         }
 
