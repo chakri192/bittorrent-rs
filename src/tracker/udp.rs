@@ -125,9 +125,9 @@ fn send_with_retries(sock: &UdpSocket, packet: &[u8], max_retries: u32) -> Resul
 pub fn announce(tracker_addr: &str, req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
     let addr: SocketAddr = tracker_addr
         .to_socket_addrs()
-        .map_err(|_| TrackerError::BadUrl(tracker_addr.to_string()))?
+        .map_err(|e| TrackerError::BadUrl(format!("{}: DNS resolution failed ({})", tracker_addr, e)))?
         .next()
-        .ok_or_else(|| TrackerError::BadUrl(tracker_addr.to_string()))?;
+        .ok_or_else(|| TrackerError::BadUrl(format!("{}: hostname resolved to zero addresses", tracker_addr)))?;
 
     let sock = UdpSocket::bind("0.0.0.0:0")?;
     sock.connect(addr)?;
