@@ -67,7 +67,7 @@ fn parse_args() -> Result<Args, String> {
         return Err(usage());
     }
 
-    let mut out_dir = PathBuf::from("downloads");
+    let mut out_dir = default_downloads_dir();
     let mut max_peers = DEFAULT_MAX_PEERS;
     let mut reannounce_override = None;
 
@@ -91,6 +91,14 @@ fn parse_args() -> Result<Args, String> {
 
 fn usage() -> String {
     "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--reannounce SECONDS]".to_string()
+}
+
+/// Default `--out`: the user's actual `~/Downloads`, not a `./downloads`
+/// created wherever the binary happens to be invoked from. Falls back to
+/// `./downloads` only if `$HOME` isn't set at all (e.g. some minimal
+/// containers) -- better than panicking over a missing default.
+fn default_downloads_dir() -> PathBuf {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads")).unwrap_or_else(|| PathBuf::from("downloads"))
 }
 
 fn main() -> ExitCode {
@@ -319,6 +327,10 @@ fn resolve_magnet(uri: &str, our_peer_id: [u8; 20]) -> Result<(TorrentFile, Vec<
         // no tracker gives us no way to find any peer at all.
         return Err("magnet link has no trackers and this client has no DHT/PEX support".to_string());
     }
+    if let Some(name) = &magnet.display_name {
+        println!("magnet: {}", name);
+    }
+    println!("querying {} tracker(s) to bootstrap peer list...", magnet.trackers.len());
 
     let bootstrap_req = build_started_request(magnet.info_hash, our_peer_id, ANNOUNCE_PORT, 1);
     let (peers, failures, _interval) = announce_to_all(&magnet.trackers, &bootstrap_req);
@@ -328,17 +340,23 @@ fn resolve_magnet(uri: &str, our_peer_id: [u8; 20]) -> Result<(TorrentFile, Vec<
     if peers.is_empty() {
         return Err("no peers found for magnet link (all trackers failed or returned none)".to_string());
     }
+    println!("found {} peer(s); requesting torrent metadata (BEP 9)...", peers.len());
 
     let mut last_err = String::new();
-    for peer in &peers {
+    for (i, peer) in peers.iter().enumerate() {
+        println!("  trying peer {}/{}: {}...", i + 1, peers.len(), peer);
         match fetch_metadata_from_peer(SocketAddr::V4(*peer), magnet.info_hash, our_peer_id, CONNECT_TIMEOUT) {
             Ok(raw_info) => {
+                println!("metadata received and verified against magnet InfoHash");
                 let announce = magnet.trackers.first().cloned();
                 let announce_list = vec![magnet.trackers.clone()];
                 let torrent = torrent::from_info_dict_bytes(&raw_info, magnet.info_hash, announce, announce_list).map_err(|e| format!("building torrent from metadata: {}", e))?;
                 return Ok((torrent, peers.into_iter().map(SocketAddr::V4).collect()));
             }
-            Err(e) => last_err = e.to_string(),
+            Err(e) => {
+                println!("  peer {} couldn't provide metadata: {}", peer, e);
+                last_err = e.to_string();
+            }
         }
     }
     Err(format!("no peer among {} would provide metadata (last error: {})", peers.len(), last_err))

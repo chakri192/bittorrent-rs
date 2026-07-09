@@ -64,7 +64,7 @@ download <file.torrent | magnet-link> [--out DIR] [--peers N] [--reannounce SECO
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--out DIR` | `downloads` | Where to write the downloaded file(s) |
+| `--out DIR` | `~/Downloads` | Where to write the downloaded file(s) |
 | `--peers N` | `30` | Max number of peer connections to use |
 | `--reannounce SECONDS` | tracker's requested interval | How often to re-query trackers for new peers. Trackers often request long intervals (20-30+ minutes); override this for faster peer discovery while testing |
 
