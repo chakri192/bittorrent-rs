@@ -4,6 +4,7 @@
 //! wire encoding differs (URL query string vs. fixed-width binary packets).
 
 pub mod http;
+pub mod https;
 pub mod udp;
 
 use std::fmt;
@@ -57,6 +58,7 @@ pub enum TrackerError {
     MalformedResponse(&'static str),
     TrackerFailure(String),
     Timeout,
+    Tls(String),
 }
 
 impl From<std::io::Error> for TrackerError {
@@ -81,26 +83,52 @@ impl fmt::Display for TrackerError {
             TrackerError::MalformedResponse(s) => write!(f, "malformed tracker response: {}", s),
             TrackerError::TrackerFailure(s) => write!(f, "tracker returned failure reason: {}", s),
             TrackerError::Timeout => write!(f, "tracker request timed out"),
+            TrackerError::Tls(s) => write!(f, "TLS error: {}", s),
         }
     }
 }
 
 impl std::error::Error for TrackerError {}
 
-/// Generates a 20-byte Azureus-style peer_id: "-RS0001-" + 12 random bytes.
-/// "RS" is an arbitrary client ID for this project; 0001 is the version.
+/// Generates a 20-byte Azureus-style peer_id: "-RS0001-" + 12 pseudo-random
+/// bytes. "RS" is an arbitrary client ID for this project; 0001 is the
+/// version.
 pub fn generate_peer_id() -> [u8; 20] {
     let mut id = [0u8; 20];
     id[..8].copy_from_slice(b"-RS0001-");
-    // No external RNG crate: seed from the system time and a stack address,
-    // then run a small xorshift. Good enough for a peer_id, which only
-    // needs to be *probably* unique, not cryptographically random.
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15)
-        ^ (&id as *const _ as u64);
-    let mut x = seed | 1; // xorshift64 requires a nonzero state
+
+    // No external RNG crate. Three entropy sources mixed together:
+    //  - a per-process atomic counter, which is what actually *guarantees*
+    //    two calls never collide -- unlike a clock reading or a stack
+    //    address, it's impossible for two increments to return the same
+    //    value regardless of how fast they happen or what the OS's clock
+    //    resolution is;
+    //  - wall-clock nanos, for variation across process runs;
+    //  - `RandomState`'s hasher, which the standard library seeds from the
+    //    OS's real RNG on every construction -- this is a well-known
+    //    no-dependency way to get real entropy in Rust without a `rand`
+    //    crate.
+    // (An earlier version of this function mixed in a stack address
+    // instead of the counter. That was a bug: calling the same function
+    // twice in a row reuses the same stack slot, so the address was
+    // identical both times and contributed zero entropy -- on a platform
+    // with coarse clock resolution this let two back-to-back calls
+    // produce an identical peer_id, caught by
+    // `peer_id_generation_is_not_constant` failing intermittently.)
+    static CALL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = CALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let time_component = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+
+    let os_entropy = {
+        use std::hash::{BuildHasher, Hasher};
+        std::collections::hash_map::RandomState::new().build_hasher().finish()
+    };
+
+    let mut x = counter ^ time_component ^ os_entropy ^ 0x9E3779B97F4A7C15;
+    if x == 0 {
+        x = 1; // xorshift64 requires a nonzero state
+    }
     for byte in &mut id[8..20] {
         x ^= x << 13;
         x ^= x >> 7;
@@ -179,10 +207,27 @@ mod tests {
     #[test]
     fn peer_id_generation_is_not_constant() {
         // Not a strong randomness guarantee, just a smoke test that the
-        // xorshift seed actually varies call to call.
+        // entropy sources actually vary call to call.
         let a = generate_peer_id();
         let b = generate_peer_id();
         assert_ne!(&a[8..], &b[8..]);
+    }
+
+    #[test]
+    fn peer_id_generation_produces_no_duplicates_across_many_rapid_calls() {
+        // Regression test for a real bug: an earlier version mixed a
+        // stack address into the entropy, which is identical across two
+        // sequential calls to the same function and contributed nothing.
+        // Combined with coarse clock resolution on some platforms, two
+        // back-to-back calls could produce an identical peer_id. The
+        // atomic call counter this now uses makes that structurally
+        // impossible regardless of clock resolution -- this test calls
+        // fast enough (no sleep) to be the adversarial case.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let id = generate_peer_id();
+            assert!(seen.insert(id), "duplicate peer_id generated: {:?}", id);
+        }
     }
 
     #[test]

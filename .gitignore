@@ -1,2 +1,7 @@
 /target
 *.torrent
+/downloads/
+*.log
+*.bak
+SHA512SUMS
+*.iso
