@@ -103,6 +103,14 @@ cargo test          # unit + integration tests (loopback only, no network needed
 cargo build --release
 ```
 
+---
+## AI Tooling
+| Model | Used for |
+|-------|----------|
+| `qwen2.5-coder:7b` | Code suggestions, refactoring |
+| `llama3.1:8b` | Prose, documentation, commit messages |
+---
+
 ## License
 
 MIT
