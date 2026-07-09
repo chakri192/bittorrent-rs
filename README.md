@@ -1,130 +1,105 @@
 # bittorrent-rs
 
-A BitTorrent client written in Rust from scratch. No `libtorrent`-style
-crate — bencode parsing, the peer wire protocol, tracker communication,
-magnet link support, and piece assembly are all implemented directly.
-The only third-party dependencies are `sha1` and `rustls` (for HTTPS
-tracker support — TLS itself is deliberately not hand-rolled).
+A BitTorrent client written in Rust from scratch — bencode parsing, the
+peer wire protocol, tracker communication, magnet link support, and
+piece assembly are all implemented directly, no `libtorrent`-style
+crate. Only third-party dependencies: `sha1`, and `rustls` for HTTPS
+tracker support (TLS itself is deliberately not hand-rolled).
 
-Verified against a real swarm: downloads from `.torrent` files come out
-byte-identical to the publisher's official checksum (tested against
-Debian's netinst ISO, SHA-512 match confirmed).
+**Verified against real swarms**, not just local tests:
+- `.torrent` downloads come out byte-identical to the publisher's
+  official checksum (tested against Debian's netinst ISO, SHA-512 match)
+- Magnet links fetch and SHA-1-verify metadata from a live peer (BEP 9),
+  then download normally against a real tracker/swarm
 
 ## What it does
 
 - Parses `.torrent` files and magnet links (`magnet:?xt=urn:btih:...`)
-- Announces to trackers over HTTP, HTTPS, and UDP to find peers
-- Connects to peers directly, verifies each downloaded piece's SHA-1
-  hash before writing it to disk, and downloads from multiple peers at
-  once
+- Announces to trackers over HTTP, HTTPS, and UDP — all queried
+  concurrently with a bounded overall timeout, so one dead/slow tracker
+  can't stall the others
+- Downloads from multiple peers at once, verifying each piece's SHA-1
+  hash before it's written to disk
 - For magnet links: fetches the torrent's metadata from a peer first
-  (there's no `.torrent` file to read it from), then proceeds exactly
-  like a normal download
+  (BEP 9/10), then proceeds like a normal download
 - Re-announces to trackers periodically so a dropped peer doesn't
   permanently strand a download
 
 ## What it doesn't do
 
-- **No seeding.** This is a downloader only — it never uploads to other
-  peers.
-- **No DHT or PEX.** Peer discovery is tracker-only. A magnet link with
-  no `tr=` tracker parameters has no way to find any peer.
-- **No resume.** Every run starts from piece 0; there's no on-disk
-  record of what a previous run already verified.
+- **No seeding** — download only, never uploads to other peers
+- **No DHT or PEX** — peer discovery is tracker-only; a magnet link with
+  no `tr=` params has no way to find any peer
+- **No resume** — every run starts from piece 0
 
-## Building
-
-Requires a Rust toolchain (`rustup` recommended: `rustup.rs`).
+## Build
 
 ```sh
 cargo build --release
 ```
 
-The binary is at `target/release/download`.
+Binary is at `target/release/download`.
 
 ## Usage
 
 ```sh
-download <file.torrent | magnet-link> [--out DIR] [--peers N] [--reannounce SECONDS]
+./target/release/download <file.torrent | magnet-link> [--out DIR] [--peers N] [--reannounce SECONDS]
 ```
 
-**From a `.torrent` file:**
+Quote magnet links — shells will otherwise mangle the `&`:
 
 ```sh
-./target/release/download ubuntu-24.04.iso.torrent --out ./downloads
+./target/release/download "magnet:?xt=urn:btih:HASH&tr=http://tracker.example.com/announce"
 ```
-
-**From a magnet link** (quote it — shells will otherwise mangle the `&`):
-
-```sh
-./target/release/download "magnet:?xt=urn:btih:HASH&tr=http://tracker.example.com/announce" --out ./downloads
-```
-
-**Options:**
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--out DIR` | `~/Downloads` | Where to write the downloaded file(s) |
-| `--peers N` | `30` | Max number of peer connections to use |
-| `--reannounce SECONDS` | tracker's requested interval | How often to re-query trackers for new peers. Trackers often request long intervals (20-30+ minutes); override this for faster peer discovery while testing |
+| `--out DIR` | `~/Downloads` | Where to write downloaded file(s) |
+| `--peers N` | `30` | Max concurrent peer connections |
+| `--reannounce SECONDS` | tracker's requested interval | How often to re-query trackers. Real intervals are often 20-30+ min; override for faster testing |
 
-Progress prints as each piece is individually verified:
+Convenience shell function (a plain `alias` doesn't handle magnet-link
+quoting well):
+
+```sh
+# add to ~/.zshrc or similar
+btdl() { /path/to/bittorrent-rs/target/release/download "$@"; }
+```
+
+## Reading the output
 
 ```
 torrent: debian-13.5.0-amd64-netinst.iso (700000000 bytes, 3020 pieces)
 found 4 peer(s), connecting up to 30
 piece 0 verified (1/3020)
-piece 1 verified (2/3020)
 ...
-download complete: debian-13.5.0-amd64-netinst.iso -> ./downloads
+download complete: debian-13.5.0-amd64-netinst.iso -> /Users/you/Downloads
 ```
 
-If a run gets stuck at "found 1 peer(s)" with no progress, that's
-almost always a thin/unhealthy swarm on the tracker's end, not this
-client — try a different torrent, or compare against another client
-(`transmission-cli`, `aria2c`) against the same `.torrent` file to
-confirm.
+Magnet links show an extra metadata-fetch phase first (trying peers
+until one provides the torrent's metadata, verifying it, then the same
+piece-by-piece flow above).
 
-### Testing without a real torrent
+**Normal, not bugs:** tracker warnings, and a peer or two failing before
+a working one is found — that's real swarm churn. **Actually stuck:**
+zero peer progress for several minutes at "found 1 peer(s)" — that's
+almost always a thin/unhealthy swarm on the tracker's end, not this
+client. Compare against `aria2c`/`transmission-cli` on the same file to
+confirm, or try a different torrent.
+
+## Testing without a real torrent
 
 ```sh
 cargo run --bin e2e_harness
 ```
 
-Spins up a fake tracker and a fake peer on `127.0.0.1` and runs the
-real `download` binary against them, then diffs the result
-byte-for-byte. Useful for confirming a working build without needing
-internet access or a real torrent.
-
-## Development
+Spins up a fake tracker + fake peer on `127.0.0.1`, runs the real
+`download` binary against them, and diffs the result byte-for-byte —
+confirms a working build with no internet or real torrent needed.
 
 ```sh
-cargo test          # unit + integration tests (loopback only, no network needed)
-cargo build --release
+cargo test          # unit + integration tests, loopback only
 ```
-
----
-
-## Author
-
-Created by [chakri192](https://github.com/chakri192)
-
-## Contributors
-
-| Contributor | Role |
-|-------------|------|
-| [chakri192](https://github.com/chakri192) | Author |
-| [aider](https://github.com/Aider-AI/aider) | AI pair programmer |
-
-### AI tooling
-
-README and code contributions assisted by [aider](https://github.com/Aider-AI/aider) using local LLMs via [Ollama](https://ollama.com):
-
-| Model | Used for |
-|-------|----------|
-| `qwen2.5-coder:7b` | Code suggestions, refactoring |
-| `llama3.1:8b` | Prose, documentation, commit messages |
-
 
 ## License
 
