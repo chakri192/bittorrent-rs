@@ -3,6 +3,5 @@
 /downloads/
 *.log
 *.bak
-*.iso
-*.aria2
 SHA512SUMS
+*.iso

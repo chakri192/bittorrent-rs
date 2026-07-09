@@ -1,11 +1,22 @@
 //! Given a torrent's list of tracker URLs (mixed http:// and udp://),
-//! announces to each in turn and merges the peer lists. A single bad or
-//! unreachable tracker doesn't abort the whole discovery -- we only fail
-//! if *every* tracker fails, which is the actual "no peers findable" case.
+//! announces to each *concurrently* and merges the peer lists. A single
+//! bad or unreachable tracker doesn't abort the whole discovery -- we
+//! only fail if *every* tracker fails, which is the actual "no peers
+//! findable" case.
+//!
+//! Trackers are queried in parallel (one thread each), not serially. A
+//! magnet link routinely lists several `udp://` trackers, each of which
+//! can take tens of seconds to time out (BEP 15's exponential backoff)
+//! if unresponsive; querying them one after another means the total wait
+//! is the *sum* of every tracker's timeout, which for 3+ dead UDP
+//! trackers can be several minutes of complete silence. Querying them
+//! concurrently means the wait is the *max* of any one tracker's
+//! timeout instead.
 
 use crate::tracker::{http, https, udp, AnnounceRequest, Event};
 use std::collections::HashSet;
 use std::net::SocketAddrV4;
+use std::thread;
 
 #[derive(Debug)]
 pub struct TrackerAttempt {
@@ -13,10 +24,11 @@ pub struct TrackerAttempt {
     pub error: String,
 }
 
-/// Announces to every URL in `tracker_urls`, returning the deduplicated
-/// union of all peers any tracker returned, the list of trackers that
-/// failed (for diagnostics -- not fatal unless *all* of them are in this
-/// list), and the re-announce interval to wait before trying again.
+/// Announces to every URL in `tracker_urls` concurrently, returning the
+/// deduplicated union of all peers any tracker returned, the list of
+/// trackers that failed (for diagnostics -- not fatal unless *all* of
+/// them are in this list), and the re-announce interval to wait before
+/// trying again.
 ///
 /// The interval is the *maximum* `interval` (or `min_interval` if a
 /// tracker sent one) across every tracker that responded -- i.e. the most
@@ -25,31 +37,43 @@ pub struct TrackerAttempt {
 /// the max rather than the min means we never violate the slowest
 /// tracker's request just because a faster one also happened to answer.
 pub fn announce_to_all(tracker_urls: &[String], req: &AnnounceRequest) -> (Vec<SocketAddrV4>, Vec<TrackerAttempt>, Option<u32>) {
+    let handles: Vec<_> = tracker_urls
+        .iter()
+        .map(|url| {
+            let url = url.clone();
+            let req = req.clone();
+            thread::spawn(move || {
+                let result = if let Some(host_port) = url.strip_prefix("udp://") {
+                    // udp:// tracker URLs sometimes have a trailing
+                    // "/announce" path segment (no meaning for UDP
+                    // trackers) -- strip it.
+                    let host_port = host_port.split('/').next().unwrap_or(host_port).to_string();
+                    udp::announce(&host_port, &req).map_err(|e| e.to_string())
+                } else if url.starts_with("https://") {
+                    https::announce(&url, &req).map_err(|e| e.to_string())
+                } else if url.starts_with("http://") {
+                    http::announce(&url, &req).map_err(|e| e.to_string())
+                } else {
+                    Err(format!("unsupported tracker scheme: {}", url))
+                };
+                (url, result)
+            })
+        })
+        .collect();
+
     let mut peers = HashSet::new();
     let mut failures = Vec::new();
     let mut max_interval: Option<u32> = None;
 
-    for url in tracker_urls {
-        let result = if let Some(host_port) = url.strip_prefix("udp://") {
-            // udp:// tracker URLs sometimes have a trailing "/announce"
-            // path segment (no meaning for UDP trackers) -- strip it.
-            let host_port = host_port.split('/').next().unwrap_or(host_port);
-            udp::announce(host_port, req).map_err(|e| e.to_string())
-        } else if url.starts_with("https://") {
-            https::announce(url, req).map_err(|e| e.to_string())
-        } else if url.starts_with("http://") {
-            http::announce(url, req).map_err(|e| e.to_string())
-        } else {
-            Err(format!("unsupported tracker scheme: {}", url))
-        };
-
+    for handle in handles {
+        let (url, result) = handle.join().unwrap_or_else(|_| ("<unknown>".to_string(), Err("tracker query thread panicked".to_string())));
         match result {
             Ok(resp) => {
                 peers.extend(resp.peers);
                 let wait = resp.min_interval.unwrap_or(resp.interval);
                 max_interval = Some(max_interval.map_or(wait, |cur| cur.max(wait)));
             }
-            Err(e) => failures.push(TrackerAttempt { url: url.clone(), error: e }),
+            Err(e) => failures.push(TrackerAttempt { url, error: e }),
         }
     }
 
