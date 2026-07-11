@@ -48,6 +48,25 @@ impl From<ConnectionError> for WorkerError {
     }
 }
 
+/// Feeds a Bitfield/Have message into the shared `WorkQueue`'s piece
+/// availability tracking (used for rarest-first selection). No-op for
+/// every other message type.
+fn note_availability(queue: &WorkQueue, msg: &Message) {
+    match msg {
+        Message::Bitfield(bits) => {
+            // `PeerState::apply_message` decodes the raw bytes into
+            // per-piece bools; reuse that instead of re-implementing the
+            // bit-unpacking here.
+            let mut scratch = PeerState::new();
+            scratch.apply_message(msg);
+            queue.note_bitfield(&scratch.peer_has_pieces);
+            let _ = bits; // the raw bytes aren't needed directly, only via `scratch`
+        }
+        Message::Have { piece_index } => queue.note_have(*piece_index),
+        _ => {}
+    }
+}
+
 /// Runs against a single peer until the work queue is empty or the
 /// connection fails. On failure, any piece this worker had partially
 /// claimed is pushed back to `queue` for another worker to retry -- the
@@ -70,26 +89,62 @@ pub fn run_worker(
     state.am_interested = true;
 
     // Drain messages until unchoked or the peer disconnects. Bitfield/Have
-    // messages that arrive in the meantime update `state` as a side effect.
+    // messages that arrive in the meantime update `state` (and the shared
+    // rarity tracker) as a side effect.
     while state.peer_choking {
         let msg = crate::peer::connection::read_message(&mut stream).map_err(|e| WorkerError::Connection { stage: "wait_for_unchoke", error: e })?;
+        note_availability(queue, &msg);
         state.apply_message(&msg);
     }
+
+    /// After this many consecutive "peer doesn't have anything we still
+    /// need" cycles with no new relevant Have/Bitfield arriving, give up
+    /// on this connection rather than holding the slot indefinitely. A
+    /// peer that's alive but useless (or has gone silent without
+    /// formally disconnecting) would otherwise never free its slot for
+    /// the re-announce loop to try someone else.
+    const MAX_IRRELEVANT_CYCLES: u32 = 50;
+    let mut irrelevant_cycles = 0u32;
 
     while let Some(work) = queue.pop() {
         let piece_index = work.index;
         if !state.peer_has_pieces.get(piece_index as usize).copied().unwrap_or(false) {
             queue.push_back(work);
+
+            // Rather than busy-looping on push_back/pop, actually read
+            // whatever the peer sends next -- a Have/Bitfield here might
+            // be exactly the piece we're waiting on, updating `state`
+            // as a side effect. A read timeout/WouldBlock just means the
+            // peer's quiet right now, not that it's gone.
             match crate::peer::connection::read_message(&mut stream) {
-                Ok(msg) => { state.apply_message(&msg); },
-                Err(ConnectionError::Wire(WireError::Io(ref e)))
-                    if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Ok(msg) => {
+                    note_availability(queue, &msg);
+                    // `apply_message` returns true for any state-affecting
+                    // message (Choke/Unchoke/Have/Bitfield/...), which is
+                    // an approximation of "this peer is still doing
+                    // something" -- good enough for a stuck-connection
+                    // safety net without needing to prove the exact piece
+                    // we're blocked on became available this cycle.
+                    let peer_is_active = state.apply_message(&msg);
+                    irrelevant_cycles = if peer_is_active { 0 } else { irrelevant_cycles + 1 };
+                }
+                Err(ConnectionError::Wire(WireError::Io(ref e))) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                    irrelevant_cycles += 1;
+                }
                 Err(e) => return Err(WorkerError::Connection { stage: "wait_for_relevant_have", error: e }),
+            }
+
+            if irrelevant_cycles >= MAX_IRRELEVANT_CYCLES {
+                return Err(WorkerError::Connection {
+                    stage: "peer_has_no_needed_pieces",
+                    error: ConnectionError::Wire(WireError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "peer never offered a piece we still need"))),
+                });
             }
             continue;
         }
+        irrelevant_cycles = 0;
 
-        match download_one_piece(&mut stream, &mut state, work.clone(), config.pipeline_depth) {
+        match download_one_piece(&mut stream, &mut state, queue, work.clone(), config.pipeline_depth) {
             Ok(data) => {
                 if let Err(e) = write_piece(spans, piece_index, piece_length, &data) {
                     // Disk failure isn't the peer's fault; requeue and bail
@@ -119,6 +174,7 @@ pub fn run_worker(
 fn download_one_piece(
     stream: &mut std::net::TcpStream,
     state: &mut PeerState,
+    queue: &WorkQueue,
     work: crate::downloader::piece_assembler::PieceWork,
     pipeline_depth: usize,
 ) -> Result<Vec<u8>, WorkerError> {
@@ -151,6 +207,7 @@ fn download_one_piece(
                 blocks_received += 1;
             }
             other => {
+                note_availability(queue, other);
                 state.apply_message(other);
             }
         }
@@ -266,7 +323,7 @@ mod tests {
             PieceWork { index: 0, hash: sha1_of(&piece0), length: 16384 },
             PieceWork { index: 1, hash: sha1_of(&piece1), length: 16384 },
         ];
-        let queue = Arc::new(WorkQueue::new(work));
+        let queue = Arc::new(WorkQueue::new(work, 2));
 
         let dir = tmp_dir("e2e");
         let files = vec![(vec!["out.bin".to_string()], 32768i64)];
@@ -292,6 +349,46 @@ mod tests {
     }
 
     #[test]
+    fn run_worker_gives_up_on_peer_with_no_needed_pieces_instead_of_hanging() {
+        let info_hash = [0x88; 20];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Mock peer: real handshake, but its bitfield claims it has ZERO
+        // pieces -- there is nothing this worker can ever get from it.
+        let mock = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut hs_buf = [0u8; 68];
+            std::io::Read::read_exact(&mut stream, &mut hs_buf).unwrap();
+            let our_hs = Handshake::new(info_hash, [0x99; 20], false);
+            std::io::Write::write_all(&mut stream, &our_hs.to_bytes()).unwrap();
+            WireMessage::Bitfield(vec![0x00]).write_to(&mut stream).unwrap(); // claims: has piece 0..7, all false
+            WireMessage::Unchoke.write_to(&mut stream).unwrap();
+            // Then just... never send anything else relevant. Read
+            // whatever the worker sends (Interested) and go quiet.
+            let _ = WireMessage::read_from(&mut stream);
+            thread::sleep(Duration::from_secs(8));
+        });
+
+        let work = vec![PieceWork { index: 0, hash: [0; 20], length: 100 }];
+        let queue = Arc::new(WorkQueue::new(work, 1));
+        let dir = tmp_dir("no-needed-pieces");
+        let files = vec![(vec!["out.bin".to_string()], 100i64)];
+        let spans = Arc::new(build_file_spans(&dir, &files));
+        let (tx, _rx) = mpsc::channel();
+        // Short connect_timeout also governs the per-read timeout on the
+        // stream, so this test doesn't take anywhere near 3 real seconds
+        // despite the mock peer sleeping that long.
+        let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_millis(100) };
+
+        let result = run_worker(addr, &config, &queue, &spans, 100, &tx);
+        assert!(matches!(result, Err(WorkerError::Connection { stage: "peer_has_no_needed_pieces", .. })), "expected bounded give-up, got: {:?}", result);
+        assert_eq!(queue.len(), 1); // piece went back for another peer
+
+        let _ = mock.join();
+    }
+
+    #[test]
     fn run_worker_requeues_piece_on_hash_mismatch_and_stops() {
         let piece0 = vec![0xCCu8; 16384];
         let info_hash = [0x77; 20];
@@ -303,7 +400,7 @@ mod tests {
         // Deliberately wrong hash -- the mock peer serves real data, but
         // the assembler should refuse to hand it back as verified.
         let work = vec![PieceWork { index: 0, hash: [0u8; 20], length: 16384 }];
-        let queue = Arc::new(WorkQueue::new(work));
+        let queue = Arc::new(WorkQueue::new(work, 1));
 
         let dir = tmp_dir("hash-mismatch");
         let files = vec![(vec!["out.bin".to_string()], 16384i64)];

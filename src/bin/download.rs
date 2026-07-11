@@ -11,7 +11,7 @@
 //! discovery), no seeding/uploading, single upfront tracker announce (no
 //! periodic re-announce), no resume support (always starts from piece 0).
 
-use bittorrent_rs::downloader::{build_file_spans, build_work_queue, run_worker, WorkQueue, WorkerConfig};
+use bittorrent_rs::downloader::{build_file_spans, build_work_queue, load_and_verify, progress_file_path, rewrite_compact, run_worker, ResumeWriter, WorkQueue, WorkerConfig};
 use bittorrent_rs::magnet::parse_magnet_uri;
 use bittorrent_rs::magnet_fetch::fetch_metadata_from_peer;
 use bittorrent_rs::torrent::{self, TorrentFile};
@@ -48,6 +48,17 @@ const POLL_TICK: Duration = Duration::from_secs(2);
 /// the "keep trying forever" behavior to a finite (if generous) window
 /// instead of hanging indefinitely against a genuinely dead swarm.
 const MAX_FRUITLESS_ROUNDS: u32 = 5;
+/// How often to print a throughput/ETA summary line during an active
+/// download (separate from the "waiting" heartbeat, which only fires
+/// when nothing's happening).
+const PROGRESS_SUMMARY_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verbosity {
+    Quiet,
+    Normal,
+    Verbose,
+}
 
 struct Args {
     source: String,
@@ -58,6 +69,11 @@ struct Args {
     /// override is for impatient manual testing, not for ignoring the
     /// floor that exists to avoid hammering a tracker.
     reannounce_override: Option<u64>,
+    verbosity: Verbosity,
+    /// Overall wall-clock budget for the whole run. `None` means no
+    /// limit (the historical behavior) -- bounded only by
+    /// `MAX_FRUITLESS_ROUNDS`.
+    timeout: Option<Duration>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -70,6 +86,8 @@ fn parse_args() -> Result<Args, String> {
     let mut out_dir = default_downloads_dir();
     let mut max_peers = DEFAULT_MAX_PEERS;
     let mut reannounce_override = None;
+    let mut verbosity = Verbosity::Normal;
+    let mut timeout = None;
 
     while let Some(flag) = argv.next() {
         match flag.as_str() {
@@ -82,15 +100,32 @@ fn parse_args() -> Result<Args, String> {
                 let n = argv.next().ok_or("--reannounce requires a number of seconds")?;
                 reannounce_override = Some(n.parse().map_err(|_| format!("--reannounce: not a number: {}", n))?);
             }
+            "--timeout" => {
+                let n = argv.next().ok_or("--timeout requires a number of seconds")?;
+                let secs: u64 = n.parse().map_err(|_| format!("--timeout: not a number: {}", n))?;
+                timeout = Some(Duration::from_secs(secs));
+            }
+            "--quiet" | "-q" => {
+                if verbosity == Verbosity::Verbose {
+                    return Err("--quiet and --verbose are mutually exclusive".to_string());
+                }
+                verbosity = Verbosity::Quiet;
+            }
+            "--verbose" | "-v" => {
+                if verbosity == Verbosity::Quiet {
+                    return Err("--quiet and --verbose are mutually exclusive".to_string());
+                }
+                verbosity = Verbosity::Verbose;
+            }
             other => return Err(format!("unrecognized argument: {}", other)),
         }
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override })
+    Ok(Args { source, out_dir, max_peers, reannounce_override, verbosity, timeout })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--reannounce SECONDS]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--reannounce SECONDS] [--timeout SECONDS] [--quiet | --verbose]".to_string()
 }
 
 /// Default `--out`: the user's actual `~/Downloads`, not a `./downloads`
@@ -135,6 +170,7 @@ fn spawn_new_workers(
     config: &Arc<WorkerConfig>,
     piece_length: u64,
     tx: &Sender<bittorrent_rs::downloader::PieceResult>,
+    verbosity: Verbosity,
 ) -> usize {
     let mut spawned = 0;
     for addr in peers {
@@ -143,6 +179,9 @@ fn spawn_new_workers(
         }
         if !attempted.insert(addr) {
             continue; // already tried this address earlier in the run
+        }
+        if verbosity == Verbosity::Verbose {
+            println!("connecting to peer {}...", addr);
         }
         let queue = Arc::clone(queue);
         let spans = Arc::clone(spans);
@@ -160,16 +199,19 @@ fn spawn_new_workers(
 
 fn run(args: Args) -> Result<(), String> {
     let our_peer_id = generate_peer_id();
+    let quiet = args.verbosity == Verbosity::Quiet;
 
     let (torrent, mut initial_peers) = if args.source.starts_with("magnet:?") {
-        resolve_magnet(&args.source, our_peer_id)?
+        resolve_magnet(&args.source, our_peer_id, args.verbosity)?
     } else {
         let bytes = fs::read(&args.source).map_err(|e| format!("reading {}: {}", args.source, e))?;
         let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| format!("parsing {}: {}", args.source, e))?;
         (torrent, Vec::new())
     };
 
-    println!("torrent: {} ({} bytes, {} pieces)", torrent.name, torrent.total_length(), torrent.pieces.len());
+    if !quiet {
+        println!("torrent: {} ({} bytes, {} pieces)", torrent.name, torrent.total_length(), torrent.pieces.len());
+    }
 
     let tracker_urls = collect_tracker_urls(&torrent);
 
@@ -181,15 +223,17 @@ fn run(args: Args) -> Result<(), String> {
     if !tracker_urls.is_empty() {
         let req = build_started_request(torrent.info_hash, our_peer_id, ANNOUNCE_PORT, torrent.total_length());
         let (peers, failures, interval) = announce_to_all(&tracker_urls, &req);
-        for f in &failures {
-            eprintln!("warning: tracker {} failed: {}", f.url, f.error);
+        if !quiet {
+            for f in &failures {
+                eprintln!("warning: tracker {} failed: {}", f.url, f.error);
+            }
         }
         if args.reannounce_override.is_none() {
             if let Some(secs) = interval {
                 reannounce_wait = Duration::from_secs(secs as u64).max(MIN_REANNOUNCE);
             }
         }
-        initial_peers.extend(peers.into_iter().map(SocketAddr::V4));
+        initial_peers.extend(peers);
     }
     if let Some(secs) = args.reannounce_override {
         reannounce_wait = Duration::from_secs(secs).max(MIN_REANNOUNCE);
@@ -200,33 +244,75 @@ fn run(args: Args) -> Result<(), String> {
     if initial_peers.is_empty() {
         return Err("no peers found from any tracker".to_string());
     }
-    println!("found {} peer(s), connecting up to {}", initial_peers.len(), args.max_peers);
-    println!("re-announce interval: {}s{}", reannounce_wait.as_secs(), if args.reannounce_override.is_some() { " (overridden via --reannounce)" } else { " (tracker-requested, floored at 30s)" });
+    if !quiet {
+        println!("found {} peer(s), connecting up to {}", initial_peers.len(), args.max_peers);
+        println!("re-announce interval: {}s{}", reannounce_wait.as_secs(), if args.reannounce_override.is_some() { " (overridden via --reannounce)" } else { " (tracker-requested, floored at 30s)" });
+    }
 
     let base_dir = if torrent.files.len() > 1 { args.out_dir.join(&torrent.name) } else { args.out_dir.clone() };
     let spans = Arc::new(build_file_spans(&base_dir, &torrent.files));
-    let queue = Arc::new(WorkQueue::new(build_work_queue(&torrent)));
     let total_pieces = torrent.pieces.len();
     let total_length = torrent.total_length();
     let piece_length = torrent.piece_length as u64;
+
+    // Resume: re-verify any pieces a previous run claimed complete
+    // against their *actual* current bytes on disk before trusting them
+    // (see downloader::resume -- a stale claim never gets blindly
+    // trusted). Confirmed pieces are excluded from the work queue and
+    // their bytes counted toward progress from the start.
+    fs::create_dir_all(&args.out_dir).map_err(|e| format!("creating output directory {}: {}", args.out_dir.display(), e))?;
+    let progress_path = progress_file_path(&args.out_dir, &torrent.info_hash);
+    let confirmed_resumed = load_and_verify(&progress_path, &spans, &torrent);
+    if !confirmed_resumed.is_empty() {
+        if !quiet {
+            println!("resuming: {} piece(s) already verified on disk, skipping", confirmed_resumed.len());
+        }
+        rewrite_compact(&progress_path, &confirmed_resumed).map_err(|e| format!("writing resume file: {}", e))?;
+    }
+    let mut resume_writer = ResumeWriter::create(&progress_path).map_err(|e| format!("opening resume file: {}", e))?;
+
+    let all_work = build_work_queue(&torrent);
+    let bytes_already_done: u64 = all_work.iter().filter(|w| confirmed_resumed.contains(&w.index)).map(|w| w.length as u64).sum();
+    let remaining_work: Vec<_> = all_work.into_iter().filter(|w| !confirmed_resumed.contains(&w.index)).collect();
+    let queue = Arc::new(WorkQueue::new(remaining_work, total_pieces));
 
     let (tx, rx) = mpsc::channel();
     let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: PIPELINE_DEPTH, connect_timeout: CONNECT_TIMEOUT });
 
     let mut attempted: HashSet<SocketAddr> = HashSet::new();
     let mut handles = Vec::new();
-    spawn_new_workers(initial_peers, &mut attempted, &mut handles, args.max_peers, &queue, &spans, &config, piece_length, &tx);
+    spawn_new_workers(initial_peers, &mut attempted, &mut handles, args.max_peers, &queue, &spans, &config, piece_length, &tx, args.verbosity);
 
-    let mut verified = 0usize;
+    let mut verified = confirmed_resumed.len();
+    let mut bytes_downloaded_this_run: u64 = 0;
+    let run_start = Instant::now();
     let mut last_announce = Instant::now();
     let mut last_heartbeat = Instant::now();
+    let mut last_progress_summary = Instant::now();
     let mut fruitless_rounds = 0u32;
 
     loop {
+        if let Some(timeout) = args.timeout {
+            if run_start.elapsed() >= timeout {
+                eprintln!("warning: --timeout of {}s reached with {} piece(s) still remaining", timeout.as_secs(), queue.len());
+                break;
+            }
+        }
+
         match rx.recv_timeout(POLL_TICK) {
             Ok(result) => {
                 verified += 1;
-                println!("piece {} verified ({}/{})", result.index, verified, total_pieces);
+                bytes_downloaded_this_run += result.data.len() as u64;
+                if let Err(e) = resume_writer.record(result.index) {
+                    // A failed resume-write doesn't invalidate the piece
+                    // itself (already verified and on disk) -- just means
+                    // a future run might needlessly re-download it. Not
+                    // worth aborting an otherwise-healthy download over.
+                    eprintln!("warning: failed to record resume progress for piece {}: {}", result.index, e);
+                }
+                if !quiet {
+                    println!("piece {} verified ({}/{})", result.index, verified, total_pieces);
+                }
                 last_heartbeat = Instant::now(); // a real download event counts as activity too
                 continue;
             }
@@ -240,6 +326,22 @@ fn run(args: Args) -> Result<(), String> {
 
         handles.retain(|h| !h.is_finished());
 
+        if !quiet && last_progress_summary.elapsed() >= PROGRESS_SUMMARY_INTERVAL && bytes_downloaded_this_run > 0 {
+            let elapsed = run_start.elapsed().as_secs_f64().max(0.001);
+            let rate = bytes_downloaded_this_run as f64 / elapsed;
+            let done = bytes_already_done + bytes_downloaded_this_run;
+            let remaining_bytes = total_length.saturating_sub(done);
+            print!("progress: {} ", format_bytes(done));
+            print!("/ {} ", format_bytes(total_length));
+            print!("({:.1}%), {}/s", 100.0 * done as f64 / total_length.max(1) as f64, format_bytes(rate as u64));
+            if rate > 0.0 {
+                println!(", ETA {}", format_duration(Duration::from_secs_f64(remaining_bytes as f64 / rate)));
+            } else {
+                println!();
+            }
+            last_progress_summary = Instant::now();
+        }
+
         if attempted.len() >= args.max_peers && handles.is_empty() {
             // Every peer slot we're willing to use has been tried and
             // none are still running -- re-announcing would only ever
@@ -251,7 +353,7 @@ fn run(args: Args) -> Result<(), String> {
             // Waiting is normal (honoring the tracker's interval), but
             // waiting *silently* looks identical to hung from a terminal.
             // Print a heartbeat periodically so it's visibly still alive.
-            if last_heartbeat.elapsed() >= Duration::from_secs(15) {
+            if !quiet && last_heartbeat.elapsed() >= Duration::from_secs(15) {
                 let remaining = reannounce_wait.saturating_sub(last_announce.elapsed()).as_secs();
                 println!(
                     "waiting: {} active connection(s), {} piece(s) remaining, next re-announce in {}s",
@@ -272,25 +374,31 @@ fn run(args: Args) -> Result<(), String> {
             // `tracker_urls` anyway -- but guard regardless).
             fruitless_rounds += 1;
         } else {
-            println!("{} piece(s) remaining, re-announcing to trackers...", queue.len());
+            if !quiet {
+                println!("{} piece(s) remaining, re-announcing to trackers...", queue.len());
+            }
             let req = build_regular_request(torrent.info_hash, our_peer_id, ANNOUNCE_PORT, total_length);
             let (peers, failures, interval) = announce_to_all(&tracker_urls, &req);
-            for f in &failures {
-                eprintln!("warning: tracker {} failed: {}", f.url, f.error);
+            if !quiet {
+                for f in &failures {
+                    eprintln!("warning: tracker {} failed: {}", f.url, f.error);
+                }
             }
             if args.reannounce_override.is_none() {
                 if let Some(secs) = interval {
                     reannounce_wait = Duration::from_secs(secs as u64).max(MIN_REANNOUNCE);
                 }
             }
-            let new_addrs: Vec<SocketAddr> = peers.into_iter().map(SocketAddr::V4).collect();
-            let spawned = spawn_new_workers(new_addrs, &mut attempted, &mut handles, args.max_peers, &queue, &spans, &config, piece_length, &tx);
+            let new_addrs: Vec<SocketAddr> = peers;
+            let spawned = spawn_new_workers(new_addrs, &mut attempted, &mut handles, args.max_peers, &queue, &spans, &config, piece_length, &tx, args.verbosity);
             if spawned == 0 && handles.is_empty() {
                 fruitless_rounds += 1;
-                println!("no new peers found ({}/{} fruitless rounds)", fruitless_rounds, MAX_FRUITLESS_ROUNDS);
+                if !quiet {
+                    println!("no new peers found ({}/{} fruitless rounds)", fruitless_rounds, MAX_FRUITLESS_ROUNDS);
+                }
             } else {
                 fruitless_rounds = 0;
-                if spawned > 0 {
+                if !quiet && spawned > 0 {
                     println!("connected {} new peer(s)", spawned);
                 }
             }
@@ -307,10 +415,42 @@ fn run(args: Args) -> Result<(), String> {
     }
 
     if queue.is_empty() {
+        // Nothing left to resume -- drop the sidecar file so a future
+        // unrelated run in the same output directory never sees it.
+        bittorrent_rs::downloader::resume::clear(&progress_path);
         println!("download complete: {} -> {}", torrent.name, base_dir.display());
         Ok(())
     } else {
-        Err(format!("incomplete: {} piece(s) never downloaded (ran out of usable peers across {} re-announce attempt(s))", queue.len(), fruitless_rounds))
+        Err(format!("incomplete: {} piece(s) never downloaded (ran out of usable peers across {} re-announce attempt(s)) -- rerun the same command to resume", queue.len(), fruitless_rounds))
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{}{}", bytes, UNITS[0])
+    } else {
+        format!("{:.1}{}", size, UNITS[unit])
+    }
+}
+
+fn format_duration(d: Duration) -> String {
+    let total_secs = d.as_secs();
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    if h > 0 {
+        format!("{}h{}m", h, m)
+    } else if m > 0 {
+        format!("{}m{}s", m, s)
+    } else {
+        format!("{}s", s)
     }
 }
 
@@ -320,41 +460,54 @@ fn run(args: Args) -> Result<(), String> {
 /// succeeds. Returns the built `TorrentFile` plus whichever peers
 /// responded (reused for the download phase so a slow/flaky real
 /// announce afterward doesn't throw away already-known-good peers).
-fn resolve_magnet(uri: &str, our_peer_id: [u8; 20]) -> Result<(TorrentFile, Vec<SocketAddr>), String> {
+fn resolve_magnet(uri: &str, our_peer_id: [u8; 20], verbosity: Verbosity) -> Result<(TorrentFile, Vec<SocketAddr>), String> {
+    let quiet = verbosity == Verbosity::Quiet;
     let magnet = parse_magnet_uri(uri).map_err(|e| format!("parsing magnet uri: {}", e))?;
     if magnet.trackers.is_empty() {
         // No DHT/PEX in this client (see module doc) -- a magnet link with
         // no tracker gives us no way to find any peer at all.
         return Err("magnet link has no trackers and this client has no DHT/PEX support".to_string());
     }
-    if let Some(name) = &magnet.display_name {
-        println!("magnet: {}", name);
+    if !quiet {
+        if let Some(name) = &magnet.display_name {
+            println!("magnet: {}", name);
+        }
+        println!("querying {} tracker(s) to bootstrap peer list...", magnet.trackers.len());
     }
-    println!("querying {} tracker(s) to bootstrap peer list...", magnet.trackers.len());
 
     let bootstrap_req = build_started_request(magnet.info_hash, our_peer_id, ANNOUNCE_PORT, 1);
     let (peers, failures, _interval) = announce_to_all(&magnet.trackers, &bootstrap_req);
-    for f in &failures {
-        eprintln!("warning: tracker {} failed: {}", f.url, f.error);
+    if !quiet {
+        for f in &failures {
+            eprintln!("warning: tracker {} failed: {}", f.url, f.error);
+        }
     }
     if peers.is_empty() {
         return Err("no peers found for magnet link (all trackers failed or returned none)".to_string());
     }
-    println!("found {} peer(s); requesting torrent metadata (BEP 9)...", peers.len());
+    if !quiet {
+        println!("found {} peer(s); requesting torrent metadata (BEP 9)...", peers.len());
+    }
 
     let mut last_err = String::new();
     for (i, peer) in peers.iter().enumerate() {
-        println!("  trying peer {}/{}: {}...", i + 1, peers.len(), peer);
-        match fetch_metadata_from_peer(SocketAddr::V4(*peer), magnet.info_hash, our_peer_id, CONNECT_TIMEOUT) {
+        if !quiet {
+            println!("  trying peer {}/{}: {}...", i + 1, peers.len(), peer);
+        }
+        match fetch_metadata_from_peer(*peer, magnet.info_hash, our_peer_id, CONNECT_TIMEOUT) {
             Ok(raw_info) => {
-                println!("metadata received and verified against magnet InfoHash");
+                if !quiet {
+                    println!("metadata received and verified against magnet InfoHash");
+                }
                 let announce = magnet.trackers.first().cloned();
                 let announce_list = vec![magnet.trackers.clone()];
                 let torrent = torrent::from_info_dict_bytes(&raw_info, magnet.info_hash, announce, announce_list).map_err(|e| format!("building torrent from metadata: {}", e))?;
-                return Ok((torrent, peers.into_iter().map(SocketAddr::V4).collect()));
+                return Ok((torrent, peers));
             }
             Err(e) => {
-                println!("  peer {} couldn't provide metadata: {}", peer, e);
+                if !quiet {
+                    println!("  peer {} couldn't provide metadata: {}", peer, e);
+                }
                 last_err = e.to_string();
             }
         }

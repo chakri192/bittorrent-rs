@@ -1,11 +1,13 @@
 pub mod file_writer;
 pub mod piece_assembler;
 pub mod queue;
+pub mod resume;
 pub mod worker;
 
 pub use file_writer::{build_file_spans, write_at_global_offset, write_piece, FileSpan};
 pub use piece_assembler::{AssemblerError, PieceAssembler, PieceWork, BLOCK_SIZE};
 pub use queue::{PieceResult, WorkQueue};
+pub use resume::{load_and_verify, progress_file_path, rewrite_compact, ResumeWriter};
 pub use worker::{run_worker, WorkerConfig, WorkerError};
 
 use crate::torrent::TorrentFile;

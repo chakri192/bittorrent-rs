@@ -28,7 +28,7 @@
 
 use crate::tracker::{http, https, udp, AnnounceRequest, Event};
 use std::collections::HashSet;
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -57,7 +57,7 @@ pub struct TrackerAttempt {
 /// interval is how clients get themselves rate-limited or banned; using
 /// the max rather than the min means we never violate the slowest
 /// tracker's request just because a faster one also happened to answer.
-pub fn announce_to_all(tracker_urls: &[String], req: &AnnounceRequest) -> (Vec<SocketAddrV4>, Vec<TrackerAttempt>, Option<u32>) {
+pub fn announce_to_all(tracker_urls: &[String], req: &AnnounceRequest) -> (Vec<SocketAddr>, Vec<TrackerAttempt>, Option<u32>) {
     let (tx, rx) = mpsc::channel();
 
     for url in tracker_urls {

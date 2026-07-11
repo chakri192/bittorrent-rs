@@ -3,7 +3,7 @@
 //! to the right place -- including pieces that straddle a file boundary
 //! in multi-file torrents.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -54,7 +54,11 @@ pub fn write_at_global_offset(spans: &[FileSpan], global_offset: u64, data: &[u8
         if let Some(parent) = span.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut f = OpenOptions::new().create(true).write(true).open(&span.path)?;
+        // truncate(false) is deliberate: we write specific byte ranges at
+        // arbitrary offsets (pieces can arrive out of order), so
+        // truncating on open would destroy data already written by a
+        // previous piece to this same file.
+        let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&span.path)?;
         f.seek(SeekFrom::Start(file_offset))?;
         f.write_all(&remaining[..chunk_len])?;
 
@@ -107,8 +111,8 @@ mod tests {
         let files = vec![(vec!["out.bin".to_string()], 1000i64)];
         let spans = build_file_spans(&dir, &files);
 
-        write_piece(&spans, 0, 100, &vec![0xAAu8; 100]).unwrap();
-        write_piece(&spans, 1, 100, &vec![0xBBu8; 100]).unwrap();
+        write_piece(&spans, 0, 100, &[0xAAu8; 100]).unwrap();
+        write_piece(&spans, 1, 100, &[0xBBu8; 100]).unwrap();
 
         let mut buf = Vec::new();
         fs::File::open(dir.join("out.bin")).unwrap().read_to_end(&mut buf).unwrap();
@@ -159,9 +163,9 @@ mod tests {
         let files = vec![(vec!["out.bin".to_string()], 300i64)];
         let spans = build_file_spans(&dir, &files);
 
-        write_piece(&spans, 2, 100, &vec![3u8; 100]).unwrap(); // write piece 2 first
-        write_piece(&spans, 0, 100, &vec![1u8; 100]).unwrap();
-        write_piece(&spans, 1, 100, &vec![2u8; 100]).unwrap();
+        write_piece(&spans, 2, 100, &[3u8; 100]).unwrap(); // write piece 2 first
+        write_piece(&spans, 0, 100, &[1u8; 100]).unwrap();
+        write_piece(&spans, 1, 100, &[2u8; 100]).unwrap();
 
         let mut buf = Vec::new();
         fs::File::open(dir.join("out.bin")).unwrap().read_to_end(&mut buf).unwrap();

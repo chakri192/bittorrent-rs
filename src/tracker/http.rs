@@ -187,20 +187,29 @@ fn parse_announce_body(body: &[u8]) -> Result<AnnounceResponse, TrackerError> {
     let complete = value.get("complete").and_then(Bencode::as_int).map(|v| v as u32);
     let incomplete = value.get("incomplete").and_then(Bencode::as_int).map(|v| v as u32);
 
-    let peers = match value.get("peers") {
-        Some(Bencode::Bytes(compact)) => parse_compact_peers(compact)?,
+    let mut peers: Vec<std::net::SocketAddr> = match value.get("peers") {
+        Some(Bencode::Bytes(compact)) => parse_compact_peers(compact)?.into_iter().map(std::net::SocketAddr::V4).collect(),
         Some(Bencode::List(list)) => {
             // Non-compact fallback: list of {ip, port} dicts.
             list.iter()
                 .filter_map(|p| {
                     let ip: std::net::Ipv4Addr = p.get("ip")?.as_str()?.parse().ok()?;
                     let port = p.get("port")?.as_int()? as u16;
-                    Some(std::net::SocketAddrV4::new(ip, port))
+                    Some(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
                 })
                 .collect()
         }
         _ => return Err(TrackerError::MalformedResponse("missing or malformed peers")),
     };
+
+    // `peers6` (IPv6 compact peers) is optional and additive -- absence
+    // isn't an error, it just means this tracker only returned IPv4 (or
+    // the swarm has no IPv6 peers to offer right now).
+    if let Some(Bencode::Bytes(compact_v6)) = value.get("peers6") {
+        if let Ok(v6_peers) = super::parse_compact_peers_v6(compact_v6) {
+            peers.extend(v6_peers);
+        }
+    }
 
     Ok(AnnounceResponse { interval, min_interval, complete, incomplete, peers })
 }

@@ -8,7 +8,7 @@ pub mod https;
 pub mod udp;
 
 use std::fmt;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
@@ -46,7 +46,7 @@ pub struct AnnounceResponse {
     pub min_interval: Option<u32>,
     pub complete: Option<u32>,
     pub incomplete: Option<u32>,
-    pub peers: Vec<SocketAddrV4>,
+    pub peers: Vec<SocketAddr>,
 }
 
 #[derive(Debug)]
@@ -162,6 +162,10 @@ pub fn percent_encode_bytes(bytes: &[u8]) -> String {
 /// (BEP 15) trackers: a flat byte string, 6 bytes per peer
 /// (4-byte big-endian IPv4 + 2-byte big-endian port).
 pub fn parse_compact_peers(data: &[u8]) -> Result<Vec<SocketAddrV4>, TrackerError> {
+    // `is_multiple_of` (clippy's suggested replacement) requires a very
+    // recent stdlib; suppressing the lint instead of rewriting keeps this
+    // crate buildable on older toolchains too.
+    #[allow(clippy::manual_is_multiple_of)]
     if data.len() % 6 != 0 {
         return Err(TrackerError::MalformedResponse("compact peers length not a multiple of 6"));
     }
@@ -171,6 +175,32 @@ pub fn parse_compact_peers(data: &[u8]) -> Result<Vec<SocketAddrV4>, TrackerErro
             let ip = Ipv4Addr::new(c[0], c[1], c[2], c[3]);
             let port = u16::from_be_bytes([c[4], c[5]]);
             SocketAddrV4::new(ip, port)
+        })
+        .collect())
+}
+
+/// Decodes the IPv6 sibling of the compact peer format (the HTTP tracker
+/// response's `peers6` key, per BEP 7 / common tracker practice -- there
+/// is no separate BEP number for this specific field, it's an informal
+/// but widely-implemented extension of BEP 23): 18 bytes per peer
+/// (16-byte IPv6 address + 2-byte big-endian port).
+///
+/// This covers HTTP/HTTPS trackers only. UDP trackers' IPv6 support
+/// (BEP 32) uses a materially different announce packet layout and isn't
+/// implemented -- `tracker::udp` remains IPv4-only.
+#[allow(clippy::manual_is_multiple_of)]
+pub fn parse_compact_peers_v6(data: &[u8]) -> Result<Vec<SocketAddr>, TrackerError> {
+    if data.len() % 18 != 0 {
+        return Err(TrackerError::MalformedResponse("compact peers6 length not a multiple of 18"));
+    }
+    Ok(data
+        .chunks_exact(18)
+        .map(|c| {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&c[..16]);
+            let ip = Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes([c[16], c[17]]);
+            SocketAddr::new(IpAddr::V6(ip), port)
         })
         .collect())
 }
@@ -253,5 +283,26 @@ mod tests {
     #[test]
     fn empty_compact_peers_is_ok() {
         assert_eq!(parse_compact_peers(&[]).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn parses_compact_peers_v6() {
+        let mut data = Vec::new();
+        // ::1 (loopback), port 6881
+        data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        data.extend_from_slice(&6881u16.to_be_bytes());
+        let peers = parse_compact_peers_v6(&data).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0], SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 6881));
+    }
+
+    #[test]
+    fn rejects_compact_peers_v6_bad_length() {
+        assert!(matches!(parse_compact_peers_v6(&[1, 2, 3]), Err(TrackerError::MalformedResponse(_))));
+    }
+
+    #[test]
+    fn empty_compact_peers_v6_is_ok() {
+        assert_eq!(parse_compact_peers_v6(&[]).unwrap(), vec![]);
     }
 }

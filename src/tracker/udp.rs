@@ -91,7 +91,12 @@ fn parse_announce_response(resp: &[u8], expected_txn: u32) -> Result<AnnounceRes
     let interval = u32::from_be_bytes(resp[8..12].try_into().unwrap());
     let incomplete = u32::from_be_bytes(resp[12..16].try_into().unwrap());
     let complete = u32::from_be_bytes(resp[16..20].try_into().unwrap());
-    let peers = parse_compact_peers(&resp[20..])?;
+    // BEP 15 (UDP tracker) is IPv4-only in this client -- see the doc
+    // comment on `parse_compact_peers_v6` for why IPv6 UDP (BEP 32) isn't
+    // implemented. `.map(SocketAddr::V4)` just widens the type to match
+    // `AnnounceResponse::peers`, which HTTP trackers can also populate
+    // with real IPv6 entries.
+    let peers = parse_compact_peers(&resp[20..])?.into_iter().map(std::net::SocketAddr::V4).collect();
 
     Ok(AnnounceResponse {
         interval,
@@ -125,9 +130,9 @@ fn send_with_retries(sock: &UdpSocket, packet: &[u8], max_retries: u32) -> Resul
 pub fn announce(tracker_addr: &str, req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
     let addr: SocketAddr = tracker_addr
         .to_socket_addrs()
-        .map_err(|_| TrackerError::BadUrl(tracker_addr.to_string()))?
+        .map_err(|e| TrackerError::BadUrl(format!("{}: DNS resolution failed ({})", tracker_addr, e)))?
         .next()
-        .ok_or_else(|| TrackerError::BadUrl(tracker_addr.to_string()))?;
+        .ok_or_else(|| TrackerError::BadUrl(format!("{}: hostname resolved to zero addresses", tracker_addr)))?;
 
     let sock = UdpSocket::bind("0.0.0.0:0")?;
     sock.connect(addr)?;

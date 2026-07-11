@@ -1,0 +1,35 @@
+[package]
+name = "bittorrent-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.bittorrent-rs]
+path = ".."
+
+[[bin]]
+name = "bencode_decode"
+path = "fuzz_targets/bencode_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "magnet_parse"
+path = "fuzz_targets/magnet_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "torrent_parse"
+path = "fuzz_targets/torrent_parse.rs"
+test = false
+doc = false
+bench = false
