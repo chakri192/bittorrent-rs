@@ -5,3 +5,7 @@
 *.bak
 SHA512SUMS
 *.iso
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+*.resume
