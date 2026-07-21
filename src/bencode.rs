@@ -100,11 +100,22 @@ impl std::error::Error for DecodeError {}
 pub struct Decoder<'a> {
     data: &'a [u8],
     pos: usize,
+    /// Strict mode enforces BEP 3's canonical form (sorted, unique dict
+    /// keys). Lenient mode accepts unsorted/duplicate keys (first
+    /// occurrence wins) -- needed for *wire* data: real clients (and DHT
+    /// nodes) routinely send non-canonical extension handshakes, and
+    /// rejecting them costs us an otherwise-usable peer. Strict stays the
+    /// default for anything we might hash or re-serialize.
+    strict: bool,
 }
 
 impl<'a> Decoder<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Decoder { data, pos: 0 }
+        Decoder { data, pos: 0, strict: true }
+    }
+
+    pub fn new_lenient(data: &'a [u8]) -> Self {
+        Decoder { data, pos: 0, strict: false }
     }
 
     pub fn pos(&self) -> usize {
@@ -203,15 +214,20 @@ impl<'a> Decoder<'a> {
                 return Ok(map);
             }
             let key = self.decode_bytes()?;
-            if let Some(prev) = &last_key {
-                // BEP 3: keys must appear in sorted (raw byte) order, no dupes.
-                if key <= *prev {
-                    return Err(DecodeError::UnsortedOrDuplicateKey);
+            if self.strict {
+                if let Some(prev) = &last_key {
+                    // BEP 3: keys must appear in sorted (raw byte) order, no dupes.
+                    if key <= *prev {
+                        return Err(DecodeError::UnsortedOrDuplicateKey);
+                    }
                 }
+                last_key = Some(key.clone());
             }
-            last_key = Some(key.clone());
             let value = self.decode_value()?;
-            map.insert(key, value);
+            // Lenient mode: first occurrence of a duplicate key wins (the
+            // value is still fully parsed either way so the stream stays
+            // in sync). In strict mode duplicates were already rejected.
+            map.entry(key).or_insert(value);
         }
     }
 
@@ -243,9 +259,58 @@ impl<'a> Decoder<'a> {
     }
 }
 
-/// Top-level convenience: decode a full bencoded buffer.
+/// Top-level convenience: decode a full bencoded buffer (strict, BEP 3
+/// canonical form).
 pub fn decode(data: &[u8]) -> Result<Bencode, DecodeError> {
     Decoder::new(data).decode_top_level()
+}
+
+/// Lenient top-level decode for data received from remote peers/nodes on
+/// the wire (extension handshakes, tracker responses, DHT/KRPC messages):
+/// accepts unsorted and duplicate dict keys (first wins). Be strict in
+/// what you send, lenient in what you accept.
+pub fn decode_lenient(data: &[u8]) -> Result<Bencode, DecodeError> {
+    Decoder::new_lenient(data).decode_top_level()
+}
+
+/// Encodes a `Bencode` value to its canonical byte form (dict keys sorted
+/// -- `BTreeMap` guarantees iteration order). Everything this client
+/// *sends* (extension handshakes, KRPC messages) goes through here.
+pub fn encode(value: &Bencode) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_into(value, &mut out);
+    out
+}
+
+fn encode_into(value: &Bencode, out: &mut Vec<u8>) {
+    match value {
+        Bencode::Int(i) => {
+            out.push(b'i');
+            out.extend_from_slice(i.to_string().as_bytes());
+            out.push(b'e');
+        }
+        Bencode::Bytes(b) => {
+            out.extend_from_slice(b.len().to_string().as_bytes());
+            out.push(b':');
+            out.extend_from_slice(b);
+        }
+        Bencode::List(items) => {
+            out.push(b'l');
+            for item in items {
+                encode_into(item, out);
+            }
+            out.push(b'e');
+        }
+        Bencode::Dict(map) => {
+            out.push(b'd');
+            // BTreeMap already iterates in sorted key order, matching BEP 3.
+            for (k, v) in map {
+                encode_into(&Bencode::Bytes(k.clone()), out);
+                encode_into(v, out);
+            }
+            out.push(b'e');
+        }
+    }
 }
 
 #[cfg(test)]
@@ -359,6 +424,41 @@ mod tests {
     #[test]
     fn rejects_bad_tag() {
         assert_eq!(decode(b"x"), Err(DecodeError::InvalidTag(b'x')));
+    }
+
+    #[test]
+    fn lenient_accepts_unsorted_dict_keys() {
+        // Same input the strict test rejects.
+        let d = decode_lenient(b"d4:spam4:eggs3:cow3:mooe").unwrap();
+        let map = d.as_dict().unwrap();
+        assert_eq!(map.get(b"cow".as_slice()).unwrap().as_bytes().unwrap(), b"moo");
+        assert_eq!(map.get(b"spam".as_slice()).unwrap().as_bytes().unwrap(), b"eggs");
+    }
+
+    #[test]
+    fn lenient_duplicate_keys_first_occurrence_wins() {
+        let d = decode_lenient(b"d3:cow3:moo3:cow3:bahe").unwrap();
+        assert_eq!(d.get("cow").unwrap().as_bytes().unwrap(), b"moo");
+    }
+
+    #[test]
+    fn lenient_still_rejects_structural_garbage() {
+        assert!(decode_lenient(b"d3:cow").is_err());
+        assert!(decode_lenient(b"x").is_err());
+    }
+
+    #[test]
+    fn encode_round_trips_through_decode() {
+        let src = b"d3:cow3:moo4:spamli1ei-2eee";
+        let val = decode(src).unwrap();
+        assert_eq!(encode(&val), src.to_vec());
+    }
+
+    #[test]
+    fn encode_canonicalizes_key_order() {
+        // Decoded leniently from unsorted input, re-encoded sorted.
+        let val = decode_lenient(b"d4:spam4:eggs3:cow3:mooe").unwrap();
+        assert_eq!(encode(&val), b"d3:cow3:moo4:spam4:eggse".to_vec());
     }
 
     #[test]
