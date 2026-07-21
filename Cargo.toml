@@ -2,11 +2,20 @@
 name = "bittorrent-rs"
 version = "0.1.0"
 edition = "2021"
+# `cargo run` maps to the client; the others are helpers (e2e_harness, infohash).
+default-run = "download"
 
 [dependencies]
 sha1 = "0.10"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "0.26"
+# Terminal UI for the `download` binary's live dashboard. Pulls in
+# crossterm (re-exported as `ratatui::crossterm`), which is the only
+# terminal backend used -- no separate crossterm dependency needed.
+ratatui = "0.29"
+# Optional TOML config file (~/.config/bittorrent-rs.toml) for default flags.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 # Pinned below the version that requires edition2024 (Cargo 1.85+ / rustc
 # 1.85+): this repo is also built/tested in a sandbox running rustc 1.75.
 # Remove this pin freely on a newer toolchain.
