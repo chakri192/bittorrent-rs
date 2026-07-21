@@ -17,7 +17,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Gauge, List, ListItem, Paragraph};
 use ratatui::Frame;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,13 +36,15 @@ pub struct AppState {
     pub down_hist: VecDeque<u64>,
     pub up_hist: VecDeque<u64>,
     pub logs: VecDeque<String>,
+    /// Per-piece completion, for the piece-map heatmap.
+    pub pieces: Vec<bool>,
     /// `Some` once the run has ended: `Ok(summary)` or `Err(reason)`.
     pub finished: Option<Result<String, String>>,
 }
 
 impl AppState {
     fn new(title: String, out_path: String, log_path: Option<String>) -> Self {
-        AppState { title, out_path, log_path, snap: Snapshot::default(), down_hist: VecDeque::new(), up_hist: VecDeque::new(), logs: VecDeque::new(), finished: None }
+        AppState { title, out_path, log_path, snap: Snapshot::default(), down_hist: VecDeque::new(), up_hist: VecDeque::new(), logs: VecDeque::new(), pieces: Vec::new(), finished: None }
     }
 }
 
@@ -97,6 +99,13 @@ impl Ui {
         }
     }
 
+    /// Updates the per-piece completion map (cheap `Vec<bool>` snapshot).
+    pub fn set_pieces(&self, pieces: Vec<bool>) {
+        if let Ok(mut s) = self.state.lock() {
+            s.pieces = pieces;
+        }
+    }
+
     /// Records one throughput sample for the sparklines.
     pub fn push_rates(&self, down: u64, up: u64) {
         if let Ok(mut s) = self.state.lock() {
@@ -145,8 +154,10 @@ fn sparkline(data: &VecDeque<u64>, width: usize) -> String {
 pub fn run(state: &Arc<Mutex<AppState>>, stop: &AtomicBool) -> bool {
     let mut terminal = ratatui::init();
     let mut user_quit = false;
+    let mut frame: usize = 0;
 
     loop {
+        frame = frame.wrapping_add(1);
         // Clone a lightweight view under the lock, then render lock-free.
         let view = {
             let s = state.lock().unwrap();
@@ -158,7 +169,9 @@ pub fn run(state: &Arc<Mutex<AppState>>, stop: &AtomicBool) -> bool {
                 down_hist: s.down_hist.clone(),
                 up_hist: s.up_hist.clone(),
                 logs: s.logs.iter().cloned().collect(),
+                pieces: s.pieces.clone(),
                 finished: s.finished.clone(),
+                frame,
             }
         };
 
@@ -198,7 +211,23 @@ struct View {
     down_hist: VecDeque<u64>,
     up_hist: VecDeque<u64>,
     logs: Vec<String>,
+    pieces: Vec<bool>,
     finished: Option<Result<String, String>>,
+    frame: usize,
+}
+
+/// Muted slate for panel borders/titles, so the colored content pops.
+const BORDER: Color = Color::Rgb(70, 80, 95);
+const TITLE: Color = Color::Rgb(130, 150, 180);
+
+/// A rounded, subtly-bordered panel with a dim title -- the shared frame
+/// for every section, for a consistent modern look.
+fn panel(title: &str) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .title(Span::styled(format!(" {} ", title), Style::default().fg(TITLE).add_modifier(Modifier::BOLD)))
 }
 
 fn render(f: &mut Frame, view: &View) {
@@ -206,36 +235,59 @@ fn render(f: &mut Frame, view: &View) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4), // header: name + progress gauge
-            Constraint::Length(8), // transfer + throughput
-            Constraint::Length(4), // swarm
-            Constraint::Min(3),    // activity log
+            Constraint::Min(7),    // transfer stats | piece map
+            Constraint::Length(6), // throughput | swarm
+            Constraint::Min(4),    // activity log
             Constraint::Length(1), // footer
         ])
         .split(f.area());
 
     render_header(f, rows[0], view);
 
-    let mid = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(42), Constraint::Percentage(58)]).split(rows[1]);
+    let mid = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(30), Constraint::Min(20)]).split(rows[1]);
     render_transfer(f, mid[0], view);
-    render_throughput(f, mid[1], view);
+    render_piecemap(f, mid[1], view);
 
-    render_swarm(f, rows[2], view);
+    let lower = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[2]);
+    render_throughput(f, lower[0], view);
+    render_swarm(f, lower[1], view);
+
     render_log(f, rows[3], view);
     render_footer(f, rows[4], view);
 }
 
+/// Braille spinner frames for the "live" indicator in the header.
+const SPINNER: [char; 10] = ['\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280f}'];
+
 fn render_header(f: &mut Frame, area: Rect, view: &View) {
-    let block = Block::default().borders(Borders::ALL).title(Span::styled(" bittorrent-rs ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    let (glyph, glyph_style) = match &view.finished {
+        Some(Ok(_)) => ('\u{2713}', Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Some(Err(_)) => ('\u{2717}', Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        None => (SPINNER[view.frame % SPINNER.len()], Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .title(Line::from(vec![
+            Span::styled(format!(" {} ", glyph), glyph_style),
+            Span::styled("bittorrent-rs ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        ]))
+        .title(Line::from(Span::styled(format!(" {} ", format_duration(view.snap.elapsed_secs)), Style::default().fg(TITLE))).right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Length(1)]).split(inner);
-    f.render_widget(Paragraph::new(Line::from(Span::styled(view.title.clone(), Style::default().add_modifier(Modifier::BOLD)))), rows[0]);
+    f.render_widget(Paragraph::new(Line::from(Span::styled(view.title.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)))), rows[0]);
 
     let snap = &view.snap;
     let frac = snap.fraction();
-    let label = format!("{:.1}%   {} / {}", frac * 100.0, format_bytes(snap.done_bytes), format_bytes(snap.total_length));
-    let gauge = Gauge::default().gauge_style(Style::default().fg(Color::Green).bg(Color::Rgb(30, 30, 30))).ratio(frac).label(Span::styled(label, Style::default().add_modifier(Modifier::BOLD)));
+    let gauge_label = format!("{:.1}%   {} / {}", frac * 100.0, format_bytes(snap.done_bytes), format_bytes(snap.total_length));
+    let gauge = Gauge::default()
+        .gauge_style(Style::default().fg(Color::Rgb(120, 220, 130)).bg(Color::Rgb(35, 40, 48)))
+        .use_unicode(true)
+        .ratio(frac)
+        .label(Span::styled(gauge_label, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
     f.render_widget(gauge, rows[1]);
 }
 
@@ -244,87 +296,173 @@ fn label(text: &str) -> Span<'static> {
 }
 
 fn render_transfer(f: &mut Frame, area: Rect, view: &View) {
-    let block = Block::default().borders(Borders::ALL).title(" transfer ");
+    let block = panel("transfer");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let snap = &view.snap;
     let eta = snap.eta_secs.map(format_duration).unwrap_or_else(|| "--".to_string());
     let lines = vec![
-        Line::from(vec![label("down"), Span::styled(format_rate(snap.down_rate), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))]),
-        Line::from(vec![label("up"), Span::styled(format_rate(snap.up_rate), Style::default().fg(Color::Cyan))]),
+        Line::from(vec![Span::styled("\u{25bc} ", Style::default().fg(Color::Green)), Span::styled(format_rate(snap.down_rate), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled("\u{25b2} ", Style::default().fg(Color::Cyan)), Span::styled(format_rate(snap.up_rate), Style::default().fg(Color::Cyan))]),
         Line::from(vec![label("uploaded"), Span::raw(format_bytes(snap.up_bytes))]),
         Line::from(vec![label("eta"), Span::styled(eta, Style::default().add_modifier(Modifier::BOLD))]),
         Line::from(vec![label("pieces"), Span::raw(format!("{} / {}", snap.verified, snap.total_pieces))]),
-        Line::from(vec![label("status"), Span::styled(format!("[{}]", snap.status), Style::default().fg(Color::Magenta))]),
+        Line::from(vec![label("status"), Span::styled(format!("[{}]", snap.status), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))]),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Gradient shade + glyph for a piece-map cell by its completion fraction.
+fn shade(frac: f64) -> (char, Color) {
+    if frac <= 0.0 {
+        ('\u{b7}', Color::Rgb(55, 60, 72))
+    } else if frac < 0.34 {
+        ('\u{2591}', Color::Rgb(60, 110, 70))
+    } else if frac < 0.67 {
+        ('\u{2592}', Color::Rgb(90, 165, 95))
+    } else if frac < 1.0 {
+        ('\u{2593}', Color::Rgb(120, 205, 120))
+    } else {
+        ('\u{2588}', Color::Rgb(150, 240, 150))
+    }
+}
+
+/// Renders the piece bitfield as a `w`x`h` heatmap: each cell aggregates a
+/// contiguous block of pieces and is shaded by how many are complete. For
+/// a 5,000-piece torrent on an 80-col terminal one cell covers ~10 pieces,
+/// so the whole download's shape is visible at a glance.
+fn piece_map_lines(pieces: &[bool], w: usize, h: usize) -> Vec<Line<'static>> {
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    if pieces.is_empty() {
+        return vec![Line::from(Span::styled("(waiting for pieces\u{2026})", Style::default().fg(Color::DarkGray)))];
+    }
+    let cells = w * h;
+    let n = pieces.len();
+    let per_cell = n.div_ceil(cells).max(1);
+    let mut lines = Vec::with_capacity(h);
+    let mut idx = 0usize;
+    for _ in 0..h {
+        let mut spans = Vec::with_capacity(w);
+        for _ in 0..w {
+            if idx >= n {
+                spans.push(Span::raw(" "));
+                continue;
+            }
+            let end = (idx + per_cell).min(n);
+            let done = pieces[idx..end].iter().filter(|&&b| b).count();
+            let frac = done as f64 / (end - idx) as f64;
+            let (ch, color) = shade(frac);
+            spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
+            idx = end;
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn render_piecemap(f: &mut Frame, area: Rect, view: &View) {
+    let block = panel("pieces");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let lines = piece_map_lines(&view.pieces, inner.width as usize, inner.height as usize);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_throughput(f: &mut Frame, area: Rect, view: &View) {
-    let block = Block::default().borders(Borders::ALL).title(" throughput ");
+    let block = panel("throughput");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let w = inner.width as usize;
     let lines = vec![
-        Line::from(Span::styled("download", Style::default().fg(Color::DarkGray))),
+        Line::from(vec![Span::styled("\u{25bc} down  ", Style::default().fg(Color::DarkGray)), Span::styled(format_rate(view.snap.down_rate), Style::default().fg(Color::Green))]),
         Line::from(Span::styled(sparkline(&view.down_hist, w), Style::default().fg(Color::Green))),
-        Line::from(Span::styled("upload", Style::default().fg(Color::DarkGray))),
+        Line::from(vec![Span::styled("\u{25b2} up    ", Style::default().fg(Color::DarkGray)), Span::styled(format_rate(view.snap.up_rate), Style::default().fg(Color::Cyan))]),
         Line::from(Span::styled(sparkline(&view.up_hist, w), Style::default().fg(Color::Cyan))),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_swarm(f: &mut Frame, area: Rect, view: &View) {
-    let block = Block::default().borders(Borders::ALL).title(" swarm ");
+    let block = panel("swarm");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let snap = &view.snap;
     let dot = Span::styled(" \u{b7} ", Style::default().fg(Color::DarkGray));
-    let endgame = if snap.endgame { Span::styled("endgame on", Style::default().fg(Color::Yellow)) } else { Span::styled("endgame off", Style::default().fg(Color::DarkGray)) };
+    let web = if snap.web_seeds > 0 {
+        Span::styled(format!("web \u{d7}{}", snap.web_seeds), Style::default().fg(Color::Green))
+    } else {
+        Span::styled("web \u{d7}0", Style::default().fg(Color::DarkGray))
+    };
+    let endgame = if snap.endgame { Span::styled("endgame", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)) } else { Span::styled("", Style::default()) };
     let lines = vec![
         Line::from(vec![
             label("peers"),
-            Span::styled(format!("{} active", snap.active_peers), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{}", snap.active_peers), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(" active", Style::default().fg(Color::Gray)),
             dot.clone(),
-            Span::raw(format!("{} dialed", snap.dialed_peers)),
+            Span::styled(format!("{} dialed", snap.dialed_peers), Style::default().fg(Color::Gray)),
             dot.clone(),
-            Span::raw(format!("{} known", snap.known_peers)),
+            Span::styled(format!("{} known", snap.known_peers), Style::default().fg(Color::Gray)),
         ]),
         Line::from(vec![
             label("sources"),
-            Span::raw(format!("trackers {}/{}", snap.trackers_ok, snap.trackers_total)),
+            Span::styled(format!("trk {}/{}", snap.trackers_ok, snap.trackers_total), Style::default().fg(Color::Gray)),
             dot.clone(),
-            Span::raw(format!("DHT {} nodes", snap.dht_nodes)),
+            Span::styled(format!("DHT {}", snap.dht_nodes), Style::default().fg(Color::Gray)),
             dot.clone(),
-            Span::raw(format!("PEX +{}", snap.pex_total)),
-            dot.clone(),
-            if snap.web_seeds > 0 { Span::styled(format!("web \u{d7}{}", snap.web_seeds), Style::default().fg(Color::Green)) } else { Span::styled("web \u{d7}0", Style::default().fg(Color::DarkGray)) },
+            Span::styled(format!("PEX +{}", snap.pex_total), Style::default().fg(Color::Gray)),
             dot,
-            endgame,
+            web,
         ]),
+        Line::from(endgame),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Classifies a log line by content into (glyph, color): successes green,
+/// failures red, discovery/network events cyan, everything else dim.
+fn log_symbol(msg: &str) -> (&'static str, Color) {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("complete") || m.contains("verified") || m.contains("mapping via") {
+        ("\u{2713}", Color::Green)
+    } else if m.contains("fail") || m.contains("error") || m.contains("disconnect") || m.contains("mismatch") || m.contains("disabled") || m.contains("unreachable") || m.contains("refused") || m.contains("timed out") || m.starts_with("no ") {
+        ("\u{2717}", Color::Red)
+    } else if m.contains("dht") || m.contains("pex") || m.contains("web seed") || m.contains("announc") || m.contains("resolving") || m.contains("tracker") || m.contains("peer(s)") || m.contains("listening") || m.contains("ipv6") {
+        ("\u{2022}", Color::Cyan)
+    } else {
+        ("\u{b7}", Color::DarkGray)
+    }
+}
+
 fn render_log(f: &mut Frame, area: Rect, view: &View) {
-    let block = Block::default().borders(Borders::ALL).title(" activity ");
+    let block = panel("activity");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let capacity = inner.height as usize;
     let start = view.logs.len().saturating_sub(capacity);
-    let items: Vec<ListItem> = view.logs.iter().skip(start).map(|l| ListItem::new(Line::from(Span::styled(l.clone(), Style::default().fg(Color::Gray))))).collect();
+    let items: Vec<ListItem> = view
+        .logs
+        .iter()
+        .skip(start)
+        .map(|l| {
+            let (sym, color) = log_symbol(l);
+            ListItem::new(Line::from(vec![Span::styled(format!("{} ", sym), Style::default().fg(color)), Span::styled(l.clone(), Style::default().fg(Color::Gray))]))
+        })
+        .collect();
     f.render_widget(List::new(items), inner);
 }
 
 fn render_footer(f: &mut Frame, area: Rect, view: &View) {
     let hint = match &view.finished {
-        Some(Ok(_)) => Span::styled(" done \u{b7} q to exit ", Style::default().fg(Color::Black).bg(Color::Green)),
-        Some(Err(_)) => Span::styled(" failed \u{b7} q to exit ", Style::default().fg(Color::White).bg(Color::Red)),
-        None => Span::styled(" q quit ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Some(Ok(_)) => Span::styled(" done \u{b7} q to exit ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
+        Some(Err(_)) => Span::styled(" failed \u{b7} q to exit ", Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)),
+        None => Span::styled(" q quit ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
     };
     let log = view.log_path.clone().unwrap_or_else(|| "(logging disabled)".to_string());
     let line = Line::from(vec![hint, Span::raw("  "), Span::styled(format!("log \u{2192} {}   out \u{2192} {}", log, view.out_path), Style::default().fg(Color::DarkGray))]);
