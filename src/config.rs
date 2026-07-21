@@ -29,6 +29,8 @@ pub struct Config {
     pub seed: Option<bool>,
     /// DHT on/off (default on). `false` is equivalent to `--no-dht`.
     pub dht: Option<bool>,
+    /// UPnP/NAT-PMP port mapping on/off (default on). `false` == `--no-portmap`.
+    pub portmap: Option<bool>,
     /// `"auto"` | `"always"` | `"never"`.
     pub ipv6: Option<String>,
     pub reannounce: Option<u64>,
