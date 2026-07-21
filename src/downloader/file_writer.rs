@@ -74,6 +74,48 @@ pub fn write_piece(spans: &[FileSpan], piece_index: u32, piece_length: u64, data
     write_at_global_offset(spans, global_offset, data)
 }
 
+/// Reads `len` bytes starting at global offset `global_offset`, stitching
+/// across file spans as needed -- the exact inverse of
+/// `write_at_global_offset`. Used by the seeder to serve `Request`s for
+/// pieces already verified on disk. Errors if any covered file is missing
+/// or shorter than the span demands (a piece we claim to have must be
+/// fully readable; anything else is a bug or external file tampering).
+pub fn read_at_global_offset(spans: &[FileSpan], global_offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut out = Vec::with_capacity(len);
+    let mut offset = global_offset;
+    let mut remaining = len;
+
+    while remaining > 0 {
+        let span = spans
+            .iter()
+            .find(|s| offset >= s.start && offset < s.end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("offset {} is outside all known files", offset)))?;
+
+        let file_offset = offset - span.start;
+        let available_in_file = span.end - offset;
+        let chunk_len = (remaining as u64).min(available_in_file) as usize;
+
+        let mut f = fs::File::open(&span.path)?;
+        f.seek(SeekFrom::Start(file_offset))?;
+        let mut chunk = vec![0u8; chunk_len];
+        f.read_exact(&mut chunk)?;
+        out.extend_from_slice(&chunk);
+
+        offset += chunk_len as u64;
+        remaining -= chunk_len;
+    }
+    Ok(out)
+}
+
+/// Reads one block (`begin`..`begin+length` within piece `piece_index`)
+/// for serving a peer's `Request`.
+pub fn read_block(spans: &[FileSpan], piece_index: u32, piece_length: u64, begin: u32, length: u32) -> io::Result<Vec<u8>> {
+    let global_offset = piece_index as u64 * piece_length + begin as u64;
+    read_at_global_offset(spans, global_offset, length as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +197,40 @@ mod tests {
         let files = vec![(vec!["a.bin".to_string()], 10i64)];
         let spans = build_file_spans(Path::new("/base"), &files);
         assert!(write_at_global_offset(&spans, 100, &[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn read_at_global_offset_round_trips_across_file_boundary() {
+        let dir = tmp_dir("read-spanning");
+        let files = vec![(vec!["a.bin".to_string()], 150i64), (vec!["b.bin".to_string()], 150i64)];
+        let spans = build_file_spans(&dir, &files);
+
+        let mut data = vec![7u8; 50];
+        data.extend(vec![9u8; 50]);
+        write_at_global_offset(&spans, 100, &data).unwrap();
+        // b.bin only has 50 bytes written at its start; reading [100,200)
+        // must return exactly what was written.
+        let back = read_at_global_offset(&spans, 100, 100).unwrap();
+        assert_eq!(back, data);
+    }
+
+    #[test]
+    fn read_block_maps_piece_coordinates_to_global_offset() {
+        let dir = tmp_dir("read-block");
+        let files = vec![(vec!["out.bin".to_string()], 300i64)];
+        let spans = build_file_spans(&dir, &files);
+        write_piece(&spans, 1, 100, &[5u8; 100]).unwrap();
+
+        let block = read_block(&spans, 1, 100, 20, 30).unwrap();
+        assert_eq!(block, vec![5u8; 30]);
+    }
+
+    #[test]
+    fn read_of_missing_file_errors_instead_of_padding() {
+        let dir = tmp_dir("read-missing");
+        let files = vec![(vec!["never-written.bin".to_string()], 100i64)];
+        let spans = build_file_spans(&dir, &files);
+        assert!(read_at_global_offset(&spans, 0, 10).is_err());
     }
 
     #[test]
