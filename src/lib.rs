@@ -1,9 +1,11 @@
 pub mod bencode;
+pub mod dht;
 pub mod downloader;
 pub mod magnet;
 pub mod magnet_fetch;
 pub mod metadata;
 pub mod peer;
+pub mod seeder;
 pub mod torrent;
 pub mod tracker;
 pub mod tracker_discovery;
