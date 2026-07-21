@@ -158,6 +158,10 @@ fn main() {
         // has no business resolving bootstrap routers), and the run
         // should exercise exactly the fake tracker + fake peer.
         .arg("--no-dht")
+        // Plain output + no logfile: keep the harness deterministic and
+        // free of the interactive dashboard / stray log artifacts.
+        .arg("--no-tui")
+        .arg("--no-log")
         .status()
         .unwrap_or_else(|e| panic!("failed to spawn {:?}: {}", download_bin, e));
 
