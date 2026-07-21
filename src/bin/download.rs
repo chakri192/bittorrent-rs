@@ -627,6 +627,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
                 last_done_bytes = cur_done;
                 last_up_bytes = cur_up;
                 ui.push_rates(smoothed_down as u64, smoothed_up as u64);
+                ui.set_pieces(have.snapshot()); // drives the piece-map heatmap
             }
             let done = bytes_already_done + bytes_downloaded_this_run;
             let remaining = display_total.saturating_sub(done);
@@ -659,6 +660,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
                 pex_total,
                 web_seeds: web_handles.iter().filter(|h| !h.is_finished()).count(),
                 eta_secs,
+                elapsed_secs: run_start.elapsed().as_secs(),
                 status,
             });
         }};
