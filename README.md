@@ -84,6 +84,7 @@ btdl() { /path/to/bittorrent-rs/target/release/download "$@"; }
 | `--no-log` | off | Disable the logfile entirely |
 | `--tui` / `--no-tui` | auto | Force the dashboard on, or the plain status-line interface even on a TTY |
 | `--dht` / `--no-dht` | on | Force the DHT node on/off |
+| `--portmap` / `--no-portmap` | on | Auto-forward the listen port via UPnP/NAT-PMP (best-effort; silently skipped if the router doesn't support it) |
 | `--seed` / `--no-seed` | off | Force seeding after completion on/off |
 | `--quiet` / `-q` | off | Suppress all status output (warnings/errors still print) |
 | `--verbose` / `-v` | off | (reserved) |
@@ -106,6 +107,7 @@ peers = 60
 port = 51413
 seed = true
 dht = true
+portmap = true
 ipv6 = "auto"      # "auto" | "always" | "never"
 reannounce = 900
 tui = true
