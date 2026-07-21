@@ -15,6 +15,9 @@ pub struct TorrentFile {
     /// (path_components, length) for each file. Single-file torrents get
     /// one entry whose path is just [name].
     pub files: Vec<(Vec<String>, i64)>,
+    /// BEP 19 web seeds (`url-list`): HTTP(S) base URLs the content can
+    /// also be fetched from. Empty for magnet-derived torrents.
+    pub url_list: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -118,7 +121,14 @@ pub fn parse_torrent_file(data: &[u8]) -> Result<TorrentFile, TorrentError> {
         })
         .unwrap_or_default();
 
-    build_torrent_from_info(info, raw_info, announce, announce_list)
+    // BEP 19 `url-list`: either a single string or a list of strings.
+    let url_list = match dict.get(b"url-list".as_slice()) {
+        Some(v @ Bencode::Bytes(_)) => v.as_str().map(str::to_string).into_iter().collect(),
+        Some(Bencode::List(l)) => l.iter().filter_map(|u| u.as_str().map(str::to_string)).collect(),
+        _ => Vec::new(),
+    };
+
+    build_torrent_from_info(info, raw_info, announce, announce_list, url_list)
 }
 
 /// Builds a `TorrentFile` from a magnet link's assembled+verified info
@@ -140,14 +150,17 @@ pub fn from_info_dict_bytes(raw_info: &[u8], expected_info_hash: [u8; 20], annou
     }
 
     let info = bencode::decode(raw_info)?;
-    build_torrent_from_info(info, raw_info, announce, announce_list)
+    // Magnet metadata (BEP 9) transfers only the info dict, which never
+    // contains `url-list`; web seeds, if any, would arrive via the magnet
+    // `ws=` param (not currently parsed).
+    build_torrent_from_info(info, raw_info, announce, announce_list, Vec::new())
 }
 
 /// Shared construction logic: given a parsed info dict value and the raw
 /// bytes it was decoded from (for the InfoHash), builds the rest of
 /// `TorrentFile`'s fields identically regardless of whether the info dict
 /// came from a `.torrent` file or a magnet metadata exchange.
-fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<String>, announce_list: Vec<Vec<String>>) -> Result<TorrentFile, TorrentError> {
+fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<String>, announce_list: Vec<Vec<String>>, url_list: Vec<String>) -> Result<TorrentFile, TorrentError> {
     let mut hasher = Sha1::new();
     hasher.update(raw_info);
     let info_hash: [u8; 20] = hasher.finalize().into();
@@ -204,6 +217,7 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
         pieces,
         name,
         files,
+        url_list,
     })
 }
 
@@ -292,6 +306,35 @@ mod tests {
                 (vec!["b.txt".to_string()], 200),
             ]
         );
+    }
+
+    #[test]
+    fn parses_url_list_as_single_string() {
+        // "http://mirror.test/f.bin" is 24 bytes. `url-list` sorts before
+        // `info`, keeping the top-level dict keys canonically ordered.
+        let mut s = Vec::new();
+        s.extend_from_slice(b"d4:infod6:lengthi1024e4:name5:f.bin12:piece lengthi16384e6:pieces20:");
+        s.extend_from_slice(&[0u8; 20]);
+        s.extend_from_slice(b"e8:url-list24:http://mirror.test/f.bine");
+        let t = parse_torrent_file(&s).unwrap();
+        assert_eq!(t.url_list, vec!["http://mirror.test/f.bin".to_string()]);
+    }
+
+    #[test]
+    fn parses_url_list_as_list() {
+        // "http://a.test/f.bin" is 19 bytes.
+        let mut s = Vec::new();
+        s.extend_from_slice(b"d4:infod6:lengthi1024e4:name5:f.bin12:piece lengthi16384e6:pieces20:");
+        s.extend_from_slice(&[0u8; 20]);
+        s.extend_from_slice(b"e8:url-listl19:http://a.test/f.bin19:http://b.test/f.binee");
+        let t = parse_torrent_file(&s).unwrap();
+        assert_eq!(t.url_list, vec!["http://a.test/f.bin".to_string(), "http://b.test/f.bin".to_string()]);
+    }
+
+    #[test]
+    fn absent_url_list_is_empty() {
+        let t = parse_torrent_file(&single_file_torrent_bytes()).unwrap();
+        assert!(t.url_list.is_empty());
     }
 
     #[test]
