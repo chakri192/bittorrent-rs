@@ -93,7 +93,11 @@ impl MetadataMessage {
     /// `Decoder::decode_value_with_span` and treat everything after as
     /// the raw metadata chunk.
     pub fn decode(payload: &[u8]) -> Result<Self, MetadataError> {
-        let mut dec = Decoder::new(payload);
+        // Lenient: this header arrives over the wire from arbitrary
+        // clients, and non-canonical key order must not cost us the
+        // metadata (SHA-1 verification of the assembled dict is what
+        // actually guards integrity).
+        let mut dec = Decoder::new_lenient(payload);
         let (value, (_start, end)) = dec.decode_value_with_span()?;
         let dict = value.as_dict().ok_or(MetadataError::NotADict)?;
 
