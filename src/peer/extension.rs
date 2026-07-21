@@ -10,6 +10,12 @@ use std::collections::BTreeMap;
 pub const EXTENDED_HANDSHAKE_ID: u8 = 0;
 /// The name both sides register under `m` for BEP 9 metadata exchange.
 pub const UT_METADATA: &str = "ut_metadata";
+/// BEP 11 peer exchange.
+pub const UT_PEX: &str = "ut_pex";
+/// The id *we* advertise for ut_pex -- peers send us `Extended { id: 2 }`
+/// for PEX messages. (ut_metadata's local id is chosen by callers of
+/// `build`; 1 by convention in this codebase.)
+pub const OUR_UT_PEX_ID: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExtendedHandshake {
@@ -60,6 +66,10 @@ impl ExtendedHandshake {
     pub fn build(our_ut_metadata_id: u8, metadata_size: Option<i64>) -> Vec<u8> {
         let mut m = BTreeMap::new();
         m.insert(UT_METADATA.as_bytes().to_vec(), Bencode::Int(our_ut_metadata_id as i64));
+        // Always advertise ut_pex too: any peer that supports BEP 11 will
+        // then push us fresh peer addresses unprompted -- valuable in
+        // thin swarms where tracker announces come back mostly-dead.
+        m.insert(UT_PEX.as_bytes().to_vec(), Bencode::Int(OUR_UT_PEX_ID as i64));
 
         let mut top = BTreeMap::new();
         top.insert(b"m".to_vec(), Bencode::Dict(m));
@@ -68,11 +78,14 @@ impl ExtendedHandshake {
         }
         top.insert(b"v".to_vec(), Bencode::Bytes(b"bittorrent-rs/0.1".to_vec()));
 
-        encode_bencode(&Bencode::Dict(top))
+        bencode::encode(&Bencode::Dict(top))
     }
 
+    /// Lenient decode: extended handshakes from real-world clients are
+    /// routinely non-canonical (unsorted `m` dicts); rejecting them cost
+    /// us usable peers ("dict keys not strictly sorted" in the field).
     pub fn parse(payload: &[u8]) -> Result<Self, ExtensionError> {
-        let value = bencode::decode(payload)?;
+        let value = bencode::decode_lenient(payload)?;
         let dict = value.as_dict().ok_or(ExtensionError::NotADict)?;
 
         let m_dict = dict.get(b"m".as_slice()).and_then(Bencode::as_dict).ok_or(ExtensionError::MissingMDict)?;
@@ -98,45 +111,10 @@ impl ExtendedHandshake {
     pub fn peer_ut_metadata_id(&self) -> Option<u8> {
         self.m.get(UT_METADATA).copied()
     }
-}
 
-/// Minimal bencode encoder (the decoder in `bencode.rs` has no inverse --
-/// we've only ever needed to *read* torrent/tracker data until now). Only
-/// handles the value shapes BEP 10/9 messages actually use.
-fn encode_bencode(value: &Bencode) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_into(value, &mut out);
-    out
-}
-
-fn encode_into(value: &Bencode, out: &mut Vec<u8>) {
-    match value {
-        Bencode::Int(i) => {
-            out.push(b'i');
-            out.extend_from_slice(i.to_string().as_bytes());
-            out.push(b'e');
-        }
-        Bencode::Bytes(b) => {
-            out.extend_from_slice(b.len().to_string().as_bytes());
-            out.push(b':');
-            out.extend_from_slice(b);
-        }
-        Bencode::List(items) => {
-            out.push(b'l');
-            for item in items {
-                encode_into(item, out);
-            }
-            out.push(b'e');
-        }
-        Bencode::Dict(map) => {
-            out.push(b'd');
-            // BTreeMap already iterates in sorted key order, matching BEP 3.
-            for (k, v) in map {
-                encode_into(&Bencode::Bytes(k.clone()), out);
-                encode_into(v, out);
-            }
-            out.push(b'e');
-        }
+    /// The peer's chosen id for `ut_pex`, if they advertised support.
+    pub fn peer_ut_pex_id(&self) -> Option<u8> {
+        self.m.get(UT_PEX).copied()
     }
 }
 
@@ -192,10 +170,20 @@ mod tests {
     }
 
     #[test]
-    fn encode_bencode_matches_hand_written_bytes_for_simple_dict() {
-        let mut m = BTreeMap::new();
-        m.insert(b"a".to_vec(), Bencode::Int(1));
-        let bytes = encode_bencode(&Bencode::Dict(m));
-        assert_eq!(bytes, b"d1:ai1ee");
+    fn build_advertises_ut_pex() {
+        let bytes = ExtendedHandshake::build(1, None);
+        let parsed = ExtendedHandshake::parse(&bytes).unwrap();
+        assert_eq!(parsed.peer_ut_pex_id(), Some(OUR_UT_PEX_ID));
+    }
+
+    #[test]
+    fn parses_non_canonical_handshake_with_unsorted_keys() {
+        // "v" before "m" at top level, and an unsorted m dict -- exactly
+        // the shape that used to fail with "dict keys not strictly
+        // sorted / duplicate key" against a real peer.
+        let raw = b"d1:v4:test1:md11:ut_metadatai3e2:aai1eee";
+        let parsed = ExtendedHandshake::parse(raw).unwrap();
+        assert_eq!(parsed.peer_ut_metadata_id(), Some(3));
+        assert_eq!(parsed.client_version.as_deref(), Some("test"));
     }
 }
