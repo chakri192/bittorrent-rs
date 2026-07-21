@@ -9,3 +9,4 @@ SHA512SUMS
 /fuzz/corpus
 /fuzz/artifacts
 *.resume
+.DS_Store
