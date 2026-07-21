@@ -2,6 +2,7 @@ pub mod connection;
 pub mod extension;
 pub mod handshake;
 pub mod message;
+pub mod pex;
 pub mod state;
 
 pub use connection::{connect_and_handshake, ConnectionError};
