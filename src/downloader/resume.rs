@@ -184,7 +184,7 @@ mod tests {
         let dir = tmp_dir("reject-mismatch");
         let spans = build_file_spans(&dir, &torrent.files);
         // Write WRONG data for piece 0 (simulating corruption/truncation).
-        write_piece(&spans, 0, 50, &vec![0xFFu8; 50]).unwrap();
+        write_piece(&spans, 0, 50, &[0xFFu8; 50]).unwrap();
 
         let progress_path = progress_file_path(&dir, &torrent.info_hash);
         stdfs::write(&progress_path, "0\n").unwrap();
