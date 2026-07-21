@@ -154,6 +154,10 @@ fn main() {
         .arg(&out_dir)
         .arg("--peers")
         .arg("1")
+        // No DHT in the harness: everything must stay on 127.0.0.1 (CI
+        // has no business resolving bootstrap routers), and the run
+        // should exercise exactly the fake tracker + fake peer.
+        .arg("--no-dht")
         .status()
         .unwrap_or_else(|e| panic!("failed to spawn {:?}: {}", download_bin, e));
 
