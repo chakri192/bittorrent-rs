@@ -14,3 +14,4 @@ pub mod tracker;
 pub mod tracker_discovery;
 pub mod tui;
 pub mod ui;
+pub mod webseed;
