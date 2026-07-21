@@ -128,38 +128,42 @@ pub fn announce_to_all(tracker_urls: &[String], req: &AnnounceRequest) -> (Vec<S
     (peers.into_iter().collect(), failures, max_interval)
 }
 
-/// Convenience for building the request each of the (at most two, per
-/// torrent lifecycle) announces in `download.rs` needs: initial discovery
-/// (`Started`) with `left` set to the full torrent size.
-pub fn build_started_request(info_hash: [u8; 20], peer_id: [u8; 20], port: u16, total_length: u64) -> AnnounceRequest {
+/// Session transfer totals reported to trackers (BEP 3): `uploaded`/
+/// `downloaded` are bytes moved *this session*; `left` is bytes still
+/// needed to complete the torrent (0 once seeding).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransferTotals {
+    pub uploaded: u64,
+    pub downloaded: u64,
+    pub left: u64,
+}
+
+/// The one true announce-request builder; the convenience wrappers below
+/// cover the two fixed shapes older call sites used.
+pub fn build_request(info_hash: [u8; 20], peer_id: [u8; 20], port: u16, totals: TransferTotals, event: Option<Event>) -> AnnounceRequest {
     AnnounceRequest {
         info_hash,
         peer_id,
         port,
-        uploaded: 0,
-        downloaded: 0,
-        left: total_length,
+        uploaded: totals.uploaded,
+        downloaded: totals.downloaded,
+        left: totals.left,
         compact: true,
-        event: Some(Event::Started),
+        event,
         numwant: Some(50),
     }
+}
+
+/// Initial discovery (`Started`) with `left` set to the full torrent size.
+pub fn build_started_request(info_hash: [u8; 20], peer_id: [u8; 20], port: u16, total_length: u64) -> AnnounceRequest {
+    build_request(info_hash, peer_id, port, TransferTotals { uploaded: 0, downloaded: 0, left: total_length }, Some(Event::Started))
 }
 
 /// A periodic re-announce (BEP 3): `event` is omitted (not `Started`
 /// again) since this is neither the first announce nor a stop/complete
 /// notification -- just "still here, still want peers."
 pub fn build_regular_request(info_hash: [u8; 20], peer_id: [u8; 20], port: u16, total_length: u64) -> AnnounceRequest {
-    AnnounceRequest {
-        info_hash,
-        peer_id,
-        port,
-        uploaded: 0,
-        downloaded: 0,
-        left: total_length,
-        compact: true,
-        event: None,
-        numwant: Some(50),
-    }
+    build_request(info_hash, peer_id, port, TransferTotals { uploaded: 0, downloaded: 0, left: total_length }, None)
 }
 
 #[cfg(test)]
