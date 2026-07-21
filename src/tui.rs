@@ -300,6 +300,8 @@ fn render_swarm(f: &mut Frame, area: Rect, view: &View) {
             Span::raw(format!("DHT {} nodes", snap.dht_nodes)),
             dot.clone(),
             Span::raw(format!("PEX +{}", snap.pex_total)),
+            dot.clone(),
+            if snap.web_seeds > 0 { Span::styled(format!("web \u{d7}{}", snap.web_seeds), Style::default().fg(Color::Green)) } else { Span::styled("web \u{d7}0", Style::default().fg(Color::DarkGray)) },
             dot,
             endgame,
         ]),
