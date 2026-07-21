@@ -6,6 +6,7 @@ pub mod magnet;
 pub mod magnet_fetch;
 pub mod metadata;
 pub mod peer;
+pub mod portmap;
 pub mod seeder;
 pub mod selection;
 pub mod torrent;
