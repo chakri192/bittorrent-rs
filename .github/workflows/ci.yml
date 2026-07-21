@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # No `cargo fmt --check`: the codebase predates rustfmt adoption
+      # and is deliberately hand-formatted (long doc'd lines).
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test
+      - name: Loopback end-to-end harness
+        # Build first: the harness spawns target/debug/download, which
+        # `cargo run --bin e2e_harness` alone would not have built.
+        run: |
+          cargo build --bin download
+          cargo run --bin e2e_harness
+
+  fuzz-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz targets compile and run against seed inputs
+        working-directory: fuzz
+        run: |
+          for target in bencode_decode magnet_parse torrent_parse; do
+            cargo +nightly fuzz run "$target" -- -runs=1000
+          done
