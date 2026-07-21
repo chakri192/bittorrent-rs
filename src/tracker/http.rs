@@ -175,7 +175,10 @@ pub(crate) fn perform_request_and_parse<S: Read + Write>(stream: &mut S, url: &P
 }
 
 fn parse_announce_body(body: &[u8]) -> Result<AnnounceResponse, TrackerError> {
-    let value = bencode::decode(body)?;
+    // Lenient: tracker responses are wire data from arbitrary
+    // implementations; non-canonical key order shouldn't cost us the
+    // whole peer list.
+    let value = bencode::decode_lenient(body)?;
     let dict = value.as_dict().ok_or(TrackerError::MalformedResponse("response is not a dict"))?;
 
     if let Some(reason) = dict.get(b"failure reason".as_slice()).and_then(Bencode::as_str) {
