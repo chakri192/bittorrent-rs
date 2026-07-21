@@ -104,6 +104,7 @@ struct Args {
     port: u16,
     seed: bool,
     no_dht: bool,
+    no_portmap: bool,
     ipv6: Ipv6Mode,
     /// Case-insensitive path substrings selecting which files to download.
     only: Vec<String>,
@@ -159,6 +160,7 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
     let mut port = cfg.port.unwrap_or(DEFAULT_PORT);
     let mut seed = cfg.seed.unwrap_or(false);
     let mut no_dht = !cfg.dht.unwrap_or(true);
+    let mut no_portmap = !cfg.portmap.unwrap_or(true);
     let mut ipv6 = match cfg.ipv6.as_deref() {
         Some("always") => Ipv6Mode::Always,
         Some("never") => Ipv6Mode::Never,
@@ -201,6 +203,8 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
             "--no-seed" => seed = false,
             "--no-dht" => no_dht = true,
             "--dht" => no_dht = false,
+            "--no-portmap" => no_portmap = true,
+            "--portmap" => no_portmap = false,
             "--tui" => no_tui = false,
             // Consumed in the pre-scan (`load_config_from_args`); accepted
             // here so they aren't flagged as unrecognized.
@@ -238,11 +242,11 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
         }
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, verbosity, timeout, port, seed, no_dht, ipv6, only, files_sel, list, log, no_log, no_tui })
+    Ok(Args { source, out_dir, max_peers, reannounce_override, verbosity, timeout, port, seed, no_dht, no_portmap, ipv6, only, files_sel, list, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--dht | --no-dht] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--dht | --no-dht] [--portmap | --no-portmap] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -473,6 +477,17 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     // free to `stop()` later).
     let uploaded_counter: Option<Arc<AtomicU64>> = seeder_handle.as_ref().map(|s| Arc::clone(&s.uploaded));
     let uploaded = || uploaded_counter.as_ref().map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+
+    // Best-effort port forwarding (UPnP/NAT-PMP) so inbound peers and DHT
+    // queries reach us behind a home router. Runs on its own thread and
+    // never blocks; silently no-ops if the router doesn't cooperate.
+    let mut portmap_handle = if args.no_portmap || seeder_handle.is_none() {
+        None
+    } else {
+        let udp_port = dht_service.as_ref().map(|d| d.port).unwrap_or(announce_port);
+        let logger = ui.clone();
+        bittorrent_rs::portmap::map_ports(announce_port, udp_port, move |m| logger.log(m))
+    };
 
     // Only wanted pieces enter the queue and the progress totals; already-
     // verified wanted pieces count as done from the start. (Resumed
@@ -757,6 +772,9 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             ui.finish(Ok(summary.clone()));
         }
 
+        if let Some(p) = portmap_handle.as_mut() {
+            p.stop();
+        }
         if let Some(s) = seeder_handle.as_mut() {
             s.stop();
         }
@@ -766,6 +784,9 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         Ok(summary)
     } else {
         let reason = format!("incomplete: {} piece(s) never downloaded ({} peer(s) dialed) -- rerun the same command to resume", queue.len(), pool.dialed());
+        if let Some(p) = portmap_handle.as_mut() {
+            p.stop();
+        }
         if let Some(s) = seeder_handle.as_mut() {
             s.stop();
         }
