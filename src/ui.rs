@@ -100,6 +100,7 @@ pub struct Snapshot {
     pub trackers_total: usize,
     pub dht_nodes: usize,
     pub pex_total: usize,
+    pub web_seeds: usize,
     pub eta_secs: Option<u64>,
     /// One-word phase: "connecting", "downloading", "waiting", ...
     pub status: &'static str,
