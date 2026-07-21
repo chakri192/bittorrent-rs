@@ -1,6 +1,8 @@
 # bittorrent-rs
 
-A complete BitTorrent client built from scratch in Rust. Bencode, the peer wire protocol, tracker communication (HTTP/HTTPS/UDP), magnet links (BEP 9/10), the mainline DHT (BEP 5), peer exchange (BEP 11), endgame mode, and seeding are all hand-rolled — no `libtorrent`-style crate. Only third-party deps: `sha1`, and `rustls` for HTTPS trackers (TLS itself deliberately not reimplemented).
+A complete BitTorrent client built from scratch in Rust. Bencode, the peer wire protocol, tracker communication (HTTP/HTTPS/UDP), magnet links (BEP 9/10), the mainline DHT (BEP 5), peer exchange (BEP 11), endgame mode, and seeding are all hand-rolled — no `libtorrent`-style crate. Protocol dependencies stay minimal: `sha1`, and `rustls` for HTTPS trackers (TLS itself deliberately not reimplemented). The `download` binary additionally uses `ratatui` for its live terminal dashboard.
+
+<p align="center"><em>Live dashboard: progress gauge, throughput sparklines, peer/swarm stats, and a tailing activity log — with the full per-peer detail streamed to a logfile.</em></p>
 
 ## Verified behavior
 
@@ -71,12 +73,43 @@ btdl() { /path/to/bittorrent-rs/target/release/download "$@"; }
 | `--port PORT` | `6881` | Preferred listen port (TCP for serving pieces, UDP for the DHT node); falls back to an ephemeral port if taken |
 | `--seed` | off | Keep seeding after the download completes, until Ctrl-C |
 | `--no-dht` | off | Disable the DHT node (tracker/PEX discovery only) |
+| `--ipv6` / `--no-ipv6` | auto | Force IPv6 peers on/off. Auto-detects a local IPv6 route and skips v6 peers when there isn't one, so a v4-only host doesn't burn dial slots on unroutable addresses |
+| `--only SUBSTR` | all files | Download only files whose path contains SUBSTR (case-insensitive; repeatable) |
+| `--files 1,3,5` | all files | Download only these 1-based file indices (see `--list`) |
+| `--list` | off | Print the torrent's file table (index, size, selection) and exit — resolves magnet metadata first if needed |
 | `--reannounce SECONDS` | tracker's requested interval | Re-query interval for new peers; real trackers often request 20–30+ min — override for faster testing |
 | `--timeout SECONDS` | none | Overall wall-clock budget for the whole run; stops and reports what's left instead of running indefinitely |
-| `--quiet` / `-q` | off | Suppress per-piece and progress output (warnings/errors still print) |
-| `--verbose` / `-v` | off | Also print each peer connection attempt and PEX discoveries |
+| `--config FILE` / `--no-config` | `~/.config/bittorrent-rs.toml` | Use a specific config file, or ignore config entirely |
+| `--log FILE` | `<out>/bittorrent-rs.log` | Where to stream the full per-peer/DHT/PEX detail |
+| `--no-log` | off | Disable the logfile entirely |
+| `--tui` / `--no-tui` | auto | Force the dashboard on, or the plain status-line interface even on a TTY |
+| `--dht` / `--no-dht` | on | Force the DHT node on/off |
+| `--seed` / `--no-seed` | off | Force seeding after completion on/off |
+| `--quiet` / `-q` | off | Suppress all status output (warnings/errors still print) |
+| `--verbose` / `-v` | off | (reserved) |
 
 Interrupted or killed mid-download? Just rerun the same command — already-verified pieces are detected and skipped, not re-downloaded.
+
+### Interface
+
+On an interactive terminal, `download` shows a live dashboard: a progress gauge, download/upload throughput sparklines, transfer stats (rate, ETA, pieces), a swarm panel (active/dialed/known peers, tracker health, DHT node count, PEX, endgame state), and a tailing activity log. Press `q` (or `Esc` / `Ctrl-C`) to stop. The high-volume detail — every peer connect/disconnect, each DHT/PEX discovery, per-piece verification — is streamed to the logfile rather than the screen, so `tail -f <out>/bittorrent-rs.log` gives the firehose while the dashboard stays readable.
+
+When stdout isn't a TTY (piped, redirected, CI) the interface automatically degrades to a periodic one-line status print, so scripted use and logs stay clean.
+
+### Config file
+
+Defaults can be set in `~/.config/bittorrent-rs.toml` (or `$XDG_CONFIG_HOME/bittorrent-rs.toml`) so you don't retype flags. Every key is optional; a CLI flag always overrides its config value. A missing file is fine; a malformed one is a hard error.
+
+```toml
+out = "/data/torrents"
+peers = 60
+port = 51413
+seed = true
+dht = true
+ipv6 = "auto"      # "auto" | "always" | "never"
+reannounce = 900
+tui = true
+```
 
 ---
 
@@ -101,7 +134,7 @@ Interrupted or killed mid-download? Just rerun the same command — already-veri
 - **Choking policy (upload)**: every interested inbound peer is unchoked, bounded by a global inbound-connection cap, with no tit-for-tat rate measurement. Tit-for-tat allocates *scarce* upload slots; a connection cap bounds the same resource with far less machinery.
 - **DHT**: fixed 160-bucket routing table (no dynamic bucket splitting), evicts least-recently-seen without a ping-first grace round, single non-rotating announce-token secret per run, IPv4 only (no BEP 32). Only nodes that actually respond to us are inserted.
 - **Bencode**: strict canonical parsing for anything hashed or re-serialized; lenient (unsorted/duplicate keys tolerated) for anything received over the wire — be strict in what you send, lenient in what you accept.
-- **No selective file download** — multi-file torrents always download every file.
+- **Boundary files under `--only`/`--files`** — a piece straddling a selected and an unselected file is downloaded in full (it carries the selected file's bytes), so an unselected *neighbour* file may end up partially written. Files entirely outside the selection are never created. This keeps piece hashing and resume simple, and matches mainline client behaviour.
 - **No partial-piece resume across peers** — if a peer disconnects mid-piece, that piece's progress on this connection is lost (whole pieces already on disk from *previous runs* still resume fine).
 
 ---
@@ -147,6 +180,7 @@ panic on malformed input there is a real bug. See `fuzz/README.md`.
 | Stuck with no piece progress | Thin/unhealthy swarm — leave it running: the DHT re-looks-up every 3 minutes and trackers get re-announced (early when the dial queue empties). Compare against `aria2c`/`transmission-cli` on the same torrent to separate client issues from swarm issues |
 | `tracker ... failed: ...` warnings | Normal — public trackers go down constantly. Only fatal if *every* tracker fails **and** the DHT finds nothing |
 | `DHT disabled (couldn't bind UDP socket)` | Another client owns the port — pass `--port` to pick a different one |
+| Lots of `HostUnreachable`/`NetworkUnreachable` on v6 peers | Your host has no IPv6 route; auto-detect normally skips these, but `--no-ipv6` forces it. These are logged, not shown, and never fatal |
 | A peer fails to provide metadata or a piece | Normal peer churn — client automatically tries the next peer |
 | Rerun re-downloads pieces I thought were already done | The resume check re-verifies against actual disk bytes — if the file was moved, edited, or `--out` changed between runs, those pieces legitimately no longer check out |
 | Port-forwarding / NAT | Inbound connections and DHT reachability improve with `--port` forwarded on your router; everything still works outbound-only, just less sociably |
