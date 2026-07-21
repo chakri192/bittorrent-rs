@@ -102,6 +102,8 @@ pub struct Snapshot {
     pub pex_total: usize,
     pub web_seeds: usize,
     pub eta_secs: Option<u64>,
+    /// Seconds since the download phase started (for the header clock).
+    pub elapsed_secs: u64,
     /// One-word phase: "connecting", "downloading", "waiting", ...
     pub status: &'static str,
 }
