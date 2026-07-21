@@ -31,6 +31,8 @@ pub struct Config {
     pub dht: Option<bool>,
     /// UPnP/NAT-PMP port mapping on/off (default on). `false` == `--no-portmap`.
     pub portmap: Option<bool>,
+    /// BEP 19 web seeds on/off (default on). `false` == `--no-webseed`.
+    pub webseed: Option<bool>,
     /// `"auto"` | `"always"` | `"never"`.
     pub ipv6: Option<String>,
     pub reannounce: Option<u64>,
