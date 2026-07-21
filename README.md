@@ -1,6 +1,6 @@
 # bittorrent-rs
 
-A complete BitTorrent client built from scratch in Rust. Bencode, the peer wire protocol, tracker communication (HTTP/HTTPS/UDP), magnet links (BEP 9/10), the mainline DHT (BEP 5), peer exchange (BEP 11), endgame mode, and seeding are all hand-rolled — no `libtorrent`-style crate. Protocol dependencies stay minimal: `sha1`, and `rustls` for HTTPS trackers (TLS itself deliberately not reimplemented). The `download` binary additionally uses `ratatui` for its live terminal dashboard.
+A complete BitTorrent client built from scratch in Rust. Bencode, the peer wire protocol, tracker communication (HTTP/HTTPS/UDP), magnet links (BEP 9/10), the mainline DHT (BEP 5), peer exchange (BEP 11), web seeds (BEP 19), endgame mode, and seeding are all hand-rolled — no `libtorrent`-style crate. Protocol dependencies stay minimal: `sha1`, and `rustls` for HTTPS trackers (TLS itself deliberately not reimplemented). The `download` binary additionally uses `ratatui` for its live terminal dashboard.
 
 <p align="center"><em>Live dashboard: progress gauge, throughput sparklines, peer/swarm stats, and a tailing activity log — with the full per-peer detail streamed to a logfile.</em></p>
 
@@ -11,6 +11,7 @@ A complete BitTorrent client built from scratch in Rust. Bencode, the peer wire 
 | `.torrent` file download | Byte-identical to publisher's checksum (tested against Debian netinst, SHA-512 confirmed) |
 | Magnet link download | Metadata fetched and SHA-1-verified from a live peer (BEP 9) before any piece download starts |
 | Trackerless magnet (no `tr=`) | Peers found via the DHT alone; metadata then fetched over BEP 9 |
+| Web seed present (BEP 19) | Pieces pulled over HTTP(S) in parallel with peers via ranged GETs; completes even with zero peers, and stops a mirror after repeated failures |
 | Tracker unreachable | Skipped with a warning; download proceeds if any other tracker or the DHT responds |
 | Tracker slow/unresponsive | Bounded to a 20s overall timeout — doesn't stall on one dead tracker |
 | Peer unchokes slowly (>10s) | Tolerated with a bounded wait (~60s) instead of dropping the connection on the first read timeout |
@@ -85,6 +86,7 @@ btdl() { /path/to/bittorrent-rs/target/release/download "$@"; }
 | `--tui` / `--no-tui` | auto | Force the dashboard on, or the plain status-line interface even on a TTY |
 | `--dht` / `--no-dht` | on | Force the DHT node on/off |
 | `--portmap` / `--no-portmap` | on | Auto-forward the listen port via UPnP/NAT-PMP (best-effort; silently skipped if the router doesn't support it) |
+| `--webseed` / `--no-webseed` | on | Use the torrent's BEP 19 web seeds (HTTP) alongside peers |
 | `--seed` / `--no-seed` | off | Force seeding after completion on/off |
 | `--quiet` / `-q` | off | Suppress all status output (warnings/errors still print) |
 | `--verbose` / `-v` | off | (reserved) |
@@ -108,6 +110,7 @@ port = 51413
 seed = true
 dht = true
 portmap = true
+webseed = true
 ipv6 = "auto"      # "auto" | "always" | "never"
 reannounce = 900
 tui = true
@@ -122,6 +125,7 @@ tui = true
    - **Trackers** (BEP 3/15/23): every tracker in the torrent announced to concurrently — HTTP, HTTPS, UDP; IPv4 and IPv6 peers from HTTP(S) trackers — merging peer lists and skipping any that fail or time out, re-announcing on the tracker's interval (early once the dial queue runs dry).
    - **DHT** (BEP 5): a real mainline DHT node — bootstraps from well-known routers, runs iterative `get_peers` lookups, `announce_peer`s our listen port, and answers inbound `ping`/`find_node`/`get_peers`/`announce_peer` from other nodes.
    - **PEX** (BEP 11): peer addresses pushed by connected peers over the extension protocol.
+   - **Web seeds** (BEP 19): if the torrent's `url-list` names HTTP(S) mirrors, one worker per mirror fetches pieces via ranged GETs into the same verify-write pipeline as peers — so a torrent with a healthy web seed finishes even with no peers at all.
 3. Checks for a resume file from a previous run — any piece it claims is done gets re-read off disk and re-hashed before being trusted; anything that doesn't check out goes back on the download list.
 4. Runs up to `--peers` concurrent connections, each pipelining block requests to keep the pipe full; dead connections are replaced from the dial queue immediately.
 5. Picks pieces **rarest-first**, and switches to **endgame mode** for the tail: the last in-flight pieces are requested from every capable peer in parallel, the first verified copy wins, and stragglers get `Cancel` — no more "99% then crawls" hostage situation.
