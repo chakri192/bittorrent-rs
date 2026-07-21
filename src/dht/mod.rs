@@ -17,7 +17,7 @@ use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
@@ -363,6 +363,9 @@ impl<T: Transport> Dht<T> {
 pub struct DhtService {
     pub peers_rx: Receiver<Vec<SocketAddr>>,
     pub port: u16,
+    /// Live routing-table size, updated by the service thread each round
+    /// -- a cheap "is the DHT healthy?" signal for the UI.
+    pub nodes: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -390,11 +393,14 @@ pub fn spawn_service(bind_port: u16, bootstrap_nodes: Vec<String>, info_hash: [u
     let port = transport.local_port();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
+    let nodes = Arc::new(AtomicUsize::new(0));
+    let nodes_thread = Arc::clone(&nodes);
     let (tx, peers_rx) = mpsc::channel();
 
     let handle = thread::spawn(move || {
         let mut dht = Dht::new(transport);
         dht.bootstrap(&bootstrap_nodes, &stop_thread);
+        nodes_thread.store(dht.table_len(), Ordering::SeqCst);
 
         while !stop_thread.load(Ordering::SeqCst) {
             let found = dht.get_peers(&info_hash, Duration::from_secs(10), &stop_thread);
@@ -408,11 +414,13 @@ pub fn spawn_service(bind_port: u16, bootstrap_nodes: Vec<String>, info_hash: [u
             if p != 0 {
                 dht.announce(&info_hash, p, &found);
             }
+            nodes_thread.store(dht.table_len(), Ordering::SeqCst);
             dht.serve_for(RELOOKUP_INTERVAL, &stop_thread);
+            nodes_thread.store(dht.table_len(), Ordering::SeqCst);
         }
     });
 
-    Ok(DhtService { peers_rx, port, stop, handle: Some(handle) })
+    Ok(DhtService { peers_rx, port, nodes, stop, handle: Some(handle) })
 }
 
 #[cfg(test)]
