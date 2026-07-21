@@ -2,7 +2,10 @@
 
 A complete BitTorrent client built from scratch in Rust. Bencode, the peer wire protocol, tracker communication (HTTP/HTTPS/UDP), magnet links (BEP 9/10), the mainline DHT (BEP 5), peer exchange (BEP 11), web seeds (BEP 19), endgame mode, and seeding are all hand-rolled — no `libtorrent`-style crate. Protocol dependencies stay minimal: `sha1`, and `rustls` for HTTPS trackers (TLS itself deliberately not reimplemented). The `download` binary additionally uses `ratatui` for its live terminal dashboard.
 
-<p align="center"><em>Live dashboard: progress gauge, throughput sparklines, peer/swarm stats, and a tailing activity log — with the full per-peer detail streamed to a logfile.</em></p>
+<p align="center">
+  <img src="docs/dashboard.svg" alt="bittorrent-rs live dashboard" width="840">
+</p>
+<p align="center"><em>Live dashboard — progress gauge, piece-map heatmap, throughput sparklines, swarm stats, and a colour-coded activity log; the full per-peer detail streams to a logfile.</em></p>
 
 ## Verified behavior
 
