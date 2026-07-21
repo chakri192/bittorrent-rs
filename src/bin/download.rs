@@ -105,6 +105,7 @@ struct Args {
     seed: bool,
     no_dht: bool,
     no_portmap: bool,
+    no_webseed: bool,
     ipv6: Ipv6Mode,
     /// Case-insensitive path substrings selecting which files to download.
     only: Vec<String>,
@@ -161,6 +162,7 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
     let mut seed = cfg.seed.unwrap_or(false);
     let mut no_dht = !cfg.dht.unwrap_or(true);
     let mut no_portmap = !cfg.portmap.unwrap_or(true);
+    let mut no_webseed = !cfg.webseed.unwrap_or(true);
     let mut ipv6 = match cfg.ipv6.as_deref() {
         Some("always") => Ipv6Mode::Always,
         Some("never") => Ipv6Mode::Never,
@@ -205,6 +207,8 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
             "--dht" => no_dht = false,
             "--no-portmap" => no_portmap = true,
             "--portmap" => no_portmap = false,
+            "--no-webseed" => no_webseed = true,
+            "--webseed" => no_webseed = false,
             "--tui" => no_tui = false,
             // Consumed in the pre-scan (`load_config_from_args`); accepted
             // here so they aren't flagged as unrecognized.
@@ -242,11 +246,11 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
         }
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, verbosity, timeout, port, seed, no_dht, no_portmap, ipv6, only, files_sel, list, log, no_log, no_tui })
+    Ok(Args { source, out_dir, max_peers, reannounce_override, verbosity, timeout, port, seed, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--dht | --no-dht] [--portmap | --no-portmap] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -535,8 +539,13 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         reannounce_wait = Duration::from_secs(secs).max(MIN_REANNOUNCE);
     }
 
-    if pool.known.is_empty() && dht_service.is_none() {
-        return Err(finish_err(ui, "no peers found from any tracker (and DHT is disabled)".to_string()));
+    // BEP 19 web seeds (from the torrent's url-list). These can carry the
+    // whole download even with zero peers, so their presence keeps the run
+    // alive below.
+    let web_seeds: Vec<String> = if args.no_webseed { Vec::new() } else { torrent.url_list.clone() };
+
+    if pool.known.is_empty() && dht_service.is_none() && web_seeds.is_empty() {
+        return Err(finish_err(ui, "no peers found from any tracker (and DHT + web seeds unavailable)".to_string()));
     }
     ui.log(format!("{} peer(s) known; dialing up to {} concurrently", pool.known.len(), args.max_peers));
     if pool.skipped_ipv6 > 0 {
@@ -546,6 +555,28 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     let (tx, rx) = mpsc::channel();
     let (pex_tx, pex_rx): (PexSender, mpsc::Receiver<Vec<SocketAddr>>) = mpsc::channel();
     let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: PIPELINE_DEPTH, connect_timeout: CONNECT_TIMEOUT });
+
+    // Web-seed workers: one thread per url-list entry, draining the same
+    // shared queue into the same verify-write-record pipeline as peers.
+    let web_stop = Arc::new(AtomicBool::new(false));
+    let mut web_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+    if !web_seeds.is_empty() {
+        ui.log(format!("web seed: {} url(s) from the torrent's url-list", web_seeds.len()));
+        let files_arc = Arc::new(torrent.files.clone());
+        for url in &web_seeds {
+            let url = url.clone();
+            let name = torrent.name.clone();
+            let files = Arc::clone(&files_arc);
+            let queue = Arc::clone(&queue);
+            let spans = Arc::clone(&spans);
+            let tx = tx.clone();
+            let web_stop = Arc::clone(&web_stop);
+            let ui2 = ui.clone();
+            web_handles.push(thread::spawn(move || {
+                bittorrent_rs::webseed::run_web_worker(&url, &name, &files, &queue, &spans, piece_length, total_length, &tx, &web_stop, move |m| ui2.log(m));
+            }));
+        }
+    }
 
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
     let mut verified = confirmed_wanted.len();
@@ -600,12 +631,13 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             let done = bytes_already_done + bytes_downloaded_this_run;
             let remaining = display_total.saturating_sub(done);
             let eta_secs = if smoothed_down > 1.0 { Some((remaining as f64 / smoothed_down) as u64) } else { None };
+            let web_active = web_handles.iter().any(|h| !h.is_finished());
             let status = if queue.in_endgame() {
                 "endgame"
+            } else if bytes_downloaded_this_run > 0 || web_active {
+                "downloading"
             } else if handles.is_empty() && pool.reserve_is_empty() {
                 "waiting"
-            } else if bytes_downloaded_this_run > 0 {
-                "downloading"
             } else {
                 "connecting"
             };
@@ -625,6 +657,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
                 trackers_total: tracker_urls.len(),
                 dht_nodes: dht_service.as_ref().map(|d| d.nodes.load(Ordering::SeqCst)).unwrap_or(0),
                 pex_total,
+                web_seeds: web_handles.iter().filter(|h| !h.is_finished()).count(),
                 eta_secs,
                 status,
             });
@@ -715,7 +748,10 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
 
         spawn_up_to_cap!();
 
-        if fresh_since_announce == 0 && handles.is_empty() && pool.reserve_is_empty() {
+        // A run isn't fruitless while a web seed is still pulling pieces --
+        // it can finish the whole download with no peers at all.
+        let web_active = web_handles.iter().any(|h| !h.is_finished());
+        if fresh_since_announce == 0 && handles.is_empty() && pool.reserve_is_empty() && !web_active {
             fruitless_rounds += 1;
             ui.log(format!("no new peers from any source ({}/{} fruitless rounds)", fruitless_rounds, MAX_FRUITLESS_ROUNDS));
             if fruitless_rounds >= MAX_FRUITLESS_ROUNDS {
@@ -727,9 +763,13 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         fresh_since_announce = 0;
     }
 
+    web_stop.store(true, Ordering::SeqCst);
     drop(tx);
     drop(pex_tx);
     for h in handles {
+        let _ = h.join();
+    }
+    for h in web_handles {
         let _ = h.join();
     }
     for result in rx.try_iter() {
