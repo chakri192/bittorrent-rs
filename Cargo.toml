@@ -18,6 +18,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 # UPnP IGD port mapping (NAT-PMP is hand-rolled in src/portmap.rs).
 igd-next = "0.15"
+# Synchronous HTTP client for BEP 19 web seeds (ranged GETs). rustls-based,
+# no async runtime -- fits the one-thread-per-source model.
+ureq = "2"
 # Pinned below the version that requires edition2024 (Cargo 1.85+ / rustc
 # 1.85+): this repo is also built/tested in a sandbox running rustc 1.75.
 # Remove this pin freely on a newer toolchain.
