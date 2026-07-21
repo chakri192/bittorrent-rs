@@ -16,6 +16,8 @@ ratatui = "0.29"
 # Optional TOML config file (~/.config/bittorrent-rs.toml) for default flags.
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# UPnP IGD port mapping (NAT-PMP is hand-rolled in src/portmap.rs).
+igd-next = "0.15"
 # Pinned below the version that requires edition2024 (Cargo 1.85+ / rustc
 # 1.85+): this repo is also built/tested in a sandbox running rustc 1.75.
 # Remove this pin freely on a newer toolchain.
