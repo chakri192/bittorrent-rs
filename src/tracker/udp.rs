@@ -151,11 +151,20 @@ pub fn announce(tracker_addr: &str, req: &AnnounceRequest) -> Result<AnnounceRes
 }
 
 fn generate_transaction_id() -> u32 {
-    let nanos = std::time::SystemTime::now()
+    // For connectionless UDP, the transaction id is the primary defense
+    // against off-path response spoofing, so it must be unpredictable. The
+    // socket's connect() already filters by source address, but a guessable
+    // id would weaken that. Use the OS CSPRNG; fall back to a time-seeded
+    // value only if the RNG is somehow unavailable, rather than aborting the
+    // announce outright.
+    let mut buf = [0u8; 4];
+    if getrandom::getrandom(&mut buf).is_ok() {
+        return u32::from_be_bytes(buf);
+    }
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u32)
-        .unwrap_or(0x1234_5678);
-    nanos ^ (&nanos as *const _ as u32)
+        .unwrap_or(0x1234_5678)
 }
 
 #[cfg(test)]
