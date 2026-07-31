@@ -27,6 +27,7 @@ pub enum TorrentError {
     MissingKey(&'static str),
     WrongType(&'static str),
     PiecesLengthNotMultipleOf20,
+    InvalidLength(&'static str),
     InfoHashMismatch,
 }
 
@@ -44,6 +45,7 @@ impl std::fmt::Display for TorrentError {
             TorrentError::MissingKey(k) => write!(f, "missing required key: {}", k),
             TorrentError::WrongType(k) => write!(f, "key has wrong type: {}", k),
             TorrentError::PiecesLengthNotMultipleOf20 => write!(f, "'pieces' length is not a multiple of 20"),
+            TorrentError::InvalidLength(k) => write!(f, "'{}' must be a positive/non-negative integer", k),
             TorrentError::InfoHashMismatch => write!(f, "assembled info dict's SHA-1 does not match the expected InfoHash"),
         }
     }
@@ -169,6 +171,12 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
         .get("piece length")
         .and_then(Bencode::as_int)
         .ok_or(TorrentError::MissingKey("piece length"))?;
+    // Guard the numeric fields before they're cast to u64 elsewhere: a
+    // non-positive piece length leads to division-by-zero in piece math, and
+    // a negative file length would wrap to a gigantic u64 (huge allocation).
+    if piece_length <= 0 {
+        return Err(TorrentError::InvalidLength("piece length"));
+    }
 
     let pieces_raw = info.get("pieces").and_then(Bencode::as_bytes).ok_or(TorrentError::MissingKey("pieces"))?;
     if pieces_raw.len() % 20 != 0 {
@@ -187,6 +195,9 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
 
     let files = if let Some(len) = info.get("length").and_then(Bencode::as_int) {
         // Single-file torrent.
+        if len < 0 {
+            return Err(TorrentError::InvalidLength("length"));
+        }
         vec![(vec![name.clone()], len)]
     } else if let Some(file_list) = info.get("files").and_then(Bencode::as_list) {
         // Multi-file torrent.
@@ -194,6 +205,9 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
             .iter()
             .map(|f| {
                 let length = f.get("length").and_then(Bencode::as_int).ok_or(TorrentError::MissingKey("length"))?;
+                if length < 0 {
+                    return Err(TorrentError::InvalidLength("length"));
+                }
                 let path = f
                     .get("path")
                     .and_then(Bencode::as_list)
