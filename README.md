@@ -26,7 +26,9 @@ Every layer hand-rolled — from the bencode parser up to the mainline DHT — w
 
 ---
 
-It pulls real public torrents to completion — a 21 GB file, verified byte for byte — and then seeds them back.
+## Overview
+
+Every layer is implemented from the specifications: the bencode parser, the peer wire protocol, tracker communication across three transports, the mainline DHT, and piece selection. It downloads real public torrents to completion — verified byte for byte against a 21 GB file — and then seeds them.
 
 ## Features
 
@@ -36,7 +38,7 @@ It pulls real public torrents to completion — a 21 GB file, verified byte for 
 
 **Four discovery sources, one queue** — trackers (HTTP / HTTPS / UDP, IPv4 + IPv6), the mainline **DHT** (BEP 5: Kademlia routing table, iterative `get_peers`, `announce_peer`, and it answers inbound queries too), **PEX** (BEP 11), and HTTP **web seeds** (BEP 19) all feed a single dial queue.
 
-**Rarest-first + endgame** — grabs the scarcest piece first; for the tail it requests the final pieces from every capable peer at once, first verified copy wins, stragglers cancelled — no 99%-then-crawl.
+**Rarest-first with endgame** — the scarcest piece in the swarm is requested first. For the final pieces, requests are issued to every capable peer simultaneously; the first verified copy is accepted and the remainder cancelled, which avoids the long tail that otherwise occurs near completion.
 
 **Seeding** — serves verified pieces to inbound peers during *and* after the download, reporting real uploaded / downloaded / left to trackers.
 
@@ -63,7 +65,7 @@ cargo build --release            # needs a stable Rust toolchain; binary at targ
 ./target/release/download foo.torrent --seed
 ```
 
-> Try it against a well-seeded, legal torrent — a current Debian ISO — to watch the piece map fill and every source light up. It's also the honest way to tell a client bug from a simply thin swarm.
+> A well-seeded, legally distributed torrent such as a current Debian ISO is the appropriate test case. It exercises every discovery source, and it distinguishes a client defect from a sparsely populated swarm.
 
 Defaults can live in `~/.config/bittorrent-rs.toml` (every key optional; a flag always wins). The flags that matter:
 
@@ -94,7 +96,7 @@ Defaults can live in `~/.config/bittorrent-rs.toml` (every key optional; a flag 
                                (serve verified pieces to inbound peers)
 ```
 
-One OS thread per peer and per web seed drains the shared queue — no async runtime, just blocking sockets and channels. Every piece is assembled and SHA-1-verified in memory before it's written, and peer workers and web-seed workers share that exact same verify-write-record path, so hashing, resume, and endgame behave identically no matter where the bytes came from. The DHT node and the inbound seeder each run on their own background thread.
+One operating-system thread per peer and per web seed drains the shared queue; there is no async runtime, only blocking sockets and channels. Every piece is assembled and SHA-1-verified in memory before it's written, and peer workers and web-seed workers share that exact same verify-write-record path, so hashing, resume, and endgame behave identically no matter where the bytes came from. The DHT node and the inbound seeder each run on their own background thread.
 
 ## Tests
 
