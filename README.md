@@ -79,10 +79,6 @@ Defaults can live in `~/.config/bittorrent-rs.toml` (every key optional; a flag 
 
 ## How it works
 
-<div align="center">
-<img src="docs/stack.svg" width="840" alt="Four discovery sources feeding one dial queue, the peer protocol, and rarest-first with an endgame" />
-</div>
-
 ```
   .torrent ─┐
   magnet ───┴─ metadata (BEP 9/10) ─▶ TorrentFile
