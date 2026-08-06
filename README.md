@@ -1,12 +1,32 @@
+<div align="center">
+
 # bittorrent-rs
 
-A complete BitTorrent client written from scratch in Rust — every layer hand-rolled, from the bencode parser up to the mainline DHT, with no `libtorrent`-style crate doing the real work. ~10k lines, 256 tests, and it pulls real public torrents to completion (a 21 GB file, verified byte-for-byte) then seeds them back.
+**A complete BitTorrent client, written from scratch in Rust.**
 
-A swarm is thousands of strangers each holding a few pieces of the same file. This speaks their protocol byte-for-byte — from the first handshake to the last verified piece.
+Every layer hand-rolled — from the bencode parser up to the mainline DHT — with no `libtorrent`-style crate doing the real work.
 
-<p align="center">
-  <img src="docs/dashboard.svg" alt="bittorrent-rs live dashboard" width="840">
+<p>
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-1c1c1e?style=flat-square&logo=rust&logoColor=DEA584" />
+  <img alt="Size" src="https://img.shields.io/badge/~10k-lines-1c1c1e?style=flat-square" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-259%20passing-1c1c1e?style=flat-square" />
+  <img alt="BEPs" src="https://img.shields.io/badge/BEP-3%20·%205%20·%209%2F10%20·%2011%20·%2015%20·%2019-1c1c1e?style=flat-square" />
+  <img alt="Fuzzed" src="https://img.shields.io/badge/parsers-fuzzed-1c1c1e?style=flat-square" />
 </p>
+
+<br />
+
+<img src="docs/dashboard.svg" alt="The live dashboard: piece-map heatmap, throughput sparklines, and a colour-coded activity log" width="840">
+
+<sub>A swarm is thousands of strangers each holding a few pieces of the same file. This speaks their protocol byte for byte — from the first handshake to the last verified piece.</sub>
+
+</div>
+
+<br />
+
+---
+
+It pulls real public torrents to completion — a 21 GB file, verified byte for byte — and then seeds them back.
 
 ## Features
 
@@ -59,6 +79,10 @@ Defaults can live in `~/.config/bittorrent-rs.toml` (every key optional; a flag 
 
 ## How it works
 
+<div align="center">
+<img src="docs/stack.svg" width="840" alt="Four discovery sources feeding one dial queue, the peer protocol, and rarest-first with an endgame" />
+</div>
+
 ```
   .torrent ─┐
   magnet ───┴─ metadata (BEP 9/10) ─▶ TorrentFile
@@ -78,7 +102,7 @@ One OS thread per peer and per web seed drains the shared queue — no async run
 
 ## Tests
 
-256 unit + integration tests, loopback only: bencode / magnet / `.torrent` parsing, the KRPC codec pinned to BEP 5's own example byte strings, DHT lookup / announce / token flows over a scripted in-memory transport, workers driven against mock peers (including a slow-unchoker and a never-unchoker), the seeder against a mock leecher, and the web-seed URL / range math. On top of that, an end-to-end harness runs the real binary against a fake tracker + peer on `127.0.0.1` and diffs the output byte-for-byte, and three `cargo-fuzz` targets hammer the untrusted parsers.
+259 tests — 256 unit plus 3 integration — all passing, loopback only: bencode / magnet / `.torrent` parsing, the KRPC codec pinned to BEP 5's own example byte strings, DHT lookup / announce / token flows over a scripted in-memory transport, workers driven against mock peers (including a slow-unchoker and a never-unchoker), the seeder against a mock leecher, and the web-seed URL / range math. On top of that, an end-to-end harness runs the real binary against a fake tracker + peer on `127.0.0.1` and diffs the output byte-for-byte, and three `cargo-fuzz` targets hammer the untrusted parsers.
 
 ```sh
 cargo test
