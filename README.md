@@ -109,27 +109,21 @@ This is a deliberate simplification appropriate to the default connection limit 
 
 ### Peer discovery
 
-Four mechanisms feed a single deduplicated dial queue: trackers over HTTP, HTTPS, and UDP across both address families; the mainline DHT; peer exchange with connected peers; and HTTP web seeds. IPv6 addresses are excluded when the host has no IPv6 route, rather than consuming connection slots on unreachable peers.
-
-UDP tracker transactions use cryptographically random transaction identifiers, which is the anti-spoofing measure the connectionless protocol depends on.
+Four mechanisms feed a single deduplicated dial queue. IPv6 addresses are excluded when the host has no IPv6 route, rather than consuming connection slots on unreachable peers. UDP tracker transactions use cryptographically random identifiers, the anti-spoofing measure the connectionless protocol depends on.
 
 ### Piece selection
 
-The scarcest piece available in the swarm is requested first, so that rare pieces do not become unavailable while common pieces circulate.
+The scarcest piece in the swarm is requested first, so rare pieces do not become unavailable while common ones circulate. For the final pieces, requests go to every capable peer at once; the first verified copy is accepted and the rest cancelled, avoiding the extended tail near completion.
 
-For the final pieces, requests are issued to every capable peer simultaneously. The first verified copy is accepted and outstanding requests are cancelled. This avoids the extended tail that otherwise occurs as a download approaches completion.
+### Verification
 
-### Verification and writing
+Pieces are assembled and verified against the torrent's SHA-1 hashes in memory before any data reaches the filesystem. Peer and web-seed workers share that path, so hashing, resume, and endgame behave identically regardless of transport.
 
-Pieces are assembled and verified against the torrent's SHA-1 hashes in memory before any data reaches the filesystem. Peer workers and web-seed workers share this same verify-write-record path, so hashing, resume behaviour, and endgame handling are identical regardless of the transport a piece arrived over.
-
-### Resume
-
-An interrupted transfer re-hashes the data present on disk against the torrent and retains what remains valid. A stored progress file is never trusted without verification.
+An interrupted transfer re-hashes what is on disk and retains what remains valid; a stored progress file is never trusted without verification.
 
 ## Interface
 
-The default interface is a `ratatui` terminal dashboard presenting a piece-map heatmap, throughput sparklines, and a colour-coded activity log, backed by a complete logfile. When output is piped it falls back automatically to plain status lines; `--no-tui` forces this behaviour.
+A `ratatui` dashboard with a piece-map heatmap, throughput sparklines, and an activity log, backed by a full logfile. Piped output falls back to plain status lines automatically; `--no-tui` forces it.
 
 ## Testing
 
@@ -138,11 +132,9 @@ cargo test
 cargo run --bin e2e_harness      # loopback transfer, byte-for-byte comparison
 ```
 
-259 tests — 256 unit and 3 integration — all passing, and all confined to loopback.
+259 tests — 256 unit and 3 integration — all passing, all confined to loopback.
 
-Coverage includes bencode, magnet, and `.torrent` parsing; the KRPC codec, verified against the example byte strings published in BEP 5; DHT lookup, announce, and token flows over a scripted in-memory transport; peer workers driven against mock peers, including a slow-unchoking peer and one that never unchokes; the seeder against a mock leecher; and web-seed URL and range arithmetic.
-
-An end-to-end harness additionally executes the release binary against a synthetic tracker and peer on `127.0.0.1` and compares the output byte for byte. Three `cargo-fuzz` targets exercise the parsers that handle untrusted input.
+Coverage spans parsing, the KRPC codec verified against BEP 5's published byte strings, DHT lookup and announce over a scripted transport, workers driven against mock peers, the seeder against a mock leecher, and web-seed range arithmetic. An end-to-end harness runs the release binary against a synthetic tracker and peer on `127.0.0.1` and compares output byte for byte. Three `cargo-fuzz` targets exercise the parsers handling untrusted input.
 
 ## Limitations
 
