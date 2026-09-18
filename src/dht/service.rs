@@ -82,3 +82,134 @@ pub fn spawn_service(bind_port: u16, bootstrap_nodes: Vec<String>, info_hash: [u
 
     Ok(DhtService { peers_rx, port, nodes, stop, handle: Some(handle) })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dht::krpc::{KrpcMessage, Query, Response};
+    use std::net::{SocketAddrV4, UdpSocket};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    const INFO_HASH: [u8; 20] = [0x42; 20];
+    const NODE_ID: [u8; 20] = [0xCC; 20];
+
+    /// Every `announce_peer` a node received: the port and the token.
+    type Announces = Arc<Mutex<Vec<(u16, Vec<u8>)>>>;
+
+    /// A DHT node on loopback: answers `find_node` with nothing, `get_peers`
+    /// with one peer and a token, and records every `announce_peer`.
+    struct FakeNode {
+        port: u16,
+        announces: Announces,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl FakeNode {
+        fn start(peer: SocketAddrV4) -> Self {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+            let port = socket.local_addr().unwrap().port();
+            let announces = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (log, halt) = (Arc::clone(&announces), Arc::clone(&stop));
+            let thread = thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                while !halt.load(Ordering::SeqCst) {
+                    let Ok((n, from)) = socket.recv_from(&mut buf) else { continue };
+                    let Ok(KrpcMessage::Query { t, query }) = KrpcMessage::decode(&buf[..n]) else { continue };
+                    let response = match query {
+                        Query::GetPeers { .. } => Response { id: NODE_ID, values: vec![peer], token: Some(b"tk".to_vec()), ..Default::default() },
+                        Query::AnnouncePeer { port, token, .. } => {
+                            log.lock().unwrap().push((port, token));
+                            Response { id: NODE_ID, ..Default::default() }
+                        }
+                        _ => Response { id: NODE_ID, ..Default::default() },
+                    };
+                    let _ = socket.send_to(&KrpcMessage::Response { t, response }.encode(), from);
+                }
+            });
+            FakeNode { port, announces, stop, thread: Some(thread) }
+        }
+
+        fn router(&self) -> String {
+            format!("127.0.0.1:{}", self.port)
+        }
+    }
+
+    impl Drop for FakeNode {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {}", what);
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn peer() -> SocketAddrV4 {
+        "203.0.113.9:51413".parse().unwrap()
+    }
+
+    #[test]
+    fn the_service_finds_peers_through_a_bootstrap_node_and_announces_our_port() {
+        let node = FakeNode::start(peer());
+        let mut service = spawn_service(0, vec![node.router()], INFO_HASH, Arc::new(AtomicU16::new(6881))).unwrap();
+
+        let found = service.peers_rx.recv_timeout(Duration::from_secs(10)).expect("the lookup delivers the peer the node knows");
+        assert_eq!(found, vec![SocketAddr::V4(peer())]);
+
+        wait_until("the announce_peer", || !node.announces.lock().unwrap().is_empty());
+        assert_eq!(node.announces.lock().unwrap()[0], (6881, b"tk".to_vec()), "our port, with the token the node handed out");
+        assert!(service.nodes.load(Ordering::SeqCst) >= 1, "the node that answered is in the routing table");
+
+        service.stop(); // returns only once the thread has ended
+    }
+
+    #[test]
+    fn a_zero_announce_port_means_not_yet_and_nothing_is_announced() {
+        let node = FakeNode::start(peer());
+        let mut service = spawn_service(0, vec![node.router()], INFO_HASH, Arc::new(AtomicU16::new(0))).unwrap();
+
+        service.peers_rx.recv_timeout(Duration::from_secs(10)).expect("peers are still delivered");
+        // The announce, had there been one, follows the delivery within
+        // microseconds; give it far longer than that.
+        thread::sleep(Duration::from_millis(500));
+
+        assert!(node.announces.lock().unwrap().is_empty());
+        service.stop();
+    }
+
+    #[test]
+    fn the_service_reports_the_udp_port_it_bound() {
+        let node = FakeNode::start(peer());
+        let mut service = spawn_service(0, vec![node.router()], INFO_HASH, Arc::new(AtomicU16::new(0))).unwrap();
+        assert_ne!(service.port, 0);
+        service.stop();
+    }
+
+    #[test]
+    fn a_stopped_service_can_be_stopped_again() {
+        let node = FakeNode::start(peer());
+        let mut service = spawn_service(0, vec![node.router()], INFO_HASH, Arc::new(AtomicU16::new(0))).unwrap();
+        service.stop();
+        service.stop();
+    }
+
+    #[test]
+    fn the_default_bootstrap_routers_are_host_port_pairs() {
+        assert!(!DEFAULT_BOOTSTRAP.is_empty());
+        for router in DEFAULT_BOOTSTRAP {
+            let (host, port) = router.rsplit_once(':').unwrap_or_else(|| panic!("{} has no port", router));
+            assert!(!host.is_empty() && port.parse::<u16>().is_ok(), "{}", router);
+        }
+    }
+}
