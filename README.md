@@ -130,12 +130,12 @@ A `ratatui` dashboard with a piece-map heatmap, throughput sparklines, and an ac
 
 ```sh
 cargo test
-cargo run --bin e2e_harness      # loopback scenarios: public, private, resume after kill, --only, dropped peer
+cargo run --bin e2e_harness      # loopback scenarios: public, private, resume, --only, dropped peer, --timeout
 ```
 
 291 tests, all passing, all confined to loopback.
 
-Coverage spans parsing, the KRPC codec verified against BEP 5's published byte strings, DHT lookup and announce over a scripted transport, workers driven against mock peers, the seeder against a mock leecher, and web-seed range arithmetic. An end-to-end harness runs the real binary against a synthetic tracker and peer on `127.0.0.1` and compares output byte for byte. Its scenarios cover a public torrent, a private one (no DHT, no PEX), a client killed mid-download that must resume and fetch only the pieces it lacks, `--only` on one file of three (only the pieces that file touches may be requested), and a peer that hangs up halfway through a piece while another supplies the rest. Three `cargo-fuzz` targets exercise the parsers handling untrusted input.
+Coverage spans parsing, the KRPC codec verified against BEP 5's published byte strings, DHT lookup and announce over a scripted transport, workers driven against mock peers, the seeder against a mock leecher, and web-seed range arithmetic. An end-to-end harness runs the real binary against a synthetic tracker and peer on `127.0.0.1` and compares output byte for byte. Its scenarios cover a public torrent, a private one (no DHT, no PEX), a client killed mid-download that must resume and fetch only the pieces it lacks, `--only` on one file of three (only the pieces that file touches may be requested), a peer that hangs up halfway through a piece while another supplies the rest, and `--timeout` against a peer that goes silent (the client must stop, exit non-zero, report the download incomplete and keep its resume file). Three `cargo-fuzz` targets exercise the parsers handling untrusted input.
 
 ## Limitations
 
