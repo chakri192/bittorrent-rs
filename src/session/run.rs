@@ -1,0 +1,533 @@
+//! One download, from the first dial to the last piece, and the seeding
+//! that can follow it.
+
+use crate::downloader::WorkQueue;
+use crate::session::{Announcer, PeerPool, ProgressSink, Progress, RateSampler, Services, Workers};
+use crate::tracker_discovery::TransferTotals;
+use crate::ui::Snapshot;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Main-loop cadence: also the dashboard refresh interval.
+pub const UI_TICK: Duration = Duration::from_millis(250);
+
+/// Give up only after this many consecutive re-announce rounds where NO
+/// discovery source produced a single new address *and* nothing is
+/// running -- bounds "retry forever" against a genuinely dead swarm.
+pub const MAX_FRUITLESS_ROUNDS: u32 = 5;
+
+/// Everything a [`Session`] is built from. The setup that produces these
+/// (resolving the torrent, resuming, starting the services) stays with the
+/// caller.
+pub struct Setup<'a> {
+    pub sink: &'a dyn ProgressSink,
+    pub services: &'a Services,
+    pub queue: Arc<WorkQueue>,
+    pub workers: Workers,
+    pub announcer: Announcer,
+    pub progress: Progress,
+    pub pool: PeerPool,
+    /// Bytes in the wanted pieces: the progress total shown.
+    pub display_total: u64,
+    /// Pieces this run must verify to be complete.
+    pub goal_pieces: usize,
+    /// Give up after this long (`--timeout`), if set.
+    pub timeout: Option<Duration>,
+}
+
+/// How a [`Session::run`] ended.
+#[derive(Debug)]
+pub struct Report {
+    /// Every wanted piece is verified.
+    pub complete: bool,
+    /// Pieces still missing.
+    pub remaining: usize,
+    /// Peers dialed over the run.
+    pub dialed: usize,
+    pub elapsed: Duration,
+    /// Bytes fetched by this run (resumed pieces don't count).
+    pub bytes_this_run: u64,
+}
+
+/// A running download: the workers fetching pieces, the dial queue, the
+/// tracker schedule, and the progress numbers, driven by [`run`](Self::run).
+pub struct Session<'a> {
+    sink: &'a dyn ProgressSink,
+    services: &'a Services,
+    queue: Arc<WorkQueue>,
+    workers: Workers,
+    announcer: Announcer,
+    progress: Progress,
+    pool: PeerPool,
+    rates: RateSampler,
+    uploaded: Option<Arc<AtomicU64>>,
+    display_total: u64,
+    goal_pieces: usize,
+    timeout: Option<Duration>,
+    run_start: Instant,
+    pex_total: usize,
+    fresh_since_announce: usize,
+    fruitless_rounds: u32,
+    endgame_announced: bool,
+}
+
+impl<'a> Session<'a> {
+    pub fn new(setup: Setup<'a>) -> Self {
+        let uploaded = setup.services.uploaded_counter();
+        let up_now = uploaded.as_ref().map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+        // Rate sampling starts from what is already counted, so resumed
+        // bytes don't read as a burst of throughput.
+        let rates = RateSampler::new(Instant::now(), setup.progress.bytes_done(), up_now);
+        Session {
+            sink: setup.sink,
+            services: setup.services,
+            queue: setup.queue,
+            workers: setup.workers,
+            announcer: setup.announcer,
+            progress: setup.progress,
+            pool: setup.pool,
+            rates,
+            uploaded,
+            display_total: setup.display_total,
+            goal_pieces: setup.goal_pieces,
+            timeout: setup.timeout,
+            run_start: Instant::now(),
+            pex_total: 0,
+            fresh_since_announce: 0,
+            fruitless_rounds: 0,
+            endgame_announced: false,
+        }
+    }
+
+    /// Bytes uploaded to inbound peers so far.
+    pub fn uploaded_bytes(&self) -> u64 {
+        self.uploaded.as_ref().map(|c| c.load(Ordering::Relaxed)).unwrap_or(0)
+    }
+
+    /// Downloads until every wanted piece is verified, `stop` is set, the
+    /// timeout passes, or the swarm proves dead. Stops the workers before
+    /// returning, so a piece one of them finished on its way out is counted.
+    pub fn run(&mut self, stop: &AtomicBool) -> Report {
+        let sink = self.sink;
+        self.run_start = Instant::now();
+        self.workers.spawn_peers(&mut self.pool);
+        self.publish();
+
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Some(timeout) = self.timeout {
+                if self.run_start.elapsed() >= timeout {
+                    sink.log(format!("--timeout of {}s reached with {} piece(s) remaining", timeout.as_secs(), self.queue.len()));
+                    break;
+                }
+            }
+
+            match self.workers.recv_result(UI_TICK) {
+                Ok(result) => self.progress.absorb(result, |m| sink.log(m)),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+
+            if self.queue.is_empty() {
+                break;
+            }
+
+            self.workers.reap();
+            self.poll_discovery();
+            self.workers.spawn_peers(&mut self.pool);
+
+            if !self.endgame_announced && self.queue.in_endgame() {
+                self.endgame_announced = true;
+                sink.log(format!("endgame: {} piece(s) left, requesting duplicates from every capable peer", self.queue.len()));
+            }
+
+            self.publish();
+
+            if !self.reannounce_if_due() {
+                continue;
+            }
+            self.workers.spawn_peers(&mut self.pool);
+            if self.round_was_fruitless_and_final() {
+                break;
+            }
+        }
+
+        for result in self.workers.shutdown() {
+            self.progress.absorb(result, |m| sink.log(m));
+        }
+
+        Report { complete: self.queue.is_empty(), remaining: self.queue.len(), dialed: self.pool.dialed(), elapsed: self.run_start.elapsed(), bytes_this_run: self.progress.bytes_this_run() }
+    }
+
+    /// Feeds the dial queue from the passive discovery sources: peer
+    /// exchange and the DHT.
+    fn poll_discovery(&mut self) {
+        let sink = self.sink;
+        let pex_fresh: usize = self.workers.pex_batches().map(|batch| self.pool.add(batch)).sum();
+        if pex_fresh > 0 {
+            self.pex_total += pex_fresh;
+            sink.log(format!("PEX: {} new peer address(es) from connected peers", pex_fresh));
+        }
+        self.fresh_since_announce += pex_fresh;
+        if let Some(dht) = self.services.dht() {
+            let dht_fresh: usize = dht.peers_rx.try_iter().map(|batch| self.pool.add(batch)).sum();
+            if dht_fresh > 0 {
+                sink.log(format!("DHT: {} new peer address(es)", dht_fresh));
+            }
+            self.fresh_since_announce += dht_fresh;
+        }
+    }
+
+    /// Re-announces to the trackers if the schedule says it is time.
+    /// Returns whether it did.
+    fn reannounce_if_due(&mut self) -> bool {
+        let sink = self.sink;
+        let starved = self.workers.active_peers() == 0 && self.pool.reserve_is_empty();
+        if !self.announcer.is_due(Instant::now(), starved) {
+            return false;
+        }
+        if self.announcer.has_trackers() {
+            sink.log(format!("{} piece(s) remaining, re-announcing to trackers", self.queue.len()));
+        }
+        let totals = TransferTotals { uploaded: self.uploaded_bytes(), downloaded: self.progress.bytes_this_run(), left: self.display_total.saturating_sub(self.progress.bytes_done()) };
+        self.fresh_since_announce += self.pool.add(self.announcer.reannounce(Instant::now(), totals, |m| sink.log(m)));
+        true
+    }
+
+    /// Ends an announce round: counts it as fruitless when no source found
+    /// a new address and nothing is running or left to dial, and returns
+    /// whether that has now happened [`MAX_FRUITLESS_ROUNDS`] times in a row.
+    fn round_was_fruitless_and_final(&mut self) -> bool {
+        // A run isn't fruitless while a web seed is still pulling pieces --
+        // it can finish the whole download with no peers at all.
+        let fruitless = self.fresh_since_announce == 0 && self.workers.active_peers() == 0 && self.pool.reserve_is_empty() && !self.workers.web_active();
+        self.fresh_since_announce = 0;
+        if !fruitless {
+            self.fruitless_rounds = 0;
+            return false;
+        }
+        self.fruitless_rounds += 1;
+        self.sink.log(format!("no new peers from any source ({}/{} fruitless rounds)", self.fruitless_rounds, MAX_FRUITLESS_ROUNDS));
+        self.fruitless_rounds >= MAX_FRUITLESS_ROUNDS
+    }
+
+    /// Pushes the current numbers to the sink.
+    fn publish(&mut self) {
+        let done = self.progress.bytes_done();
+        let up = self.uploaded_bytes();
+        if self.rates.sample(Instant::now(), done, up) {
+            self.sink.push_rates(self.rates.down_rate() as u64, self.rates.up_rate() as u64);
+            self.sink.set_pieces(self.progress.have_snapshot()); // drives the piece-map heatmap
+        }
+        let remaining = self.display_total.saturating_sub(done);
+        let eta_secs = if self.rates.down_rate() > 1.0 { Some((remaining as f64 / self.rates.down_rate()) as u64) } else { None };
+        let web_active = self.workers.web_active();
+        let status = if self.queue.in_endgame() {
+            "endgame"
+        } else if self.progress.bytes_this_run() > 0 || web_active {
+            "downloading"
+        } else if self.workers.active_peers() == 0 && self.pool.reserve_is_empty() {
+            "waiting"
+        } else {
+            "connecting"
+        };
+        self.sink.set_snapshot(Snapshot {
+            total_length: self.display_total,
+            total_pieces: self.goal_pieces,
+            verified: self.progress.verified(),
+            done_bytes: done,
+            down_rate: self.rates.down_rate(),
+            up_bytes: up,
+            up_rate: self.rates.up_rate(),
+            active_peers: self.workers.active_peers(),
+            dialed_peers: self.pool.dialed(),
+            known_peers: self.pool.known_count(),
+            endgame: self.queue.in_endgame(),
+            trackers_ok: self.announcer.trackers_ok(),
+            trackers_total: self.announcer.tracker_count(),
+            dht_nodes: self.services.dht().map(|d| d.nodes.load(Ordering::SeqCst)).unwrap_or(0),
+            pex_total: self.pex_total,
+            web_seeds: self.workers.web_running(),
+            eta_secs,
+            elapsed_secs: self.run_start.elapsed().as_secs(),
+            status,
+        });
+    }
+
+    /// Tells the trackers the download completed, if this run fetched
+    /// anything. A run that only resumed finished pieces has nothing to
+    /// report.
+    pub fn announce_completed(&mut self) {
+        if self.progress.bytes_this_run() > 0 {
+            let totals = TransferTotals { uploaded: self.uploaded_bytes(), downloaded: self.progress.bytes_this_run(), left: 0 };
+            self.announcer.completed(Instant::now(), totals);
+        }
+    }
+
+    /// Post-completion seeding: keep the listener and DHT alive,
+    /// re-announce with `left = 0` on the tracker interval, publish upload
+    /// stats. Returns when `stop` is set (user quit).
+    pub fn seed(&mut self, name: &str, port: u16, stop: &AtomicBool) {
+        let sink = self.sink;
+        sink.log(format!("seeding {} on port {} -- press q to stop", name, port));
+
+        // Seeding has its own cadence: count the interval from here.
+        self.announcer.restart_clock(Instant::now());
+        // Seeding downloads nothing, so the down total stays at 0.
+        let mut rates = RateSampler::new(Instant::now(), 0, self.uploaded_bytes());
+
+        while !stop.load(Ordering::SeqCst) {
+            if rates.sample(Instant::now(), 0, self.uploaded_bytes()) {
+                sink.push_rates(0, rates.up_rate() as u64);
+            }
+            // The totals are those of the selected subset, all of it done.
+            sink.set_snapshot(Snapshot {
+                total_length: self.display_total,
+                total_pieces: self.goal_pieces,
+                verified: self.goal_pieces,
+                done_bytes: self.display_total,
+                down_rate: 0.0,
+                up_bytes: self.uploaded_bytes(),
+                up_rate: rates.up_rate(),
+                endgame: false,
+                status: "seeding",
+                ..Default::default()
+            });
+
+            if self.announcer.has_trackers() && self.announcer.is_due(Instant::now(), false) {
+                let totals = TransferTotals { uploaded: self.uploaded_bytes(), downloaded: self.progress.bytes_this_run(), left: 0 };
+                let _ = self.announcer.reannounce(Instant::now(), totals, |m| sink.log(m));
+            }
+            thread::sleep(UI_TICK);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::downloader::{build_file_spans, progress_file_path, PieceWork, ResumeWriter, WorkerConfig};
+    use crate::peer::handshake::Handshake;
+    use crate::peer::message::Message;
+    use crate::seeder::{self, HaveMap};
+    use crate::session::sink::RecordingSink;
+    use crate::session::Log;
+    use sha1::{Digest, Sha1};
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener};
+    use std::path::{Path, PathBuf};
+
+    const INFO_HASH: [u8; 20] = [7; 20];
+    const PIECE_LEN: usize = 256;
+    const PIECES: usize = 4;
+
+    fn data() -> Vec<u8> {
+        (0..PIECE_LEN * PIECES).map(|i| (i as u8).wrapping_mul(7)).collect()
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bittorrent-rs-session-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A peer on loopback that has every piece and unchokes at once. With
+    /// `serve` false it never answers a request, which is a peer that has
+    /// gone silent.
+    fn fake_peer(serve: bool) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let data = data();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let mut hs = [0u8; 68];
+            if stream.read_exact(&mut hs).is_err() || stream.write_all(&Handshake::new(INFO_HASH, [9; 20], false).to_bytes()).is_err() {
+                return;
+            }
+            let mut bits = vec![0u8; PIECES.div_ceil(8)];
+            for i in 0..PIECES {
+                bits[i / 8] |= 1 << (7 - i % 8);
+            }
+            if Message::Bitfield(bits).write_to(&mut stream).is_err() || Message::Unchoke.write_to(&mut stream).is_err() {
+                return;
+            }
+            while let Ok(msg) = Message::read_from(&mut stream) {
+                if let (true, Message::Request { index, begin, length }) = (serve, msg) {
+                    let start = index as usize * PIECE_LEN;
+                    let block = data[start..start + PIECE_LEN][begin as usize..(begin + length) as usize].to_vec();
+                    if (Message::Piece { index, begin, block }).write_to(&mut stream).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        addr
+    }
+
+    /// A session over the 4-piece test torrent, wired to `sink` and to the
+    /// given peers, writing into `dir`.
+    fn session<'a>(sink: &'a Arc<RecordingSink>, services: &'a Services, dir: &Path, peers: &[SocketAddr], timeout: Option<Duration>) -> Session<'a> {
+        let data = data();
+        let work = data.chunks(PIECE_LEN).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32 }).collect();
+        let queue = Arc::new(WorkQueue::new(work, PIECES));
+        let spans = Arc::new(build_file_spans(dir, &[(vec!["f.bin".to_string()], data.len() as i64)]));
+        let config = Arc::new(WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(1) });
+        let log: Log = {
+            let sink = Arc::clone(sink);
+            Arc::new(move |m| sink.log(m))
+        };
+        let workers = Workers::new(Arc::clone(&queue), spans, config, PIECE_LEN as u64, 4, false, log);
+        let progress = Progress::new(Arc::new(HaveMap::new(PIECES)), ResumeWriter::create(&progress_file_path(dir, &INFO_HASH)).unwrap(), PIECES, 0, 0);
+        let mut pool = PeerPool::new(true);
+        pool.add(peers.iter().copied());
+        Session::new(Setup {
+            sink: &**sink,
+            services,
+            queue,
+            workers,
+            announcer: Announcer::new(Vec::new(), INFO_HASH, [2; 20], 6881, None, Instant::now()),
+            progress,
+            pool,
+            display_total: data.len() as u64,
+            goal_pieces: PIECES,
+            timeout,
+        })
+    }
+
+    #[test]
+    fn a_run_downloads_every_piece_from_a_peer_and_reports_it_complete() {
+        let dir = tmp_dir("complete");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let mut s = session(&sink, &services, &dir, &[fake_peer(true)], None);
+
+        let report = s.run(&AtomicBool::new(false));
+
+        assert!(report.complete);
+        assert_eq!((report.remaining, report.dialed, report.bytes_this_run), (0, 1, data().len() as u64));
+        assert_eq!(std::fs::read(dir.join("f.bin")).unwrap(), data(), "every piece verified and on disk");
+        for piece in 0..PIECES {
+            assert!(sink.lines.lock().unwrap().iter().any(|l| l.starts_with(&format!("piece {} verified (", piece))), "piece {} was reported", piece);
+        }
+        assert!(sink.snapshots.lock().unwrap().iter().any(|snap| snap.status == "downloading"), "and the dashboard saw it downloading");
+    }
+
+    #[test]
+    fn a_run_against_a_silent_peer_ends_at_the_timeout_incomplete() {
+        let dir = tmp_dir("timeout");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let mut s = session(&sink, &services, &dir, &[fake_peer(false)], Some(Duration::from_secs(1)));
+
+        let report = s.run(&AtomicBool::new(false));
+
+        assert!(!report.complete);
+        assert_eq!(report.remaining, PIECES);
+        assert!(report.elapsed >= Duration::from_secs(1));
+        assert!(sink.logged(&format!("--timeout of 1s reached with {} piece(s) remaining", PIECES)));
+    }
+
+    #[test]
+    fn a_stop_request_ends_the_run_at_once_incomplete() {
+        let dir = tmp_dir("stop");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let mut s = session(&sink, &services, &dir, &[], None);
+
+        let report = s.run(&AtomicBool::new(true));
+
+        assert!(!report.complete);
+        assert_eq!((report.remaining, report.dialed, report.bytes_this_run), (PIECES, 0, 0));
+        assert!(report.elapsed < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_result_still_in_the_channel_when_the_run_ends_is_counted() {
+        // A worker marks a piece done *before* sending its result, so the
+        // loop can see the queue empty a moment before the last result
+        // arrives. That piece must still be counted, recorded and
+        // advertised, or the resume file and the have-map lose it.
+        let dir = tmp_dir("drain");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let mut s = session(&sink, &services, &dir, &[], None);
+        s.workers.inject_result(crate::downloader::PieceResult { index: 2, data: vec![0; PIECE_LEN] });
+
+        let report = s.run(&AtomicBool::new(true)); // ends before the loop reads the channel
+
+        assert_eq!(report.bytes_this_run, PIECE_LEN as u64);
+        assert!(sink.logged("piece 2 verified (1/4)"));
+        assert_eq!(std::fs::read_to_string(progress_file_path(&dir, &INFO_HASH)).unwrap().trim(), "2", "and it is in the resume file");
+    }
+
+    #[test]
+    fn the_snapshot_says_waiting_with_nobody_to_dial_and_connecting_with_someone() {
+        let dir = tmp_dir("status");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+
+        let mut alone = session(&sink, &services, &dir, &[], None);
+        alone.publish();
+        let snap = sink.last_snapshot();
+        assert_eq!((snap.status, snap.known_peers, snap.trackers_total), ("waiting", 0, 0));
+        assert_eq!((snap.total_length, snap.total_pieces, snap.verified), (data().len() as u64, PIECES, 0));
+
+        let mut with_peer = session(&sink, &services, &dir, &["127.0.0.1:9".parse().unwrap()], None);
+        with_peer.publish();
+        let snap = sink.last_snapshot();
+        assert_eq!((snap.status, snap.known_peers, snap.dialed_peers), ("connecting", 1, 0));
+    }
+
+    #[test]
+    fn seeding_reports_everything_done_until_told_to_stop() {
+        let dir = tmp_dir("seed");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let mut s = session(&sink, &services, &dir, &[], None);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(400));
+                stop.store(true, Ordering::SeqCst);
+            })
+        };
+
+        s.seed("f.bin", 6881, &stop);
+        stopper.join().unwrap();
+
+        assert!(sink.logged("seeding f.bin on port 6881 -- press q to stop"));
+        let snap = sink.last_snapshot();
+        assert_eq!(snap.status, "seeding");
+        assert_eq!((snap.verified, snap.total_pieces, snap.done_bytes, snap.total_length), (PIECES, PIECES, data().len() as u64, data().len() as u64));
+        assert!(!sink.rates.lock().unwrap().is_empty(), "upload rate was sampled while seeding");
+    }
+
+    #[test]
+    fn upload_bytes_come_from_the_seeders_counter() {
+        let dir = tmp_dir("uploaded");
+        let sink = Arc::new(RecordingSink::default());
+        let mut services = Services::new();
+        services.attach_seeder(seeder::start(0, INFO_HASH, [2; 20], Arc::new(Vec::new()), PIECE_LEN as u64, 0, Arc::new(HaveMap::new(0))).unwrap());
+        services.uploaded_counter().unwrap().store(42, Ordering::SeqCst);
+        let mut s = session(&sink, &services, &dir, &[], None);
+
+        assert_eq!(s.uploaded_bytes(), 42);
+        s.publish();
+        assert_eq!(sink.last_snapshot().up_bytes, 42);
+    }
+
+    #[test]
+    fn a_session_without_a_seeder_has_uploaded_nothing() {
+        let dir = tmp_dir("noseeder");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        assert_eq!(session(&sink, &services, &dir, &[], None).uploaded_bytes(), 0);
+    }
+}

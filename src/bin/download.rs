@@ -20,7 +20,7 @@ use bittorrent_rs::downloader::{build_file_spans, load_and_verify, progress_file
 use bittorrent_rs::magnet::{parse_magnet_uri, MagnetLink};
 use bittorrent_rs::magnet_fetch::fetch_metadata_from_peer;
 use bittorrent_rs::seeder::{self, HaveMap};
-use bittorrent_rs::session::{Announcer, DownloadPlan, Log, Outstanding, PeerPool, Progress, RateSampler, Services, Workers};
+use bittorrent_rs::session::{Announcer, DownloadPlan, Log, Outstanding, PeerPool, Progress, Services, Session, Setup, Workers};
 use bittorrent_rs::torrent::{self, TorrentFile};
 use bittorrent_rs::tracker::{generate_peer_id, Event};
 use bittorrent_rs::tracker_discovery::{announce_to_all, build_request, TransferTotals};
@@ -45,12 +45,6 @@ const DEFAULT_PORT: u16 = 6881;
 const DEFAULT_MAX_PEERS: usize = 30;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PIPELINE_DEPTH: usize = 5;
-/// Main-loop cadence: also the dashboard refresh interval.
-const UI_TICK: Duration = Duration::from_millis(250);
-/// Give up only after this many consecutive re-announce rounds where NO
-/// discovery source produced a single new address *and* nothing is
-/// running -- bounds "retry forever" against a genuinely dead swarm.
-const MAX_FRUITLESS_ROUNDS: u32 = 5;
 /// Budget for resolving a magnet's metadata before declaring the swarm
 /// unreachable.
 const METADATA_RESOLVE_BUDGET: Duration = Duration::from_secs(120);
@@ -464,8 +458,6 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     let mut pool = PeerPool::new(allow_ipv6);
     pool.add(bootstrap_peers);
 
-    let mut pex_total = 0usize;
-
     // First real announce, now that the true size is known.
     let mut announcer = Announcer::new(tracker_urls, torrent.info_hash, our_peer_id, announce_port, args.reannounce_override.map(Duration::from_secs), Instant::now());
     let first_totals = TransferTotals { uploaded: uploaded(), downloaded: 0, left: display_total.saturating_sub(bytes_already_done) };
@@ -498,166 +490,31 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         workers.start_web_seeds(&web_seeds, &torrent.name, &torrent.files, total_length);
     }
 
-    let mut progress = Progress::new(Arc::clone(&have), resume_writer, goal_pieces, pieces_done, bytes_already_done);
-    let run_start = Instant::now();
-    let mut fruitless_rounds = 0u32;
-    let mut fresh_since_announce = 0usize;
-    let mut endgame_announced = false;
+    let progress = Progress::new(Arc::clone(&have), resume_writer, goal_pieces, pieces_done, bytes_already_done);
+    let mut session = Session::new(Setup { sink: ui, services: &services, queue: Arc::clone(&queue), workers, announcer, progress, pool, display_total, goal_pieces, timeout: args.timeout });
+    let report = session.run(stop);
 
-    // Rate sampling / smoothing for the dashboard. Resumed bytes are the
-    // baseline, so they don't read as a burst of throughput.
-    let mut rates = RateSampler::new(Instant::now(), bytes_already_done, uploaded());
-
-    macro_rules! publish_snapshot {
-        () => {{
-            let done = progress.bytes_done();
-            if rates.sample(Instant::now(), done, uploaded()) {
-                ui.push_rates(rates.down_rate() as u64, rates.up_rate() as u64);
-                ui.set_pieces(have.snapshot()); // drives the piece-map heatmap
-            }
-            let remaining = display_total.saturating_sub(done);
-            let eta_secs = if rates.down_rate() > 1.0 { Some((remaining as f64 / rates.down_rate()) as u64) } else { None };
-            let web_active = workers.web_active();
-            let status = if queue.in_endgame() {
-                "endgame"
-            } else if progress.bytes_this_run() > 0 || web_active {
-                "downloading"
-            } else if workers.active_peers() == 0 && pool.reserve_is_empty() {
-                "waiting"
-            } else {
-                "connecting"
-            };
-            ui.set_snapshot(Snapshot {
-                total_length: display_total,
-                total_pieces: goal_pieces,
-                verified: progress.verified(),
-                done_bytes: done,
-                down_rate: rates.down_rate(),
-                up_bytes: uploaded(),
-                up_rate: rates.up_rate(),
-                active_peers: workers.active_peers(),
-                dialed_peers: pool.dialed(),
-                known_peers: pool.known_count(),
-                endgame: queue.in_endgame(),
-                trackers_ok: announcer.trackers_ok(),
-                trackers_total: announcer.tracker_count(),
-                dht_nodes: services.dht().map(|d| d.nodes.load(Ordering::SeqCst)).unwrap_or(0),
-                pex_total,
-                web_seeds: workers.web_running(),
-                eta_secs,
-                elapsed_secs: run_start.elapsed().as_secs(),
-                status,
-            });
-        }};
-    }
-
-    workers.spawn_peers(&mut pool);
-    publish_snapshot!();
-
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
-        if let Some(timeout) = args.timeout {
-            if run_start.elapsed() >= timeout {
-                ui.log(format!("--timeout of {}s reached with {} piece(s) remaining", timeout.as_secs(), queue.len()));
-                break;
-            }
-        }
-
-        match workers.recv_result(UI_TICK) {
-            Ok(result) => progress.absorb(result, |m| ui.log(m)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-
-        if queue.is_empty() {
-            break;
-        }
-
-        workers.reap();
-
-        // Passive discovery feeds -> dial queue.
-        let pex_fresh: usize = workers.pex_batches().map(|batch| pool.add(batch)).sum();
-        if pex_fresh > 0 {
-            pex_total += pex_fresh;
-            ui.log(format!("PEX: {} new peer address(es) from connected peers", pex_fresh));
-        }
-        fresh_since_announce += pex_fresh;
-        if let Some(dht) = services.dht() {
-            let dht_fresh: usize = dht.peers_rx.try_iter().map(|batch| pool.add(batch)).sum();
-            if dht_fresh > 0 {
-                ui.log(format!("DHT: {} new peer address(es)", dht_fresh));
-            }
-            fresh_since_announce += dht_fresh;
-        }
-
-        workers.spawn_peers(&mut pool);
-
-        if !endgame_announced && queue.in_endgame() {
-            endgame_announced = true;
-            ui.log(format!("endgame: {} piece(s) left, requesting duplicates from every capable peer", queue.len()));
-        }
-
-        publish_snapshot!();
-
-        let starved = workers.active_peers() == 0 && pool.reserve_is_empty();
-        if !announcer.is_due(Instant::now(), starved) {
-            continue;
-        }
-        if announcer.has_trackers() {
-            ui.log(format!("{} piece(s) remaining, re-announcing to trackers", queue.len()));
-        }
-        let totals = TransferTotals { uploaded: uploaded(), downloaded: progress.bytes_this_run(), left: display_total.saturating_sub(progress.bytes_done()) };
-        fresh_since_announce += pool.add(announcer.reannounce(Instant::now(), totals, |m| ui.log(m)));
-
-        workers.spawn_peers(&mut pool);
-
-        // A run isn't fruitless while a web seed is still pulling pieces --
-        // it can finish the whole download with no peers at all.
-        let web_active = workers.web_active();
-        if fresh_since_announce == 0 && workers.active_peers() == 0 && pool.reserve_is_empty() && !web_active {
-            fruitless_rounds += 1;
-            ui.log(format!("no new peers from any source ({}/{} fruitless rounds)", fruitless_rounds, MAX_FRUITLESS_ROUNDS));
-            if fruitless_rounds >= MAX_FRUITLESS_ROUNDS {
-                break;
-            }
-        } else {
-            fruitless_rounds = 0;
-        }
-        fresh_since_announce = 0;
-    }
-
-    for result in workers.shutdown() {
-        progress.absorb(result, |m| ui.log(m));
-    }
-
-    let complete = queue.is_empty();
-    let elapsed = run_start.elapsed();
-    let avg = progress.bytes_this_run() as f64 / elapsed.as_secs_f64().max(0.001);
-
-    if complete {
+    if report.complete {
         bittorrent_rs::downloader::resume::clear(&progress_path);
         let scope = if selective { format!("{} selected", ui::format_bytes(display_total)) } else { ui::format_bytes(total_length) };
+        let avg = report.bytes_this_run as f64 / report.elapsed.as_secs_f64().max(0.001);
         let summary = format!(
             "download complete: {} -> {}\n  {} in {} \u{b7} {} avg \u{b7} {} uploaded",
             torrent.name,
             base_dir.display(),
             scope,
-            ui::format_duration(elapsed.as_secs()),
+            ui::format_duration(report.elapsed.as_secs()),
             ui::format_rate(avg),
-            ui::format_bytes(uploaded()),
+            ui::format_bytes(session.uploaded_bytes()),
         );
         ui.log("download complete");
 
-        if progress.bytes_this_run() > 0 {
-            announcer.completed(Instant::now(), TransferTotals { uploaded: uploaded(), downloaded: progress.bytes_this_run(), left: 0 });
-        }
+        session.announce_completed();
 
         if args.seed && services.has_seeder() {
             // Keep the UI live and seeding until the user quits. The UI
             // totals reflect the selected subset (display_total/goal).
-            seed_loop(&torrent.name, announce_port, &mut announcer, uploaded_counter.clone(), display_total, goal_pieces, progress.bytes_this_run(), ui, stop);
+            session.seed(&torrent.name, announce_port, stop);
         } else {
             ui.finish(Ok(summary.clone()));
         }
@@ -665,7 +522,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         services.shutdown();
         Ok(summary)
     } else {
-        let reason = format!("incomplete: {} piece(s) never downloaded ({} peer(s) dialed) -- rerun the same command to resume", queue.len(), pool.dialed());
+        let reason = format!("incomplete: {} piece(s) never downloaded ({} peer(s) dialed) -- rerun the same command to resume", report.remaining, report.dialed);
         services.shutdown();
         // If we're here because the user quit, don't flash a failure
         // banner -- main prints the "stopped" line.
@@ -681,54 +538,6 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
 fn finish_err(ui: &Ui, reason: String) -> String {
     ui.finish(Err(reason.clone()));
     reason
-}
-
-/// Post-completion seeding: keep the listener and DHT alive, re-announce
-/// with `left = 0` on the tracker interval, publish upload stats. Returns
-/// when `stop` is set (user quit).
-#[allow(clippy::too_many_arguments)]
-fn seed_loop(
-    name: &str,
-    announce_port: u16,
-    announcer: &mut Announcer,
-    uploaded_counter: Option<Arc<AtomicU64>>,
-    total_length: u64,
-    total_pieces: usize,
-    downloaded_this_run: u64,
-    ui: &Ui,
-    stop: &AtomicBool,
-) {
-    let uploaded = || uploaded_counter.as_ref().map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
-    ui.log(format!("seeding {} on port {} -- press q to stop", name, announce_port));
-
-    // Seeding has its own cadence: count the interval from here.
-    announcer.restart_clock(Instant::now());
-    // Seeding downloads nothing, so the down total stays at 0.
-    let mut rates = RateSampler::new(Instant::now(), 0, uploaded());
-
-    while !stop.load(Ordering::SeqCst) {
-        if rates.sample(Instant::now(), 0, uploaded()) {
-            ui.push_rates(0, rates.up_rate() as u64);
-        }
-        ui.set_snapshot(Snapshot {
-            total_length,
-            total_pieces,
-            verified: total_pieces,
-            done_bytes: total_length,
-            down_rate: 0.0,
-            up_bytes: uploaded(),
-            up_rate: rates.up_rate(),
-            endgame: false,
-            status: "seeding",
-            ..Default::default()
-        });
-
-        if announcer.has_trackers() && announcer.is_due(Instant::now(), false) {
-            let totals = TransferTotals { uploaded: uploaded(), downloaded: downloaded_this_run, left: 0 };
-            let _ = announcer.reannounce(Instant::now(), totals, |m| ui.log(m));
-        }
-        thread::sleep(UI_TICK);
-    }
 }
 
 /// Bootstraps a magnet link into a full `TorrentFile`: gathers peers from

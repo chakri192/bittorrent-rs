@@ -38,6 +38,11 @@ impl Progress {
         log(format!("piece {} verified ({}/{})", piece.index, self.verified, self.goal_pieces));
     }
 
+    /// Which pieces are on disk right now, for the piece-map display.
+    pub fn have_snapshot(&self) -> Vec<bool> {
+        self.have.snapshot()
+    }
+
     /// Wanted pieces verified: resumed ones plus this run's.
     pub fn verified(&self) -> usize {
         self.verified

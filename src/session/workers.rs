@@ -105,6 +105,13 @@ impl Workers {
         self.pex_rx.try_iter()
     }
 
+    /// Puts a result on the channel as a finished worker would, for tests
+    /// of what happens to results nobody has collected yet.
+    #[cfg(test)]
+    pub(crate) fn inject_result(&self, result: PieceResult) {
+        self.results_tx.send(result).unwrap();
+    }
+
     /// Stops the web seeds, waits for every worker to finish, and returns
     /// the pieces they completed that nobody had collected yet.
     pub fn shutdown(&mut self) -> Vec<PieceResult> {

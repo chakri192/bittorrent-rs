@@ -9,7 +9,9 @@ pub mod peer_pool;
 pub mod plan;
 pub mod progress;
 pub mod rate;
+pub mod run;
 pub mod services;
+pub mod sink;
 pub mod workers;
 
 pub use announce::{Announcer, NetworkTrackers, TrackerClient};
@@ -17,5 +19,7 @@ pub use peer_pool::PeerPool;
 pub use plan::{DownloadPlan, Outstanding};
 pub use progress::Progress;
 pub use rate::RateSampler;
+pub use run::{Report, Session, Setup};
 pub use services::Services;
+pub use sink::ProgressSink;
 pub use workers::{Log, Workers};
