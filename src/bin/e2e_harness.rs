@@ -22,7 +22,7 @@ use sha1::{Digest, Sha1};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
@@ -54,6 +54,9 @@ enum Kind {
     /// up, say the download is incomplete, and keep what it has for a
     /// later resume.
     TimeoutIncomplete,
+    /// `--seed`: after downloading, the client must stay up and serve the
+    /// finished torrent to a peer that connects to it.
+    SeedAfterDownload,
 }
 
 struct Scenario {
@@ -68,6 +71,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "selective-multi-file", kind: Kind::SelectiveMultiFile },
     Scenario { name: "drop-mid-piece", kind: Kind::DropMidPiece },
     Scenario { name: "timeout-incomplete", kind: Kind::TimeoutIncomplete },
+    Scenario { name: "seed-after-download", kind: Kind::SeedAfterDownload },
 ];
 
 fn main() {
@@ -79,6 +83,7 @@ fn main() {
             Kind::SelectiveMultiFile => run_selective_multi_file(scenario.name),
             Kind::DropMidPiece => run_drop_mid_piece(scenario.name),
             Kind::TimeoutIncomplete => run_timeout_incomplete(scenario.name),
+            Kind::SeedAfterDownload => run_seed_after_download(scenario.name),
         };
         match outcome {
             Ok(summary) => println!("PASS [{}]: {}", scenario.name, summary),
@@ -240,6 +245,15 @@ struct Swarm {
     tracker_addr: SocketAddr,
     /// One log per peer, in the order the tracker lists them.
     logs: Vec<Arc<Mutex<PeerLog>>>,
+    /// The request line of every announce the tracker received, in order:
+    /// `GET /announce?info_hash=...&port=...&event=started ... HTTP/1.1`.
+    announces: Arc<Mutex<Vec<String>>>,
+}
+
+/// One query parameter of an announce request line.
+fn announce_param(request_line: &str, key: &str) -> Option<String> {
+    let query = request_line.split_once('?')?.1.split(' ').next()?;
+    query.split('&').find_map(|pair| pair.strip_prefix(key)?.strip_prefix('=')).map(str::to_string)
 }
 
 /// What a fake peer needs to know about the torrent it serves.
@@ -250,8 +264,9 @@ struct PeerContext {
     piece_count: usize,
 }
 
-/// Starts a fake tracker (answers one announce, listing every peer) and
-/// one fake peer per entry of `behaviors`, all on loopback.
+/// Starts a fake tracker (answers every announce with the full peer list,
+/// and records it) and one fake peer per entry of `behaviors`, all on
+/// loopback.
 fn spawn_swarm(fx: &Fixture, behaviors: Vec<Behavior>) -> Swarm {
     let tracker_listener = TcpListener::bind("127.0.0.1:0").expect("bind fake tracker");
     let tracker_addr = tracker_listener.local_addr().unwrap();
@@ -267,11 +282,9 @@ fn spawn_swarm(fx: &Fixture, behaviors: Vec<Behavior>) -> Swarm {
         thread::spawn(move || run_fake_peer(listener, cx, behavior, log));
     }
 
+    let announces = Arc::new(Mutex::new(Vec::new()));
+    let tracker_announces = Arc::clone(&announces);
     thread::spawn(move || {
-        let Ok((mut stream, _)) = tracker_listener.accept() else { return };
-        let mut buf = [0u8; 4096];
-        let _ = stream.read(&mut buf); // drain the request; we don't need its contents
-
         let mut peers_bin = Vec::new();
         for addr in &peer_addrs {
             let IpAddr::V4(ip) = addr.ip() else { unreachable!("loopback bind is always v4 here") };
@@ -284,13 +297,21 @@ fn spawn_swarm(fx: &Fixture, behaviors: Vec<Behavior>) -> Swarm {
         body.extend_from_slice(format!("{}:", peers_bin.len()).as_bytes());
         body.extend_from_slice(&peers_bin);
         body.push(b'e');
-
         let headers = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
-        let _ = stream.write_all(headers.as_bytes());
-        let _ = stream.write_all(&body);
+
+        // Runs until the harness exits; each announce is a fresh connection.
+        for stream in tracker_listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]);
+            tracker_announces.lock().unwrap().push(request.lines().next().unwrap_or("").to_string());
+            let _ = stream.write_all(headers.as_bytes());
+            let _ = stream.write_all(&body);
+        }
     });
 
-    Swarm { tracker_addr, logs }
+    Swarm { tracker_addr, logs, announces }
 }
 
 /// One fake peer: accepts a single connection and plays `behavior` on it.
@@ -737,4 +758,151 @@ fn run_timeout_incomplete(name: &str) -> Result<String, String> {
     }
 
     Ok(format!("stopped {:.0?} after a {}s --timeout with {} of {} pieces; exited 1, reported incomplete, resume file kept", elapsed, TIMEOUT.as_secs(), STALL_AFTER, fx.piece_count))
+}
+
+/// Kills the client when dropped, so a scenario that leaves it running on
+/// purpose can't leak it on an early return.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Waits until the client's log contains `needle`, failing if the client
+/// exits first or `limit` passes.
+fn wait_for_log(path: &Path, needle: &str, limit: Duration, child: &mut Child) -> Result<(), String> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if fs::read_to_string(path).is_ok_and(|log| log.contains(needle)) {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().map_err(|e| format!("waiting for the client: {}", e))? {
+            return Err(format!("client exited ({:?}) before logging {:?}", status.code(), needle));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("client had not logged {:?} after {:?}", needle, limit));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Plays a leecher against the client's listener: connects, handshakes,
+/// checks the client advertises every piece, and downloads them all,
+/// comparing each against the source.
+fn leech_everything(fx: &Fixture, port: u16) -> Result<(), String> {
+    let wire = |what: &str, e: bittorrent_rs::peer::message::WireError| format!("{}: {:?}", what, e);
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connecting to the client's listener on port {}: {}", port, e))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+
+    let ours = Handshake::new(fx.info_hash, [0x77; 20], false);
+    stream.write_all(&ours.to_bytes()).map_err(|e| format!("sending the handshake: {}", e))?;
+    let mut hs_buf = [0u8; 68];
+    stream.read_exact(&mut hs_buf).map_err(|e| format!("reading the client's handshake: {}", e))?;
+    let theirs = Handshake::from_bytes(&hs_buf).map_err(|e| format!("the client's handshake: {:?}", e))?;
+    if theirs.info_hash != fx.info_hash {
+        return Err("the client answered with a different info hash".to_string());
+    }
+
+    let bitfield = loop {
+        match Message::read_from(&mut stream).map_err(|e| wire("waiting for the bitfield", e))? {
+            Message::Bitfield(bits) => break bits,
+            _ => continue,
+        }
+    };
+    let advertised = (0..fx.piece_count).filter(|i| bitfield.get(i / 8).is_some_and(|byte| byte & (1 << (7 - (i % 8))) != 0)).count();
+    if advertised != fx.piece_count {
+        return Err(format!("the client advertised {} of {} pieces after finishing", advertised, fx.piece_count));
+    }
+
+    Message::Interested.write_to(&mut stream).map_err(|e| wire("sending interested", e))?;
+    loop {
+        match Message::read_from(&mut stream).map_err(|e| wire("waiting for the unchoke", e))? {
+            Message::Unchoke => break,
+            _ => continue,
+        }
+    }
+
+    for index in 0..fx.piece_count {
+        let start = index * fx.piece_len;
+        let end = (start + fx.piece_len).min(fx.data.len());
+        Message::Request { index: index as u32, begin: 0, length: (end - start) as u32 }.write_to(&mut stream).map_err(|e| wire("requesting a piece", e))?;
+        let block = loop {
+            match Message::read_from(&mut stream).map_err(|e| wire(&format!("waiting for piece {}", index), e))? {
+                Message::Piece { index: got, begin: 0, block } if got as usize == index => break block,
+                _ => continue,
+            }
+        };
+        if block != fx.data[start..end] {
+            return Err(format!("piece {} served by the client differs from the source", index));
+        }
+    }
+    Ok(())
+}
+
+/// `--seed`: once the download is done the client keeps running and serves
+/// the torrent to whoever connects.
+///
+/// It cannot test the graceful stop. In plain (non-TTY) mode nothing ever
+/// sets the client's stop flag -- only the dashboard's `q` does, and there
+/// is no signal handler -- so the harness can only kill it.
+fn run_seed_after_download(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    // Port 0: let the OS pick, so this can't collide with a real client on
+    // 6881. What matters is that the client announces the port it really
+    // listens on.
+    let child = client_command(&torrent, &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .arg("--seed")
+        .args(["--port", "0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+
+    wait_for_log(&log_path, "seeding e2e.bin on port", Duration::from_secs(20), &mut client.0)?;
+    check_downloaded(&fx, &out_dir)?;
+    if client.0.try_wait().map_err(|e| e.to_string())?.is_some() {
+        return Err("the client exited once the download finished; --seed should keep it running".to_string());
+    }
+    if progress_file_path(&out_dir, &fx.info_hash).exists() {
+        return Err("the resume file is still there after the download completed".to_string());
+    }
+
+    // Both tracker announces the client owes: started, then completed.
+    let announces = swarm.announces.lock().unwrap().clone();
+    let [started, completed] = announces.as_slice() else {
+        return Err(format!("the tracker saw {} announces, expected started and completed: {:?}", announces.len(), announces));
+    };
+    let total = fx.data.len().to_string();
+    for (line, event, downloaded, left) in [(started, "started", "0", total.as_str()), (completed, "completed", total.as_str(), "0")] {
+        for (key, want) in [("event", event), ("downloaded", downloaded), ("left", left)] {
+            let got = announce_param(line, key);
+            if got.as_deref() != Some(want) {
+                return Err(format!("{} announce has {}={:?}, expected {:?}: {}", event, key, got, want, line));
+            }
+        }
+    }
+
+    // Connect to the port the client told the tracker about and leech.
+    let port: u16 = announce_param(started, "port").and_then(|p| p.parse().ok()).ok_or_else(|| format!("no port in the announce: {}", started))?;
+    leech_everything(&fx, port)?;
+
+    if client.0.try_wait().map_err(|e| e.to_string())?.is_some() {
+        return Err("the client exited while seeding".to_string());
+    }
+    let log = fs::read_to_string(&log_path).map_err(|e| format!("reading client log {:?}: {}", log_path, e))?;
+    if !log.contains("download complete") {
+        return Err("client log lacks \"download complete\"".to_string());
+    }
+
+    Ok(format!("finished, announced started+completed, kept running, and served all {} pieces to a leecher on port {}", fx.piece_count, port))
 }
