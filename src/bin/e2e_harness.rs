@@ -50,6 +50,10 @@ enum Kind {
     /// A peer that hangs up halfway through a piece: the piece must go
     /// back on the queue and be finished by someone else.
     DropMidPiece,
+    /// `--timeout` against a peer that goes silent: the client must give
+    /// up, say the download is incomplete, and keep what it has for a
+    /// later resume.
+    TimeoutIncomplete,
 }
 
 struct Scenario {
@@ -63,6 +67,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "resume-after-kill", kind: Kind::ResumeAfterKill },
     Scenario { name: "selective-multi-file", kind: Kind::SelectiveMultiFile },
     Scenario { name: "drop-mid-piece", kind: Kind::DropMidPiece },
+    Scenario { name: "timeout-incomplete", kind: Kind::TimeoutIncomplete },
 ];
 
 fn main() {
@@ -73,6 +78,7 @@ fn main() {
             Kind::ResumeAfterKill => run_resume_after_kill(scenario.name),
             Kind::SelectiveMultiFile => run_selective_multi_file(scenario.name),
             Kind::DropMidPiece => run_drop_mid_piece(scenario.name),
+            Kind::TimeoutIncomplete => run_timeout_incomplete(scenario.name),
         };
         match outcome {
             Ok(summary) => println!("PASS [{}]: {}", scenario.name, summary),
@@ -660,4 +666,75 @@ fn run_drop_mid_piece(name: &str) -> Result<String, String> {
     }
 
     Ok(format!("peer hung up mid-piece {}; the other peer supplied the remaining {} pieces and the file matches", dropped_piece, expected.len()))
+}
+
+/// `--timeout` with a peer that stops answering partway: the run must end
+/// on its own, report an incomplete download and fail, and leave its
+/// progress recorded so the same command can resume.
+fn run_timeout_incomplete(name: &str) -> Result<String, String> {
+    const STALL_AFTER: usize = 3;
+    const TIMEOUT: Duration = Duration::from_secs(3);
+    // After the timeout the client waits for its workers, and one is
+    // blocked reading from the silent peer until its read timeout (10s)
+    // expires. Allow that and some slack, but not an indefinite hang.
+    const LONGEST_EXPECTED: Duration = Duration::from_secs(30);
+
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::StallAfter(STALL_AFTER)]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path, stderr_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"), dir.join("stderr.txt"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let started = Instant::now();
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .arg("--timeout")
+        .arg(TIMEOUT.as_secs().to_string())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&stderr_path).expect("create stderr file"))
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    let elapsed = started.elapsed();
+
+    if status.code() != Some(1) {
+        return Err(format!("client exited with {:?}; an incomplete download must exit with 1", status.code()));
+    }
+    if elapsed < TIMEOUT {
+        return Err(format!("client gave up after {:?}, before its --timeout of {:?}", elapsed, TIMEOUT));
+    }
+    if elapsed > LONGEST_EXPECTED {
+        return Err(format!("client took {:?} to stop after a {:?} timeout", elapsed, TIMEOUT));
+    }
+
+    // The peer must have got as far as going silent, or nothing was tested.
+    let served = swarm.logs[0].lock().unwrap().served.clone();
+    if served.len() != STALL_AFTER {
+        return Err(format!("the peer served {:?} before the timeout; expected {} pieces, so the client never reached the stall", served, STALL_AFTER));
+    }
+    let remaining = fx.piece_count - STALL_AFTER;
+
+    let stderr = fs::read_to_string(&stderr_path).map_err(|e| format!("reading {:?}: {}", stderr_path, e))?;
+    let reason = format!("error: incomplete: {} piece(s) never downloaded (1 peer(s) dialed) -- rerun the same command to resume", remaining);
+    if !stderr.contains(&reason) {
+        return Err(format!("stderr lacks {:?}; it says {:?}", reason, stderr.trim()));
+    }
+
+    let log = fs::read_to_string(&log_path).map_err(|e| format!("reading client log {:?}: {}", log_path, e))?;
+    let notice = format!("--timeout of {}s reached with {} piece(s) remaining", TIMEOUT.as_secs(), remaining);
+    if !log.contains(&notice) {
+        return Err(format!("client log lacks {:?}", notice));
+    }
+
+    // Progress is kept for a resume: the pieces the peer sent are recorded,
+    // and the resume file is not cleared as it would be on completion.
+    let recorded = read_recorded(&progress_file_path(&out_dir, &fx.info_hash));
+    if recorded != served {
+        return Err(format!("resume file lists {:?}; expected the pieces the peer served, {:?}", recorded, served));
+    }
+    if fs::read(out_dir.join("e2e.bin")).is_ok_and(|on_disk| on_disk == fx.data) {
+        return Err("the output file is complete although the download was reported incomplete".to_string());
+    }
+
+    Ok(format!("stopped {:.0?} after a {}s --timeout with {} of {} pieces; exited 1, reported incomplete, resume file kept", elapsed, TIMEOUT.as_secs(), STALL_AFTER, fx.piece_count))
 }
