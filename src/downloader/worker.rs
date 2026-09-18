@@ -122,8 +122,10 @@ pub fn run_worker(
         // BEP 10 extended handshake, sent first thing after the BT
         // handshake per convention. Advertises ut_pex (and ut_metadata,
         // though piece workers never serve metadata) so peers know they
-        // can push us PEX updates.
-        crate::peer::connection::send_message(&mut stream, &Message::Extended { id: 0, payload: ExtendedHandshake::build(1, None) })
+        // can push us PEX updates -- but only when a `pex_tx` exists to
+        // receive them. The caller passes `None` for private torrents
+        // (BEP 27), and advertising PEX we'd then discard is pointless.
+        crate::peer::connection::send_message(&mut stream, &Message::Extended { id: 0, payload: ExtendedHandshake::build_with_pex(1, None, pex_tx.is_some()) })
             .map_err(|e| WorkerError::Connection { stage: "send_extended_handshake", error: e })?;
     }
 

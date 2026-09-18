@@ -63,13 +63,26 @@ impl ExtendedHandshake {
     /// `metadata_size` is `Some` only once we actually have the info dict
     /// (e.g. we're seeding metadata to someone else); a pure downloader
     /// starting from a magnet link sends `None`.
+    ///
+    /// Also advertises `ut_pex`; use [`build_with_pex`](Self::build_with_pex)
+    /// to withhold it (private torrents).
     pub fn build(our_ut_metadata_id: u8, metadata_size: Option<i64>) -> Vec<u8> {
+        Self::build_with_pex(our_ut_metadata_id, metadata_size, true)
+    }
+
+    /// As [`build`](Self::build), but `advertise_pex = false` leaves
+    /// `ut_pex` out of the `m` dict. BEP 27 forbids peer exchange on
+    /// private torrents, and not advertising it is what stops
+    /// well-behaved peers from sending it to us in the first place.
+    pub fn build_with_pex(our_ut_metadata_id: u8, metadata_size: Option<i64>, advertise_pex: bool) -> Vec<u8> {
         let mut m = BTreeMap::new();
         m.insert(UT_METADATA.as_bytes().to_vec(), Bencode::Int(our_ut_metadata_id as i64));
-        // Always advertise ut_pex too: any peer that supports BEP 11 will
+        // Advertise ut_pex by default: any peer that supports BEP 11 will
         // then push us fresh peer addresses unprompted -- valuable in
         // thin swarms where tracker announces come back mostly-dead.
-        m.insert(UT_PEX.as_bytes().to_vec(), Bencode::Int(OUR_UT_PEX_ID as i64));
+        if advertise_pex {
+            m.insert(UT_PEX.as_bytes().to_vec(), Bencode::Int(OUR_UT_PEX_ID as i64));
+        }
 
         let mut top = BTreeMap::new();
         top.insert(b"m".to_vec(), Bencode::Dict(m));
@@ -167,6 +180,14 @@ mod tests {
         let raw = b"d1:md6:ut_pexi1eee";
         let parsed = ExtendedHandshake::parse(raw).unwrap();
         assert_eq!(parsed.peer_ut_metadata_id(), None);
+    }
+
+    #[test]
+    fn build_with_pex_disabled_omits_ut_pex_but_keeps_ut_metadata() {
+        let bytes = ExtendedHandshake::build_with_pex(1, None, false);
+        let parsed = ExtendedHandshake::parse(&bytes).unwrap();
+        assert_eq!(parsed.peer_ut_pex_id(), None, "private torrents must not advertise ut_pex");
+        assert_eq!(parsed.peer_ut_metadata_id(), Some(1));
     }
 
     #[test]

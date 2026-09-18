@@ -18,6 +18,9 @@ pub struct TorrentFile {
     /// BEP 19 web seeds (`url-list`): HTTP(S) base URLs the content can
     /// also be fetched from. Empty for magnet-derived torrents.
     pub url_list: Vec<String>,
+    /// BEP 27 `private` flag. A private torrent's peers must come only
+    /// from its tracker: no DHT, no PEX, no local discovery.
+    pub private: bool,
 }
 
 #[derive(Debug)]
@@ -222,6 +225,12 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
         return Err(TorrentError::MissingKey("length|files"));
     };
 
+    // BEP 27 specifies `private=1`, but libtorrent treats any non-zero
+    // value as private. Erring toward private is the safe direction: the
+    // cost of a false positive is a slower swarm, the cost of a false
+    // negative is leaking a private tracker's peers into the public DHT.
+    let private = info.get("private").and_then(Bencode::as_int).is_some_and(|v| v != 0);
+
     Ok(TorrentFile {
         announce,
         announce_list,
@@ -232,6 +241,7 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
         name,
         files,
         url_list,
+        private,
     })
 }
 
@@ -273,6 +283,48 @@ mod tests {
         s.extend_from_slice(&piece_hash);
         s.extend_from_slice(b"ee");
         s
+    }
+
+    /// Same shape as `single_file_torrent_bytes`, with `private_kv`
+    /// appended to the info dict. Bencode keys must stay sorted and
+    /// "private" sorts after "pieces", so appending is the valid spot.
+    fn torrent_bytes_with_private(private_kv: &[u8]) -> Vec<u8> {
+        let mut s = Vec::new();
+        s.extend_from_slice(b"d8:announce20:http://tracker.test/4:infod6:lengthi1024e4:name8:file.bin12:piece lengthi16384e6:pieces20:");
+        s.extend_from_slice(&[0xAB; 20]);
+        s.extend_from_slice(private_kv);
+        s.extend_from_slice(b"ee");
+        s
+    }
+
+    #[test]
+    fn torrent_without_private_key_is_public() {
+        assert!(!parse_torrent_file(&single_file_torrent_bytes()).unwrap().private);
+    }
+
+    #[test]
+    fn private_one_marks_the_torrent_private() {
+        assert!(parse_torrent_file(&torrent_bytes_with_private(b"7:privatei1e")).unwrap().private);
+    }
+
+    #[test]
+    fn private_zero_is_public() {
+        assert!(!parse_torrent_file(&torrent_bytes_with_private(b"7:privatei0e")).unwrap().private);
+    }
+
+    #[test]
+    fn non_integer_private_value_is_treated_as_public() {
+        assert!(!parse_torrent_file(&torrent_bytes_with_private(b"7:private3:yes")).unwrap().private);
+    }
+
+    #[test]
+    fn private_flag_is_covered_by_the_info_hash() {
+        // `private` lives inside the info dict, so it changes the hash --
+        // which is exactly why a client can't be tricked into treating a
+        // private torrent as public by editing outside the info dict.
+        let public = parse_torrent_file(&single_file_torrent_bytes()).unwrap();
+        let private = parse_torrent_file(&torrent_bytes_with_private(b"7:privatei1e")).unwrap();
+        assert_ne!(public.info_hash, private.info_hash);
     }
 
     #[test]

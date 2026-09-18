@@ -403,15 +403,30 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             return Err(finish_err(ui, "magnet link has no trackers and DHT is disabled (--no-dht) -- no way to find any peer".to_string()));
         }
         let (torrent, peers) = resolve_magnet(&magnet, our_peer_id, args.port, dht_service.as_ref(), ui, stop)?;
+        // The DHT had to run to fetch the metadata, since a magnet link
+        // doesn't say whether the torrent is private until the info dict
+        // arrives. Now that it has, shut the DHT down: no lookups, no
+        // announces, no answering queries for a private info-hash.
+        let dht_service = if torrent.private {
+            if let Some(mut d) = dht_service {
+                d.stop();
+            }
+            None
+        } else {
+            dht_service
+        };
         (torrent, dht_service, peers)
     } else {
         let bytes = fs::read(&args.source).map_err(|e| finish_err(ui, format!("reading {}: {}", args.source, e)))?;
         let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| finish_err(ui, format!("parsing {}: {}", args.source, e)))?;
         // A `.torrent` already carries the file list, so `--list` needs no
         // network at all.
-        let dht_service = if args.list { None } else { start_dht(&args, torrent.info_hash, &dht_announce_port, ui) };
+        let dht_service = if args.list || torrent.private { None } else { start_dht(&args, torrent.info_hash, &dht_announce_port, ui) };
         (torrent, dht_service, Vec::new())
     };
+    if torrent.private && !args.list {
+        ui.log("private torrent (BEP 27): DHT and peer exchange disabled, peers come from the tracker only");
+    }
 
     ui.set_title(torrent.name.clone());
     ui.log(format!("torrent: {} ({}, {} pieces)", torrent.name, ui::format_bytes(torrent.total_length()), torrent.pieces.len()));
@@ -552,6 +567,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         ui.log(format!("skipped {} IPv6 peer(s) with no local route (pass --ipv6 to force)", pool.skipped_ipv6));
     }
 
+    let private = torrent.private;
     let (tx, rx) = mpsc::channel();
     let (pex_tx, pex_rx): (PexSender, mpsc::Receiver<Vec<SocketAddr>>) = mpsc::channel();
     let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: PIPELINE_DEPTH, connect_timeout: CONNECT_TIMEOUT });
@@ -601,10 +617,12 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
                 let spans = Arc::clone(&spans);
                 let config = Arc::clone(&config);
                 let tx = tx.clone();
-                let pex_tx = pex_tx.clone();
+                // No PEX channel for private torrents (BEP 27): the worker
+                // then neither advertises ut_pex nor forwards what it hears.
+                let pex_tx = (!private).then(|| pex_tx.clone());
                 let ui2 = ui.clone();
                 handles.push(thread::spawn(move || {
-                    if let Err(e) = run_worker(addr, &config, &queue, &spans, piece_length, &tx, Some(&pex_tx)) {
+                    if let Err(e) = run_worker(addr, &config, &queue, &spans, piece_length, &tx, pex_tx.as_ref()) {
                         ui2.log(format!("peer {} disconnected: {:?}", addr, e));
                     }
                 }));

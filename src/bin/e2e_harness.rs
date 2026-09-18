@@ -8,18 +8,50 @@
 //! spawned as a subprocess exactly as a user would run it, and its output
 //! file is diffed byte-for-byte against the original.
 //!
+//! Each [`Scenario`] is one such run with a different torrent or flag
+//! set, and adds its own assertions on top of the byte-for-byte check
+//! (what the client advertised to the peer, what it logged).
+//!
 //! Run with: `cargo run --bin e2e_harness`
 
 use bittorrent_rs::peer::handshake::Handshake;
 use bittorrent_rs::peer::message::Message;
+use bittorrent_rs::peer::ExtendedHandshake;
 use sha1::{Digest, Sha1};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
+struct Scenario {
+    name: &'static str,
+    /// Sets BEP 27 `private=1` in the info dict. The client must then
+    /// leave the DHT off and withhold `ut_pex`, even though this scenario
+    /// deliberately does *not* pass `--no-dht`.
+    private: bool,
+}
+
+const SCENARIOS: &[Scenario] = &[Scenario { name: "public", private: false }, Scenario { name: "private", private: true }];
+
 fn main() {
+    let mut failed = false;
+    for scenario in SCENARIOS {
+        match run_scenario(scenario) {
+            Ok(summary) => println!("PASS [{}]: {}", scenario.name, summary),
+            Err(reason) => {
+                eprintln!("FAIL [{}]: {}", scenario.name, reason);
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        std::process::exit(1);
+    }
+}
+
+fn run_scenario(scenario: &Scenario) -> Result<String, String> {
     let data = b"hello bittorrent world, this is the e2e harness payload.\n".repeat(30); // a few pieces' worth
     let piece_len: usize = 256;
 
@@ -41,6 +73,10 @@ fn main() {
         v.extend_from_slice(format!("12:piece lengthi{}e", piece_len).as_bytes());
         v.extend_from_slice(format!("6:pieces{}:", pieces_concat.len()).as_bytes());
         v.extend_from_slice(&pieces_concat);
+        // Keys must stay sorted: "private" comes after "pieces".
+        if scenario.private {
+            v.extend_from_slice(b"7:privatei1e");
+        }
         v.extend_from_slice(b"e");
         v
     };
@@ -65,7 +101,8 @@ fn main() {
         v.extend_from_slice(b"e");
         v
     };
-    let torrent_path = std::env::temp_dir().join("e2e_harness.torrent");
+    let tmp = std::env::temp_dir();
+    let torrent_path = tmp.join(format!("e2e_harness_{}.torrent", scenario.name));
     fs::write(&torrent_path, &torrent_bytes).expect("write torrent file");
 
     // Fake tracker: answers exactly one HTTP GET with a compact peer list
@@ -95,8 +132,12 @@ fn main() {
         let _ = stream.write_all(&body);
     });
 
-    // Fake peer: real handshake, announces every piece via bitfield,
-    // unchokes immediately, serves whatever blocks are requested.
+    // Fake peer: real handshake (with the BEP 10 bit set so the client
+    // sends its extended handshake), announces every piece via bitfield,
+    // unchokes immediately, serves whatever blocks are requested. Records
+    // whether the client's extended handshake offered `ut_pex`.
+    let pex_offered: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let pex_offered_peer = Arc::clone(&pex_offered);
     let peer_data = data.clone();
     thread::spawn(move || {
         let Ok((mut stream, _)) = peer_listener.accept() else { return };
@@ -109,7 +150,7 @@ fn main() {
         if their_hs.info_hash != info_hash {
             return;
         }
-        let our_hs = Handshake::new(info_hash, [0x99; 20], false);
+        let our_hs = Handshake::new(info_hash, [0x99; 20], true);
         if stream.write_all(&our_hs.to_bytes()).is_err() {
             return;
         }
@@ -137,46 +178,72 @@ fn main() {
                         return;
                     }
                 }
+                Ok(Message::Extended { id: 0, payload }) => {
+                    if let Ok(hs) = ExtendedHandshake::parse(&payload) {
+                        *pex_offered_peer.lock().unwrap() = Some(hs.peer_ut_pex_id().is_some());
+                    }
+                }
                 Ok(_) => continue,
                 Err(_) => return,
             }
         }
     });
 
-    let out_dir = std::env::temp_dir().join("e2e_harness_out");
+    let out_dir = tmp.join(format!("e2e_harness_{}_out", scenario.name));
+    let log_path = tmp.join(format!("e2e_harness_{}.log", scenario.name));
     let _ = fs::remove_dir_all(&out_dir);
+    let _ = fs::remove_file(&log_path);
 
     let download_bin = std::env::current_exe().expect("current exe").parent().expect("exe dir").join("download");
 
-    let status = Command::new(&download_bin)
-        .arg(&torrent_path)
-        .arg("--out")
-        .arg(&out_dir)
-        .arg("--peers")
-        .arg("1")
-        // No DHT in the harness: everything must stay on 127.0.0.1 (CI
-        // has no business resolving bootstrap routers), and the run
-        // should exercise exactly the fake tracker + fake peer.
-        .arg("--no-dht")
-        // Plain output + no logfile: keep the harness deterministic and
-        // free of the interactive dashboard / stray log artifacts.
-        .arg("--no-tui")
-        .arg("--no-log")
-        .status()
-        .unwrap_or_else(|e| panic!("failed to spawn {:?}: {}", download_bin, e));
+    let mut cmd = Command::new(&download_bin);
+    cmd.arg(&torrent_path).arg("--out").arg(&out_dir).arg("--peers").arg("1");
+    // Don't let a developer's ~/.config/bittorrent-rs.toml change what
+    // this run does.
+    cmd.arg("--no-config");
+    if scenario.private {
+        // DHT stays *on*: the point is that the client turns it off
+        // itself. Were that to regress, the client would try to reach the
+        // public bootstrap routers, so the log assertion below is what
+        // catches it.
+        cmd.arg("--dht");
+    } else {
+        // No DHT: everything must stay on 127.0.0.1 (CI has no business
+        // resolving bootstrap routers), and the run should exercise
+        // exactly the fake tracker + fake peer.
+        cmd.arg("--no-dht");
+    }
+    // Plain output, but a logfile: the assertions below read what the
+    // client says about its own decisions (DHT started or not).
+    cmd.arg("--no-tui").arg("--log").arg(&log_path);
 
+    let status = cmd.status().map_err(|e| format!("failed to spawn {:?}: {}", download_bin, e))?;
     if !status.success() {
-        eprintln!("FAIL: download binary exited with {:?}", status.code());
-        std::process::exit(1);
+        return Err(format!("download binary exited with {:?}", status.code()));
     }
 
     let downloaded_path = out_dir.join("e2e.bin");
-    let downloaded = fs::read(&downloaded_path).unwrap_or_else(|e| panic!("reading {:?}: {}", downloaded_path, e));
-
-    if downloaded == data {
-        println!("PASS: {} bytes downloaded via fake tracker+peer match the source exactly", data.len());
-    } else {
-        eprintln!("FAIL: downloaded {} bytes, expected {}, content differs", downloaded.len(), data.len());
-        std::process::exit(1);
+    let downloaded = fs::read(&downloaded_path).map_err(|e| format!("reading {:?}: {}", downloaded_path, e))?;
+    if downloaded != data {
+        return Err(format!("downloaded {} bytes, expected {}, content differs", downloaded.len(), data.len()));
     }
+
+    let log = fs::read_to_string(&log_path).map_err(|e| format!("reading client log {:?}: {}", log_path, e))?;
+    let dht_started = log.contains("DHT node running");
+    let said_private = log.contains("private torrent");
+    if dht_started {
+        // Only reachable in the private scenario: the public one passes
+        // --no-dht.
+        return Err("client started a DHT node for a private torrent".to_string());
+    }
+    if said_private != scenario.private {
+        return Err(format!("client log {} a private-torrent notice (private = {})", if said_private { "has" } else { "lacks" }, scenario.private));
+    }
+
+    let offered = *pex_offered.lock().unwrap();
+    if offered != Some(!scenario.private) {
+        return Err(format!("client's extended handshake offered ut_pex = {:?}, expected {}", offered, !scenario.private));
+    }
+
+    Ok(format!("{} bytes downloaded via fake tracker+peer match the source exactly", data.len()))
 }
