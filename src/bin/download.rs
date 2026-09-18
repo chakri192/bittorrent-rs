@@ -20,7 +20,7 @@ use bittorrent_rs::downloader::{build_file_spans, build_work_queue, load_and_ver
 use bittorrent_rs::magnet::{parse_magnet_uri, MagnetLink};
 use bittorrent_rs::magnet_fetch::fetch_metadata_from_peer;
 use bittorrent_rs::seeder::{self, HaveMap};
-use bittorrent_rs::session::PeerPool;
+use bittorrent_rs::session::{PeerPool, RateSampler};
 use bittorrent_rs::torrent::{self, TorrentFile};
 use bittorrent_rs::tracker::{generate_peer_id, Event};
 use bittorrent_rs::tracker_discovery::{announce_to_all, build_request, TransferTotals};
@@ -554,12 +554,9 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     let mut fresh_since_announce = 0usize;
     let mut endgame_announced = false;
 
-    // Rate sampling / smoothing for the dashboard.
-    let mut last_sample = Instant::now();
-    let mut last_done_bytes = bytes_already_done;
-    let mut last_up_bytes = uploaded();
-    let mut smoothed_down = 0.0f64;
-    let mut smoothed_up = 0.0f64;
+    // Rate sampling / smoothing for the dashboard. Resumed bytes are the
+    // baseline, so they don't read as a burst of throughput.
+    let mut rates = RateSampler::new(Instant::now(), bytes_already_done, uploaded());
 
     macro_rules! spawn_up_to_cap {
         () => {
@@ -584,24 +581,13 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
 
     macro_rules! publish_snapshot {
         () => {{
-            let now = Instant::now();
-            let dt = now.duration_since(last_sample).as_secs_f64();
-            if dt >= 0.25 {
-                let cur_done = bytes_already_done + bytes_downloaded_this_run;
-                let cur_up = uploaded();
-                let inst_down = cur_done.saturating_sub(last_done_bytes) as f64 / dt;
-                let inst_up = cur_up.saturating_sub(last_up_bytes) as f64 / dt;
-                smoothed_down = 0.6 * smoothed_down + 0.4 * inst_down;
-                smoothed_up = 0.6 * smoothed_up + 0.4 * inst_up;
-                last_sample = now;
-                last_done_bytes = cur_done;
-                last_up_bytes = cur_up;
-                ui.push_rates(smoothed_down as u64, smoothed_up as u64);
+            let done = bytes_already_done + bytes_downloaded_this_run;
+            if rates.sample(Instant::now(), done, uploaded()) {
+                ui.push_rates(rates.down_rate() as u64, rates.up_rate() as u64);
                 ui.set_pieces(have.snapshot()); // drives the piece-map heatmap
             }
-            let done = bytes_already_done + bytes_downloaded_this_run;
             let remaining = display_total.saturating_sub(done);
-            let eta_secs = if smoothed_down > 1.0 { Some((remaining as f64 / smoothed_down) as u64) } else { None };
+            let eta_secs = if rates.down_rate() > 1.0 { Some((remaining as f64 / rates.down_rate()) as u64) } else { None };
             let web_active = web_handles.iter().any(|h| !h.is_finished());
             let status = if queue.in_endgame() {
                 "endgame"
@@ -617,9 +603,9 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
                 total_pieces: goal_pieces,
                 verified,
                 done_bytes: done,
-                down_rate: smoothed_down,
+                down_rate: rates.down_rate(),
                 up_bytes: uploaded(),
-                up_rate: smoothed_up,
+                up_rate: rates.up_rate(),
                 active_peers: handles.len(),
                 dialed_peers: pool.dialed(),
                 known_peers: pool.known_count(),
@@ -842,19 +828,12 @@ fn seed_loop(
     ui.log(format!("seeding {} on port {} -- press q to stop", torrent.name, announce_port));
 
     let mut last_announce = Instant::now();
-    let mut last_sample = Instant::now();
-    let mut last_up = uploaded();
-    let mut smoothed_up = 0.0f64;
+    // Seeding downloads nothing, so the down total stays at 0.
+    let mut rates = RateSampler::new(Instant::now(), 0, uploaded());
 
     while !stop.load(Ordering::SeqCst) {
-        let now = Instant::now();
-        let dt = now.duration_since(last_sample).as_secs_f64();
-        if dt >= 0.25 {
-            let cur = uploaded();
-            smoothed_up = 0.6 * smoothed_up + 0.4 * (cur.saturating_sub(last_up) as f64 / dt);
-            last_sample = now;
-            last_up = cur;
-            ui.push_rates(0, smoothed_up as u64);
+        if rates.sample(Instant::now(), 0, uploaded()) {
+            ui.push_rates(0, rates.up_rate() as u64);
         }
         ui.set_snapshot(Snapshot {
             total_length,
@@ -863,7 +842,7 @@ fn seed_loop(
             done_bytes: total_length,
             down_rate: 0.0,
             up_bytes: uploaded(),
-            up_rate: smoothed_up,
+            up_rate: rates.up_rate(),
             endgame: false,
             status: "seeding",
             ..Default::default()
