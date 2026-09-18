@@ -130,12 +130,12 @@ A `ratatui` dashboard with a piece-map heatmap, throughput sparklines, and an ac
 
 ```sh
 cargo test
-cargo run --bin e2e_harness      # loopback scenarios: public, private, resume, --only, dropped peer, --timeout
+cargo run --bin e2e_harness      # loopback scenarios: public, private, resume, --only, dropped peer, --timeout, --seed
 ```
 
 291 tests, all passing, all confined to loopback.
 
-Coverage spans parsing, the KRPC codec verified against BEP 5's published byte strings, DHT lookup and announce over a scripted transport, workers driven against mock peers, the seeder against a mock leecher, and web-seed range arithmetic. An end-to-end harness runs the real binary against a synthetic tracker and peer on `127.0.0.1` and compares output byte for byte. Its scenarios cover a public torrent, a private one (no DHT, no PEX), a client killed mid-download that must resume and fetch only the pieces it lacks, `--only` on one file of three (only the pieces that file touches may be requested), a peer that hangs up halfway through a piece while another supplies the rest, and `--timeout` against a peer that goes silent (the client must stop, exit non-zero, report the download incomplete and keep its resume file). Three `cargo-fuzz` targets exercise the parsers handling untrusted input.
+Coverage spans parsing, the KRPC codec verified against BEP 5's published byte strings, DHT lookup and announce over a scripted transport, workers driven against mock peers, the seeder against a mock leecher, and web-seed range arithmetic. An end-to-end harness runs the real binary against a synthetic tracker and peer on `127.0.0.1` and compares output byte for byte. Its scenarios cover a public torrent, a private one (no DHT, no PEX), a client killed mid-download that must resume and fetch only the pieces it lacks, `--only` on one file of three (only the pieces that file touches may be requested), a peer that hangs up halfway through a piece while another supplies the rest, and `--timeout` against a peer that goes silent (the client must stop, exit non-zero, report the download incomplete and keep its resume file), and `--seed` (the client announces started and completed, stays up, and serves every piece back to a leecher on the port it announced). Three `cargo-fuzz` targets exercise the parsers handling untrusted input.
 
 ## Limitations
 
@@ -144,6 +144,7 @@ Coverage spans parsing, the KRPC codec verified against BEP 5's published byte s
 - **The DHT is IPv4-only** (BEP 32 is not implemented), and uses a fixed-bucket routing table.
 - **Under `--only`, a piece spanning a selected and an unselected file is retrieved in full**, which may leave an adjacent file partially written. This matches standard client behaviour.
 - **Magnet links to private torrents use the DHT briefly.** The `private` flag lives in the info dict, which a magnet link does not carry, so the DHT runs while the metadata is fetched and is shut down as soon as the flag is seen. A `.torrent` file never touches the DHT.
+- **`--seed` without a terminal cannot be stopped cleanly.** The dashboard stops on `q`, `Esc` or Ctrl-C; with output piped or redirected there is no equivalent and no signal handler, so the process runs until it is killed, and a kill skips the shutdown that removes the router port mapping (it lapses with its one-hour lease).
 - **No partial-piece resume across peers.** A peer disconnecting mid-piece forfeits that connection's progress on it. Complete verified pieces from earlier sessions resume normally.
 
 ## Network configuration
