@@ -2,6 +2,9 @@
 name = "bittorrent-rs"
 version = "0.1.0"
 edition = "2021"
+# Floor set by the locked dependency graph (darling 0.23 and instability
+# 0.3, pulled in by ratatui, need 1.88); CI's `msrv` job builds with it.
+rust-version = "1.88"
 # `cargo run` maps to the client; the others are helpers (e2e_harness, infohash).
 default-run = "download"
 
@@ -24,10 +27,6 @@ getrandom = "0.2"
 # Synchronous HTTP client for BEP 19 web seeds (ranged GETs). rustls-based,
 # no async runtime -- fits the one-thread-per-source model.
 ureq = "2"
-# Pinned below the version that requires edition2024 (Cargo 1.85+ / rustc
-# 1.85+): this repo is also built/tested in a sandbox running rustc 1.75.
-# Remove this pin freely on a newer toolchain.
-zeroize = "=1.8.1"
 
 [lib]
 name = "bittorrent_rs"

@@ -30,6 +30,17 @@ jobs:
           cargo build --bin download
           cargo run --bin e2e_harness
 
+  # Keeps `rust-version` in Cargo.toml honest: builds everything, with the
+  # committed lockfile, on exactly the declared minimum toolchain.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build on the minimum supported Rust version
+        run: cargo check --locked --all-targets
+
   fuzz-build:
     runs-on: ubuntu-latest
     steps:

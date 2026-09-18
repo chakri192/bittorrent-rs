@@ -50,7 +50,6 @@ dependencies = [
  "toml",
  "ureq",
  "webpki-roots 0.26.11",
- "zeroize",
 ]
 
 [[package]]
