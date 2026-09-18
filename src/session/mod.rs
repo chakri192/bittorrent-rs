@@ -4,12 +4,14 @@
 //! `bin/download.rs` used to hold all of this in one long function; the
 //! parts that had no reason to live in a binary move here one at a time.
 
+pub mod announce;
 pub mod peer_pool;
 pub mod plan;
 pub mod progress;
 pub mod rate;
 pub mod services;
 
+pub use announce::{Announcer, NetworkTrackers, TrackerClient};
 pub use peer_pool::PeerPool;
 pub use plan::{DownloadPlan, Outstanding};
 pub use progress::Progress;

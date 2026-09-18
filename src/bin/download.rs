@@ -20,7 +20,7 @@ use bittorrent_rs::downloader::{build_file_spans, load_and_verify, progress_file
 use bittorrent_rs::magnet::{parse_magnet_uri, MagnetLink};
 use bittorrent_rs::magnet_fetch::fetch_metadata_from_peer;
 use bittorrent_rs::seeder::{self, HaveMap};
-use bittorrent_rs::session::{DownloadPlan, Outstanding, PeerPool, Progress, RateSampler, Services};
+use bittorrent_rs::session::{Announcer, DownloadPlan, Outstanding, PeerPool, Progress, RateSampler, Services};
 use bittorrent_rs::torrent::{self, TorrentFile};
 use bittorrent_rs::tracker::{generate_peer_id, Event};
 use bittorrent_rs::tracker_discovery::{announce_to_all, build_request, TransferTotals};
@@ -45,10 +45,6 @@ const DEFAULT_PORT: u16 = 6881;
 const DEFAULT_MAX_PEERS: usize = 30;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PIPELINE_DEPTH: usize = 5;
-/// Floor on re-announce spacing regardless of what a tracker requests,
-/// and the fast-path wait when the dial queue runs completely dry.
-const MIN_REANNOUNCE: Duration = Duration::from_secs(30);
-const DEFAULT_REANNOUNCE: Duration = Duration::from_secs(120);
 /// Main-loop cadence: also the dashboard refresh interval.
 const UI_TICK: Duration = Duration::from_millis(250);
 /// Give up only after this many consecutive re-announce rounds where NO
@@ -468,27 +464,12 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     let mut pool = PeerPool::new(allow_ipv6);
     pool.add(bootstrap_peers);
 
-    let mut trackers_ok = 0usize;
     let mut pex_total = 0usize;
 
     // First real announce, now that the true size is known.
-    let mut reannounce_wait = DEFAULT_REANNOUNCE;
-    if !tracker_urls.is_empty() {
-        let totals = TransferTotals { uploaded: uploaded(), downloaded: 0, left: display_total.saturating_sub(bytes_already_done) };
-        let req = build_request(torrent.info_hash, our_peer_id, announce_port, totals, Some(Event::Started));
-        let (peers, failures, interval) = announce_to_all(&tracker_urls, &req);
-        trackers_ok = tracker_urls.len().saturating_sub(failures.len());
-        for f in &failures {
-            ui.log(format!("tracker {} failed: {}", f.url, f.error));
-        }
-        if let Some(secs) = interval {
-            reannounce_wait = Duration::from_secs(secs as u64).max(MIN_REANNOUNCE);
-        }
-        pool.add(peers);
-    }
-    if let Some(secs) = args.reannounce_override {
-        reannounce_wait = Duration::from_secs(secs).max(MIN_REANNOUNCE);
-    }
+    let mut announcer = Announcer::new(tracker_urls, torrent.info_hash, our_peer_id, announce_port, args.reannounce_override.map(Duration::from_secs), Instant::now());
+    let first_totals = TransferTotals { uploaded: uploaded(), downloaded: 0, left: display_total.saturating_sub(bytes_already_done) };
+    pool.add(announcer.start(Instant::now(), first_totals, |m| ui.log(m)));
 
     // BEP 19 web seeds (from the torrent's url-list). These can carry the
     // whole download even with zero peers, so their presence keeps the run
@@ -533,7 +514,6 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
     let mut progress = Progress::new(Arc::clone(&have), resume_writer, goal_pieces, pieces_done, bytes_already_done);
     let run_start = Instant::now();
-    let mut last_announce = Instant::now();
     let mut fruitless_rounds = 0u32;
     let mut fresh_since_announce = 0usize;
     let mut endgame_announced = false;
@@ -594,8 +574,8 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
                 dialed_peers: pool.dialed(),
                 known_peers: pool.known_count(),
                 endgame: queue.in_endgame(),
-                trackers_ok,
-                trackers_total: tracker_urls.len(),
+                trackers_ok: announcer.trackers_ok(),
+                trackers_total: announcer.tracker_count(),
                 dht_nodes: services.dht().map(|d| d.nodes.load(Ordering::SeqCst)).unwrap_or(0),
                 pex_total,
                 web_seeds: web_handles.iter().filter(|h| !h.is_finished()).count(),
@@ -657,28 +637,14 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         publish_snapshot!();
 
         let starved = handles.is_empty() && pool.reserve_is_empty();
-        let effective_wait = if starved { MIN_REANNOUNCE } else { reannounce_wait };
-        if last_announce.elapsed() < effective_wait {
+        if !announcer.is_due(Instant::now(), starved) {
             continue;
         }
-        last_announce = Instant::now();
-
-        if !tracker_urls.is_empty() {
+        if announcer.has_trackers() {
             ui.log(format!("{} piece(s) remaining, re-announcing to trackers", queue.len()));
-            let totals = TransferTotals { uploaded: uploaded(), downloaded: progress.bytes_this_run(), left: display_total.saturating_sub(progress.bytes_done()) };
-            let req = build_request(torrent.info_hash, our_peer_id, announce_port, totals, None);
-            let (peers, failures, interval) = announce_to_all(&tracker_urls, &req);
-            trackers_ok = tracker_urls.len().saturating_sub(failures.len());
-            for f in &failures {
-                ui.log(format!("tracker {} failed: {}", f.url, f.error));
-            }
-            if args.reannounce_override.is_none() {
-                if let Some(secs) = interval {
-                    reannounce_wait = Duration::from_secs(secs as u64).max(MIN_REANNOUNCE);
-                }
-            }
-            fresh_since_announce += pool.add(peers);
         }
+        let totals = TransferTotals { uploaded: uploaded(), downloaded: progress.bytes_this_run(), left: display_total.saturating_sub(progress.bytes_done()) };
+        fresh_since_announce += pool.add(announcer.reannounce(Instant::now(), totals, |m| ui.log(m)));
 
         spawn_up_to_cap!();
 
@@ -728,16 +694,14 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         );
         ui.log("download complete");
 
-        if !tracker_urls.is_empty() && progress.bytes_this_run() > 0 {
-            let totals = TransferTotals { uploaded: uploaded(), downloaded: progress.bytes_this_run(), left: 0 };
-            let req = build_request(torrent.info_hash, our_peer_id, announce_port, totals, Some(Event::Completed));
-            let _ = announce_to_all(&tracker_urls, &req);
+        if progress.bytes_this_run() > 0 {
+            announcer.completed(Instant::now(), TransferTotals { uploaded: uploaded(), downloaded: progress.bytes_this_run(), left: 0 });
         }
 
         if args.seed && services.has_seeder() {
             // Keep the UI live and seeding until the user quits. The UI
             // totals reflect the selected subset (display_total/goal).
-            seed_loop(&torrent, our_peer_id, &tracker_urls, announce_port, reannounce_wait, uploaded_counter.clone(), display_total, goal_pieces, progress.bytes_this_run(), ui, stop);
+            seed_loop(&torrent.name, announce_port, &mut announcer, uploaded_counter.clone(), display_total, goal_pieces, progress.bytes_this_run(), ui, stop);
         } else {
             ui.finish(Ok(summary.clone()));
         }
@@ -768,11 +732,9 @@ fn finish_err(ui: &Ui, reason: String) -> String {
 /// when `stop` is set (user quit).
 #[allow(clippy::too_many_arguments)]
 fn seed_loop(
-    torrent: &TorrentFile,
-    our_peer_id: [u8; 20],
-    tracker_urls: &[String],
+    name: &str,
     announce_port: u16,
-    reannounce_wait: Duration,
+    announcer: &mut Announcer,
     uploaded_counter: Option<Arc<AtomicU64>>,
     total_length: u64,
     total_pieces: usize,
@@ -781,9 +743,10 @@ fn seed_loop(
     stop: &AtomicBool,
 ) {
     let uploaded = || uploaded_counter.as_ref().map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
-    ui.log(format!("seeding {} on port {} -- press q to stop", torrent.name, announce_port));
+    ui.log(format!("seeding {} on port {} -- press q to stop", name, announce_port));
 
-    let mut last_announce = Instant::now();
+    // Seeding has its own cadence: count the interval from here.
+    announcer.restart_clock(Instant::now());
     // Seeding downloads nothing, so the down total stays at 0.
     let mut rates = RateSampler::new(Instant::now(), 0, uploaded());
 
@@ -804,11 +767,9 @@ fn seed_loop(
             ..Default::default()
         });
 
-        if !tracker_urls.is_empty() && last_announce.elapsed() >= reannounce_wait.max(MIN_REANNOUNCE) {
+        if announcer.has_trackers() && announcer.is_due(Instant::now(), false) {
             let totals = TransferTotals { uploaded: uploaded(), downloaded: downloaded_this_run, left: 0 };
-            let req = build_request(torrent.info_hash, our_peer_id, announce_port, totals, None);
-            let _ = announce_to_all(tracker_urls, &req);
-            last_announce = Instant::now();
+            let _ = announcer.reannounce(Instant::now(), totals, |m| ui.log(m));
         }
         thread::sleep(UI_TICK);
     }
