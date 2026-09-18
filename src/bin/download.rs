@@ -20,7 +20,7 @@ use bittorrent_rs::downloader::{build_file_spans, load_and_verify, progress_file
 use bittorrent_rs::magnet::{parse_magnet_uri, MagnetLink};
 use bittorrent_rs::magnet_fetch::fetch_metadata_from_peer;
 use bittorrent_rs::seeder::{self, HaveMap};
-use bittorrent_rs::session::{DownloadPlan, Outstanding, PeerPool, RateSampler};
+use bittorrent_rs::session::{DownloadPlan, Outstanding, PeerPool, RateSampler, Services};
 use bittorrent_rs::torrent::{self, TorrentFile};
 use bittorrent_rs::tracker::{generate_peer_id, Event};
 use bittorrent_rs::tracker_discovery::{announce_to_all, build_request, TransferTotals};
@@ -32,7 +32,7 @@ use std::io::IsTerminal;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -346,35 +346,36 @@ fn main() -> ExitCode {
 fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String> {
     let our_peer_id = generate_peer_id();
 
-    let dht_announce_port = Arc::new(AtomicU16::new(0));
+    // Dropping `services` (including on any early `return Err`) stops the
+    // DHT, the listener and the port mapping.
+    let mut services = Services::new();
 
-    let (torrent, mut dht_service, bootstrap_peers) = if args.source.starts_with("magnet:?") {
+    let (torrent, bootstrap_peers) = if args.source.starts_with("magnet:?") {
         let magnet = parse_magnet_uri(&args.source).map_err(|e| finish_err(ui, format!("parsing magnet uri: {}", e)))?;
-        let dht_service = start_dht(&args, magnet.info_hash, &dht_announce_port, ui);
-        if magnet.trackers.is_empty() && dht_service.is_none() {
+        if !args.no_dht {
+            services.start_dht(args.port, magnet.info_hash, |m| ui.log(m));
+        }
+        if magnet.trackers.is_empty() && services.dht().is_none() {
             return Err(finish_err(ui, "magnet link has no trackers and DHT is disabled (--no-dht) -- no way to find any peer".to_string()));
         }
-        let (torrent, peers) = resolve_magnet(&magnet, our_peer_id, args.port, dht_service.as_ref(), ui, stop)?;
+        let (torrent, peers) = resolve_magnet(&magnet, our_peer_id, args.port, services.dht(), ui, stop)?;
         // The DHT had to run to fetch the metadata, since a magnet link
         // doesn't say whether the torrent is private until the info dict
         // arrives. Now that it has, shut the DHT down: no lookups, no
         // announces, no answering queries for a private info-hash.
-        let dht_service = if torrent.private {
-            if let Some(mut d) = dht_service {
-                d.stop();
-            }
-            None
-        } else {
-            dht_service
-        };
-        (torrent, dht_service, peers)
+        if torrent.private {
+            services.stop_dht();
+        }
+        (torrent, peers)
     } else {
         let bytes = fs::read(&args.source).map_err(|e| finish_err(ui, format!("reading {}: {}", args.source, e)))?;
         let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| finish_err(ui, format!("parsing {}: {}", args.source, e)))?;
         // A `.torrent` already carries the file list, so `--list` needs no
         // network at all.
-        let dht_service = if args.list || torrent.private { None } else { start_dht(&args, torrent.info_hash, &dht_announce_port, ui) };
-        (torrent, dht_service, Vec::new())
+        if !args.no_dht && !args.list && !torrent.private {
+            services.start_dht(args.port, torrent.info_hash, |m| ui.log(m));
+        }
+        (torrent, Vec::new())
     };
     if torrent.private && !args.list {
         ui.log("private torrent (BEP 27): DHT and peer exchange disabled, peers come from the tracker only");
@@ -392,9 +393,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     let mask = bittorrent_rs::selection::build_mask(&torrent.files, &args.files_sel, &args.only).map_err(|e| finish_err(ui, e))?;
     if args.list {
         let listing = bittorrent_rs::selection::format_list(&torrent.name, &torrent.files, &mask);
-        if let Some(d) = dht_service.as_mut() {
-            d.stop();
-        }
+        services.shutdown();
         ui.finish(Ok(listing.clone()));
         return Ok(listing);
     }
@@ -428,33 +427,26 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     for &idx in &confirmed_resumed {
         have.set(idx);
     }
-    let mut seeder_handle = match seeder::start(args.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have)) {
+    match seeder::start(args.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have)) {
         Ok(handle) => {
             ui.log(format!("listening for inbound peers on port {}", handle.port));
-            dht_announce_port.store(handle.port, Ordering::SeqCst);
-            Some(handle)
+            services.attach_seeder(handle);
         }
-        Err(e) => {
-            ui.log(format!("warning: could not start listener (download-only): {}", e));
-            None
-        }
-    };
-    let announce_port = seeder_handle.as_ref().map(|s| s.port).unwrap_or(args.port);
-    // Read uploaded bytes without borrowing `seeder_handle` (so it stays
-    // free to `stop()` later).
-    let uploaded_counter: Option<Arc<AtomicU64>> = seeder_handle.as_ref().map(|s| Arc::clone(&s.uploaded));
+        Err(e) => ui.log(format!("warning: could not start listener (download-only): {}", e)),
+    }
+    let announce_port = services.announce_port(args.port);
+    // A separate handle on the upload counter, so it stays readable
+    // whatever happens to the seeder itself.
+    let uploaded_counter = services.uploaded_counter();
     let uploaded = || uploaded_counter.as_ref().map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
 
     // Best-effort port forwarding (UPnP/NAT-PMP) so inbound peers and DHT
     // queries reach us behind a home router. Runs on its own thread and
     // never blocks; silently no-ops if the router doesn't cooperate.
-    let mut portmap_handle = if args.no_portmap || seeder_handle.is_none() {
-        None
-    } else {
-        let udp_port = dht_service.as_ref().map(|d| d.port).unwrap_or(announce_port);
+    if !args.no_portmap {
         let logger = ui.clone();
-        bittorrent_rs::portmap::map_ports(announce_port, udp_port, move |m| logger.log(m))
-    };
+        services.start_portmap(move |m| logger.log(m));
+    }
 
     // Only wanted pieces enter the queue and the progress totals; already-
     // verified wanted pieces count as done from the start. (Resumed
@@ -504,7 +496,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     // alive below.
     let web_seeds: Vec<String> = if args.no_webseed { Vec::new() } else { torrent.url_list.clone() };
 
-    if pool.known_count() == 0 && dht_service.is_none() && web_seeds.is_empty() {
+    if pool.known_count() == 0 && services.dht().is_none() && web_seeds.is_empty() {
         return Err(finish_err(ui, "no peers found from any tracker (and DHT + web seeds unavailable)".to_string()));
     }
     ui.log(format!("{} peer(s) known; dialing up to {} concurrently", pool.known_count(), args.max_peers));
@@ -605,7 +597,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
                 endgame: queue.in_endgame(),
                 trackers_ok,
                 trackers_total: tracker_urls.len(),
-                dht_nodes: dht_service.as_ref().map(|d| d.nodes.load(Ordering::SeqCst)).unwrap_or(0),
+                dht_nodes: services.dht().map(|d| d.nodes.load(Ordering::SeqCst)).unwrap_or(0),
                 pex_total,
                 web_seeds: web_handles.iter().filter(|h| !h.is_finished()).count(),
                 eta_secs,
@@ -656,7 +648,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             ui.log(format!("PEX: {} new peer address(es) from connected peers", pex_fresh));
         }
         fresh_since_announce += pex_fresh;
-        if let Some(dht) = &dht_service {
+        if let Some(dht) = services.dht() {
             let dht_fresh: usize = dht.peers_rx.try_iter().map(|batch| pool.add(batch)).sum();
             if dht_fresh > 0 {
                 ui.log(format!("DHT: {} new peer address(es)", dht_fresh));
@@ -755,7 +747,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             let _ = announce_to_all(&tracker_urls, &req);
         }
 
-        if args.seed && seeder_handle.is_some() {
+        if args.seed && services.has_seeder() {
             // Keep the UI live and seeding until the user quits. The UI
             // totals reflect the selected subset (display_total/goal).
             seed_loop(&torrent, our_peer_id, &tracker_urls, announce_port, reannounce_wait, uploaded_counter.clone(), display_total, goal_pieces, bytes_downloaded_this_run, ui, stop);
@@ -763,27 +755,11 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             ui.finish(Ok(summary.clone()));
         }
 
-        if let Some(p) = portmap_handle.as_mut() {
-            p.stop();
-        }
-        if let Some(s) = seeder_handle.as_mut() {
-            s.stop();
-        }
-        if let Some(d) = dht_service.as_mut() {
-            d.stop();
-        }
+        services.shutdown();
         Ok(summary)
     } else {
         let reason = format!("incomplete: {} piece(s) never downloaded ({} peer(s) dialed) -- rerun the same command to resume", queue.len(), pool.dialed());
-        if let Some(p) = portmap_handle.as_mut() {
-            p.stop();
-        }
-        if let Some(s) = seeder_handle.as_mut() {
-            s.stop();
-        }
-        if let Some(d) = dht_service.as_mut() {
-            d.stop();
-        }
+        services.shutdown();
         // If we're here because the user quit, don't flash a failure
         // banner -- main prints the "stopped" line.
         if !stop.load(Ordering::SeqCst) {
@@ -848,22 +824,6 @@ fn seed_loop(
             last_announce = Instant::now();
         }
         thread::sleep(UI_TICK);
-    }
-}
-
-fn start_dht(args: &Args, info_hash: [u8; 20], announce_port: &Arc<AtomicU16>, ui: &Ui) -> Option<dht::DhtService> {
-    if args.no_dht {
-        return None;
-    }
-    match dht::spawn_service(args.port, dht::DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect(), info_hash, Arc::clone(announce_port)) {
-        Ok(service) => {
-            ui.log(format!("DHT node running on UDP port {}", service.port));
-            Some(service)
-        }
-        Err(e) => {
-            ui.log(format!("DHT disabled (couldn't bind UDP socket): {}", e));
-            None
-        }
     }
 }
 

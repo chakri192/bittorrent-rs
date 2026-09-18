@@ -7,7 +7,9 @@
 pub mod peer_pool;
 pub mod plan;
 pub mod rate;
+pub mod services;
 
 pub use peer_pool::PeerPool;
 pub use plan::{DownloadPlan, Outstanding};
 pub use rate::RateSampler;
+pub use services::Services;
