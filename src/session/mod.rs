@@ -10,6 +10,7 @@ pub mod plan;
 pub mod progress;
 pub mod rate;
 pub mod services;
+pub mod workers;
 
 pub use announce::{Announcer, NetworkTrackers, TrackerClient};
 pub use peer_pool::PeerPool;
@@ -17,3 +18,4 @@ pub use plan::{DownloadPlan, Outstanding};
 pub use progress::Progress;
 pub use rate::RateSampler;
 pub use services::Services;
+pub use workers::{Log, Workers};

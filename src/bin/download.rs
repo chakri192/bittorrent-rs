@@ -16,11 +16,11 @@
 
 use bittorrent_rs::config::Config;
 use bittorrent_rs::dht;
-use bittorrent_rs::downloader::{build_file_spans, load_and_verify, progress_file_path, rewrite_compact, run_worker, PexSender, ResumeWriter, WorkQueue, WorkerConfig};
+use bittorrent_rs::downloader::{build_file_spans, load_and_verify, progress_file_path, rewrite_compact, ResumeWriter, WorkQueue, WorkerConfig};
 use bittorrent_rs::magnet::{parse_magnet_uri, MagnetLink};
 use bittorrent_rs::magnet_fetch::fetch_metadata_from_peer;
 use bittorrent_rs::seeder::{self, HaveMap};
-use bittorrent_rs::session::{Announcer, DownloadPlan, Outstanding, PeerPool, Progress, RateSampler, Services};
+use bittorrent_rs::session::{Announcer, DownloadPlan, Log, Outstanding, PeerPool, Progress, RateSampler, Services, Workers};
 use bittorrent_rs::torrent::{self, TorrentFile};
 use bittorrent_rs::tracker::{generate_peer_id, Event};
 use bittorrent_rs::tracker_discovery::{announce_to_all, build_request, TransferTotals};
@@ -484,34 +484,20 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         ui.log(format!("skipped {} IPv6 peer(s) with no local route (pass --ipv6 to force)", pool.skipped_ipv6()));
     }
 
-    let private = torrent.private;
-    let (tx, rx) = mpsc::channel();
-    let (pex_tx, pex_rx): (PexSender, mpsc::Receiver<Vec<SocketAddr>>) = mpsc::channel();
     let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: PIPELINE_DEPTH, connect_timeout: CONNECT_TIMEOUT });
+    let worker_log: Log = {
+        let ui = ui.clone();
+        Arc::new(move |m: String| ui.log(m))
+    };
+    let mut workers = Workers::new(Arc::clone(&queue), Arc::clone(&spans), config, piece_length, args.max_peers, torrent.private, worker_log);
 
     // Web-seed workers: one thread per url-list entry, draining the same
     // shared queue into the same verify-write-record pipeline as peers.
-    let web_stop = Arc::new(AtomicBool::new(false));
-    let mut web_handles: Vec<thread::JoinHandle<()>> = Vec::new();
     if !web_seeds.is_empty() {
         ui.log(format!("web seed: {} url(s) from the torrent's url-list", web_seeds.len()));
-        let files_arc = Arc::new(torrent.files.clone());
-        for url in &web_seeds {
-            let url = url.clone();
-            let name = torrent.name.clone();
-            let files = Arc::clone(&files_arc);
-            let queue = Arc::clone(&queue);
-            let spans = Arc::clone(&spans);
-            let tx = tx.clone();
-            let web_stop = Arc::clone(&web_stop);
-            let ui2 = ui.clone();
-            web_handles.push(thread::spawn(move || {
-                bittorrent_rs::webseed::run_web_worker(&url, &name, &files, &queue, &spans, piece_length, total_length, &tx, &web_stop, move |m| ui2.log(m));
-            }));
-        }
+        workers.start_web_seeds(&web_seeds, &torrent.name, &torrent.files, total_length);
     }
 
-    let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
     let mut progress = Progress::new(Arc::clone(&have), resume_writer, goal_pieces, pieces_done, bytes_already_done);
     let run_start = Instant::now();
     let mut fruitless_rounds = 0u32;
@@ -522,27 +508,6 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     // baseline, so they don't read as a burst of throughput.
     let mut rates = RateSampler::new(Instant::now(), bytes_already_done, uploaded());
 
-    macro_rules! spawn_up_to_cap {
-        () => {
-            while handles.len() < args.max_peers && !queue.is_empty() {
-                let Some(addr) = pool.next_to_dial() else { break };
-                let queue = Arc::clone(&queue);
-                let spans = Arc::clone(&spans);
-                let config = Arc::clone(&config);
-                let tx = tx.clone();
-                // No PEX channel for private torrents (BEP 27): the worker
-                // then neither advertises ut_pex nor forwards what it hears.
-                let pex_tx = (!private).then(|| pex_tx.clone());
-                let ui2 = ui.clone();
-                handles.push(thread::spawn(move || {
-                    if let Err(e) = run_worker(addr, &config, &queue, &spans, piece_length, &tx, pex_tx.as_ref()) {
-                        ui2.log(format!("peer {} disconnected: {:?}", addr, e));
-                    }
-                }));
-            }
-        };
-    }
-
     macro_rules! publish_snapshot {
         () => {{
             let done = progress.bytes_done();
@@ -552,12 +517,12 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             }
             let remaining = display_total.saturating_sub(done);
             let eta_secs = if rates.down_rate() > 1.0 { Some((remaining as f64 / rates.down_rate()) as u64) } else { None };
-            let web_active = web_handles.iter().any(|h| !h.is_finished());
+            let web_active = workers.web_active();
             let status = if queue.in_endgame() {
                 "endgame"
             } else if progress.bytes_this_run() > 0 || web_active {
                 "downloading"
-            } else if handles.is_empty() && pool.reserve_is_empty() {
+            } else if workers.active_peers() == 0 && pool.reserve_is_empty() {
                 "waiting"
             } else {
                 "connecting"
@@ -570,7 +535,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
                 down_rate: rates.down_rate(),
                 up_bytes: uploaded(),
                 up_rate: rates.up_rate(),
-                active_peers: handles.len(),
+                active_peers: workers.active_peers(),
                 dialed_peers: pool.dialed(),
                 known_peers: pool.known_count(),
                 endgame: queue.in_endgame(),
@@ -578,7 +543,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
                 trackers_total: announcer.tracker_count(),
                 dht_nodes: services.dht().map(|d| d.nodes.load(Ordering::SeqCst)).unwrap_or(0),
                 pex_total,
-                web_seeds: web_handles.iter().filter(|h| !h.is_finished()).count(),
+                web_seeds: workers.web_running(),
                 eta_secs,
                 elapsed_secs: run_start.elapsed().as_secs(),
                 status,
@@ -586,7 +551,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         }};
     }
 
-    spawn_up_to_cap!();
+    workers.spawn_peers(&mut pool);
     publish_snapshot!();
 
     loop {
@@ -600,7 +565,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             }
         }
 
-        match rx.recv_timeout(UI_TICK) {
+        match workers.recv_result(UI_TICK) {
             Ok(result) => progress.absorb(result, |m| ui.log(m)),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -610,10 +575,10 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             break;
         }
 
-        handles.retain(|h| !h.is_finished());
+        workers.reap();
 
         // Passive discovery feeds -> dial queue.
-        let pex_fresh: usize = pex_rx.try_iter().map(|batch| pool.add(batch)).sum();
+        let pex_fresh: usize = workers.pex_batches().map(|batch| pool.add(batch)).sum();
         if pex_fresh > 0 {
             pex_total += pex_fresh;
             ui.log(format!("PEX: {} new peer address(es) from connected peers", pex_fresh));
@@ -627,7 +592,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             fresh_since_announce += dht_fresh;
         }
 
-        spawn_up_to_cap!();
+        workers.spawn_peers(&mut pool);
 
         if !endgame_announced && queue.in_endgame() {
             endgame_announced = true;
@@ -636,7 +601,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
 
         publish_snapshot!();
 
-        let starved = handles.is_empty() && pool.reserve_is_empty();
+        let starved = workers.active_peers() == 0 && pool.reserve_is_empty();
         if !announcer.is_due(Instant::now(), starved) {
             continue;
         }
@@ -646,12 +611,12 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         let totals = TransferTotals { uploaded: uploaded(), downloaded: progress.bytes_this_run(), left: display_total.saturating_sub(progress.bytes_done()) };
         fresh_since_announce += pool.add(announcer.reannounce(Instant::now(), totals, |m| ui.log(m)));
 
-        spawn_up_to_cap!();
+        workers.spawn_peers(&mut pool);
 
         // A run isn't fruitless while a web seed is still pulling pieces --
         // it can finish the whole download with no peers at all.
-        let web_active = web_handles.iter().any(|h| !h.is_finished());
-        if fresh_since_announce == 0 && handles.is_empty() && pool.reserve_is_empty() && !web_active {
+        let web_active = workers.web_active();
+        if fresh_since_announce == 0 && workers.active_peers() == 0 && pool.reserve_is_empty() && !web_active {
             fruitless_rounds += 1;
             ui.log(format!("no new peers from any source ({}/{} fruitless rounds)", fruitless_rounds, MAX_FRUITLESS_ROUNDS));
             if fruitless_rounds >= MAX_FRUITLESS_ROUNDS {
@@ -663,16 +628,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         fresh_since_announce = 0;
     }
 
-    web_stop.store(true, Ordering::SeqCst);
-    drop(tx);
-    drop(pex_tx);
-    for h in handles {
-        let _ = h.join();
-    }
-    for h in web_handles {
-        let _ = h.join();
-    }
-    for result in rx.try_iter() {
+    for result in workers.shutdown() {
         progress.absorb(result, |m| ui.log(m));
     }
 
