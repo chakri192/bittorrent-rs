@@ -5,7 +5,9 @@
 //! parts that had no reason to live in a binary move here one at a time.
 
 pub mod peer_pool;
+pub mod plan;
 pub mod rate;
 
 pub use peer_pool::PeerPool;
+pub use plan::{DownloadPlan, Outstanding};
 pub use rate::RateSampler;

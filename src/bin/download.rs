@@ -16,11 +16,11 @@
 
 use bittorrent_rs::config::Config;
 use bittorrent_rs::dht;
-use bittorrent_rs::downloader::{build_file_spans, build_work_queue, load_and_verify, progress_file_path, rewrite_compact, run_worker, PexSender, ResumeWriter, WorkQueue, WorkerConfig};
+use bittorrent_rs::downloader::{build_file_spans, load_and_verify, progress_file_path, rewrite_compact, run_worker, PexSender, ResumeWriter, WorkQueue, WorkerConfig};
 use bittorrent_rs::magnet::{parse_magnet_uri, MagnetLink};
 use bittorrent_rs::magnet_fetch::fetch_metadata_from_peer;
 use bittorrent_rs::seeder::{self, HaveMap};
-use bittorrent_rs::session::{PeerPool, RateSampler};
+use bittorrent_rs::session::{DownloadPlan, Outstanding, PeerPool, RateSampler};
 use bittorrent_rs::torrent::{self, TorrentFile};
 use bittorrent_rs::tracker::{generate_peer_id, Event};
 use bittorrent_rs::tracker_discovery::{announce_to_all, build_request, TransferTotals};
@@ -398,17 +398,13 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         ui.finish(Ok(listing.clone()));
         return Ok(listing);
     }
-    let selective = !bittorrent_rs::selection::selects_everything(&mask);
-    // `selected_set` = pieces we intend to download; `display_total` /
-    // `goal_pieces` drive the progress UI for the selected subset. The
-    // *true* torrent length still governs on-disk piece math (spans,
-    // seeder), so those stay `total_length`.
-    let (selected_set, selected_bytes) = bittorrent_rs::selection::selected_pieces(&torrent.files, piece_length, &mask);
-    let display_total = if selective { selected_bytes } else { total_length };
-    let goal_pieces = if selective { selected_set.len() } else { total_pieces };
-    let is_wanted = |idx: u32| !selective || selected_set.contains(&idx);
+    // `display_total` / `goal_pieces` drive the progress UI for the
+    // selected subset. The *true* torrent length still governs on-disk
+    // piece math (spans, seeder), so those stay `total_length`.
+    let plan = DownloadPlan::new(&torrent, &mask);
+    let (selective, display_total, goal_pieces) = (plan.is_selective(), plan.display_total(), plan.goal_pieces());
     if selective {
-        ui.log(format!("selective download: {} of {} file(s), {} piece(s), {}", mask.iter().filter(|&&b| b).count(), torrent.files.len(), selected_set.len(), ui::format_bytes(display_total)));
+        ui.log(format!("selective download: {} of {} file(s), {} piece(s), {}", mask.iter().filter(|&&b| b).count(), torrent.files.len(), goal_pieces, ui::format_bytes(display_total)));
     }
 
     let tracker_urls = collect_tracker_urls(&torrent);
@@ -464,11 +460,8 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     // verified wanted pieces count as done from the start. (Resumed
     // *unwanted* pieces from a prior full run stay advertised for seeding
     // via `have` above, but don't count toward this run's goal.)
-    let all_work = build_work_queue(&torrent);
-    let confirmed_wanted: std::collections::HashSet<u32> = confirmed_resumed.iter().copied().filter(|i| is_wanted(*i)).collect();
-    let bytes_already_done: u64 = all_work.iter().filter(|w| confirmed_wanted.contains(&w.index)).map(|w| w.length as u64).sum();
-    let remaining_work: Vec<_> = all_work.into_iter().filter(|w| is_wanted(w.index) && !confirmed_resumed.contains(&w.index)).collect();
-    let queue = Arc::new(WorkQueue::new(remaining_work, total_pieces));
+    let Outstanding { work, pieces_done, bytes_done: bytes_already_done } = plan.outstanding(&torrent, &confirmed_resumed);
+    let queue = Arc::new(WorkQueue::new(work, total_pieces));
 
     let allow_ipv6 = match args.ipv6 {
         Ipv6Mode::Always => true,
@@ -547,7 +540,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     }
 
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
-    let mut verified = confirmed_wanted.len();
+    let mut verified = pieces_done;
     let run_start = Instant::now();
     let mut last_announce = Instant::now();
     let mut fruitless_rounds = 0u32;
