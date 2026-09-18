@@ -20,6 +20,7 @@ use bittorrent_rs::downloader::{build_file_spans, build_work_queue, load_and_ver
 use bittorrent_rs::magnet::{parse_magnet_uri, MagnetLink};
 use bittorrent_rs::magnet_fetch::fetch_metadata_from_peer;
 use bittorrent_rs::seeder::{self, HaveMap};
+use bittorrent_rs::session::PeerPool;
 use bittorrent_rs::torrent::{self, TorrentFile};
 use bittorrent_rs::tracker::{generate_peer_id, Event};
 use bittorrent_rs::tracker_discovery::{announce_to_all, build_request, TransferTotals};
@@ -337,55 +338,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// One dial queue fed by every discovery source (tracker, DHT, PEX,
-/// magnet bootstrap). `known` remembers every address ever seen so a peer
-/// is dialed at most once; `reserve` holds the ones not yet dialed.
-struct PeerPool {
-    known: HashSet<SocketAddr>,
-    reserve: VecDeque<SocketAddr>,
-    /// When false, IPv6 peer addresses are dropped on arrival rather than
-    /// wasting a dial slot on an unroutable host.
-    allow_ipv6: bool,
-    /// Count of IPv6 addresses dropped for lack of a route (diagnostics).
-    skipped_ipv6: usize,
-}
-
-impl PeerPool {
-    fn new(allow_ipv6: bool) -> Self {
-        PeerPool { known: HashSet::new(), reserve: VecDeque::new(), allow_ipv6, skipped_ipv6: 0 }
-    }
-
-    fn add(&mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> usize {
-        let mut fresh = 0;
-        for addr in addrs {
-            if addr.port() == 0 {
-                continue;
-            }
-            if addr.is_ipv6() && !self.allow_ipv6 {
-                self.skipped_ipv6 += 1;
-                continue;
-            }
-            if self.known.insert(addr) {
-                self.reserve.push_back(addr);
-                fresh += 1;
-            }
-        }
-        fresh
-    }
-
-    fn next_to_dial(&mut self) -> Option<SocketAddr> {
-        self.reserve.pop_front()
-    }
-
-    fn reserve_is_empty(&self) -> bool {
-        self.reserve.is_empty()
-    }
-
-    fn dialed(&self) -> usize {
-        self.known.len() - self.reserve.len()
-    }
-}
-
 /// The whole download, start to finish, publishing to `ui`. Returns a
 /// human-readable completion summary (`Ok`) or a failure reason (`Err`);
 /// either way it also calls `ui.finish` so the dashboard can wind down
@@ -559,12 +511,12 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     // alive below.
     let web_seeds: Vec<String> = if args.no_webseed { Vec::new() } else { torrent.url_list.clone() };
 
-    if pool.known.is_empty() && dht_service.is_none() && web_seeds.is_empty() {
+    if pool.known_count() == 0 && dht_service.is_none() && web_seeds.is_empty() {
         return Err(finish_err(ui, "no peers found from any tracker (and DHT + web seeds unavailable)".to_string()));
     }
-    ui.log(format!("{} peer(s) known; dialing up to {} concurrently", pool.known.len(), args.max_peers));
-    if pool.skipped_ipv6 > 0 {
-        ui.log(format!("skipped {} IPv6 peer(s) with no local route (pass --ipv6 to force)", pool.skipped_ipv6));
+    ui.log(format!("{} peer(s) known; dialing up to {} concurrently", pool.known_count(), args.max_peers));
+    if pool.skipped_ipv6() > 0 {
+        ui.log(format!("skipped {} IPv6 peer(s) with no local route (pass --ipv6 to force)", pool.skipped_ipv6()));
     }
 
     let private = torrent.private;
@@ -670,7 +622,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
                 up_rate: smoothed_up,
                 active_peers: handles.len(),
                 dialed_peers: pool.dialed(),
-                known_peers: pool.known.len(),
+                known_peers: pool.known_count(),
                 endgame: queue.in_endgame(),
                 trackers_ok,
                 trackers_total: tracker_urls.len(),
@@ -1083,45 +1035,4 @@ fn collect_tracker_urls(torrent: &TorrentFile) -> Vec<String> {
     urls.sort();
     urls.dedup();
     urls
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn v4(s: &str) -> SocketAddr {
-        s.parse().unwrap()
-    }
-    fn v6(s: &str) -> SocketAddr {
-        s.parse().unwrap()
-    }
-
-    #[test]
-    fn pool_dedups_and_skips_port_zero() {
-        let mut pool = PeerPool::new(true);
-        let added = pool.add([v4("10.0.0.1:6881"), v4("10.0.0.1:6881"), v4("10.0.0.2:0")]);
-        assert_eq!(added, 1, "duplicate collapses, port-0 is dropped");
-        assert_eq!(pool.dialed(), 0);
-        assert_eq!(pool.next_to_dial(), Some(v4("10.0.0.1:6881")));
-        assert_eq!(pool.dialed(), 1);
-        assert!(pool.reserve_is_empty());
-    }
-
-    #[test]
-    fn pool_drops_ipv6_when_disallowed_and_counts_it() {
-        let mut pool = PeerPool::new(false);
-        let added = pool.add([v4("10.0.0.1:6881"), v6("[2001:db8::1]:6881"), v6("[2001:db8::2]:51413")]);
-        assert_eq!(added, 1, "only the v4 peer is queued");
-        assert_eq!(pool.skipped_ipv6, 2);
-        assert_eq!(pool.next_to_dial(), Some(v4("10.0.0.1:6881")));
-        assert!(pool.reserve_is_empty());
-    }
-
-    #[test]
-    fn pool_keeps_ipv6_when_allowed() {
-        let mut pool = PeerPool::new(true);
-        let added = pool.add([v6("[2001:db8::1]:6881")]);
-        assert_eq!(added, 1);
-        assert_eq!(pool.skipped_ipv6, 0);
-    }
 }

@@ -9,6 +9,7 @@ pub mod peer;
 pub mod portmap;
 pub mod seeder;
 pub mod selection;
+pub mod session;
 pub mod torrent;
 pub mod tracker;
 pub mod tracker_discovery;
