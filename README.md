@@ -9,7 +9,7 @@ Every layer is written here — the bencode parser, the peer wire protocol, trac
 <p>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-1c1c1e?style=flat-square&logo=rust&logoColor=DEA584" />
   <img alt="Size" src="https://img.shields.io/badge/~10k-lines-1c1c1e?style=flat-square" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-342%20passing-1c1c1e?style=flat-square" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-360%20passing-1c1c1e?style=flat-square" />
   <img alt="BEPs" src="https://img.shields.io/badge/BEP-3%20·%205%20·%209%2F10%20·%2011%20·%2015%20·%2019%20·%2027-1c1c1e?style=flat-square" />
   <img alt="Fuzzed" src="https://img.shields.io/badge/parsers-fuzzed-1c1c1e?style=flat-square" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-1c1c1e?style=flat-square" />
@@ -133,7 +133,7 @@ cargo test
 cargo run --bin e2e_harness      # loopback scenarios: public, private, resume, --only, dropped peer, --timeout, --seed
 ```
 
-342 tests (341 unit, 1 doctest), all passing, all confined to loopback.
+360 tests (359 unit, 1 doctest), all passing, all confined to loopback.
 
 Coverage spans parsing, the KRPC codec verified against BEP 5's published byte strings, DHT lookup and announce over a scripted transport, workers driven against mock peers, the seeder against a mock leecher, and web-seed range arithmetic. An end-to-end harness runs the real binary against a synthetic tracker and peer on `127.0.0.1` and compares output byte for byte. Its scenarios cover a public torrent, a private one (no DHT, no PEX), a client killed mid-download that must resume and fetch only the pieces it lacks, `--only` on one file of three (only the pieces that file touches may be requested), a peer that hangs up halfway through a piece while another supplies the rest, and `--timeout` against a peer that goes silent (the client must stop, exit non-zero, report the download incomplete and keep its resume file), and `--seed` (the client announces started and completed, stays up, and serves every piece back to a leecher on the port it announced). Three `cargo-fuzz` targets exercise the parsers handling untrusted input.
 
