@@ -9,8 +9,8 @@ Every layer is written here — the bencode parser, the peer wire protocol, trac
 <p>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-1c1c1e?style=flat-square&logo=rust&logoColor=DEA584" />
   <img alt="Size" src="https://img.shields.io/badge/~10k-lines-1c1c1e?style=flat-square" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-259%20passing-1c1c1e?style=flat-square" />
-  <img alt="BEPs" src="https://img.shields.io/badge/BEP-3%20·%205%20·%209%2F10%20·%2011%20·%2015%20·%2019-1c1c1e?style=flat-square" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-269%20passing-1c1c1e?style=flat-square" />
+  <img alt="BEPs" src="https://img.shields.io/badge/BEP-3%20·%205%20·%209%2F10%20·%2011%20·%2015%20·%2019%20·%2027-1c1c1e?style=flat-square" />
   <img alt="Fuzzed" src="https://img.shields.io/badge/parsers-fuzzed-1c1c1e?style=flat-square" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-1c1c1e?style=flat-square" />
 </p>
@@ -37,12 +37,13 @@ It has been validated against real public torrents, including a 21 GB distributi
 | 5 | DHT Protocol | Kademlia routing table, iterative `get_peers`, `announce_peer`, inbound query handling |
 | 9 / 10 | Metadata Exchange · Extension Protocol | Retrieving the info dictionary from peers for magnet links |
 | 11 | Peer Exchange | Peer discovery through connected peers |
+| 27 | Private Torrents | Honours the `private` flag: tracker-only peer discovery, no DHT or PEX |
 | 15 | UDP Tracker Protocol | Connectionless tracker announces |
 | 19 | WebSeed — HTTP/FTP Seeding | Ranged HTTP retrieval from web servers |
 
 ## Requirements
 
-A stable Rust toolchain. No system libraries beyond those the listed crates require.
+Rust 1.88 or newer (the floor set by the locked dependency graph, and checked in CI). No system libraries beyond those the listed crates require.
 
 ## Installation
 
@@ -129,10 +130,10 @@ A `ratatui` dashboard with a piece-map heatmap, throughput sparklines, and an ac
 
 ```sh
 cargo test
-cargo run --bin e2e_harness      # loopback transfer, byte-for-byte comparison
+cargo run --bin e2e_harness      # loopback transfers (public and private torrent), byte-for-byte comparison
 ```
 
-259 tests — 256 unit and 3 integration — all passing, all confined to loopback.
+269 tests — 266 unit and 3 integration — all passing, all confined to loopback.
 
 Coverage spans parsing, the KRPC codec verified against BEP 5's published byte strings, DHT lookup and announce over a scripted transport, workers driven against mock peers, the seeder against a mock leecher, and web-seed range arithmetic. An end-to-end harness runs the release binary against a synthetic tracker and peer on `127.0.0.1` and compares output byte for byte. Three `cargo-fuzz` targets exercise the parsers handling untrusted input.
 
@@ -140,8 +141,9 @@ Coverage spans parsing, the KRPC codec verified against BEP 5's published byte s
 
 - **One thread per peer with blocking I/O.** Appropriate at the default connection limit; not a scaling strategy.
 - **Seeding unchokes every interested peer** up to the connection cap. There is no tit-for-tat rate measurement.
-- **The DHT is IPv4-only** (BEP 32 is not implemented), uses a fixed-bucket routing table, and derives announce tokens from a single non-rotating secret per run.
+- **The DHT is IPv4-only** (BEP 32 is not implemented), and uses a fixed-bucket routing table.
 - **Under `--only`, a piece spanning a selected and an unselected file is retrieved in full**, which may leave an adjacent file partially written. This matches standard client behaviour.
+- **Magnet links to private torrents use the DHT briefly.** The `private` flag lives in the info dict, which a magnet link does not carry, so the DHT runs while the metadata is fetched and is shut down as soon as the flag is seen. A `.torrent` file never touches the DHT.
 - **No partial-piece resume across peers.** A peer disconnecting mid-piece forfeits that connection's progress on it. Complete verified pieces from earlier sessions resume normally.
 
 ## Network configuration
