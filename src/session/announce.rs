@@ -45,6 +45,9 @@ pub struct Announcer<C: TrackerClient = NetworkTrackers> {
     port: u16,
     /// `--reannounce`: an interval that wins over whatever trackers ask.
     fixed_interval: Option<Duration>,
+    /// The shortest wait ever used: [`MIN_REANNOUNCE`] in real use. Only
+    /// tests lower it, so they need not sit through 30-second waits.
+    floor: Duration,
     wait: Duration,
     last_at: Instant,
     trackers_ok: usize,
@@ -65,10 +68,19 @@ impl<C: TrackerClient> Announcer<C> {
             peer_id,
             port,
             fixed_interval,
+            floor: MIN_REANNOUNCE,
             wait: fixed_interval.map_or(DEFAULT_REANNOUNCE, |d| d.max(MIN_REANNOUNCE)),
             last_at: now,
             trackers_ok: 0,
         }
+    }
+
+    /// Lowers the floor under every wait to `floor`.
+    #[cfg(test)]
+    pub(crate) fn with_floor(mut self, floor: Duration) -> Self {
+        self.floor = floor;
+        self.wait = self.fixed_interval.map_or(DEFAULT_REANNOUNCE, |d| d.max(floor));
+        self
     }
 
     pub fn has_trackers(&self) -> bool {
@@ -93,7 +105,7 @@ impl<C: TrackerClient> Announcer<C> {
     /// and nothing left to dial) shortens the wait to [`MIN_REANNOUNCE`],
     /// since fresh peers are the only way forward.
     pub fn is_due(&self, now: Instant, starved: bool) -> bool {
-        let wait = if starved { MIN_REANNOUNCE } else { self.wait };
+        let wait = if starved { self.floor } else { self.wait };
         now.saturating_duration_since(self.last_at) >= wait
     }
 
@@ -135,7 +147,7 @@ impl<C: TrackerClient> Announcer<C> {
         // get rate-limited.
         if self.fixed_interval.is_none() {
             if let Some(secs) = interval {
-                self.wait = Duration::from_secs(secs as u64).max(MIN_REANNOUNCE);
+                self.wait = Duration::from_secs(secs as u64).max(self.floor);
             }
         }
         peers
@@ -331,6 +343,29 @@ mod tests {
         assert_eq!(a.trackers_ok(), 0, "the reply is not used");
         assert!(a.is_due(secs(t0, 100 + 120), false), "and its interval isn't adopted");
         assert!(!a.is_due(secs(t0, 100 + 119), false));
+    }
+
+    #[test]
+    fn a_lowered_floor_applies_to_starvation_adopted_and_fixed_intervals() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let client = Scripted::default();
+        client.reply(&[], &[], Some(0));
+
+        // Starved: the wait is the floor itself.
+        let mut a = announcer(&client, 1, None, t0).with_floor(ms(50));
+        assert!(!a.is_due(t0 + ms(49), true));
+        assert!(a.is_due(t0 + ms(50), true));
+
+        // A tracker interval below the floor is raised to the (lowered) floor.
+        a.start(t0, totals(), |_| {});
+        assert!(!a.is_due(t0 + ms(49), false));
+        assert!(a.is_due(t0 + ms(50), false));
+
+        // So is a fixed one.
+        let b = announcer(&client, 1, Some(0), t0).with_floor(ms(70));
+        assert!(!b.is_due(t0 + ms(69), false));
+        assert!(b.is_due(t0 + ms(70), false));
     }
 
     #[test]

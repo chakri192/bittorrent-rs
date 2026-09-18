@@ -373,6 +373,12 @@ mod tests {
     /// A session over the 4-piece test torrent, wired to `sink` and to the
     /// given peers, writing into `dir`.
     fn session<'a>(sink: &'a Arc<RecordingSink>, services: &'a Services, dir: &Path, peers: &[SocketAddr], timeout: Option<Duration>) -> Session<'a> {
+        session_with_floor(sink, services, dir, peers, timeout, crate::session::announce::MIN_REANNOUNCE)
+    }
+
+    /// As [`session`], with the announce floor lowered, so the paths that
+    /// wait on it (a starved swarm) run in milliseconds.
+    fn session_with_floor<'a>(sink: &'a Arc<RecordingSink>, services: &'a Services, dir: &Path, peers: &[SocketAddr], timeout: Option<Duration>, floor: Duration) -> Session<'a> {
         let data = data();
         let work = data.chunks(PIECE_LEN).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32 }).collect();
         let queue = Arc::new(WorkQueue::new(work, PIECES));
@@ -391,7 +397,7 @@ mod tests {
             services,
             queue,
             workers,
-            announcer: Announcer::new(Vec::new(), INFO_HASH, [2; 20], 6881, None, Instant::now()),
+            announcer: Announcer::new(Vec::new(), INFO_HASH, [2; 20], 6881, None, Instant::now()).with_floor(floor),
             progress,
             pool,
             display_total: data.len() as u64,
@@ -445,6 +451,136 @@ mod tests {
         assert!(!report.complete);
         assert_eq!((report.remaining, report.dialed, report.bytes_this_run), (PIECES, 0, 0));
         assert!(report.elapsed < Duration::from_secs(1));
+    }
+
+    /// A loopback address nothing listens on: dialing it is refused at once.
+    fn dead_addr() -> SocketAddr {
+        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+    }
+
+    /// A web seed that accepts the connection and then says nothing, so
+    /// its worker stays busy for as long as the test needs.
+    fn stalled_web_seed() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let _held = listener.accept();
+            thread::sleep(Duration::from_secs(30));
+        });
+        format!("http://{}/", addr)
+    }
+
+    #[test]
+    fn a_dead_swarm_ends_the_run_after_the_fruitless_rounds() {
+        let dir = tmp_dir("dead");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        // One peer that refuses connections, no trackers, no DHT, no web
+        // seed: nothing will ever be found. No stop request, so the way out
+        // is the swarm being declared dead; the timeout is only a net so a
+        // regression there fails this test instead of hanging it.
+        let mut s = session_with_floor(&sink, &services, &dir, &[dead_addr()], Some(Duration::from_secs(15)), Duration::from_millis(1));
+
+        let report = s.run(&AtomicBool::new(false));
+
+        assert!(!report.complete);
+        assert_eq!((report.remaining, report.dialed, report.bytes_this_run), (PIECES, 1, 0));
+        for round in 1..=MAX_FRUITLESS_ROUNDS {
+            assert!(sink.logged(&format!("no new peers from any source ({}/{} fruitless rounds)", round, MAX_FRUITLESS_ROUNDS)), "round {} was announced", round);
+        }
+        assert!(!sink.logged("--timeout"), "it ended by declaring the swarm dead, not by the safety timeout");
+        assert!(report.elapsed < Duration::from_secs(15), "and promptly: {:?}", report.elapsed);
+    }
+
+    #[test]
+    fn a_run_does_not_give_up_while_a_peer_is_still_connected() {
+        let dir = tmp_dir("connected");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        // A peer that connects, unchokes and never answers. Its worker gives
+        // up when its 1s read timeout expires; until then the swarm is not
+        // dead, however many announce rounds come and go.
+        let mut s = session_with_floor(&sink, &services, &dir, &[fake_peer(false)], Some(Duration::from_secs(15)), Duration::from_millis(1)); // the timeout is only a net
+
+        let report = s.run(&AtomicBool::new(false));
+
+        assert!(!report.complete);
+        assert!(!sink.logged("--timeout"), "it ended by declaring the swarm dead, not by the safety timeout");
+        assert!(report.elapsed >= Duration::from_secs(1), "the run outlasted the peer's read timeout: {:?}", report.elapsed);
+        let first_fruitless = sink.lines.lock().unwrap().iter().position(|l| l.contains("(1/5 fruitless rounds)")).expect("it did give up in the end");
+        let peer_gone = sink.lines.lock().unwrap().iter().position(|l| l.contains("disconnected")).expect("the peer's worker logged its exit");
+        assert!(peer_gone < first_fruitless, "no round was fruitless before the peer went away");
+    }
+
+    #[test]
+    fn a_round_counts_as_fruitless_only_when_nothing_is_running_found_or_left_to_dial() {
+        let dir = tmp_dir("rounds");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let mut s = session(&sink, &services, &dir, &[], None);
+
+        for round in 1..MAX_FRUITLESS_ROUNDS {
+            assert!(!s.round_was_fruitless_and_final(), "round {} is not yet the last", round);
+            assert_eq!(s.fruitless_rounds, round);
+        }
+        assert!(s.round_was_fruitless_and_final(), "the fifth in a row ends the run");
+        assert!(sink.logged("(5/5 fruitless rounds)"));
+    }
+
+    #[test]
+    fn finding_new_addresses_resets_the_fruitless_count() {
+        let dir = tmp_dir("fresh");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let mut s = session(&sink, &services, &dir, &[], None);
+        s.fruitless_rounds = MAX_FRUITLESS_ROUNDS - 1;
+        s.fresh_since_announce = 2;
+
+        assert!(!s.round_was_fruitless_and_final(), "a round that found peers is never the last");
+        assert_eq!(s.fruitless_rounds, 0);
+        assert_eq!(s.fresh_since_announce, 0, "and the next round starts counting from nothing");
+    }
+
+    #[test]
+    fn a_peer_waiting_to_be_dialed_keeps_the_swarm_alive() {
+        let dir = tmp_dir("reserve");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let mut s = session(&sink, &services, &dir, &[dead_addr()], None); // known, not yet dialed
+        s.fruitless_rounds = MAX_FRUITLESS_ROUNDS - 1;
+
+        assert!(!s.round_was_fruitless_and_final());
+        assert_eq!(s.fruitless_rounds, 0);
+    }
+
+    #[test]
+    fn a_connected_peer_keeps_the_swarm_alive() {
+        let dir = tmp_dir("active");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let mut s = session(&sink, &services, &dir, &[fake_peer(false)], None);
+        s.workers.spawn_peers(&mut s.pool);
+        assert_eq!(s.workers.active_peers(), 1);
+        s.fruitless_rounds = MAX_FRUITLESS_ROUNDS - 1;
+
+        assert!(!s.round_was_fruitless_and_final());
+        assert_eq!(s.fruitless_rounds, 0);
+    }
+
+    #[test]
+    fn a_web_seed_still_working_keeps_the_swarm_alive() {
+        // A web seed can finish the whole download with no peers at all.
+        let dir = tmp_dir("web");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let mut s = session(&sink, &services, &dir, &[], None);
+        let len = data().len() as i64;
+        s.workers.start_web_seeds(&[stalled_web_seed()], "t", &[(vec!["f.bin".to_string()], len)], len as u64);
+        assert!(s.workers.web_active());
+        s.fruitless_rounds = MAX_FRUITLESS_ROUNDS - 1;
+
+        assert!(!s.round_was_fruitless_and_final());
+        assert_eq!(s.fruitless_rounds, 0);
     }
 
     #[test]
