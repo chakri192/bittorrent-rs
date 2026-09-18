@@ -51,3 +51,136 @@ pub(super) fn absorb(msg: &Message, state: &mut PeerState, queue: &WorkQueue, pe
     }
     state.apply_message(msg)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::downloader::PieceWork;
+    use std::io::ErrorKind;
+    use std::net::SocketAddr;
+    use std::sync::mpsc;
+
+    fn queue(pieces: usize) -> WorkQueue {
+        WorkQueue::new((0..pieces).map(|i| PieceWork { index: i as u32, hash: [0; 20], length: 16 }).collect(), pieces)
+    }
+
+    /// A ut_pex payload announcing the given compact peers.
+    fn pex(peers: &[[u8; 6]]) -> Vec<u8> {
+        let added = peers.concat();
+        let mut payload = format!("d5:added{}:", added.len()).into_bytes();
+        payload.extend_from_slice(&added);
+        payload.push(b'e');
+        payload
+    }
+
+    fn pex_message(payload: Vec<u8>) -> Message {
+        Message::Extended { id: OUR_UT_PEX_ID, payload }
+    }
+
+    /// The order the queue would hand pieces out in, which is rarest first.
+    fn pop_order(q: &WorkQueue) -> Vec<u32> {
+        std::iter::from_fn(|| q.pop()).map(|w| w.index).take(q.len()).collect()
+    }
+
+    #[test]
+    fn a_bitfield_updates_the_peers_state_and_the_queues_rarity() {
+        let q = queue(4);
+        let mut state = PeerState::new();
+
+        // The peer has pieces 0 and 3 (bits are most-significant first).
+        let active = absorb(&Message::Bitfield(vec![0b1001_0000]), &mut state, &q, None);
+
+        assert!(active, "a bitfield is the peer doing something");
+        assert_eq!(&state.peer_has_pieces[..4], &[true, false, false, true]);
+        // Pieces 1 and 2 now have no holder, so they are the rarest and go
+        // first. (With no rarity data the queue would hand out 0 and 3
+        // first, so this fails if the bitfield is not fed to it.)
+        let order = pop_order(&q);
+        assert_eq!(order.iter().take(2).copied().collect::<std::collections::BTreeSet<_>>(), [1, 2].into(), "got {:?}", order);
+    }
+
+    #[test]
+    fn a_have_makes_that_piece_less_rare() {
+        let q = queue(4);
+        let mut state = PeerState::new();
+
+        assert!(absorb(&Message::Have { piece_index: 2 }, &mut state, &q, None));
+
+        assert_eq!(pop_order(&q).last(), Some(&2), "piece 2 has a holder now, so it is handed out last");
+    }
+
+    #[test]
+    fn pex_addresses_go_to_the_channel_and_count_as_activity() {
+        let (tx, rx) = mpsc::channel();
+        let mut state = PeerState::new();
+
+        let active = absorb(&pex_message(pex(&[[10, 1, 2, 3, 0x1a, 0x0b]])), &mut state, &queue(1), Some(&tx));
+
+        assert!(active);
+        assert_eq!(rx.try_recv().unwrap(), vec!["10.1.2.3:6667".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn without_a_channel_pex_is_dropped_but_the_peer_still_counts_as_alive() {
+        // The caller passes no channel for a private torrent (BEP 27).
+        let mut state = PeerState::new();
+        assert!(absorb(&pex_message(pex(&[[10, 1, 2, 3, 0x1a, 0x0b]])), &mut state, &queue(1), None));
+    }
+
+    #[test]
+    fn an_empty_pex_batch_is_not_forwarded() {
+        let (tx, rx) = mpsc::channel();
+        let mut state = PeerState::new();
+        assert!(absorb(&pex_message(b"d5:added0:e".to_vec()), &mut state, &queue(1), Some(&tx)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_malformed_pex_payload_is_ignored_and_never_costs_the_connection() {
+        let (tx, rx) = mpsc::channel();
+        let mut state = PeerState::new();
+        assert!(absorb(&pex_message(b"this is not bencode".to_vec()), &mut state, &queue(1), Some(&tx)), "still a live peer");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_extension_message_we_did_not_ask_for_is_ordinary_traffic() {
+        let (tx, rx) = mpsc::channel();
+        let mut state = PeerState::new();
+        let other = Message::Extended { id: OUR_UT_PEX_ID + 1, payload: pex(&[[10, 1, 2, 3, 0x1a, 0x0b]]) };
+
+        assert!(!absorb(&other, &mut state, &queue(1), Some(&tx)), "it changes nothing, so it is not evidence of activity");
+        assert!(rx.try_recv().is_err(), "and its payload is not read as PEX");
+    }
+
+    #[test]
+    fn choke_and_unchoke_change_the_peers_state() {
+        let mut state = PeerState::new();
+        assert!(state.peer_choking);
+        assert!(absorb(&Message::Unchoke, &mut state, &queue(1), None));
+        assert!(!state.peer_choking);
+        assert!(absorb(&Message::Choke, &mut state, &queue(1), None));
+        assert!(state.peer_choking);
+    }
+
+    fn wire_io(kind: ErrorKind) -> ConnectionError {
+        ConnectionError::Wire(WireError::Io(std::io::Error::new(kind, "x")))
+    }
+
+    #[test]
+    fn a_read_timeout_is_told_apart_from_a_dead_connection() {
+        // WouldBlock on Unix, TimedOut on Windows: both mean "nothing yet".
+        assert!(is_read_timeout(&wire_io(ErrorKind::WouldBlock)));
+        assert!(is_read_timeout(&wire_io(ErrorKind::TimedOut)));
+        assert!(!is_read_timeout(&wire_io(ErrorKind::UnexpectedEof)));
+        assert!(!is_read_timeout(&wire_io(ErrorKind::ConnectionReset)));
+        assert!(!is_read_timeout(&ConnectionError::InfoHashMismatch));
+    }
+
+    #[test]
+    fn a_timeout_from_the_socket_itself_is_not_a_read_timeout() {
+        // Only a timeout while reading a message counts: a connect or write
+        // that times out is a real failure.
+        assert!(!is_read_timeout(&ConnectionError::Io(std::io::Error::new(ErrorKind::TimedOut, "x"))));
+    }
+}

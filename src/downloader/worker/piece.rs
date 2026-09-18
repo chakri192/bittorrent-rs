@@ -93,3 +93,27 @@ fn stage_label(base: &'static str, blocks_received: u32) -> &'static str {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn before_any_block_arrives_the_stage_keeps_its_plain_name() {
+        assert_eq!(stage_label("send_request", 0), "send_request");
+        assert_eq!(stage_label("read_message_during_piece_download", 0), "read_message_during_piece_download");
+    }
+
+    #[test]
+    fn after_some_progress_the_stage_says_so() {
+        // A peer dying after 500 blocks is not the same failure as one
+        // dying before its first, and the label is how the log tells them apart.
+        assert_eq!(stage_label("send_request", 1), "send_request_after_prior_progress");
+        assert_eq!(stage_label("read_message_during_piece_download", 500), "read_message_after_prior_progress");
+    }
+
+    #[test]
+    fn a_stage_with_no_progress_variant_is_left_alone() {
+        assert_eq!(stage_label("connect_and_handshake", 7), "connect_and_handshake");
+    }
+}

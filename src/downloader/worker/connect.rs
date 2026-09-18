@@ -71,3 +71,121 @@ pub(super) fn establish(peer_addr: SocketAddr, config: &WorkerConfig, queue: &Wo
 
     Ok((stream, state))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::downloader::PieceWork;
+    use crate::peer::handshake::Handshake;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    const INFO_HASH: [u8; 20] = [0x42; 20];
+
+    fn config() -> WorkerConfig {
+        WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2) }
+    }
+
+    fn queue(pieces: usize) -> WorkQueue {
+        WorkQueue::new((0..pieces).map(|i| PieceWork { index: i as u32, hash: [0; 20], length: 16 }).collect(), pieces)
+    }
+
+    /// A peer that completes the handshake (advertising BEP 10 support or
+    /// not) and then follows `script`, which is handed the connection.
+    fn fake_peer(supports_extensions: bool, script: impl FnOnce(&mut TcpStream) + Send + 'static) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut hs = [0u8; 68];
+            stream.read_exact(&mut hs).unwrap();
+            stream.write_all(&Handshake::new(INFO_HASH, [9; 20], supports_extensions).to_bytes()).unwrap();
+            script(&mut stream);
+        });
+        addr
+    }
+
+    /// Reads messages from the client until one satisfies `want`.
+    fn read_until(stream: &mut TcpStream, want: impl Fn(&Message) -> bool) -> Message {
+        loop {
+            let msg = Message::read_from(stream).expect("the client should keep talking");
+            if want(&msg) {
+                return msg;
+            }
+        }
+    }
+
+    #[test]
+    fn establish_says_it_is_interested_and_returns_once_the_peer_unchokes() {
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let addr = fake_peer(false, move |stream| {
+            // A real peer will not unchoke us until we have said we are interested.
+            read_until(stream, |m| matches!(m, Message::Interested));
+            seen_tx.send(()).unwrap();
+            Message::Unchoke.write_to(stream).unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let (_stream, state) = establish(addr, &config(), &queue(1), None).expect("connected and unchoked");
+
+        seen_rx.try_recv().expect("the peer received Interested before it unchoked us");
+        assert!(!state.peer_choking);
+        assert!(state.am_interested);
+        assert!(!state.supports_extensions, "the peer did not advertise BEP 10");
+    }
+
+    /// Whether the client's extended handshake offered ut_pex, when it is
+    /// given a PEX channel (`Some`) or not (`None`, a private torrent).
+    fn offers_pex(channel: Option<PexSender>) -> bool {
+        let (tx, rx) = mpsc::channel();
+        let addr = fake_peer(true, move |stream| {
+            let Message::Extended { payload, .. } = read_until(stream, |m| matches!(m, Message::Extended { id: 0, .. })) else { unreachable!() };
+            tx.send(ExtendedHandshake::parse(&payload).unwrap().peer_ut_pex_id().is_some()).unwrap();
+            read_until(stream, |m| matches!(m, Message::Interested));
+            Message::Unchoke.write_to(stream).unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+        establish(addr, &config(), &queue(1), channel.as_ref()).expect("connected and unchoked");
+        rx.recv_timeout(Duration::from_secs(2)).expect("the peer saw an extended handshake")
+    }
+
+    #[test]
+    fn an_extension_capable_peer_is_offered_pex_only_when_there_is_a_channel_for_it() {
+        let (tx, _rx) = mpsc::channel();
+        assert!(offers_pex(Some(tx)));
+        assert!(!offers_pex(None), "BEP 27: a private torrent's workers do not advertise ut_pex");
+    }
+
+    #[test]
+    fn what_the_peer_says_while_choked_updates_the_state_and_the_queue() {
+        let addr = fake_peer(false, |stream| {
+            Message::Bitfield(vec![0b0110_0000]).write_to(stream).unwrap();
+            Message::Unchoke.write_to(stream).unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let (_stream, state) = establish(addr, &config(), &queue(4), None).unwrap();
+
+        assert_eq!(&state.peer_has_pieces[..4], &[false, true, true, false], "the bitfield sent before the unchoke was kept");
+    }
+
+    #[test]
+    fn a_peer_that_hangs_up_before_unchoking_is_a_named_failure() {
+        let addr = fake_peer(false, |_stream| {}); // handshake, then close
+
+        let err = establish(addr, &config(), &queue(1), None).expect_err("no unchoke ever comes");
+
+        // Depending on timing the client notices on its write or on its read.
+        assert!(matches!(err, WorkerError::Connection { stage, .. } if stage == "wait_for_unchoke" || stage == "send_interested"), "got {:?}", err);
+    }
+
+    #[test]
+    fn an_unreachable_peer_fails_at_the_connect_stage() {
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let err = establish(dead, &config(), &queue(1), None).expect_err("nothing is listening");
+        assert!(matches!(err, WorkerError::Connection { stage: "connect_and_handshake", .. }), "got {:?}", err);
+    }
+}
