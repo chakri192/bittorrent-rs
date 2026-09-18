@@ -20,7 +20,7 @@ use bittorrent_rs::downloader::{build_file_spans, load_and_verify, progress_file
 use bittorrent_rs::magnet::{parse_magnet_uri, MagnetLink};
 use bittorrent_rs::magnet_fetch::fetch_metadata_from_peer;
 use bittorrent_rs::seeder::{self, HaveMap};
-use bittorrent_rs::session::{DownloadPlan, Outstanding, PeerPool, RateSampler, Services};
+use bittorrent_rs::session::{DownloadPlan, Outstanding, PeerPool, Progress, RateSampler, Services};
 use bittorrent_rs::torrent::{self, TorrentFile};
 use bittorrent_rs::tracker::{generate_peer_id, Event};
 use bittorrent_rs::tracker_discovery::{announce_to_all, build_request, TransferTotals};
@@ -419,7 +419,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         ui.log(format!("resuming: {} piece(s) already verified on disk", confirmed_resumed.len()));
         rewrite_compact(&progress_path, &confirmed_resumed).map_err(|e| finish_err(ui, format!("writing resume file: {}", e)))?;
     }
-    let mut resume_writer = ResumeWriter::create(&progress_path).map_err(|e| finish_err(ui, format!("opening resume file: {}", e)))?;
+    let resume_writer = ResumeWriter::create(&progress_path).map_err(|e| finish_err(ui, format!("opening resume file: {}", e)))?;
 
     // Upload side: serve verified pieces to inbound peers for the whole
     // run. A bind failure downgrades to download-only with a warning.
@@ -468,7 +468,6 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     let mut pool = PeerPool::new(allow_ipv6);
     pool.add(bootstrap_peers);
 
-    let mut bytes_downloaded_this_run: u64 = 0;
     let mut trackers_ok = 0usize;
     let mut pex_total = 0usize;
 
@@ -532,7 +531,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     }
 
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
-    let mut verified = pieces_done;
+    let mut progress = Progress::new(Arc::clone(&have), resume_writer, goal_pieces, pieces_done, bytes_already_done);
     let run_start = Instant::now();
     let mut last_announce = Instant::now();
     let mut fruitless_rounds = 0u32;
@@ -566,7 +565,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
 
     macro_rules! publish_snapshot {
         () => {{
-            let done = bytes_already_done + bytes_downloaded_this_run;
+            let done = progress.bytes_done();
             if rates.sample(Instant::now(), done, uploaded()) {
                 ui.push_rates(rates.down_rate() as u64, rates.up_rate() as u64);
                 ui.set_pieces(have.snapshot()); // drives the piece-map heatmap
@@ -576,7 +575,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             let web_active = web_handles.iter().any(|h| !h.is_finished());
             let status = if queue.in_endgame() {
                 "endgame"
-            } else if bytes_downloaded_this_run > 0 || web_active {
+            } else if progress.bytes_this_run() > 0 || web_active {
                 "downloading"
             } else if handles.is_empty() && pool.reserve_is_empty() {
                 "waiting"
@@ -586,7 +585,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             ui.set_snapshot(Snapshot {
                 total_length: display_total,
                 total_pieces: goal_pieces,
-                verified,
+                verified: progress.verified(),
                 done_bytes: done,
                 down_rate: rates.down_rate(),
                 up_bytes: uploaded(),
@@ -622,15 +621,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         }
 
         match rx.recv_timeout(UI_TICK) {
-            Ok(result) => {
-                verified += 1;
-                bytes_downloaded_this_run += result.data.len() as u64;
-                have.set(result.index);
-                if let Err(e) = resume_writer.record(result.index) {
-                    ui.log(format!("warning: failed to record resume progress for piece {}: {}", result.index, e));
-                }
-                ui.log(format!("piece {} verified ({}/{})", result.index, verified, goal_pieces));
-            }
+            Ok(result) => progress.absorb(result, |m| ui.log(m)),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -674,7 +665,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
 
         if !tracker_urls.is_empty() {
             ui.log(format!("{} piece(s) remaining, re-announcing to trackers", queue.len()));
-            let totals = TransferTotals { uploaded: uploaded(), downloaded: bytes_downloaded_this_run, left: display_total.saturating_sub(bytes_already_done + bytes_downloaded_this_run) };
+            let totals = TransferTotals { uploaded: uploaded(), downloaded: progress.bytes_this_run(), left: display_total.saturating_sub(progress.bytes_done()) };
             let req = build_request(torrent.info_hash, our_peer_id, announce_port, totals, None);
             let (peers, failures, interval) = announce_to_all(&tracker_urls, &req);
             trackers_ok = tracker_urls.len().saturating_sub(failures.len());
@@ -716,16 +707,12 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         let _ = h.join();
     }
     for result in rx.try_iter() {
-        verified += 1;
-        bytes_downloaded_this_run += result.data.len() as u64;
-        have.set(result.index);
-        let _ = resume_writer.record(result.index);
-        ui.log(format!("piece {} verified ({}/{})", result.index, verified, goal_pieces));
+        progress.absorb(result, |m| ui.log(m));
     }
 
     let complete = queue.is_empty();
     let elapsed = run_start.elapsed();
-    let avg = bytes_downloaded_this_run as f64 / elapsed.as_secs_f64().max(0.001);
+    let avg = progress.bytes_this_run() as f64 / elapsed.as_secs_f64().max(0.001);
 
     if complete {
         bittorrent_rs::downloader::resume::clear(&progress_path);
@@ -741,8 +728,8 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         );
         ui.log("download complete");
 
-        if !tracker_urls.is_empty() && bytes_downloaded_this_run > 0 {
-            let totals = TransferTotals { uploaded: uploaded(), downloaded: bytes_downloaded_this_run, left: 0 };
+        if !tracker_urls.is_empty() && progress.bytes_this_run() > 0 {
+            let totals = TransferTotals { uploaded: uploaded(), downloaded: progress.bytes_this_run(), left: 0 };
             let req = build_request(torrent.info_hash, our_peer_id, announce_port, totals, Some(Event::Completed));
             let _ = announce_to_all(&tracker_urls, &req);
         }
@@ -750,7 +737,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         if args.seed && services.has_seeder() {
             // Keep the UI live and seeding until the user quits. The UI
             // totals reflect the selected subset (display_total/goal).
-            seed_loop(&torrent, our_peer_id, &tracker_urls, announce_port, reannounce_wait, uploaded_counter.clone(), display_total, goal_pieces, bytes_downloaded_this_run, ui, stop);
+            seed_loop(&torrent, our_peer_id, &tracker_urls, announce_port, reannounce_wait, uploaded_counter.clone(), display_total, goal_pieces, progress.bytes_this_run(), ui, stop);
         } else {
             ui.finish(Ok(summary.clone()));
         }
