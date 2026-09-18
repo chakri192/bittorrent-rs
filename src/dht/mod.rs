@@ -91,12 +91,58 @@ pub fn random_node_id() -> NodeId {
     h.finalize().into()
 }
 
+/// How often the announce-token secret is replaced. BEP 5 leaves the
+/// schedule to the implementation but requires a token to stay valid for
+/// a while after it is issued; mainline rotates every 5 minutes and
+/// accepts the previous generation too, so a token is good for 5-10.
+const TOKEN_ROTATION: Duration = Duration::from_secs(300);
+
+/// The secrets announce tokens are derived from: the current one, plus
+/// the one before it so a token handed out just before a rotation still
+/// verifies. Anything older is rejected, which is the point -- a token
+/// harvested once cannot be replayed indefinitely.
+struct TokenSecrets {
+    current: [u8; 20],
+    previous: Option<[u8; 20]>,
+    rotated_at: Instant,
+}
+
+impl TokenSecrets {
+    fn new(now: Instant) -> Self {
+        TokenSecrets { current: random_node_id(), previous: None, rotated_at: now }
+    }
+
+    fn rotate(&mut self, now: Instant) {
+        self.previous = Some(std::mem::replace(&mut self.current, random_node_id()));
+        self.rotated_at = now;
+    }
+
+    fn rotate_if_due(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.rotated_at) >= TOKEN_ROTATION {
+            self.rotate(now);
+        }
+    }
+
+    fn accepts(&self, ip: &std::net::Ipv4Addr, token: &[u8]) -> bool {
+        token_for(&self.current, ip) == token || self.previous.is_some_and(|prev| token_for(&prev, ip) == token)
+    }
+}
+
+/// Announce token for `ip` under `secret`: the first 8 bytes of
+/// sha1(secret || ip). Opaque to the receiver (BEP 5), verifiable by us.
+fn token_for(secret: &[u8; 20], ip: &std::net::Ipv4Addr) -> Vec<u8> {
+    let mut h = Sha1::new();
+    h.update(secret);
+    h.update(ip.octets());
+    h.finalize()[..8].to_vec()
+}
+
 pub struct Dht<T: Transport> {
     node_id: NodeId,
     table: RoutingTable,
     transport: T,
     txid_counter: u16,
-    token_secret: [u8; 20],
+    tokens: TokenSecrets,
     /// info_hash -> peers other nodes announced to us. Bounded per hash;
     /// this client is a downloader first, storage node second.
     peer_store: HashMap<NodeId, Vec<SocketAddrV4>>,
@@ -112,7 +158,7 @@ impl<T: Transport> Dht<T> {
             table: RoutingTable::new(node_id),
             transport,
             txid_counter: 0,
-            token_secret: random_node_id(), // any 20 unpredictable bytes
+            tokens: TokenSecrets::new(Instant::now()),
             peer_store: HashMap::new(),
         }
     }
@@ -142,16 +188,8 @@ impl<T: Transport> Dht<T> {
         Ok(t)
     }
 
-    /// Announce token for `ip` (BEP 5: opaque to the receiver, must be
-    /// verifiable by us later): sha1(secret || ip). One static secret per
-    /// process run -- mainline rotates every 5 minutes and accepts two
-    /// generations; for a client process that lives for one download,
-    /// non-rotating is an honest simplification.
     fn make_token(&self, ip: &std::net::Ipv4Addr) -> Vec<u8> {
-        let mut h = Sha1::new();
-        h.update(self.token_secret);
-        h.update(ip.octets());
-        h.finalize()[..8].to_vec()
+        token_for(&self.tokens.current, ip)
     }
 
     /// Handles one inbound datagram. Queries get answered on the spot;
@@ -164,6 +202,7 @@ impl<T: Transport> Dht<T> {
 
         match msg {
             KrpcMessage::Query { t, query } => {
+                self.tokens.rotate_if_due(Instant::now());
                 // A node that queries us is alive at that address --
                 // exactly the freshness signal the routing table wants.
                 self.table.insert(*query.sender_id(), from_v4);
@@ -178,7 +217,7 @@ impl<T: Transport> Dht<T> {
                         }
                     }
                     Query::AnnouncePeer { info_hash, port, token, implied_port, .. } => {
-                        if *token != self.make_token(from_v4.ip()) {
+                        if !self.tokens.accepts(from_v4.ip(), token) {
                             let err = KrpcMessage::Error { t, code: 203, message: "bad token".to_string() };
                             let _ = self.transport.send_to(&err.encode(), from);
                             return None;
@@ -666,5 +705,79 @@ mod tests {
             KrpcMessage::Response { response, .. } => assert_eq!(response.values, vec![v4("10.5.5.5:7070")], "implied_port=1 must use the UDP source port, not the port field"),
             _ => unreachable!(),
         }
+    }
+    /// Sends `get_peers` from `asker` and returns the token in the reply.
+    fn harvest_token(dht: &mut Dht<&MockTransport>, transport: &MockTransport, asker: SocketAddrV4, info_hash: [u8; 20]) -> Vec<u8> {
+        let stop = AtomicBool::new(false);
+        let q = KrpcMessage::Query { t: b"g".to_vec(), query: Query::GetPeers { id: [0x02; 20], info_hash } };
+        transport.push_inbound(q.encode(), asker);
+        dht.serve_for(Duration::from_millis(1), &stop);
+        match KrpcMessage::decode(transport.sent_to(asker).last().unwrap()).unwrap() {
+            KrpcMessage::Response { response, .. } => response.token.expect("get_peers response must carry a token"),
+            other => panic!("expected response, got {:?}", other),
+        }
+    }
+
+    /// Sends `announce_peer` with `token` and reports whether it was
+    /// accepted (a plain response) or refused (error 203).
+    fn announce_accepted(dht: &mut Dht<&MockTransport>, transport: &MockTransport, asker: SocketAddrV4, info_hash: [u8; 20], token: Vec<u8>) -> bool {
+        let stop = AtomicBool::new(false);
+        let q = KrpcMessage::Query { t: b"a".to_vec(), query: Query::AnnouncePeer { id: [0x02; 20], info_hash, port: 9999, token, implied_port: false } };
+        transport.push_inbound(q.encode(), asker);
+        dht.serve_for(Duration::from_millis(1), &stop);
+        match KrpcMessage::decode(transport.sent_to(asker).last().unwrap()).unwrap() {
+            KrpcMessage::Response { .. } => true,
+            KrpcMessage::Error { code: 203, .. } => false,
+            other => panic!("unexpected reply {:?}", other),
+        }
+    }
+
+    #[test]
+    fn token_issued_before_one_rotation_is_still_accepted() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let asker = v4("10.5.5.5:7000");
+        let token = harvest_token(&mut dht, &transport, asker, [0x77; 20]);
+
+        dht.tokens.rotate(Instant::now());
+
+        assert!(announce_accepted(&mut dht, &transport, asker, [0x77; 20], token), "one generation back must still verify");
+    }
+
+    #[test]
+    fn token_issued_before_two_rotations_is_rejected() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let asker = v4("10.5.5.5:7000");
+        let token = harvest_token(&mut dht, &transport, asker, [0x77; 20]);
+
+        dht.tokens.rotate(Instant::now());
+        dht.tokens.rotate(Instant::now());
+
+        assert!(!announce_accepted(&mut dht, &transport, asker, [0x77; 20], token), "a stale token must not be replayable");
+    }
+
+    #[test]
+    fn rotation_happens_only_once_the_interval_has_elapsed() {
+        let start = Instant::now();
+        let mut secrets = TokenSecrets::new(start);
+        let original = secrets.current;
+
+        secrets.rotate_if_due(start + TOKEN_ROTATION - Duration::from_secs(1));
+        assert_eq!(secrets.current, original, "must not rotate early");
+        assert!(secrets.previous.is_none());
+
+        secrets.rotate_if_due(start + TOKEN_ROTATION);
+        assert_ne!(secrets.current, original, "must rotate at the interval");
+        assert_eq!(secrets.previous, Some(original), "the old secret is kept for one more generation");
+    }
+
+    #[test]
+    fn tokens_are_bound_to_the_requesters_ip() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let token = harvest_token(&mut dht, &transport, v4("10.5.5.5:7000"), [0x77; 20]);
+
+        assert!(!announce_accepted(&mut dht, &transport, v4("10.6.6.6:7000"), [0x77; 20], token), "a token must not work from a different address");
     }
 }
