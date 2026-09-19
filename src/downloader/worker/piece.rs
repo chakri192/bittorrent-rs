@@ -1,8 +1,9 @@
 //! Downloading one piece from a peer: pipelining its block requests,
 //! assembling the blocks, and verifying the result.
 
+use super::connect::MAX_UNCHOKE_WAIT_TIMEOUTS;
 use super::pipeline::{depth_for, Throughput};
-use super::{absorb, PexSender, WorkerError};
+use super::{absorb, is_read_timeout, PexSender, WorkerError};
 use crate::downloader::piece_assembler::PieceAssembler;
 use crate::downloader::queue::WorkQueue;
 use crate::peer::{Message, PeerState};
@@ -32,6 +33,8 @@ pub(super) fn download_one_piece(
     // Outstanding (begin, length) requests -- what we'd need to Cancel
     // (BEP 3) if this piece completes elsewhere mid-flight.
     let mut in_flight: Vec<(u32, u32)> = Vec::new();
+    // Read timeouts sat through in a row while the peer has us choked.
+    let mut choked_timeouts = 0u32;
 
     loop {
         // Endgame check: if a duplicate of this piece verified elsewhere,
@@ -44,16 +47,27 @@ pub(super) fn download_one_piece(
             return Ok(None);
         }
 
-        let depth = depth_for(throughput.rate(Instant::now()), min_depth, state.peer_request_limit);
-        while in_flight.len() < depth {
-            let reqs = assembler.next_requests(depth - in_flight.len());
-            if reqs.is_empty() {
-                break;
-            }
-            for (index, begin, length) in reqs {
-                crate::peer::connection::send_message(stream, &Message::Request { index, begin, length })
-                    .map_err(|e| WorkerError::Connection { stage: stage_label("send_request", blocks_received), error: e })?;
-                in_flight.push((begin, length));
+        if state.peer_choking {
+            // A choke makes the peer discard every request it has not yet
+            // answered, and it will not send them after an unchoke. Forget
+            // them here too, so that once unchoked the blocks still missing
+            // are asked for again; the ones that arrived are kept. Nothing
+            // is requested while choked.
+            in_flight.clear();
+            assembler.forget_requests();
+        } else {
+            choked_timeouts = 0;
+            let depth = depth_for(throughput.rate(Instant::now()), min_depth, state.peer_request_limit);
+            while in_flight.len() < depth {
+                let reqs = assembler.next_requests(depth - in_flight.len());
+                if reqs.is_empty() {
+                    break;
+                }
+                for (index, begin, length) in reqs {
+                    crate::peer::connection::send_message(stream, &Message::Request { index, begin, length })
+                        .map_err(|e| WorkerError::Connection { stage: stage_label("send_request", blocks_received), error: e })?;
+                    in_flight.push((begin, length));
+                }
             }
         }
 
@@ -61,7 +75,24 @@ pub(super) fn download_one_piece(
             break;
         }
 
-        let msg = crate::peer::connection::read_message(stream).map_err(|e| WorkerError::Connection { stage: stage_label("read_message_during_piece_download", blocks_received), error: e })?;
+        let msg = match crate::peer::connection::read_message(stream) {
+            Ok(msg) => msg,
+            // Waiting out a choke is not a failure -- peers unchoke in
+            // rounds of 10-30 seconds -- so a quiet spell is put up with
+            // (for as long as the wait for an unchoke at connect time is).
+            Err(ref e) if state.peer_choking && is_read_timeout(e) => {
+                choked_timeouts += 1;
+                if choked_timeouts >= MAX_UNCHOKE_WAIT_TIMEOUTS {
+                    return Err(WorkerError::Connection {
+                        stage: "peer_choked_us_mid_piece",
+                        error: crate::peer::ConnectionError::Wire(crate::peer::WireError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "peer stayed choked through the whole wait budget"))),
+                    });
+                }
+                crate::peer::connection::send_message(stream, &Message::KeepAlive).map_err(|e| WorkerError::Connection { stage: "keepalive_while_choked", error: e })?;
+                continue;
+            }
+            Err(e) => return Err(WorkerError::Connection { stage: stage_label("read_message_during_piece_download", blocks_received), error: e }),
+        };
         match &msg {
             Message::Piece { index, begin, block } if *index == piece_index => {
                 let _ = assembler.record_block(*begin, block);

@@ -7,7 +7,7 @@ use std::net::{SocketAddr, TcpStream};
 
 /// How many read timeouts in a row to sit through while waiting for the
 /// peer to unchoke us before giving up on it.
-const MAX_UNCHOKE_WAIT_TIMEOUTS: u32 = 6;
+pub(super) const MAX_UNCHOKE_WAIT_TIMEOUTS: u32 = 6;
 
 /// Connects to `peer_addr`, does the BitTorrent handshake and (if the peer
 /// supports it) the extended one, tells the peer we are interested, and

@@ -74,18 +74,30 @@ impl PieceAssembler {
 
     /// Returns up to `max_new` fresh `(index, begin, length)` requests to
     /// send, advancing the internal cursor so the same block is never
-    /// handed out twice. Used to keep `pipeline_depth` requests in flight
-    /// at once per BEP 3's pipelining recommendation.
+    /// handed out twice, and never one that has already arrived. Used to
+    /// keep `pipeline_depth` requests in flight at once per BEP 3's
+    /// pipelining recommendation.
     pub fn next_requests(&mut self, max_new: usize) -> Vec<BlockRequest> {
         let mut out = Vec::with_capacity(max_new);
         while out.len() < max_new && self.next_unrequested_block < self.num_blocks() {
             let block_idx = self.next_unrequested_block;
+            self.next_unrequested_block += 1;
+            if self.received[block_idx as usize] {
+                continue;
+            }
             let begin = block_idx * BLOCK_SIZE;
             let len = self.block_len(block_idx);
             out.push((self.work.index, begin, len));
-            self.next_unrequested_block += 1;
         }
         out
+    }
+
+    /// Forgets which blocks have been requested, so that the ones still
+    /// missing are handed out again by `next_requests`. For when the peer
+    /// has discarded every request it was sent (BEP 3: a choke does that).
+    /// Blocks that have arrived are kept.
+    pub fn forget_requests(&mut self) {
+        self.next_unrequested_block = 0;
     }
 
     /// Records an arrived `Piece` message's payload at byte offset `begin`.
@@ -235,5 +247,32 @@ mod tests {
         let mut asm = PieceAssembler::new(work);
         assert_eq!(asm.next_requests(10).len(), 1);
         assert_eq!(asm.next_requests(10).len(), 0);
+    }
+
+    #[test]
+    fn requests_never_include_a_block_that_has_already_arrived() {
+        let data = vec![7u8; (BLOCK_SIZE * 3) as usize];
+        let mut a = PieceAssembler::new(PieceWork { index: 0, hash: hash_of(&data), length: data.len() as u32 });
+        a.record_block(BLOCK_SIZE, &data[..BLOCK_SIZE as usize]).unwrap(); // the middle block, unasked
+
+        let requests = a.next_requests(10);
+
+        assert_eq!(requests.iter().map(|&(_, begin, _)| begin).collect::<Vec<_>>(), vec![0, 2 * BLOCK_SIZE], "the middle block is skipped");
+    }
+
+    #[test]
+    fn forgetting_requests_makes_the_missing_blocks_come_round_again_and_only_those() {
+        let data: Vec<u8> = (0..(BLOCK_SIZE * 4) as usize).map(|i| i as u8).collect();
+        let mut a = PieceAssembler::new(PieceWork { index: 9, hash: hash_of(&data), length: data.len() as u32 });
+        assert_eq!(a.next_requests(4).len(), 4, "everything requested");
+        assert!(a.next_requests(4).is_empty(), "and nothing left to request");
+        a.record_block(0, &data[..BLOCK_SIZE as usize]).unwrap();
+        a.record_block(2 * BLOCK_SIZE, &data[2 * BLOCK_SIZE as usize..3 * BLOCK_SIZE as usize]).unwrap();
+
+        a.forget_requests();
+        let again = a.next_requests(4);
+
+        assert_eq!(again.iter().map(|&(index, begin, _)| (index, begin)).collect::<Vec<_>>(), vec![(9, BLOCK_SIZE), (9, 3 * BLOCK_SIZE)], "blocks 1 and 3, the ones that never arrived");
+        assert!(a.next_requests(4).is_empty());
     }
 }

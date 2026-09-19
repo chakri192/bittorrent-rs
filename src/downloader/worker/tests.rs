@@ -673,3 +673,138 @@ fn a_sequential_queue_is_downloaded_in_order_and_a_rarest_first_one_is_not() {
     assert_eq!(download_order("order-sequential", Order::Sequential), vec![0, 1, 2, 3]);
     assert_eq!(download_order("order-rarest", Order::RarestFirst), vec![2, 3, 0, 1], "the same swarm, fetched rare pieces first");
 }
+
+// ---- a peer that chokes us in the middle of things ----
+
+/// What a choking peer saw.
+struct ChokerLog {
+    /// Requests that arrived while it had the client choked, and so ignored,
+    /// as a real peer does.
+    ignored_while_choked: usize,
+}
+
+/// A peer that serves `serve_before_choke` blocks, then chokes the client
+/// and ignores its requests until `choked_for` has passed (for good, with
+/// `None`), and then unchokes it and serves again.
+fn spawn_choking_peer(listener: TcpListener, info_hash: [u8; 20], pieces: Vec<Vec<u8>>, serve_before_choke: usize, choked_for: Option<Duration>) -> thread::JoinHandle<ChokerLog> {
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut hs_buf = [0u8; 68];
+        std::io::Read::read_exact(&mut stream, &mut hs_buf).unwrap();
+        std::io::Write::write_all(&mut stream, &Handshake::new(info_hash, [0x99; 20], false).to_bytes()).unwrap();
+        let mut bits = vec![0u8; pieces.len().div_ceil(8)];
+        for i in 0..pieces.len() {
+            bits[i / 8] |= 1 << (7 - (i % 8));
+        }
+        WireMessage::Bitfield(bits).write_to(&mut stream).unwrap();
+        WireMessage::Unchoke.write_to(&mut stream).unwrap();
+        stream.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+
+        let mut log = ChokerLog { ignored_while_choked: 0 };
+        let (mut served, mut choked_until, mut choke_done) = (0usize, None::<Instant>, false);
+        loop {
+            if let (Some(until), Some(_)) = (choked_until, choked_for) {
+                if Instant::now() >= until {
+                    if WireMessage::Unchoke.write_to(&mut stream).is_err() {
+                        return log;
+                    }
+                    choked_until = None;
+                }
+            }
+            match WireMessage::read_from(&mut stream) {
+                Ok(WireMessage::Request { index, begin, length }) => {
+                    if choked_until.is_some() {
+                        log.ignored_while_choked += 1;
+                        continue;
+                    }
+                    let block = pieces[index as usize][begin as usize..(begin + length) as usize].to_vec();
+                    if (WireMessage::Piece { index, begin, block }).write_to(&mut stream).is_err() {
+                        return log;
+                    }
+                    served += 1;
+                    if !choke_done && served == serve_before_choke {
+                        choke_done = true;
+                        if WireMessage::Choke.write_to(&mut stream).is_err() {
+                            return log;
+                        }
+                        // "For good" is an hour: longer than any test.
+                        choked_until = Some(Instant::now() + choked_for.unwrap_or(Duration::from_secs(3600)));
+                    }
+                }
+                Ok(_) => {}
+                Err(WireError::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => return log,
+            }
+        }
+    })
+}
+
+/// Two pieces of four blocks each, from a peer that chokes after serving
+/// `serve_before_choke` blocks for `choked_for`, with a client read timeout
+/// of `read_timeout`.
+fn download_through_a_choke(name: &str, serve_before_choke: usize, choked_for: Duration, read_timeout: Duration) -> (Result<(), WorkerError>, ChokerLog, Vec<u32>) {
+    let pieces: Vec<Vec<u8>> = (0..2u8).map(|i| (0..4 * 16384).map(|b| (b as u8).wrapping_mul(11).wrapping_add(i)).collect()).collect();
+    let info_hash = [0x65; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = spawn_choking_peer(listener, info_hash, pieces.clone(), serve_before_choke, Some(choked_for));
+
+    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32 }).collect();
+    let queue = Arc::new(WorkQueue::new(work, 2));
+    let dir = tmp_dir(name);
+    let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 8 * 16384)]));
+    let (tx, rx) = mpsc::channel();
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: read_timeout, down_limit: None, interrupt: Default::default() };
+
+    let result = run_worker(addr, &config, &queue, &spans, 4 * 16384, &tx, None);
+    drop(tx);
+    let mut got: Vec<u32> = rx.try_iter().map(|r| r.index).collect();
+    got.sort_unstable();
+    // Hang up so the peer's loop ends and it can be joined.
+    drop(config);
+    let log = peer.join().unwrap();
+    (result, log, got)
+}
+
+#[test]
+fn a_choke_at_any_point_is_waited_out_and_the_missing_blocks_are_asked_for_again() {
+    // Mid-way through the first piece, exactly between the pieces, and
+    // mid-way through the second. The choke lasts three read timeouts.
+    for serve_before_choke in [2, 4, 6] {
+        let (result, log, got) = download_through_a_choke(&format!("choke-{}", serve_before_choke), serve_before_choke, Duration::from_millis(600), Duration::from_millis(200));
+
+        assert!(result.is_ok(), "choked after {} blocks: {:?}", serve_before_choke, result);
+        assert_eq!(got, vec![0, 1], "choked after {} blocks: both pieces arrived and verified", serve_before_choke);
+        assert!(log.ignored_while_choked > 0, "choked after {} blocks: the peer discarded requests, so some had to be sent again", serve_before_choke);
+        // At most one piece's worth (4 blocks) were already on their way
+        // when the choke came; a client that kept asking while choked would
+        // send that many again on every quiet spell.
+        assert!(log.ignored_while_choked <= 4, "choked after {} blocks: {} requests reached a peer that had us choked", serve_before_choke, log.ignored_while_choked);
+    }
+}
+
+#[test]
+fn a_peer_that_chokes_and_never_unchokes_is_given_up_on_and_the_piece_goes_back() {
+    let pieces: Vec<Vec<u8>> = vec![vec![0x5A; 4 * 16384]];
+    let info_hash = [0x66; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _peer = spawn_choking_peer(listener, info_hash, pieces.clone(), 1, None);
+    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: sha1_of(&pieces[0]), length: 4 * 16384 }], 1));
+    let dir = tmp_dir("choked-for-good");
+    let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 4 * 16384)]));
+    let (tx, _rx) = mpsc::channel();
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default() };
+
+    // Run it where a failure to give up shows as a failed test, not a hung one.
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker_queue = Arc::clone(&queue);
+    thread::spawn(move || {
+        let _ = done_tx.send(run_worker(addr, &config, &worker_queue, &spans, 4 * 16384, &tx, None));
+    });
+    let result = done_rx.recv_timeout(Duration::from_secs(15)).expect("the worker should have given up on a peer that never unchokes");
+
+    assert!(matches!(result, Err(WorkerError::Connection { stage: "peer_choked_us_mid_piece", .. })), "{:?}", result);
+    assert_eq!(queue.len(), 1, "the piece is back on the queue for another peer");
+    assert!(!queue.in_endgame());
+}
