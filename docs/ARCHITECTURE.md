@@ -26,6 +26,7 @@ someone about to change the code.
        │
        ▼
   peer/  handshake · wire messages · extensions (BEP 10) · PEX (BEP 11)
+         Fast Extension (BEP 6) · message stream encryption · PeerStream
   bencode.rs · torrent.rs   the formats everything above reads
 ```
 
@@ -97,6 +98,14 @@ how much they took, one optimistic), and offers the info dictionary to peers
 that have only a magnet link (BEP 9), saying `upload_only` once it has every
 piece (BEP 21).
 
+**Connections are `PeerStream`s** (`peer/stream.rs`): anything that reads and
+writes and can be shut down from another thread. A worker or the seeder does
+not know whether it has a plain socket or an encrypted one (`peer/mse.rs`), so
+a transport is one more implementation of the trait. **The Fast Extension**
+(`peer/fast.rs`, and the choke handling in `worker/piece.rs` and `seeder.rs`)
+changes what "choked" means: a worker may still ask for the pieces a peer has
+allowed, and a peer that refuses a request says so instead of staying silent.
+
 Piece data reaches disk only after its hash has matched. Everything before
 that is untrusted bytes in a buffer.
 
@@ -150,5 +159,5 @@ seeding half of tit-for-tat, since inbound peers are never downloaded from;
 trackers are asked concurrently rather than by BEP 12 tier; a piece
 interrupted part-way is handed to the next peer within a run but not saved
 across runs; one piece is downloaded at a time per connection, so a request
-pipeline drains at each piece boundary; no encryption, uTP, BEP 6, BEP 14 or
-BEP 32, and no BEP 52 (v2) torrents.
+pipeline drains at each piece boundary; no uTP, BEP 14 or BEP 32, and no BEP 52
+(v2) torrents.

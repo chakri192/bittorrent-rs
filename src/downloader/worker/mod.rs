@@ -21,10 +21,10 @@ mod tests;
 use crate::downloader::file_writer::{write_piece, FileSpan};
 use crate::downloader::queue::{PieceResult, Take, WorkQueue};
 use crate::ratelimit::RateLimiter;
-use crate::peer::{ConnectionError, WireError};
+use crate::peer::{ConnectionError, Message, WireError};
 use connect::establish;
 use messages::{absorb, is_read_timeout};
-use piece::{download_one_piece, Meter};
+use piece::{download_one_piece, Downloaded, Meter};
 pub use peer_stats::{Activity, PeerRegistry, PeerRow, PeerStat};
 use pipeline::Throughput;
 use crate::peer::{Closer, PeerStream};
@@ -174,10 +174,13 @@ pub fn run_worker(
     let mut irrelevant_cycles = 0u32;
     // How fast this peer delivers, which sets how many requests to queue.
     let mut throughput = Throughput::default();
+    // Pieces this peer keeps refusing to send (BEP 6): not asked for again on this connection.
+    let mut refused: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     loop {
-        // The rarest piece *this peer has*: one it lacks is no use to it.
-        let work = match queue.take_for(|piece| state.peer_has_pieces.get(piece as usize).copied().unwrap_or(false)) {
+        // The rarest piece *this peer has* and will send now: one it lacks is
+        // no use to it, nor is one it will not send while it has us choked.
+        let work = match queue.take_for(|piece| state.peer_has_pieces.get(piece as usize).copied().unwrap_or(false) && state.may_request(piece) && !refused.contains(&piece)) {
             Take::Piece(work) => work,
             Take::Done => break,
             Take::NothingForThisPeer => {
@@ -191,7 +194,7 @@ pub fn run_worker(
         let piece_index = work.index;
 
         match download_one_piece(&mut stream, &mut state, queue, work.clone(), config, Meter { throughput: &mut throughput, stat }, pex_tx) {
-            Ok(Some(data)) => {
+            Ok(Downloaded::Verified(data)) => {
                 if let Err(e) = write_piece(spans, piece_index, piece_length, &data) {
                     // Disk failure isn't the peer's fault; requeue and bail
                     // out of this worker entirely rather than risk more
@@ -206,7 +209,12 @@ pub fn run_worker(
                     let _ = results_tx.send(PieceResult { index: piece_index, data });
                 }
             }
-            Ok(None) => {
+            Ok(Downloaded::Refused) => {
+                // Not this peer's to give: let someone else have the piece.
+                queue.push_back(work);
+                refused.insert(piece_index);
+            }
+            Ok(Downloaded::Abandoned) => {
                 // Endgame: another worker finished this piece while we
                 // were mid-download; nothing to write, nothing to report.
             }
@@ -242,11 +250,19 @@ fn wait_for_a_piece_it_has(stream: &mut dyn PeerStream, state: &mut crate::peer:
         }
         Err(ref e) if is_read_timeout(e) => {
             *irrelevant_cycles += 1;
+            // Waiting out a choke: show we are still here, as while waiting
+            // for the first unchoke, or the peer's idle timeout reaps us.
+            if state.peer_choking {
+                crate::peer::connection::send_message(stream, &Message::KeepAlive).map_err(|e| WorkerError::Connection { stage: "keepalive_while_choked", error: e })?;
+            }
         }
         Err(e) => return Err(WorkerError::Connection { stage: "wait_for_relevant_have", error: e }),
     }
 
-    if *irrelevant_cycles >= MAX_IRRELEVANT_CYCLES {
+    // A choke is waited out for as long as the first unchoke is; nothing
+    // else on offer is waited on for longer.
+    let budget = if state.peer_choking { connect::MAX_UNCHOKE_WAIT_TIMEOUTS } else { MAX_IRRELEVANT_CYCLES };
+    if *irrelevant_cycles >= budget {
         return Err(WorkerError::Connection {
             stage: "peer_has_no_needed_pieces",
             error: ConnectionError::Wire(WireError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "peer never offered a piece we still need"))),

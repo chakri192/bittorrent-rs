@@ -1149,3 +1149,256 @@ fn a_worker_that_requires_encryption_gives_up_on_a_peer_that_will_not() {
     let (result, _) = download_with_encryption("mse-required", crate::peer::Encryption::Off, crate::peer::Encryption::Require);
     assert!(matches!(result, Err(WorkerError::Connection { stage: "connect_and_handshake", .. })), "{:?}", result);
 }
+
+// ---- the Fast Extension (BEP 6) ----
+
+/// A fake peer on the Fast Extension. After the handshake it sends `opening`
+/// (each message after its delay), then passes every `Request` to
+/// `on_request` -- which answers through the stream, given the request's
+/// `(index, begin, length)` and how many came before it -- until that says
+/// to stop, the worker hangs up, or a second goes by in silence. Returns
+/// every request it saw, in order.
+fn spawn_fast_peer<F>(listener: TcpListener, info_hash: [u8; 20], opening: Vec<(Duration, WireMessage)>, mut on_request: F) -> thread::JoinHandle<Vec<(u32, u32, u32)>>
+where
+    F: FnMut(&mut TcpStream, (u32, u32, u32), usize) -> bool + Send + 'static,
+{
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut hs_buf = [0u8; 68];
+        stream.read_exact(&mut hs_buf).unwrap();
+        assert!(Handshake::from_bytes(&hs_buf).unwrap().supports_fast(), "the worker offers the Fast Extension");
+        std::io::Write::write_all(&mut stream, &Handshake::new(info_hash, [0x99; 20], false).with_fast(true).to_bytes()).unwrap();
+        for (delay, msg) in opening {
+            thread::sleep(delay);
+            msg.write_to(&mut stream).unwrap();
+        }
+        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+
+        let mut seen = Vec::new();
+        while let Ok(msg) = WireMessage::read_from(&mut stream) {
+            if let WireMessage::Request { index, begin, length } = msg {
+                seen.push((index, begin, length));
+                if !on_request(&mut stream, (index, begin, length), seen.len() - 1) {
+                    break;
+                }
+            }
+        }
+        seen
+    })
+}
+
+/// A worker for a torrent of `pieces` (one file, pieces of `piece_length`) against `addr`, with short timeouts.
+fn run_fast_worker(name: &str, addr: std::net::SocketAddr, info_hash: [u8; 20], pieces: &[Vec<u8>], piece_length: u32, pipeline_depth: usize) -> (Result<(), WorkerError>, Arc<WorkQueue>, Vec<crate::downloader::queue::PieceResult>) {
+    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32 }).collect();
+    let queue = Arc::new(WorkQueue::new(work, pieces.len()));
+    let total: usize = pieces.iter().map(Vec::len).sum();
+    let dir = tmp_dir(name);
+    let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], total as i64)]));
+    let (tx, rx) = mpsc::channel();
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default() };
+    let result = run_worker(addr, &config, &queue, &spans, piece_length as u64, &tx, None);
+    drop(tx);
+    (result, queue, rx.try_iter().collect())
+}
+
+fn serve(stream: &mut TcpStream, pieces: &[Vec<u8>], (index, begin, length): (u32, u32, u32)) {
+    let block = pieces[index as usize][begin as usize..(begin + length) as usize].to_vec();
+    WireMessage::Piece { index, begin, block }.write_to(stream).unwrap();
+}
+
+#[test]
+fn a_fast_peer_is_downloaded_from_while_it_still_has_us_choked() {
+    // The peer sends HaveAll, allows piece 1 (not piece 0, which the worker
+    // would otherwise ask for first) and does not unchoke -- until it has served that piece. A worker that waited for an unchoke first would
+    // wait for ever, and one that asked for piece 1 too soon would be rejected.
+    let pieces = vec![vec![0xA1u8; 16384], vec![0xB2u8; 16384]];
+    let info_hash = [0x51; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = pieces.clone();
+    let mut unchoked = false;
+    let too_early = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let early = Arc::clone(&too_early);
+    let peer = spawn_fast_peer(listener, info_hash, vec![(Duration::ZERO, WireMessage::HaveAll), (Duration::ZERO, WireMessage::AllowedFast { piece_index: 1 })], move |stream, request, _| {
+        if request.0 != 1 && !unchoked {
+            early.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            WireMessage::RejectRequest { index: request.0, begin: request.1, length: request.2 }.write_to(stream).unwrap();
+            return true;
+        }
+        serve(stream, &served, request);
+        if !unchoked {
+            unchoked = true;
+            WireMessage::Unchoke.write_to(stream).unwrap();
+        }
+        true
+    });
+
+    let (result, queue, results) = run_fast_worker("fast-allowed", addr, info_hash, &pieces, 16384, 2);
+
+    result.expect("the worker finished the torrent");
+    let seen = peer.join().unwrap();
+    assert_eq!(seen, vec![(1, 0, 16384), (0, 0, 16384)], "the allowed piece first, the other only after the unchoke");
+    assert_eq!(too_early.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing asked for while choked that the peer had not allowed");
+    assert!(queue.is_empty());
+    assert_eq!(results.len(), 2);
+}
+
+#[test]
+fn a_peer_that_only_says_have_all_has_every_piece() {
+    // No bitfield anywhere: the pieces the worker is willing to ask for come from HaveAll alone.
+    let pieces = vec![vec![1u8; 16384], vec![2u8; 16384], vec![3u8; 16384]];
+    let info_hash = [0x52; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = pieces.clone();
+    let peer = spawn_fast_peer(listener, info_hash, vec![(Duration::ZERO, WireMessage::HaveAll), (Duration::ZERO, WireMessage::Unchoke)], move |stream, request, _| {
+        serve(stream, &served, request);
+        true
+    });
+
+    let (result, queue, results) = run_fast_worker("fast-have-all", addr, info_hash, &pieces, 16384, 2);
+
+    result.unwrap();
+    assert_eq!(peer.join().unwrap().len(), 3);
+    assert!(queue.is_empty());
+    assert_eq!(results.len(), 3);
+}
+
+#[test]
+fn a_peer_that_starts_with_have_none_is_kept_until_it_has_something() {
+    let pieces = vec![vec![7u8; 16384]];
+    let info_hash = [0x53; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = pieces.clone();
+    let opening = vec![(Duration::ZERO, WireMessage::HaveNone), (Duration::ZERO, WireMessage::Unchoke), (Duration::from_millis(250), WireMessage::Have { piece_index: 0 })];
+    let peer = spawn_fast_peer(listener, info_hash, opening, move |stream, request, _| {
+        serve(stream, &served, request);
+        true
+    });
+
+    let (result, _, results) = run_fast_worker("fast-have-none", addr, info_hash, &pieces, 16384, 2);
+
+    result.unwrap();
+    assert_eq!(peer.join().unwrap().len(), 1);
+    assert_eq!(results.len(), 1);
+}
+
+#[test]
+fn a_request_the_peer_rejects_is_made_again() {
+    let pieces = vec![vec![9u8; 16384]];
+    let info_hash = [0x54; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = pieces.clone();
+    let peer = spawn_fast_peer(listener, info_hash, vec![(Duration::ZERO, WireMessage::HaveAll), (Duration::ZERO, WireMessage::Unchoke)], move |stream, request, nth| {
+        if nth < 2 {
+            WireMessage::RejectRequest { index: request.0, begin: request.1, length: request.2 }.write_to(stream).unwrap();
+        } else {
+            serve(stream, &served, request);
+        }
+        true
+    });
+
+    let (result, _, results) = run_fast_worker("fast-reject-retry", addr, info_hash, &pieces, 16384, 2);
+
+    result.expect("two refusals are not the end of the piece");
+    assert_eq!(peer.join().unwrap(), vec![(0, 0, 16384); 3], "the same block asked for three times");
+    assert_eq!(results[0].data, pieces[0]);
+}
+
+#[test]
+fn a_peer_that_never_stops_refusing_is_given_up_on_for_that_piece_and_the_piece_goes_back() {
+    let pieces = vec![vec![9u8; 16384]];
+    let info_hash = [0x55; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = spawn_fast_peer(listener, info_hash, vec![(Duration::ZERO, WireMessage::HaveAll), (Duration::ZERO, WireMessage::Unchoke)], move |stream, request, nth| {
+        WireMessage::RejectRequest { index: request.0, begin: request.1, length: request.2 }.write_to(stream).unwrap();
+        nth < 40 // a worker that never gives up is cut off here
+    });
+
+    let (result, queue, results) = run_fast_worker("fast-reject-forever", addr, info_hash, &pieces, 16384, 2);
+
+    // The worker stopped asking of its own accord, with the piece back in the queue for someone else.
+    assert_eq!(peer.join().unwrap().len(), 8, "asked as many times as it puts up with");
+    assert!(matches!(result, Err(WorkerError::Connection { stage: "wait_for_relevant_have", .. })), "it went on to wait for something else, not to drop the peer over a piece: {:?}", result);
+    assert_eq!(queue.len(), 1, "the piece is still to be had");
+    assert!(results.is_empty());
+}
+
+#[test]
+fn what_a_peer_rejects_after_choking_us_is_not_held_against_it() {
+    // BEP 6: a choke no longer discards the peer's queue silently; it rejects each request. The
+    // worker has already forgotten those, so the rejections are not news (and a dozen of
+    // them are not a peer refusing), and the piece is asked for again once the peer unchokes.
+    const BLOCKS: usize = 12;
+    let pieces = vec![vec![5u8; 16384 * BLOCKS]];
+    let info_hash = [0x56; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = pieces.clone();
+    let peer = spawn_fast_peer(listener, info_hash, vec![(Duration::ZERO, WireMessage::HaveAll), (Duration::ZERO, WireMessage::Unchoke)], move |stream, request, nth| {
+        if nth < BLOCKS {
+            if nth == 0 {
+                WireMessage::Choke.write_to(stream).unwrap();
+            }
+            WireMessage::RejectRequest { index: request.0, begin: request.1, length: request.2 }.write_to(stream).unwrap();
+            if nth == BLOCKS - 1 {
+                WireMessage::Unchoke.write_to(stream).unwrap();
+            }
+        } else {
+            serve(stream, &served, request);
+        }
+        true
+    });
+
+    let (result, _, results) = run_fast_worker("fast-choke-rejects", addr, info_hash, &pieces, 16384 * BLOCKS as u32, BLOCKS);
+
+    result.expect("the rejections that followed the choke were not counted against the peer");
+    assert_eq!(peer.join().unwrap().len(), 2 * BLOCKS, "every block twice: once before the choke, once after");
+    assert_eq!(results[0].data, pieces[0]);
+}
+
+#[test]
+fn a_peer_that_chokes_between_pieces_and_stays_silent_is_kept_alive_for_a_while_and_then_left() {
+    // Not mid-piece: the worker has nothing it may ask for, so it waits -- as
+    // long as it would have for a first unchoke, telling the peer it is still here.
+    let pieces = vec![vec![3u8; 16384], vec![4u8; 16384]];
+    let info_hash = [0x57; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = pieces.clone();
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut hs_buf = [0u8; 68];
+        stream.read_exact(&mut hs_buf).unwrap();
+        std::io::Write::write_all(&mut stream, &Handshake::new(info_hash, [0x99; 20], false).to_bytes()).unwrap();
+        WireMessage::Bitfield(vec![0b1100_0000]).write_to(&mut stream).unwrap();
+        WireMessage::Unchoke.write_to(&mut stream).unwrap();
+        let mut keepalives = 0;
+        while let Ok(msg) = WireMessage::read_from(&mut stream) {
+            match msg {
+                WireMessage::Request { index, begin, length } => {
+                    // The choke goes first, so that the worker has seen it by the time the piece is in.
+                    WireMessage::Choke.write_to(&mut stream).unwrap();
+                    serve(&mut stream, &served, (index, begin, length));
+                }
+                WireMessage::KeepAlive => keepalives += 1,
+                _ => {}
+            }
+        }
+        keepalives
+    });
+
+    let started = Instant::now();
+    let (result, queue, results) = run_fast_worker("choked-between-pieces", addr, info_hash, &pieces, 16384, 2);
+
+    assert!(matches!(result, Err(WorkerError::Connection { stage: "peer_has_no_needed_pieces", .. })), "{:?}", result);
+    assert!(started.elapsed() < Duration::from_secs(3), "it gave up after the short wait for an unchoke, not the long one for something to be offered: {:?}", started.elapsed());
+    assert!(peer.join().unwrap() >= 3, "and the peer heard from it in the meantime");
+    assert_eq!(results.len(), 1);
+    assert_eq!(queue.len(), 1);
+}

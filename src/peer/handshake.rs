@@ -11,6 +11,11 @@ pub const HANDSHAKE_LEN: usize = 1 + 19 + 8 + 20 + 20;
 const EXTENSION_PROTOCOL_BIT_BYTE: usize = 5;
 const EXTENSION_PROTOCOL_BIT_MASK: u8 = 0x10;
 
+/// Reserved-byte bit for BEP 6 (Fast Extension): `reserved[7] |= 0x04`.
+/// Used between two peers only if both set it.
+const FAST_EXTENSION_BIT_BYTE: usize = 7;
+const FAST_EXTENSION_BIT_MASK: u8 = 0x04;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handshake {
     pub reserved: [u8; 8],
@@ -44,6 +49,21 @@ impl Handshake {
             reserved[EXTENSION_PROTOCOL_BIT_BYTE] |= EXTENSION_PROTOCOL_BIT_MASK;
         }
         Handshake { reserved, info_hash, peer_id }
+    }
+
+    /// This handshake, with the Fast Extension bit (BEP 6) set or cleared.
+    pub fn with_fast(mut self, fast: bool) -> Self {
+        if fast {
+            self.reserved[FAST_EXTENSION_BIT_BYTE] |= FAST_EXTENSION_BIT_MASK;
+        } else {
+            self.reserved[FAST_EXTENSION_BIT_BYTE] &= !FAST_EXTENSION_BIT_MASK;
+        }
+        self
+    }
+
+    /// Whether the sender speaks the Fast Extension (BEP 6).
+    pub fn supports_fast(&self) -> bool {
+        self.reserved[FAST_EXTENSION_BIT_BYTE] & FAST_EXTENSION_BIT_MASK != 0
     }
 
     pub fn supports_extensions(&self) -> bool {
@@ -147,5 +167,18 @@ mod tests {
         let mut buf = Handshake::new([1; 20], [2; 20], false).to_bytes().to_vec();
         buf.extend_from_slice(&[0, 0, 0, 1, 2]); // e.g. start of an Unchoke message
         assert!(Handshake::from_bytes(&buf).is_ok());
+    }
+
+    #[test]
+    fn the_fast_extension_bit_is_reserved_7_0x04_and_leaves_the_others_alone() {
+        let plain = Handshake::new([1; 20], [2; 20], true);
+        assert!(!plain.supports_fast());
+        let fast = plain.clone().with_fast(true);
+        assert!(fast.supports_fast());
+        assert_eq!(fast.reserved[7], 0x04);
+        assert!(fast.supports_extensions(), "the extension protocol bit is still set");
+        assert_eq!(fast.to_bytes()[27], 0x04, "byte 27 of the handshake: 20 + 7");
+        assert!(Handshake::from_bytes(&fast.to_bytes()).unwrap().supports_fast(), "and it survives the wire");
+        assert!(!fast.with_fast(false).supports_fast(), "and can be cleared");
     }
 }

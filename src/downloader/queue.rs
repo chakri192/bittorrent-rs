@@ -286,6 +286,12 @@ impl WorkQueue {
         }
     }
 
+    /// How many peers have been seen to hold each piece.
+    #[cfg(test)]
+    pub(crate) fn availability(&self) -> Vec<u32> {
+        lock(&self.availability).clone()
+    }
+
     /// How many pieces the torrent has (what the queue was built for).
     pub fn total_pieces(&self) -> usize {
         lock(&self.availability).len()

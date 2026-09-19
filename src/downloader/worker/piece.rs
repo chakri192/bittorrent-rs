@@ -10,8 +10,18 @@ use crate::downloader::queue::WorkQueue;
 use crate::peer::{Message, PeerState, PeerStream};
 use std::time::Instant;
 
-/// Downloads one piece. Returns `Ok(None)` if the piece was abandoned
-/// because another worker completed it first (endgame duplicate).
+/// How a piece download ended, short of the connection failing.
+pub(super) enum Downloaded {
+    /// The piece is whole and matches its hash.
+    Verified(Vec<u8>),
+    /// Another worker completed it first (endgame duplicate).
+    Abandoned,
+    /// The peer keeps refusing to send it (BEP 6 `reject request`); worth
+    /// trying elsewhere, not worth dropping the connection over.
+    Refused,
+}
+
+/// Downloads one piece.
 ///
 /// `config.pipeline_depth` requests are kept in flight at least; how many more depends
 /// on how fast this peer has been delivering (`throughput`, which carries
@@ -31,18 +41,20 @@ pub(super) fn download_one_piece(
     config: &WorkerConfig,
     meter: Meter,
     pex_tx: Option<&PexSender>,
-) -> Result<Option<Vec<u8>>, WorkerError> {
+) -> Result<Downloaded, WorkerError> {
     let (assembler, resumed) = match queue.take_partial(work.index) {
         Some(partial) => (PieceAssembler::resume(work.clone(), partial), true),
         None => (PieceAssembler::new(work.clone()), false),
     };
     let mut link = Link { stream, state, queue, config, meter, pex_tx };
     match attempt(&mut link, assembler)? {
-        Attempt::Verified(data) => Ok(Some(data)),
-        Attempt::Abandoned => Ok(None),
+        Attempt::Verified(data) => Ok(Downloaded::Verified(data)),
+        Attempt::Abandoned => Ok(Downloaded::Abandoned),
+        Attempt::Refused => Ok(Downloaded::Refused),
         Attempt::Mismatch if resumed => match attempt(&mut link, PieceAssembler::new(work))? {
-            Attempt::Verified(data) => Ok(Some(data)),
-            Attempt::Abandoned => Ok(None),
+            Attempt::Verified(data) => Ok(Downloaded::Verified(data)),
+            Attempt::Abandoned => Ok(Downloaded::Abandoned),
+            Attempt::Refused => Ok(Downloaded::Refused),
             Attempt::Mismatch => Err(WorkerError::PieceHashMismatch),
         },
         Attempt::Mismatch => Err(WorkerError::PieceHashMismatch),
@@ -73,6 +85,8 @@ enum Attempt {
     Abandoned,
     /// Every block arrived and the piece does not match its hash.
     Mismatch,
+    /// The peer refused the requests too many times.
+    Refused,
 }
 
 /// Fetches what `assembler` lacks and checks the result. If the connection
@@ -85,6 +99,13 @@ fn attempt(link: &mut Link, mut assembler: PieceAssembler) -> Result<Attempt, Wo
             Err(_) => Attempt::Mismatch,
         }),
         Ok(Fetched::Abandoned) => Ok(Attempt::Abandoned),
+        Ok(Fetched::Refused) => {
+            // What did arrive is kept for the next peer, as when a connection fails.
+            if let Some(partial) = assembler.into_partial() {
+                link.queue.stash_partial(piece_index, partial);
+            }
+            Ok(Attempt::Refused)
+        }
         Err(e) => {
             if let Some(partial) = assembler.into_partial() {
                 link.queue.stash_partial(piece_index, partial);
@@ -97,7 +118,12 @@ fn attempt(link: &mut Link, mut assembler: PieceAssembler) -> Result<Attempt, Wo
 enum Fetched {
     Complete,
     Abandoned,
+    Refused,
 }
+
+/// How many times a peer may refuse requests for one piece before it is
+/// given up on for that piece.
+const MAX_REFUSALS_PER_PIECE: u32 = 8;
 
 /// Requests and receives blocks until `assembler` has them all.
 fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler) -> Result<Fetched, WorkerError> {
@@ -109,6 +135,7 @@ fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler) -> Result<Fetch
     let mut in_flight: Vec<(u32, u32)> = Vec::new();
     // Read timeouts sat through in a row while the peer has us choked.
     let mut choked_timeouts = 0u32;
+    let mut refusals = 0u32;
 
     loop {
         // Endgame check: if a duplicate of this piece verified elsewhere,
@@ -121,17 +148,20 @@ fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler) -> Result<Fetch
             return Ok(Fetched::Abandoned);
         }
 
-        if state.peer_choking {
+        if !state.may_request(piece_index) {
             // A choke makes the peer discard every request it has not yet
             // answered, and it will not send them after an unchoke. Forget
             // them here too, so that once unchoked the blocks still missing
             // are asked for again; the ones that arrived are kept. Nothing
-            // is requested while choked.
+            // is requested while choked -- except, with the Fast Extension,
+            // for the pieces the peer has said we may have regardless.
             in_flight.clear();
             assembler.forget_requests();
             meter.stat.set(Activity::Choked);
         } else {
-            choked_timeouts = 0;
+            if !state.peer_choking {
+                choked_timeouts = 0;
+            }
             meter.stat.set(Activity::Downloading);
             let depth = depth_for(meter.throughput.rate(Instant::now()), config.pipeline_depth, state.peer_request_limit);
             while in_flight.len() < depth {
@@ -180,6 +210,17 @@ fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler) -> Result<Fetch
                 if let Some(limiter) = config.down_limit.as_deref() {
                     // Not past the point where the client is stopping.
                     limiter.acquire_while(block.len(), || !config.interrupt.is_triggered());
+                }
+            }
+            // BEP 6: the peer will not send this block. Ask again, a few
+            // times; a request we had already forgotten (the reply to a choke)
+            // is nothing to act on.
+            Message::RejectRequest { index, begin, length } if *index == piece_index && in_flight.contains(&(*begin, *length)) => {
+                in_flight.retain(|&(b, _)| b != *begin);
+                assembler.refuse_request(*begin);
+                refusals += 1;
+                if refusals >= MAX_REFUSALS_PER_PIECE {
+                    return Ok(Fetched::Refused);
                 }
             }
             Message::Piece { .. } => {

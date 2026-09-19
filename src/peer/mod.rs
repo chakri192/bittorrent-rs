@@ -1,5 +1,6 @@
 pub mod connection;
 pub mod extension;
+pub mod fast;
 pub mod handshake;
 pub mod message;
 pub mod mse;

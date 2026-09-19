@@ -72,12 +72,15 @@ pub struct PieceAssembler {
     /// been requested yet -- lets `next_requests` hand out fresh block
     /// offsets without re-scanning `received` each call.
     next_unrequested_block: u32,
+    /// Blocks that were requested and then refused (BEP 6 `reject request`),
+    /// to be handed out again ahead of any fresh ones.
+    refused: Vec<u32>,
 }
 
 impl PieceAssembler {
     pub fn new(work: PieceWork) -> Self {
         let num_blocks = work.length.div_ceil(BLOCK_SIZE);
-        PieceAssembler { buf: vec![0u8; work.length as usize], received: vec![false; num_blocks as usize], next_unrequested_block: 0, work }
+        PieceAssembler { buf: vec![0u8; work.length as usize], received: vec![false; num_blocks as usize], next_unrequested_block: 0, refused: Vec::new(), work }
     }
 
     /// An assembler that starts from `partial`, so that only the blocks it
@@ -118,6 +121,12 @@ impl PieceAssembler {
     /// pipelining recommendation.
     pub fn next_requests(&mut self, max_new: usize) -> Vec<BlockRequest> {
         let mut out = Vec::with_capacity(max_new);
+        while out.len() < max_new {
+            let Some(block_idx) = self.refused.pop() else { break };
+            if !self.received[block_idx as usize] {
+                out.push((self.work.index, block_idx * BLOCK_SIZE, self.block_len(block_idx)));
+            }
+        }
         while out.len() < max_new && self.next_unrequested_block < self.num_blocks() {
             let block_idx = self.next_unrequested_block;
             self.next_unrequested_block += 1;
@@ -137,6 +146,20 @@ impl PieceAssembler {
     /// Blocks that have arrived are kept.
     pub fn forget_requests(&mut self) {
         self.next_unrequested_block = 0;
+        self.refused.clear();
+    }
+
+    /// The peer refused the request for the block at `begin` (BEP 6): it is
+    /// handed out again by the next `next_requests`, though only that one,
+    /// the rest of what is in flight being still expected. Ignored if it was
+    /// never requested, has arrived, or is already waiting to be asked again.
+    pub fn refuse_request(&mut self, begin: u32) {
+        let block_idx = begin / BLOCK_SIZE;
+        let asked = block_idx < self.next_unrequested_block;
+        let on_a_boundary = block_idx * BLOCK_SIZE == begin;
+        if asked && on_a_boundary && !self.received[block_idx as usize] && !self.refused.contains(&block_idx) {
+            self.refused.push(block_idx);
+        }
     }
 
     /// Records an arrived `Piece` message's payload at byte offset `begin`.
@@ -376,5 +399,51 @@ mod tests {
             second.record_block(n * BLOCK_SIZE, block(&data, n)).unwrap();
         }
         assert_eq!(second.finish(), Err(AssemblerError::HashMismatch));
+    }
+
+    fn four_blocks() -> PieceAssembler {
+        let length = BLOCK_SIZE * 4;
+        PieceAssembler::new(PieceWork { index: 6, hash: [0; 20], length })
+    }
+
+    #[test]
+    fn a_refused_block_is_asked_for_again_and_only_that_one() {
+        let mut asm = four_blocks();
+        assert_eq!(asm.next_requests(3).len(), 3); // blocks 0, 1, 2 are out
+        asm.refuse_request(BLOCK_SIZE);
+        // The refused block comes first; then the fresh one; nothing else is repeated.
+        assert_eq!(asm.next_requests(5), vec![(6, BLOCK_SIZE, BLOCK_SIZE), (6, 3 * BLOCK_SIZE, BLOCK_SIZE)]);
+        assert_eq!(asm.next_requests(5), vec![]);
+    }
+
+    #[test]
+    fn a_refusal_of_something_never_requested_or_already_received_is_ignored() {
+        let mut asm = four_blocks();
+        asm.next_requests(2);
+        asm.refuse_request(3 * BLOCK_SIZE); // not asked for yet
+        asm.refuse_request(50 * BLOCK_SIZE); // not even in the piece
+        asm.refuse_request(7); // not on a block boundary
+        asm.record_block(0, &vec![0; BLOCK_SIZE as usize]).unwrap();
+        asm.refuse_request(0); // already here
+        assert_eq!(asm.next_requests(5), vec![(6, 2 * BLOCK_SIZE, BLOCK_SIZE), (6, 3 * BLOCK_SIZE, BLOCK_SIZE)], "the cursor alone decides, as if no refusal had come");
+    }
+
+    #[test]
+    fn refusing_the_same_block_twice_asks_for_it_once() {
+        let mut asm = four_blocks();
+        asm.next_requests(4);
+        asm.refuse_request(0);
+        asm.refuse_request(0);
+        assert_eq!(asm.next_requests(5), vec![(6, 0, BLOCK_SIZE)]);
+    }
+
+    #[test]
+    fn forgetting_the_requests_drops_the_refusals_too_they_are_covered() {
+        let mut asm = four_blocks();
+        asm.next_requests(4);
+        asm.refuse_request(BLOCK_SIZE);
+        asm.forget_requests();
+        let asked = asm.next_requests(10);
+        assert_eq!(asked.len(), 4, "every missing block once, the refused one not twice: {:?}", asked);
     }
 }

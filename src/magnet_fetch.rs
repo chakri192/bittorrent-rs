@@ -66,7 +66,7 @@ impl std::error::Error for MetadataFetchError {}
 /// `info_hash` (the hash from the magnet URI). Returns the raw info dict
 /// bytes on success -- ready for `torrent::from_info_dict_bytes`.
 pub fn fetch_metadata_from_peer(addr: SocketAddr, info_hash: [u8; 20], our_peer_id: [u8; 20], timeout: Duration, encryption: crate::peer::Encryption) -> Result<Vec<u8>, MetadataFetchError> {
-    let (mut stream, peer_handshake) = crate::peer::connect_and_handshake_with(addr, info_hash, our_peer_id, true, timeout, encryption)?;
+    let (mut stream, peer_handshake) = crate::peer::connect_and_handshake_with(addr, info_hash, our_peer_id, true, false, timeout, encryption)?;
     if !peer_handshake.supports_extensions() {
         return Err(MetadataFetchError::PeerLacksExtensionProtocol);
     }

@@ -106,6 +106,10 @@ enum Kind {
     /// peer will, a plain one where it will not (unless required), and
     /// incoming connections are taken either way (unless required).
     Encryption,
+    /// The Fast Extension (BEP 6): the client downloads what a peer allows
+    /// while still choked, and as a seeder tells a fast peer what it has
+    /// with `have all`, allows it pieces and serves them before any unchoke.
+    FastExtension,
     /// A disk that cannot be written to ends the run at once with a message
     /// saying so, instead of dialing the same peers over and over.
     DiskFailure,
@@ -165,6 +169,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "magnet-peer-hint", kind: Kind::MagnetPeerHint },
     Scenario { name: "tracker-redirect", kind: Kind::TrackerRedirect },
     Scenario { name: "encryption", kind: Kind::Encryption },
+    Scenario { name: "fast-extension", kind: Kind::FastExtension },
     Scenario { name: "disk-failure", kind: Kind::DiskFailure },
     Scenario { name: "prefer-files", kind: Kind::PreferFiles },
     Scenario { name: "json-events", kind: Kind::JsonEvents },
@@ -209,6 +214,7 @@ fn main() {
             Kind::MagnetPeerHint => run_magnet_peer_hint(scenario.name),
             Kind::TrackerRedirect => run_tracker_redirect(scenario.name),
             Kind::Encryption => run_encryption(scenario.name),
+            Kind::FastExtension => run_fast_extension(scenario.name),
             Kind::DiskFailure => run_disk_failure(scenario.name),
             Kind::PreferFiles => run_prefer_files(scenario.name),
             Kind::JsonEvents => run_json_events(scenario.name),
@@ -345,6 +351,10 @@ struct PeerLog {
     plain_connections: usize,
     /// Whether the client's extended handshake offered `ut_pex`.
     pex_offered: Option<bool>,
+    /// Whether the client's handshake had the Fast Extension bit.
+    fast_offered: Option<bool>,
+    /// Requests a `Fast` peer turned away because it had the client choked.
+    refused_while_choked: usize,
     /// Every piece index the client asked for, in order (repeats included).
     requested: Vec<u32>,
     /// Every block requested as (piece, offset within the piece), in order.
@@ -410,6 +420,10 @@ enum Behavior {
     /// Serves normally but has only these pieces, and says so in its
     /// bitfield: what a mid-download peer in a real swarm looks like.
     Partial(BTreeSet<u32>),
+    /// Speaks the Fast Extension: `have all`, then `allowed fast` for these
+    /// pieces, and no unchoke until they have all been served. A request for
+    /// any other piece while choked is refused with `reject request`.
+    Fast(BTreeSet<u32>),
 }
 
 /// How the fake tracker treats the client's announces.
@@ -558,12 +572,14 @@ fn serve_connection(tcp: TcpStream, cx: &PeerContext, behavior: &Behavior, log: 
     if their_hs.info_hash != cx.info_hash {
         return;
     }
-    let our_hs = Handshake::new(cx.info_hash, [0x99; 20], true);
+    let fast = matches!(behavior, Behavior::Fast(_));
+    let our_hs = Handshake::new(cx.info_hash, [0x99; 20], true).with_fast(fast);
     if stream.write_all(&our_hs.to_bytes()).is_err() {
         return;
     }
     {
         let mut log = log.lock().unwrap();
+        log.fast_offered = Some(their_hs.supports_fast());
         if encrypted {
             log.encrypted_connections += 1;
         } else {
@@ -577,7 +593,11 @@ fn serve_connection(tcp: TcpStream, cx: &PeerContext, behavior: &Behavior, log: 
             bits[i / 8] |= 1 << (7 - (i % 8));
         }
     }
-    if Message::Bitfield(bits).write_to(&mut stream).is_err() {
+    if let Behavior::Fast(allowed) = behavior {
+        if Message::HaveAll.write_to(&mut stream).is_err() || allowed.iter().any(|&piece_index| Message::AllowedFast { piece_index }.write_to(&mut stream).is_err()) {
+            return;
+        }
+    } else if Message::Bitfield(bits).write_to(&mut stream).is_err() {
         return;
     }
     let nth_connection = {
@@ -591,7 +611,9 @@ fn serve_connection(tcp: TcpStream, cx: &PeerContext, behavior: &Behavior, log: 
     if let Behavior::UnchokeAfter(delay) = behavior {
         thread::sleep(*delay);
     }
-    if Message::Unchoke.write_to(&mut stream).is_err() {
+    // A `Fast` peer holds the client choked until it has served what it allowed.
+    let mut choking = matches!(behavior, Behavior::Fast(_));
+    if !choking && Message::Unchoke.write_to(&mut stream).is_err() {
         return;
     }
 
@@ -604,6 +626,18 @@ fn serve_connection(tcp: TcpStream, cx: &PeerContext, behavior: &Behavior, log: 
             Ok(Message::Request { index, begin, length }) => {
                 let piece_start = index as usize * cx.piece_len;
                 let piece_end = (piece_start + cx.piece_len).min(cx.data.len());
+                if let (Behavior::Fast(allowed), true) = (behavior, choking) {
+                    if !allowed.contains(&index) {
+                        let mut log = log.lock().unwrap();
+                        log.requested.push(index);
+                        log.refused_while_choked += 1;
+                        drop(log);
+                        if (Message::RejectRequest { index, begin, length }).write_to(&mut stream).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
                 let hang_up = {
                     let mut log = log.lock().unwrap();
                     log.requested.push(index);
@@ -643,6 +677,14 @@ fn serve_connection(tcp: TcpStream, cx: &PeerContext, behavior: &Behavior, log: 
                 }
                 if (Message::Piece { index, begin, block }).write_to(&mut stream).is_err() {
                     return;
+                }
+                if let Behavior::Fast(allowed) = behavior {
+                    if choking && allowed.is_subset(&log.lock().unwrap().served) {
+                        choking = false;
+                        if Message::Unchoke.write_to(&mut stream).is_err() {
+                            return;
+                        }
+                    }
                 }
             }
             Ok(Message::Extended { id: 0, payload }) => {
@@ -2359,6 +2401,118 @@ fn run_serve_metadata(name: &str) -> Result<String, String> {
         other => return Err(format!("expected the info dict as piece 0, got {:?}", other)),
     }
     Ok(format!("a peer holding only the info hash got the {}-byte info dictionary from the seeding client, byte for byte, and was told it is a seed", fx.info_bytes.len()))
+}
+
+/// The Fast Extension (BEP 6), both ways round.
+///
+/// As a downloader: the peer says `have all`, allows one piece and keeps the
+/// client choked until it has been given that piece, so the download can only
+/// finish if the client asks for it while choked -- and it must not ask for
+/// any other piece before the unchoke. As a seeder: a peer that offers the
+/// extension is told `have all` rather than sent a bitfield, is allowed the
+/// pieces BEP 6 says for its address, gets one of them without ever being
+/// unchoked, and has a request for another piece refused, not ignored.
+fn run_fast_extension(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let dir = scratch_dir(name);
+
+    // The client downloading.
+    const ALLOWED: u32 = 5;
+    let swarm = spawn_swarm(&fx, vec![Behavior::Fast(BTreeSet::from([ALLOWED]))]);
+    let torrent = dir.join("e2e.torrent");
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let out_dir = dir.join("out");
+    let mut child = client_command(&torrent, &out_dir, &dir.join("client.log"), 1).arg("--no-dht").spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("the client exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+    {
+        let seen = swarm.logs[0].lock().unwrap();
+        if seen.fast_offered != Some(true) {
+            return Err(format!("the client's handshake should offer the Fast Extension, and said {:?}", seen.fast_offered));
+        }
+        if seen.requested.first() != Some(&ALLOWED) {
+            return Err(format!("with only piece {} allowed while choked, that should be the first asked for; the requests were {:?}", ALLOWED, seen.requested));
+        }
+        if seen.refused_while_choked != 0 {
+            return Err(format!("the client asked for {} piece(s) the peer had not allowed while it had the client choked", seen.refused_while_choked));
+        }
+    }
+
+    // The client seeding.
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let torrent = dir.join("seed.torrent");
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let log_path = dir.join("seed.log");
+    let child = client_command(&torrent, &dir.join("seed-out"), &log_path, 1).args(["--no-dht", "--seed", "--port", "0"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, "seeding e2e.bin on port", Duration::from_secs(20), &mut client.0)?;
+    let port: u16 = swarm.announces.lock().unwrap().first().and_then(|line| announce_param(line, "port")).and_then(|p| p.parse().ok()).ok_or("no port in the client's first announce")?;
+
+    let wire = |what: &str, e: bittorrent_rs::peer::message::WireError| format!("{}: {:?}", what, e);
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connecting to the listener: {}", e))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    stream.write_all(&Handshake::new(fx.info_hash, [0x58; 20], false).with_fast(true).to_bytes()).map_err(|e| e.to_string())?;
+    let mut hs_buf = [0u8; 68];
+    stream.read_exact(&mut hs_buf).map_err(|e| format!("reading the handshake: {}", e))?;
+    if !Handshake::from_bytes(&hs_buf).map_err(|e| format!("the handshake: {:?}", e))?.supports_fast() {
+        return Err("the seeding client does not offer the Fast Extension".to_string());
+    }
+
+    // Its opening: `have all`, and the allowed pieces, in whatever order, and no bitfield. Nothing else
+    // need come, so read until we have both `have all` and a quiet moment.
+    let (mut have_all, mut allowed) = (false, Vec::new());
+    stream.set_read_timeout(Some(Duration::from_millis(700))).map_err(|e| e.to_string())?;
+    loop {
+        match Message::read_from(&mut stream) {
+            Ok(Message::HaveAll) => have_all = true,
+            Ok(Message::AllowedFast { piece_index }) => allowed.push(piece_index),
+            Ok(Message::Bitfield(_)) => return Err("a fast peer should be sent have-all, not a bitfield, by a client with every piece".to_string()),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    if !have_all {
+        return Err("the seeding client did not send have-all".to_string());
+    }
+    let mut expected = bittorrent_rs::peer::fast::allowed_fast_set(std::net::Ipv4Addr::LOCALHOST, &fx.info_hash, fx.piece_count as u32, 5);
+    expected.sort_unstable();
+    allowed.sort_unstable();
+    if allowed != expected {
+        return Err(format!("allowed fast pieces {:?}, where BEP 6's recipe for 127.0.0.1 gives {:?}", allowed, expected));
+    }
+
+    // An allowed piece, asked for without ever having said `interested`.
+    let index = allowed[0] as usize;
+    let (start, end) = (index * fx.piece_len, ((index + 1) * fx.piece_len).min(fx.data.len()));
+    Message::Request { index: index as u32, begin: 0, length: (end - start) as u32 }.write_to(&mut stream).map_err(|e| wire("requesting an allowed piece", e))?;
+    let block = loop {
+        match Message::read_from(&mut stream).map_err(|e| wire("waiting for the allowed piece", e))? {
+            Message::Piece { index: got, block, .. } if got as usize == index => break block,
+            Message::RejectRequest { .. } => return Err("the client refused a piece it had allowed".to_string()),
+            _ => continue,
+        }
+    };
+    if block != fx.data[start..end] {
+        return Err(format!("the allowed piece {} came back different from the source", index));
+    }
+
+    // One it did not allow: refused, not left unanswered.
+    let other = (0..fx.piece_count as u32).find(|piece| !allowed.contains(piece)).ok_or("every piece was allowed; the fixture is too small for this check")?;
+    let length = (fx.piece_len).min(fx.data.len() - other as usize * fx.piece_len) as u32;
+    Message::Request { index: other, begin: 0, length }.write_to(&mut stream).map_err(|e| wire("requesting a piece not allowed", e))?;
+    loop {
+        match Message::read_from(&mut stream).map_err(|e| wire("waiting for the refusal", e))? {
+            Message::RejectRequest { index: got, .. } if got == other => break,
+            Message::Piece { .. } => return Err("a choked fast peer was sent a piece it had not been allowed".to_string()),
+            _ => continue,
+        }
+    }
+
+    Ok(format!("downloaded from a peer that kept it choked until the allowed piece {} was served; as a seeder said have-all, allowed {:?}, served piece {} choked and refused piece {}", ALLOWED, allowed, index, other))
 }
 
 /// `--verify` on files written by the harness itself: whole ones pass with

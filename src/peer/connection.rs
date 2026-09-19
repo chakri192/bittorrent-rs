@@ -69,7 +69,7 @@ pub fn connect_and_handshake(
     support_extensions: bool,
     timeout: Duration,
 ) -> Result<(Box<dyn PeerStream>, Handshake), ConnectionError> {
-    connect_and_handshake_with(addr, info_hash, our_peer_id, support_extensions, timeout, Encryption::Off)
+    connect_and_handshake_with(addr, info_hash, our_peer_id, support_extensions, false, timeout, Encryption::Off)
 }
 
 fn open(addr: SocketAddr, timeout: Duration) -> Result<TcpStream, ConnectionError> {
@@ -90,7 +90,8 @@ fn read_handshake(stream: &mut dyn PeerStream, info_hash: [u8; 20]) -> Result<Ha
     Ok(peer_handshake)
 }
 
-/// [`connect_and_handshake`] with a choice about encryption (MSE). With
+/// [`connect_and_handshake`] with a choice about the Fast Extension
+/// (`support_fast` sets its handshake bit, BEP 6) and about encryption (MSE). With
 /// [`Prefer`](Encryption::Prefer) an encrypted connection is tried first and,
 /// if the peer will not do it, a plain one is made; with
 /// [`Require`](Encryption::Require) there is no second try. A peer that
@@ -100,10 +101,11 @@ pub fn connect_and_handshake_with(
     info_hash: [u8; 20],
     our_peer_id: [u8; 20],
     support_extensions: bool,
+    support_fast: bool,
     timeout: Duration,
     encryption: Encryption,
 ) -> Result<(Box<dyn PeerStream>, Handshake), ConnectionError> {
-    let outbound = Handshake::new(info_hash, our_peer_id, support_extensions).to_bytes();
+    let outbound = Handshake::new(info_hash, our_peer_id, support_extensions).with_fast(support_fast).to_bytes();
 
     if encryption != Encryption::Off {
         let stream = open(addr, timeout)?;
@@ -189,7 +191,7 @@ mod tests {
     }
 
     fn connect(addr: SocketAddr, encryption: Encryption) -> Result<(), ConnectionError> {
-        connect_and_handshake_with(addr, HASH, [0x11; 20], false, Duration::from_secs(5), encryption).map(|(_, hs)| assert_eq!(hs.info_hash, HASH))
+        connect_and_handshake_with(addr, HASH, [0x11; 20], false, false, Duration::from_secs(5), encryption).map(|(_, hs)| assert_eq!(hs.info_hash, HASH))
     }
 
     fn settle(seen: &Arc<Mutex<Vec<Saw>>>, count: usize) -> Vec<Saw> {
@@ -261,5 +263,32 @@ mod tests {
         });
         let err = connect(addr, Encryption::Require).unwrap_err();
         assert!(matches!(err, ConnectionError::InfoHashMismatch), "{:?}", err);
+    }
+
+    /// A plain peer that reads our handshake, answers with one that says
+    /// `it_is_fast`, and reports what ours said about the Fast Extension.
+    fn fast_peer(it_is_fast: bool) -> (SocketAddr, std::sync::mpsc::Receiver<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut theirs = [0u8; HANDSHAKE_LEN];
+            stream.read_exact(&mut theirs).unwrap();
+            let _ = tx.send(Handshake::from_bytes(&theirs).unwrap().supports_fast());
+            let _ = stream.write_all(&Handshake::new(HASH, [0x99; 20], false).with_fast(it_is_fast).to_bytes());
+        });
+        (addr, rx)
+    }
+
+    #[test]
+    fn the_fast_extension_is_offered_only_when_asked_for() {
+        for asked in [true, false] {
+            let (addr, said) = fast_peer(true);
+            let (_, theirs) = connect_and_handshake_with(addr, HASH, [0x11; 20], false, asked, Duration::from_secs(5), Encryption::Off).unwrap();
+            assert_eq!(said.recv_timeout(Duration::from_secs(5)).unwrap(), asked, "our handshake");
+            assert!(theirs.supports_fast(), "and the peer's bit is handed back for the caller to combine with ours");
+        }
     }
 }

@@ -22,7 +22,7 @@ pub(super) const MAX_UNCHOKE_WAIT_TIMEOUTS: u32 = 6;
 /// the client can end the wait; the returned [`Registration`] must be kept
 /// as long as the connection is used.
 pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, queue: &WorkQueue, pex_tx: Option<&PexSender>) -> Result<(Box<dyn PeerStream>, PeerState, Registration<'a>), WorkerError> {
-    let (mut stream, peer_handshake) = connect_and_handshake_with(peer_addr, config.info_hash, config.our_peer_id, true, config.connect_timeout, config.encryption)
+    let (mut stream, peer_handshake) = connect_and_handshake_with(peer_addr, config.info_hash, config.our_peer_id, true, true, config.connect_timeout, config.encryption)
         .map_err(|e| WorkerError::Connection { stage: "connect_and_handshake", error: e })?;
 
     // Registered before anything else is read, so that stopping the client
@@ -31,6 +31,8 @@ pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, que
 
     let mut state = PeerState::for_torrent(queue.total_pieces());
     state.supports_extensions = peer_handshake.supports_extensions();
+    // We always offer the Fast Extension (BEP 6), so it is in use when the peer does.
+    state.fast = peer_handshake.supports_fast();
 
     if state.supports_extensions {
         // BEP 10 extended handshake, sent first thing after the BT
@@ -56,8 +58,11 @@ pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, que
     // a row against a perfectly good peer. Bounded so a peer that never
     // unchokes still frees its slot: with the default 10s read timeout
     // this waits up to ~60s, roughly two choke-algorithm rounds.
+    //
+    // With the Fast Extension the wait can end early: a peer that names a
+    // piece as allowed-fast is one we can start on while still choked.
     let mut unchoke_timeouts = 0u32;
-    while state.peer_choking {
+    while state.peer_choking && !state.has_allowed_pieces() {
         match crate::peer::connection::read_message(&mut stream) {
             Ok(msg) => {
                 absorb(&msg, &mut state, queue, pex_tx);

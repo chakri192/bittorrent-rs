@@ -15,6 +15,12 @@ const MSG_REQUEST: u8 = 6;
 const MSG_PIECE: u8 = 7;
 const MSG_CANCEL: u8 = 8;
 const MSG_PORT: u8 = 9;
+// BEP 6, the Fast Extension.
+const MSG_SUGGEST: u8 = 13;
+const MSG_HAVE_ALL: u8 = 14;
+const MSG_HAVE_NONE: u8 = 15;
+const MSG_REJECT_REQUEST: u8 = 16;
+const MSG_ALLOWED_FAST: u8 = 17;
 /// BEP 10 extension protocol messages all share id 20; the extension
 /// message id (ut_metadata, etc.) is negotiated separately and lives in
 /// the payload. Handled fully in Phase 4 -- carried here as an opaque
@@ -41,6 +47,17 @@ pub enum Message {
     Piece { index: u32, begin: u32, block: Vec<u8> },
     Cancel { index: u32, begin: u32, length: u32 },
     Port(u16),
+    /// BEP 6: a piece the sender suggests the receiver fetch from it.
+    Suggest { piece_index: u32 },
+    /// BEP 6: the sender has every piece (in place of a full bitfield).
+    HaveAll,
+    /// BEP 6: the sender has no piece (in place of an empty bitfield).
+    HaveNone,
+    /// BEP 6: the sender will not answer this request. Sent instead of
+    /// silence, so the requester need not wait to find out.
+    RejectRequest { index: u32, begin: u32, length: u32 },
+    /// BEP 6: the receiver may request this piece even while choked.
+    AllowedFast { piece_index: u32 },
     /// Raw BEP 10 extended message: `id` is the negotiated extended
     /// message id (0 = handshake), `payload` is the bencoded dict (+
     /// trailing raw bytes for ut_metadata data pieces). Parsed further in
@@ -89,6 +106,11 @@ impl Message {
             Message::Piece { .. } => Some(MSG_PIECE),
             Message::Cancel { .. } => Some(MSG_CANCEL),
             Message::Port(_) => Some(MSG_PORT),
+            Message::Suggest { .. } => Some(MSG_SUGGEST),
+            Message::HaveAll => Some(MSG_HAVE_ALL),
+            Message::HaveNone => Some(MSG_HAVE_NONE),
+            Message::RejectRequest { .. } => Some(MSG_REJECT_REQUEST),
+            Message::AllowedFast { .. } => Some(MSG_ALLOWED_FAST),
             Message::Extended { .. } => Some(MSG_EXTENDED),
         }
     }
@@ -101,9 +123,9 @@ impl Message {
 
         let mut payload = Vec::new();
         match self {
-            Message::Have { piece_index } => payload.extend_from_slice(&piece_index.to_be_bytes()),
+            Message::Have { piece_index } | Message::Suggest { piece_index } | Message::AllowedFast { piece_index } => payload.extend_from_slice(&piece_index.to_be_bytes()),
             Message::Bitfield(bits) => payload.extend_from_slice(bits),
-            Message::Request { index, begin, length } | Message::Cancel { index, begin, length } => {
+            Message::Request { index, begin, length } | Message::Cancel { index, begin, length } | Message::RejectRequest { index, begin, length } => {
                 payload.extend_from_slice(&index.to_be_bytes());
                 payload.extend_from_slice(&begin.to_be_bytes());
                 payload.extend_from_slice(&length.to_be_bytes());
@@ -119,7 +141,7 @@ impl Message {
                 payload.extend_from_slice(ext_payload);
             }
             // No payload. (KeepAlive has no id and returned above.)
-            Message::Choke | Message::Unchoke | Message::Interested | Message::NotInterested | Message::KeepAlive => {}
+            Message::Choke | Message::Unchoke | Message::Interested | Message::NotInterested | Message::HaveAll | Message::HaveNone | Message::KeepAlive => {}
         }
 
         let len = 1 + payload.len() as u32; // +1 for the id byte
@@ -175,6 +197,11 @@ impl Message {
                 begin: read_u32(payload, 4)?,
                 length: read_u32(payload, 8)?,
             },
+            MSG_SUGGEST => Message::Suggest { piece_index: read_u32(payload, 0)? },
+            MSG_HAVE_ALL => Message::HaveAll,
+            MSG_HAVE_NONE => Message::HaveNone,
+            MSG_REJECT_REQUEST => Message::RejectRequest { index: read_u32(payload, 0)?, begin: read_u32(payload, 4)?, length: read_u32(payload, 8)? },
+            MSG_ALLOWED_FAST => Message::AllowedFast { piece_index: read_u32(payload, 0)? },
             MSG_PORT => {
                 if payload.len() < 2 {
                     return Err(WireError::Truncated { expected: 2, got: payload.len() });
@@ -320,5 +347,27 @@ mod tests {
         let mut buf = Vec::new();
         msg.write_to(&mut buf).unwrap();
         assert_eq!(buf, msg.to_bytes());
+    }
+
+    #[test]
+    fn the_fast_extension_messages_have_their_ids_and_round_trip() {
+        assert_eq!(Message::Suggest { piece_index: 7 }.to_bytes(), vec![0, 0, 0, 5, 13, 0, 0, 0, 7]);
+        assert_eq!(Message::HaveAll.to_bytes(), vec![0, 0, 0, 1, 14]);
+        assert_eq!(Message::HaveNone.to_bytes(), vec![0, 0, 0, 1, 15]);
+        assert_eq!(Message::RejectRequest { index: 1, begin: 2, length: 3 }.to_bytes(), vec![0, 0, 0, 13, 16, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3]);
+        assert_eq!(Message::AllowedFast { piece_index: 9 }.to_bytes(), vec![0, 0, 0, 5, 17, 0, 0, 0, 9]);
+        for msg in [Message::Suggest { piece_index: 1 }, Message::HaveAll, Message::HaveNone, Message::RejectRequest { index: u32::MAX, begin: 0, length: 16384 }, Message::AllowedFast { piece_index: 0 }] {
+            round_trip(msg);
+        }
+    }
+
+    #[test]
+    fn truncated_fast_extension_messages_are_errors_not_panics() {
+        for (id, payload_len) in [(13u8, 3usize), (16, 11), (17, 0)] {
+            let mut frame = ((1 + payload_len) as u32).to_be_bytes().to_vec();
+            frame.push(id);
+            frame.extend(vec![0u8; payload_len]);
+            assert!(matches!(Message::read_from(&mut Cursor::new(frame)), Err(WireError::Truncated { .. })), "id {}", id);
+        }
     }
 }

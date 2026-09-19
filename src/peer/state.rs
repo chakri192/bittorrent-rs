@@ -26,11 +26,20 @@ pub struct PeerState {
     /// The most outstanding requests the peer said it will queue (`reqq` in
     /// its extended handshake), if it said.
     pub peer_request_limit: Option<usize>,
+    /// Whether both sides speak the Fast Extension (BEP 6). Set by the
+    /// connection layer from the two handshakes.
+    pub fast: bool,
+    /// Pieces the peer said we may request even while it has us choked
+    /// (BEP 6 `allowed fast`).
+    pub allowed_fast: std::collections::HashSet<u32>,
     /// How many pieces `peer_has_pieces` may ever describe: the torrent's
     /// piece count. Piece indices come off the wire, so without a bound a
     /// single `have` for piece 4294967295 makes the client allocate 4 GiB.
     piece_limit: usize,
 }
+
+/// The most allowed-fast pieces remembered from one peer.
+const MAX_ALLOWED_FAST: usize = 64;
 
 /// The ceiling on pieces tracked when the torrent's real piece count is
 /// not known (16 Mi pieces, 16 MiB of state). Real torrents have far fewer.
@@ -47,6 +56,8 @@ impl Default for PeerState {
             peer_has_pieces: Vec::new(),
             supports_extensions: false,
             peer_request_limit: None,
+            fast: false,
+            allowed_fast: std::collections::HashSet::new(),
             piece_limit: MAX_TRACKED_PIECES,
         }
     }
@@ -61,6 +72,19 @@ impl PeerState {
     /// peer says about a piece beyond that is ignored.
     pub fn for_torrent(piece_count: usize) -> Self {
         PeerState { piece_limit: piece_count.min(MAX_TRACKED_PIECES), ..Self::default() }
+    }
+
+    /// Whether a request for `piece` may be sent now: the peer has not
+    /// choked us, or (BEP 6) it has said this piece is ours regardless.
+    /// Whether the peer *has* the piece is a separate question.
+    pub fn may_request(&self, piece: u32) -> bool {
+        !self.peer_choking || (self.fast && self.allowed_fast.contains(&piece))
+    }
+
+    /// Whether the peer has named pieces we may request although it has us
+    /// choked (BEP 6), so there is something to start on before an unchoke.
+    pub fn has_allowed_pieces(&self) -> bool {
+        self.fast && !self.allowed_fast.is_empty()
     }
 
     /// Ensures `peer_has_pieces` can index up to `piece_index` inclusive,
@@ -110,6 +134,23 @@ impl PeerState {
                 // A bitfield is padded to whole bytes, and a peer may send
                 // more than that; only the torrent's pieces count.
                 self.peer_has_pieces.truncate(self.piece_limit);
+                true
+            }
+            // BEP 6: a whole bitfield in one byte.
+            Message::HaveAll => {
+                self.peer_has_pieces = vec![true; self.piece_limit];
+                true
+            }
+            Message::HaveNone => {
+                self.peer_has_pieces.clear();
+                true
+            }
+            Message::AllowedFast { piece_index } => {
+                // Bounded: a peer naming ever more pieces must not grow this
+                // without limit, and one beyond the torrent is meaningless.
+                if (*piece_index as usize) < self.piece_limit && self.allowed_fast.len() < MAX_ALLOWED_FAST {
+                    self.allowed_fast.insert(*piece_index);
+                }
                 true
             }
             _ => false,
@@ -276,5 +317,46 @@ mod tests {
         let mut s = PeerState::for_torrent(100);
         s.apply_message(&Message::Bitfield(vec![0b1010_0000]));
         assert_eq!(&s.peer_has_pieces, &[true, false, true, false, false, false, false, false]);
+    }
+
+    #[test]
+    fn have_all_and_have_none_replace_the_bitfield() {
+        let mut s = PeerState::for_torrent(5);
+        assert!(s.apply_message(&Message::HaveAll));
+        assert_eq!(s.peer_has_pieces, vec![true; 5], "every piece the torrent has, and no more");
+        assert!(s.apply_message(&Message::HaveNone));
+        assert!(s.peer_has_pieces.is_empty());
+    }
+
+    #[test]
+    fn allowed_fast_pieces_are_remembered_within_the_torrent_and_within_a_bound() {
+        let mut s = PeerState::for_torrent(1000);
+        s.apply_message(&Message::AllowedFast { piece_index: 3 });
+        s.apply_message(&Message::AllowedFast { piece_index: 3 });
+        s.apply_message(&Message::AllowedFast { piece_index: 1000 }); // not a piece of this torrent
+        s.apply_message(&Message::AllowedFast { piece_index: u32::MAX });
+        assert_eq!(s.allowed_fast, std::collections::HashSet::from([3]));
+
+        for p in 0..500 {
+            s.apply_message(&Message::AllowedFast { piece_index: p });
+        }
+        assert_eq!(s.allowed_fast.len(), 64, "a peer naming ever more pieces cannot grow it without limit");
+    }
+
+    #[test]
+    fn a_choked_peer_can_be_asked_only_for_its_allowed_fast_pieces_and_only_on_the_fast_extension() {
+        let mut s = PeerState::for_torrent(10);
+        assert!(s.peer_choking);
+        s.apply_message(&Message::AllowedFast { piece_index: 4 });
+        assert!(!s.may_request(4), "the extension is not agreed, so the message means nothing");
+        assert!(!s.has_allowed_pieces());
+        s.fast = true;
+        assert!(s.has_allowed_pieces());
+        assert!(s.may_request(4));
+        assert!(!s.may_request(5), "only the piece it named");
+        s.apply_message(&Message::Unchoke);
+        assert!(s.may_request(5), "unchoked, anything goes");
+        s.apply_message(&Message::Choke);
+        assert!(!s.may_request(5));
     }
 }

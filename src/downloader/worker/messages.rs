@@ -34,6 +34,12 @@ pub(super) fn absorb(msg: &Message, state: &mut PeerState, queue: &WorkQueue, pe
             scratch.apply_message(msg);
             queue.note_bitfield(&scratch.peer_has_pieces);
         }
+        // BEP 6: the same as a bitfield with every bit set.
+        Message::HaveAll => {
+            let mut scratch = PeerState::for_torrent(queue.total_pieces());
+            scratch.apply_message(msg);
+            queue.note_bitfield(&scratch.peer_has_pieces);
+        }
         Message::Have { piece_index } => queue.note_have(*piece_index),
         // The peer's extended handshake (BEP 10): the one thing the worker
         // takes from it is how many requests the peer will queue.
@@ -104,6 +110,17 @@ mod tests {
         // first, so this fails if the bitfield is not fed to it.)
         let order = pop_order(&q);
         assert_eq!(order.iter().take(2).copied().collect::<std::collections::BTreeSet<_>>(), [1, 2].into(), "got {:?}", order);
+    }
+
+    #[test]
+    fn have_all_counts_every_piece_as_held_by_the_peer_like_a_full_bitfield() {
+        let q = queue(4);
+        let mut state = PeerState::for_torrent(4);
+        let active = absorb(&Message::HaveAll, &mut state, &q, None);
+
+        assert!(active);
+        assert_eq!(state.peer_has_pieces, vec![true; 4]);
+        assert_eq!(q.availability(), vec![1, 1, 1, 1]);
     }
 
     fn extended_handshake(body: &str) -> Message {

@@ -28,6 +28,8 @@ use crate::peer::extension::{ExtendedHandshake, EXTENDED_HANDSHAKE_ID};
 use crate::peer::handshake::{Handshake, HANDSHAKE_LEN};
 use crate::peer::message::Message;
 use crate::peer::state::PeerState;
+use crate::peer::fast::allowed_fast_set;
+use crate::peer::mse::MseStream;
 use crate::peer::PeerStream;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -47,6 +49,8 @@ const MAX_REQUEST_LEN: u32 = 128 * 1024;
 const MAX_INBOUND_PEERS: usize = 40;
 /// The id peers send `ut_metadata` requests to us under.
 const SEEDER_UT_METADATA_ID: u8 = 1;
+/// How many pieces a peer using the Fast Extension may request while choked.
+const ALLOWED_FAST_PIECES: usize = 5;
 /// How often the choice of who to unchoke is made again.
 pub const RECHOKE_INTERVAL: Duration = Duration::from_secs(10);
 /// An inbound peer silent for this long gets dropped.
@@ -293,6 +297,7 @@ pub fn start_with(
 /// Serves one inbound peer: handshake, bitfield, then Request/Piece until
 /// the peer leaves, goes idle too long, or the seeder shuts down.
 fn serve_peer(stream: TcpStream, shared: &SeederShared) -> std::io::Result<()> {
+    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
 
@@ -311,8 +316,10 @@ fn serve_peer(stream: TcpStream, shared: &SeederShared) -> std::io::Result<()> {
     }
     // Extensions are offered only when there is something to offer through
     // them: the info dictionary, for a peer that has only a magnet link.
-    let ours = Handshake::new(shared.info_hash, shared.our_peer_id, shared.metadata.is_some());
+    let ours = Handshake::new(shared.info_hash, shared.our_peer_id, shared.metadata.is_some()).with_fast(true);
     stream.write_all(&ours.to_bytes())?;
+    // The Fast Extension (BEP 6) is in use only if both sides said so.
+    let fast = their_hs.supports_fast();
     let speaks_extensions = shared.metadata.is_some() && their_hs.supports_extensions();
     // From here the loop wakes often to check for a stop, new pieces and a
     // change of choke.
@@ -325,7 +332,27 @@ fn serve_peer(stream: TcpStream, shared: &SeederShared) -> std::io::Result<()> {
     // to announce, never as one that is missed.
     let mut seen_version = shared.have.version();
     let mut advertised = shared.have.snapshot();
-    Message::Bitfield(PeerState::encode_bitfield(&advertised)).write_to(&mut stream).map_err(wire_to_io)?;
+    let first = if !fast {
+        Message::Bitfield(PeerState::encode_bitfield(&advertised))
+    } else if advertised.iter().all(|&has| has) && !advertised.is_empty() {
+        Message::HaveAll
+    } else if advertised.iter().all(|&has| !has) {
+        Message::HaveNone
+    } else {
+        Message::Bitfield(PeerState::encode_bitfield(&advertised))
+    };
+    first.write_to(&mut stream).map_err(wire_to_io)?;
+    // Pieces this peer may request while choked: the BEP 6 recipe, from its
+    // address and the torrent, limited to what there is to serve.
+    let mut allowed_fast = std::collections::HashSet::new();
+    if let (true, Some(std::net::IpAddr::V4(ip))) = (fast, peer_ip) {
+        for piece in allowed_fast_set(ip, &shared.info_hash, advertised.len() as u32, ALLOWED_FAST_PIECES) {
+            if advertised[piece as usize] {
+                Message::AllowedFast { piece_index: piece }.write_to(&mut stream).map_err(wire_to_io)?;
+                allowed_fast.insert(piece);
+            }
+        }
+    }
     if let (true, Some(metadata)) = (speaks_extensions, &shared.metadata) {
         // A seed says so (BEP 21): nothing is to be gained by offering it pieces.
         let seed = shared.have.count() == shared.have.total();
@@ -392,8 +419,14 @@ fn serve_peer(stream: TcpStream, shared: &SeederShared) -> std::io::Result<()> {
             }
             Message::NotInterested => shared.choker.set_interested(choker_id, false),
             Message::Request { index, begin, length } => {
-                if !shared.choker.is_unchoked(choker_id) {
-                    continue; // BEP 3: requests while choked are ignored
+                // Choked peers get nothing, except the pieces the Fast
+                // Extension lets them ask for anyway. A fast peer is told when
+                // a request will not be answered; others are left in silence
+                // (BEP 3).
+                let reject = |stream: &mut MseStream| -> std::io::Result<()> { if fast { Message::RejectRequest { index, begin, length }.write_to(stream).map_err(wire_to_io) } else { Ok(()) } };
+                if !shared.choker.is_unchoked(choker_id) && !allowed_fast.contains(&index) {
+                    reject(&mut stream)?;
+                    continue;
                 }
                 if length > MAX_REQUEST_LEN {
                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "oversized block request"));
@@ -401,7 +434,8 @@ fn serve_peer(stream: TcpStream, shared: &SeederShared) -> std::io::Result<()> {
                 let piece_len = shared.piece_len(index);
                 let in_bounds = shared.have.get(index) && (begin as u64).saturating_add(length as u64) <= piece_len;
                 if !in_bounds {
-                    continue; // request for data we don't have / can't have; ignore
+                    reject(&mut stream)?; // data we don't have / can't have
+                    continue;
                 }
                 let block = read_block(&shared.spans, index, shared.piece_length, begin, length)?;
                 if let Some(limit) = &shared.up_limit {
@@ -443,6 +477,10 @@ fn serve_peer(stream: TcpStream, shared: &SeederShared) -> std::io::Result<()> {
             // queued request to cancel). Choke/Unchoke describe *their*
             // upload policy toward us -- irrelevant, we request nothing.
             Message::Have { .. } | Message::Bitfield(_) | Message::Cancel { .. } | Message::Choke | Message::Unchoke | Message::KeepAlive | Message::Piece { .. } | Message::Port(_) | Message::Extended { .. } => {}
+            // The Fast Extension's other messages describe the *peer's*
+            // side: what it has, what it will not send us, what it suggests
+            // we fetch. We request nothing from an inbound peer.
+            Message::Suggest { .. } | Message::HaveAll | Message::HaveNone | Message::RejectRequest { .. } | Message::AllowedFast { .. } => {}
         }
     }
 }
@@ -1176,5 +1214,156 @@ mod tests {
         let (_, bitfield) = leech_connect(handle.port, info_hash);
         assert_eq!(bitfield.first(), Some(&true), "a plain peer is served as usual");
         handle.stop();
+    }
+
+    // ---- the Fast Extension (BEP 6) ----
+
+    /// A seeder with `have` of `pieces` 16 KiB pieces and no unchoke slots,
+    /// so nobody is ever unchoked.
+    fn start_fast_seeder(dir: &std::path::Path, pieces: usize, have: &[usize]) -> (SeederHandle, [u8; 20]) {
+        let files = vec![(vec!["seed.bin".to_string()], (pieces * 16384) as i64)];
+        let spans = Arc::new(build_file_spans(dir, &files));
+        for i in 0..pieces {
+            write_piece(&spans, i as u32, 16384, &vec![i as u8 + 1; 16384]).unwrap();
+        }
+        let map = Arc::new(HaveMap::new(pieces));
+        for &i in have {
+            map.set(i as u32);
+        }
+        let info_hash = [0x69; 20];
+        let options = SeederOptions { unchoke_slots: 0, ..Default::default() };
+        (start_with(0, info_hash, [0x20; 20], spans, 16384, (pieces * 16384) as u64, map, None, options).unwrap(), info_hash)
+    }
+
+    /// Connects saying it speaks the Fast Extension (or not), and collects
+    /// what the seeder sends first.
+    fn fast_leecher(port: u16, info_hash: [u8; 20], fast: bool) -> (TcpStream, Handshake, Vec<Message>) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.write_all(&Handshake::new(info_hash, [0x25; 20], false).with_fast(fast).to_bytes()).unwrap();
+        let mut buf = [0u8; HANDSHAKE_LEN];
+        stream.read_exact(&mut buf).unwrap();
+        let theirs = Handshake::from_bytes(&buf).unwrap();
+        stream.set_read_timeout(Some(Duration::from_millis(700))).unwrap();
+        let mut first = Vec::new();
+        while let Ok(m) = Message::read_from(&mut stream) {
+            first.push(m);
+        }
+        (stream, theirs, first)
+    }
+
+    #[test]
+    fn a_fast_peer_is_told_of_a_full_seed_in_one_message_and_a_partial_one_the_usual_way() {
+        let dir = tmp_dir("fast-have-all");
+        let (mut seed, hash) = start_fast_seeder(&dir, 8, &[0, 1, 2, 3, 4, 5, 6, 7]);
+        let (_, theirs, first) = fast_leecher(seed.port, hash, true);
+        assert!(theirs.supports_fast(), "the seeder speaks it too");
+        assert_eq!(first[0], Message::HaveAll);
+        seed.stop();
+
+        let dir = tmp_dir("fast-have-none");
+        let (mut empty, hash) = start_fast_seeder(&dir, 8, &[]);
+        assert_eq!(fast_leecher(empty.port, hash, true).2[0], Message::HaveNone);
+        empty.stop();
+
+        let dir = tmp_dir("fast-partial");
+        let (mut partial, hash) = start_fast_seeder(&dir, 8, &[1, 5]);
+        assert!(matches!(&fast_leecher(partial.port, hash, true).2[0], Message::Bitfield(bits) if *bits == vec![0b0100_0100]));
+        partial.stop();
+    }
+
+    #[test]
+    fn a_peer_that_does_not_speak_it_gets_an_ordinary_bitfield_and_nothing_fast() {
+        let dir = tmp_dir("fast-off");
+        let (mut seed, hash) = start_fast_seeder(&dir, 8, &[0, 1, 2, 3, 4, 5, 6, 7]);
+        let (_, _, first) = fast_leecher(seed.port, hash, false);
+        assert_eq!(first, vec![Message::Bitfield(vec![0xFF])], "a bitfield, and no allowed-fast messages");
+        seed.stop();
+    }
+
+    #[test]
+    fn the_allowed_fast_pieces_are_the_recipes_and_only_ones_the_seeder_has() {
+        let dir = tmp_dir("fast-allowed");
+        let pieces = 40;
+        // Every other piece is missing.
+        let have: Vec<usize> = (0..pieces).step_by(2).collect();
+        let (mut seed, hash) = start_fast_seeder(&dir, pieces, &have);
+
+        let (_, _, first) = fast_leecher(seed.port, hash, true);
+
+        let sent: Vec<u32> = first.iter().filter_map(|m| if let Message::AllowedFast { piece_index } = m { Some(*piece_index) } else { None }).collect();
+        let recipe = allowed_fast_set(std::net::Ipv4Addr::LOCALHOST, &hash, pieces as u32, ALLOWED_FAST_PIECES);
+        let expected: Vec<u32> = recipe.into_iter().filter(|p| p % 2 == 0).collect();
+        assert_eq!(sent, expected, "the recipe's pieces, less those the seeder cannot serve");
+        assert!(sent.len() <= ALLOWED_FAST_PIECES);
+        seed.stop();
+    }
+
+    #[test]
+    fn a_choked_fast_peer_is_served_an_allowed_piece_and_rejected_for_any_other() {
+        let dir = tmp_dir("fast-serve");
+        let pieces = 40;
+        let all: Vec<usize> = (0..pieces).collect();
+        let (mut seed, hash) = start_fast_seeder(&dir, pieces, &all);
+        let (mut stream, _, first) = fast_leecher(seed.port, hash, true);
+        let allowed: Vec<u32> = first.iter().filter_map(|m| if let Message::AllowedFast { piece_index } = m { Some(*piece_index) } else { None }).collect();
+        assert!(!allowed.is_empty());
+        let not_allowed = (0..pieces as u32).find(|p| !allowed.contains(p)).unwrap();
+
+        // Never unchoked (no slots), yet an allowed piece is served ...
+        Message::Request { index: allowed[0], begin: 0, length: 16384 }.write_to(&mut stream).unwrap();
+        // ... and any other is rejected, naming exactly the request.
+        Message::Request { index: not_allowed, begin: 0, length: 16384 }.write_to(&mut stream).unwrap();
+
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let (mut served, mut rejected) = (None, None);
+        while served.is_none() || rejected.is_none() {
+            match Message::read_from(&mut stream).unwrap() {
+                Message::Piece { index, block, .. } => served = Some((index, block)),
+                Message::RejectRequest { index, begin, length } => rejected = Some((index, begin, length)),
+                _ => {}
+            }
+        }
+        assert_eq!(served, Some((allowed[0], vec![allowed[0] as u8 + 1; 16384])), "the block, without an unchoke");
+        assert_eq!(rejected, Some((not_allowed, 0, 16384)));
+        seed.stop();
+    }
+
+    #[test]
+    fn a_fast_peer_asking_for_a_piece_the_seeder_lacks_or_out_of_range_is_rejected_not_left_waiting() {
+        let dir = tmp_dir("fast-reject-missing");
+        let (mut seed, hash) = start_fast_seeder(&dir, 8, &[0, 1, 2, 3]);
+        let (mut stream, _, first) = fast_leecher(seed.port, hash, true);
+        let allowed: Vec<u32> = first.iter().filter_map(|m| if let Message::AllowedFast { piece_index } = m { Some(*piece_index) } else { None }).collect();
+        let usable = allowed.first().copied().expect("some allowed piece among those it has");
+
+        // An allowed piece, but past the end of it.
+        Message::Request { index: usable, begin: 16384, length: 16384 }.write_to(&mut stream).unwrap();
+
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let reply = loop {
+            match Message::read_from(&mut stream).unwrap() {
+                m @ Message::RejectRequest { .. } => break m,
+                _ => continue,
+            }
+        };
+        assert_eq!(reply, Message::RejectRequest { index: usable, begin: 16384, length: 16384 });
+        seed.stop();
+    }
+
+    #[test]
+    fn a_non_fast_peer_asking_while_choked_is_still_met_with_silence() {
+        let dir = tmp_dir("fast-silence");
+        let (mut seed, hash) = start_fast_seeder(&dir, 8, &[0, 1, 2, 3, 4, 5, 6, 7]);
+        let (mut stream, _, _) = fast_leecher(seed.port, hash, false);
+
+        Message::Request { index: 0, begin: 0, length: 16384 }.write_to(&mut stream).unwrap();
+
+        stream.set_read_timeout(Some(Duration::from_millis(700))).unwrap();
+        let mut got = Vec::new();
+        while let Ok(m) = Message::read_from(&mut stream) {
+            got.push(m);
+        }
+        assert!(got.iter().all(|m| !matches!(m, Message::RejectRequest { .. } | Message::Piece { .. })), "BEP 3: ignored, not rejected: {:?}", got);
+        seed.stop();
     }
 }
