@@ -162,6 +162,10 @@ enum Kind {
     StoppedAnnounceIsBounded,
     /// A second signal during that wait exits at once with status 130.
     SecondSignalForcesExit,
+    /// BEP 12: a torrent whose announce list is [[a dead tracker, one that works], [another]] is
+    /// announced to the first tier's working tracker and to no other, and that tracker alone hears
+    /// `stopped`; with `--tracker-mode concurrent` every tracker is asked.
+    TrackerTiers,
     /// The multi-torrent daemon: two torrents downloaded and then seeded on one
     /// port, told to it over its control socket; one paused and resumed; one removed while the other
     /// carries on; and, after a restart, what was left remembered.
@@ -213,6 +217,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "seed-time-ends-seeding", kind: Kind::SeedTime },
     Scenario { name: "stopped-announce-is-bounded", kind: Kind::StoppedAnnounceIsBounded },
     Scenario { name: "second-signal-forces-exit", kind: Kind::SecondSignalForcesExit },
+    Scenario { name: "tracker-tiers", kind: Kind::TrackerTiers },
     Scenario { name: "daemon-two-torrents", kind: Kind::Daemon },
 ];
 
@@ -264,6 +269,7 @@ fn main() {
             Kind::SeedTime => run_seed_time(scenario.name),
             Kind::StoppedAnnounceIsBounded => run_stopped_announce_is_bounded(scenario.name),
             Kind::SecondSignalForcesExit => run_second_signal_forces_exit(scenario.name),
+            Kind::TrackerTiers => run_tracker_tiers(scenario.name),
             Kind::Daemon => run_daemon(scenario.name),
         };
         match outcome {
@@ -3506,4 +3512,55 @@ fn run_daemon(name: &str) -> Result<String, String> {
     wait_or_kill(&mut child.0, Duration::from_secs(20))?;
 
     Ok(format!("two torrents downloaded and seeded on the one port {}, both announcing it and both served on it; one paused and resumed (refused on the port while it was paused); one removed (told to its tracker, files kept, refused on the port) while the other carried on; and after stop and a restart only the other was there, seeding again", daemon.port))
+}
+
+// ---- BEP 12 ----------------------------------------------------------
+
+fn run_tracker_tiers(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]); // its tracker is the one that works, and lists the peer
+    let (second_tier, second_announces) = spawn_tracker(Vec::new(), TrackerMode::Answer);
+    let dead = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("addr") // closed again at once: nothing listens there
+    };
+    let dir = scratch_dir(name);
+    let url = |addr: SocketAddr| format!("http://{}/announce", addr);
+    let bstr = |text: &str| format!("{}:{}", text.len(), text);
+    let mut torrent = Vec::new();
+    torrent.extend_from_slice(b"d");
+    torrent.extend_from_slice(format!("8:announce{}", bstr(&url(dead))).as_bytes());
+    torrent.extend_from_slice(format!("13:announce-listll{}{}el{}ee", bstr(&url(dead)), bstr(&url(swarm.tracker_addr)), bstr(&url(second_tier))).as_bytes());
+    torrent.extend_from_slice(b"4:info");
+    torrent.extend_from_slice(&fx.info_bytes);
+    torrent.extend_from_slice(b"e");
+    let torrent_path = dir.join("tiers.torrent");
+    fs::write(&torrent_path, &torrent).expect("write torrent file");
+
+    // By tier (the default): the tracker that works hears everything, and the one in the next tier nothing.
+    let out_dir = dir.join("out-tiered");
+    let mut child = client_command(&torrent_path, &out_dir, &dir.join("tiered.log"), 1).arg("--no-dht").spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    if !wait_or_kill(&mut child, RUN_LIMIT)?.success() {
+        return Err("the client did not finish".to_string());
+    }
+    check_downloaded(&fx, &out_dir)?;
+    let heard = swarm.announces.lock().unwrap().clone();
+    if heard.is_empty() || !heard[0].contains("event=started") {
+        return Err(format!("the working tracker of the first tier did not hear `started` first: {:?}", heard));
+    }
+    check_stopped_last(&swarm, fx.data.len(), 0)?;
+    if !second_announces.lock().unwrap().is_empty() {
+        return Err(format!("the second tier was asked though the first had an answer: {:?}", second_announces.lock().unwrap()));
+    }
+
+    // Concurrent: every tracker, so the second tier's too.
+    let out_dir = dir.join("out-concurrent");
+    let mut child = client_command(&torrent_path, &out_dir, &dir.join("concurrent.log"), 1).args(["--no-dht", "--tracker-mode", "concurrent"]).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    if !wait_or_kill(&mut child, RUN_LIMIT)?.success() {
+        return Err("the client did not finish with --tracker-mode concurrent".to_string());
+    }
+    if !second_announces.lock().unwrap().iter().any(|line| line.contains("event=started")) {
+        return Err("--tracker-mode concurrent did not ask the second tier".to_string());
+    }
+    Ok("by tier: the first tier's dead tracker was passed over, its working one heard `started` and `stopped`, and the second tier heard nothing; concurrent: the second tier was asked too".to_string())
 }

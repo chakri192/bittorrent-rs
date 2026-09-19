@@ -142,6 +142,67 @@ fn describe(deadline: Duration) -> String {
     }
 }
 
+/// How a torrent's trackers are asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrackerMode {
+    /// As BEP 12 says: the announce list is a list of tiers; a tier's trackers are tried in order until one
+    /// answers, which then goes to the front of its tier, and a tier is tried only if every one before it failed.
+    #[default]
+    Tiered,
+    /// Every tracker at once, and the union of what they say: more peers sooner, and more requests to trackers.
+    Concurrent,
+}
+
+impl TrackerMode {
+    pub fn parse(text: &str) -> Option<TrackerMode> {
+        match text {
+            "tiered" => Some(TrackerMode::Tiered),
+            "concurrent" => Some(TrackerMode::Concurrent),
+            _ => None,
+        }
+    }
+}
+
+/// How long a tracker in a tier is given before the next one is tried. (Concurrent announces wait longer for
+/// stragglers, since they cost nothing to wait for; here each one waited for delays the next.)
+pub const TIERED_TRACKER_DEADLINE: Duration = Duration::from_secs(8);
+
+/// Asks the trackers of `tiers` as BEP 12 has it, with `ask` making one announce to one URL: the tiers in order and
+/// each tier's trackers in order, stopping at the first that answers, which is moved to the front of its tier so that
+/// it is asked first next time. Returns that tracker and what it said, if one answered; and the trackers asked that
+/// did not, in the order asked.
+pub fn walk_tiers<T>(tiers: &mut [Vec<String>], mut ask: impl FnMut(&str) -> Result<T, String>) -> (Option<(String, T)>, Vec<TrackerAttempt>) {
+    let mut failures = Vec::new();
+    for tier in tiers.iter_mut() {
+        for i in 0..tier.len() {
+            match ask(&tier[i]) {
+                Ok(answer) => {
+                    let url = tier.remove(i);
+                    tier.insert(0, url.clone());
+                    return (Some((url, answer)), failures);
+                }
+                Err(error) => failures.push(TrackerAttempt { url: tier[i].clone(), error }),
+            }
+        }
+    }
+    (None, failures)
+}
+
+/// Puts each tier in a random order, as BEP 12 has clients do so that the load is spread over a tier's trackers.
+pub fn shuffled(mut tiers: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    for tier in tiers.iter_mut() {
+        for i in (1..tier.len()).rev() {
+            let mut byte = [0u8; 4];
+            // (If the system has no randomness the order is left as it was.)
+            if getrandom::getrandom(&mut byte).is_err() {
+                return tiers;
+            }
+            tier.swap(i, u32::from_le_bytes(byte) as usize % (i + 1));
+        }
+    }
+    tiers
+}
+
 /// Session transfer totals reported to trackers (BEP 3): `uploaded`/
 /// `downloaded` are bytes moved *this session*; `left` is bytes still
 /// needed to complete the torrent (0 once seeding).
@@ -271,5 +332,75 @@ mod tests {
         assert!(failures.is_empty(), "{:?}", failures);
         assert_eq!(peers.len(), 1);
         assert_eq!(interval, Some(900));
+    }
+
+    // ---- tiers ------------------------------------------------------------
+
+    fn tiers(list: &[&[&str]]) -> Vec<Vec<String>> {
+        list.iter().map(|tier| tier.iter().map(|u| u.to_string()).collect()).collect()
+    }
+
+    #[test]
+    fn the_first_tracker_that_answers_ends_the_walk_and_goes_to_the_front_of_its_tier() {
+        let mut list = tiers(&[&["a", "b", "c"], &["d"]]);
+        let mut asked = Vec::new();
+        let (found, failures) = walk_tiers(&mut list, |url| {
+            asked.push(url.to_string());
+            if url == "b" { Ok(7) } else { Err(format!("{} is down", url)) }
+        });
+        assert_eq!(asked, vec!["a", "b"], "in order, and no further once one answered: not c, and not the next tier");
+        assert_eq!(found, Some(("b".to_string(), 7)));
+        assert_eq!(failures.iter().map(|f| (f.url.as_str(), f.error.as_str())).collect::<Vec<_>>(), vec![("a", "a is down")]);
+        assert_eq!(list, tiers(&[&["b", "a", "c"], &["d"]]), "the one that answered is asked first next time");
+    }
+
+    #[test]
+    fn a_tier_is_tried_only_once_every_tracker_before_it_has_failed() {
+        let mut list = tiers(&[&["a", "b"], &["c", "d"], &["e"]]);
+        let mut asked = Vec::new();
+        let (found, failures) = walk_tiers(&mut list, |url| {
+            asked.push(url.to_string());
+            if url == "d" { Ok(()) } else { Err("no".to_string()) }
+        });
+        assert_eq!(asked, vec!["a", "b", "c", "d"]);
+        assert_eq!(found.map(|(url, _)| url), Some("d".to_string()));
+        assert_eq!(failures.len(), 3);
+        assert_eq!(list, tiers(&[&["a", "b"], &["d", "c"], &["e"]]), "only its own tier is reordered");
+    }
+
+    #[test]
+    fn when_every_tracker_fails_they_all_were_asked_and_none_answered() {
+        let mut list = tiers(&[&["a"], &["b", "c"]]);
+        let (found, failures) = walk_tiers(&mut list, |_| Err::<(), _>("no".to_string()));
+        assert!(found.is_none());
+        assert_eq!(failures.iter().map(|f| f.url.as_str()).collect::<Vec<_>>(), vec!["a", "b", "c"]);
+        assert_eq!(list, tiers(&[&["a"], &["b", "c"]]), "nothing reordered");
+        assert!(walk_tiers(&mut Vec::<Vec<String>>::new(), |_| Ok::<(), String>(())).0.is_none(), "no trackers, no answer");
+    }
+
+    #[test]
+    fn shuffling_keeps_every_tracker_in_its_tier_and_does_change_the_order() {
+        let original = tiers(&[&["a", "b", "c", "d", "e", "f", "g", "h"], &["i"], &[]]);
+        let mut changed = false;
+        for _ in 0..20 {
+            let shuffled = shuffled(original.clone());
+            assert_eq!(shuffled.len(), 3);
+            for (before, after) in original.iter().zip(&shuffled) {
+                let (mut b, mut a) = (before.clone(), after.clone());
+                b.sort();
+                a.sort();
+                assert_eq!(a, b, "the same trackers, in the same tier");
+            }
+            changed |= shuffled[0] != original[0];
+        }
+        assert!(changed, "twenty shuffles of eight, and the order never once differed");
+    }
+
+    #[test]
+    fn a_tracker_mode_is_read_from_its_name() {
+        assert_eq!(TrackerMode::parse("tiered"), Some(TrackerMode::Tiered));
+        assert_eq!(TrackerMode::parse("concurrent"), Some(TrackerMode::Concurrent));
+        assert_eq!(TrackerMode::parse("Tiered"), None);
+        assert_eq!(TrackerMode::default(), TrackerMode::Tiered, "BEP 12 is the default");
     }
 }

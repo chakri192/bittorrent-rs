@@ -14,6 +14,7 @@
 //! dht = true
 //! lsd = true         # find peers on the local network (BEP 14)
 //! transport = "tcp"  # "tcp" | "utp" | "both"
+//! tracker_mode = "tiered"  # "tiered" (BEP 12) | "concurrent" (every tracker at once)
 //! ipv6 = "auto"      # "auto" | "always" | "never"
 //! reannounce = 900
 //! seed_ratio = 2.0   # stop seeding at this ratio ...
@@ -55,6 +56,8 @@ pub struct Config {
     pub encryption: Option<String>,
     /// `"tcp"` | `"utp"` | `"both"`: how peers are dialed (`--transport`).
     pub transport: Option<String>,
+    /// `"tiered"` | `"concurrent"`: how the trackers are asked (`--tracker-mode`).
+    pub tracker_mode: Option<String>,
 }
 
 impl Config {

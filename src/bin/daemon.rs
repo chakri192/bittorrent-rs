@@ -30,6 +30,7 @@ mod unix {
     use bittorrent_rs::peer::{Encryption, TransportMode};
     use bittorrent_rs::ratelimit::parse_rate;
     use bittorrent_rs::session::env::{dht_bootstrap, lsd_config};
+    use bittorrent_rs::tracker_discovery::TrackerMode;
     use bittorrent_rs::session::{has_ipv6_egress, seed_limits, Ipv6Mode, NetworkConfig, SeedLimits, SharedNetwork};
     use bittorrent_rs::tracker::generate_peer_id;
     use bittorrent_rs::ui::format_rate;
@@ -65,6 +66,7 @@ mod unix {
         pub portmap: bool,
         pub ipv6: Ipv6Mode,
         pub transport: TransportMode,
+        pub tracker_mode: TrackerMode,
         pub encryption: Option<Encryption>,
         pub max_peers: usize,
         pub seed_limits: SeedLimits,
@@ -80,7 +82,7 @@ mod unix {
     }
 
     fn usage() -> String {
-        "usage: daemon run [--state-dir DIR] [--socket PATH] [--port PORT] [--max-up RATE] [--max-down RATE] [--peers N] [--dht | --no-dht] [--lsd | --no-lsd] [--portmap | --no-portmap] [--ipv6 | --no-ipv6] [--transport tcp|utp|both] [--encryption off|prefer|require] [--seed-ratio RATIO] [--seed-time DURATION] [--quiet]\n\
+        "usage: daemon run [--state-dir DIR] [--socket PATH] [--port PORT] [--max-up RATE] [--max-down RATE] [--peers N] [--dht | --no-dht] [--lsd | --no-lsd] [--portmap | --no-portmap] [--ipv6 | --no-ipv6] [--transport tcp|utp|both] [--tracker-mode tiered|concurrent] [--encryption off|prefer|require] [--seed-ratio RATIO] [--seed-time DURATION] [--quiet]\n\
          \x20      daemon add <file.torrent | magnet:?...> [--out DIR] [--socket PATH] [--json]\n\
          \x20      daemon list | status ID | remove ID | stop [--socket PATH] [--json]\n\
          \n\
@@ -96,7 +98,7 @@ mod unix {
         }
         let mut positional = None;
         let mut args = Args { command: Command::List, state_dir: None, socket: None, json: false };
-        let mut run = RunArgs { port: DEFAULT_PORT, max_up: None, max_down: None, dht: true, lsd: true, portmap: true, ipv6: Ipv6Mode::Auto, transport: TransportMode::Tcp, encryption: None, max_peers: 30, seed_limits: SeedLimits::default(), quiet: false };
+        let mut run = RunArgs { port: DEFAULT_PORT, max_up: None, max_down: None, dht: true, lsd: true, portmap: true, ipv6: Ipv6Mode::Auto, transport: TransportMode::Tcp, tracker_mode: TrackerMode::Tiered, encryption: None, max_peers: 30, seed_limits: SeedLimits::default(), quiet: false };
         let mut out = None;
         let mut job = JobOptions::default();
 
@@ -123,6 +125,7 @@ mod unix {
                 "--ipv6" => run.ipv6 = Ipv6Mode::Always,
                 "--no-ipv6" => run.ipv6 = Ipv6Mode::Never,
                 "--transport" => run.transport = TransportMode::parse(&value("tcp, utp or both")?).ok_or("--transport: expected tcp, utp or both")?,
+                "--tracker-mode" => run.tracker_mode = TrackerMode::parse(&value("tiered or concurrent")?).ok_or("--tracker-mode: expected tiered or concurrent")?,
                 "--encryption" => run.encryption = Some(Encryption::parse(&value("off, prefer or require")?).map_err(|e| format!("--encryption: {}", e))?),
                 "--seed-ratio" => run.seed_limits.ratio = Some(seed_limits::parse_ratio(&value("a ratio such as 1 or 2.5")?).map_err(|e| format!("--seed-ratio: {}", e))?),
                 "--seed-time" => run.seed_limits.time = Some(seed_limits::parse_duration(&value("a duration such as 30m, 12h or 1d")?).map_err(|e| format!("--seed-time: {}", e))?),
@@ -214,7 +217,7 @@ mod unix {
         };
         let config = NetworkConfig { port: run.port, transport: run.transport, encryption: run.encryption, dht: run.dht, dht_bootstrap: dht_bootstrap(), ipv6, portmap: run.portmap, max_up: run.max_up, max_down: run.max_down };
         let network = Arc::new(SharedNetwork::start(&config, say).map_err(|e| format!("cannot listen: {}", e))?);
-        let defaults = JobDefaults { max_peers: run.max_peers, ipv6: run.ipv6, lsd: run.lsd.then(lsd_config), encryption: run.encryption, transport: run.transport, seed_limits: run.seed_limits, ..Default::default() };
+        let defaults = JobDefaults { max_peers: run.max_peers, ipv6: run.ipv6, lsd: run.lsd.then(lsd_config), encryption: run.encryption, transport: run.transport, tracker_mode: run.tracker_mode, seed_limits: run.seed_limits, ..Default::default() };
         let manager = Manager::new(Arc::clone(&network), generate_peer_id(), defaults, Some(store));
         let server = match Server::start(&socket, Arc::clone(&manager), Arc::clone(&stop)) {
             Ok(server) => server,
@@ -347,13 +350,15 @@ mod unix {
         fn run_takes_the_daemons_settings_and_has_defaults_for_all() {
             let Command::Run(defaults) = parse(&["run"]).unwrap().command else { panic!("run") };
             assert_eq!((defaults.port, defaults.dht, defaults.lsd, defaults.portmap, defaults.ipv6, defaults.transport), (6881, true, true, true, Ipv6Mode::Auto, TransportMode::Tcp));
+            assert_eq!(defaults.tracker_mode, TrackerMode::Tiered);
             assert_eq!((defaults.max_up, defaults.max_down, defaults.encryption, defaults.max_peers, defaults.quiet), (None, None, None, 30, false));
 
-            let args = parse(&["run", "--state-dir", "/s", "--socket", "/s/x.sock", "--port", "7000", "--max-up", "1M", "--max-down", "2K", "--peers", "12", "--no-dht", "--no-lsd", "--no-portmap", "--no-ipv6", "--transport", "both", "--encryption", "require", "--seed-ratio", "1.5", "--seed-time", "2h", "--quiet"]).unwrap();
+            let args = parse(&["run", "--state-dir", "/s", "--socket", "/s/x.sock", "--port", "7000", "--max-up", "1M", "--max-down", "2K", "--peers", "12", "--no-dht", "--no-lsd", "--no-portmap", "--no-ipv6", "--transport", "both", "--tracker-mode", "concurrent", "--encryption", "require", "--seed-ratio", "1.5", "--seed-time", "2h", "--quiet"]).unwrap();
             assert_eq!((args.state_dir, args.socket), (Some(PathBuf::from("/s")), Some(PathBuf::from("/s/x.sock"))));
             let Command::Run(run) = args.command else { panic!("run") };
             assert_eq!((run.port, run.max_up, run.max_down, run.max_peers), (7000, Some(1 << 20), Some(2048), 12));
             assert_eq!((run.dht, run.lsd, run.portmap, run.ipv6, run.transport, run.encryption, run.quiet), (false, false, false, Ipv6Mode::Never, TransportMode::Both, Some(Encryption::Require), true));
+            assert_eq!(run.tracker_mode, TrackerMode::Concurrent);
             assert_eq!((run.seed_limits.ratio, run.seed_limits.time), (Some(1.5), Some(Duration::from_secs(7200))));
         }
 
@@ -389,7 +394,8 @@ mod unix {
             assert!(parse(&["run", "--transport", "udp"]).unwrap_err().starts_with("--transport:"));
             assert!(parse(&["run", "--encryption", "maybe"]).unwrap_err().starts_with("--encryption:"));
             assert!(parse(&["run", "--seed-ratio", "-1"]).is_err());
-            for flag in ["--state-dir", "--socket", "--port", "--max-up", "--max-down", "--peers", "--transport", "--encryption", "--seed-ratio", "--seed-time"] {
+            assert!(parse(&["run", "--tracker-mode", "all"]).unwrap_err().starts_with("--tracker-mode:"));
+            for flag in ["--tracker-mode", "--state-dir", "--socket", "--port", "--max-up", "--max-down", "--peers", "--transport", "--encryption", "--seed-ratio", "--seed-time"] {
                 assert!(parse(&["run", flag]).unwrap_err().contains("requires"), "{} with no value", flag);
             }
             assert!(parse(&["add", "x", "--out"]).unwrap_err().contains("requires"));

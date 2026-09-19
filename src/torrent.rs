@@ -389,6 +389,19 @@ impl TorrentFile {
         urls
     }
 
+    /// The trackers as BEP 12 has them: the tiers of `announce-list`, most preferred first (empty tiers left out),
+    /// or, with no list, `announce` as a tier of its own. A torrent whose list does not include its `announce` gets
+    /// that too, as a tier before the rest, since a client that ignored it would be ignoring a tracker the maker named.
+    pub fn tracker_tiers(&self) -> Vec<Vec<String>> {
+        let mut tiers: Vec<Vec<String>> = self.announce_list.iter().filter(|tier| !tier.is_empty()).cloned().collect();
+        if let Some(announce) = &self.announce {
+            if !tiers.iter().any(|tier| tier.contains(announce)) {
+                tiers.insert(0, vec![announce.clone()]);
+            }
+        }
+        tiers
+    }
+
     /// Whether the torrent is BitTorrent v2 only (BEP 52), with no v1 piece
     /// hashes: it can be read, listed and verified, but not yet downloaded.
     pub fn is_v2_only(&self) -> bool {
@@ -889,5 +902,28 @@ mod tests {
             }
         }
         assert!(matches!(parse_torrent_file(&crate::bencode::encode(&top)).unwrap_err(), TorrentError::V2(crate::v2::V2Error::BadPieceLength)));
+    }
+
+    // ---- BEP 12 ------------------------------------------------------------
+
+    fn with_trackers(announce: Option<&str>, list: &[&[&str]]) -> TorrentFile {
+        let mut torrent = parse_torrent_file(b"d4:infod6:lengthi10e4:name1:f12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee").unwrap();
+        torrent.announce = announce.map(str::to_string);
+        torrent.announce_list = list.iter().map(|tier| tier.iter().map(|u| u.to_string()).collect()).collect();
+        torrent
+    }
+
+    #[test]
+    fn the_tiers_are_the_announce_list_and_announce_alone_is_a_tier_of_one() {
+        assert_eq!(with_trackers(Some("http://a/"), &[]).tracker_tiers(), vec![vec!["http://a/".to_string()]]);
+        assert!(with_trackers(None, &[]).tracker_tiers().is_empty());
+        let both = with_trackers(Some("http://a/"), &[&["http://a/", "http://b/"], &["http://c/"]]);
+        assert_eq!(both.tracker_tiers(), vec![vec!["http://a/".to_string(), "http://b/".to_string()], vec!["http://c/".to_string()]], "as listed, `announce` being in it already");
+    }
+
+    #[test]
+    fn an_announce_the_list_leaves_out_is_a_tier_before_the_rest_and_empty_tiers_are_dropped() {
+        let torrent = with_trackers(Some("http://main/"), &[&[], &["http://b/"], &[]]);
+        assert_eq!(torrent.tracker_tiers(), vec![vec!["http://main/".to_string()], vec!["http://b/".to_string()]]);
     }
 }

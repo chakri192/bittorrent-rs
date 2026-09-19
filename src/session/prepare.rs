@@ -79,6 +79,8 @@ pub struct Options {
     /// listening side (`--transport`). A mode that wants uTP without a running
     /// uTP socket falls back to TCP, and says so.
     pub transport: crate::peer::TransportMode,
+    /// How the trackers are asked: by BEP 12's tiers, or all at once (`--tracker-mode`).
+    pub tracker_mode: crate::tracker_discovery::TrackerMode,
     /// Message stream encryption (`--encryption`). `None` is the default:
     /// outgoing connections are plain, incoming ones may be either.
     pub encryption: Option<crate::peer::Encryption>,
@@ -176,7 +178,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
         sink.log(format!("selective download: {} of {} file(s), {} piece(s), {}", mask.iter().filter(|&&b| b).count(), torrent.files.len(), goal_pieces, format_bytes(display_total)));
     }
 
-    let tracker_urls = torrent.tracker_urls();
+    let tracker_tiers = crate::tracker_discovery::shuffled(torrent.tracker_tiers());
     // A multi-file torrent's name is the directory its files go under,
     // however many files it lists (one is legal and common).
     let base_dir = if torrent.multi_file { options.out_dir.join(&torrent.name) } else { options.out_dir.clone() };
@@ -287,7 +289,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     pool.add(bootstrap_peers);
 
     // First real announce, now that the true size is known.
-    let mut announcer = Announcer::new(tracker_urls, torrent.info_hash, our_peer_id, announce_port, options.reannounce_override, Instant::now());
+    let mut announcer = Announcer::tiered(tracker_tiers, options.tracker_mode, torrent.info_hash, our_peer_id, announce_port, options.reannounce_override, Instant::now());
     let first_totals = TransferTotals { uploaded: services.uploaded_counter().map_or(0, |c| c.load(std::sync::atomic::Ordering::Relaxed)), downloaded: 0, left: display_total.saturating_sub(bytes_already_done) };
     pool.add(announcer.start(Instant::now(), first_totals, |m| sink.log(m)));
 
@@ -395,6 +397,7 @@ mod tests {
             sequential: false,
             encryption: None,
             transport: Default::default(),
+            tracker_mode: Default::default(),
             prefer: Vec::new(),
             retry_delay: Duration::from_secs(15),
             pipeline_depth: 5,

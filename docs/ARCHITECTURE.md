@@ -218,7 +218,7 @@ Four layers, each catching what the one below cannot.
 Deliberate, and the README's Limitations lists them: one thread per
 connection (fine for tens of peers, not thousands); choking is only the
 seeding half of tit-for-tat, since inbound peers are never downloaded from;
-trackers are asked concurrently rather than by BEP 12 tier; a piece
+a magnet link's trackers are asked concurrently, having no tiers, and `--tracker-mode concurrent` does the same for a torrent's; a piece
 interrupted part-way is handed to the next peer within a run but not saved
 across runs; one piece is downloaded at a time per connection, so a request
 pipeline drains at each piece boundary; uTP and local discovery are IPv4 only (and uTP is
