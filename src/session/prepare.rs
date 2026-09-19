@@ -125,6 +125,7 @@ pub struct Prepared {
     display_total: u64,
     goal_pieces: usize,
     timeout: Option<Duration>,
+    partial_path: PathBuf,
     pub info: RunInfo,
 }
 
@@ -142,6 +143,7 @@ impl Prepared {
             display_total: self.display_total,
             goal_pieces: self.goal_pieces,
             timeout: self.timeout,
+            partial_path: Some(self.partial_path),
         })
     }
 }
@@ -280,6 +282,20 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     let preferred = if options.prefer.iter().any(|&p| p) { crate::selection::selected_pieces_of(torrent, &options.prefer).0 } else { Default::default() };
     let queue = Arc::new(WorkQueue::new(work, total_pieces).with_order(if options.sequential { Order::Sequential } else { Order::RarestFirst }).with_preferred(preferred));
 
+    // What a run that was stopped had received of pieces it did not finish.
+    let partial_path = crate::downloader::partial::partial_file_path(&options.out_dir, &torrent.info_hash);
+    let kept = crate::downloader::partial::load(&partial_path);
+    let mut resumed_blocks = 0;
+    for (index, partial) in kept.into_iter().filter(|(index, _)| queue.is_wanted(*index)) {
+        resumed_blocks += partial.blocks_held();
+        queue.stash_partial(index, partial);
+    }
+    // (Whatever this run leaves unfinished is written again as it ends.)
+    crate::downloader::resume::clear(&partial_path);
+    if resumed_blocks > 0 {
+        sink.log(format!("resuming: {} block(s) of unfinished pieces kept from the last run", resumed_blocks));
+    }
+
     sink.log(if allow_ipv6 {
         "IPv6 peers enabled".to_string()
     } else {
@@ -328,7 +344,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     }
 
     let progress = Progress::new(have, resume_writer, goal_pieces, pieces_done, bytes_already_done);
-    Ok(Prepared { queue, workers, announcer, progress, pool, display_total, goal_pieces, timeout: options.timeout, info: RunInfo { base_dir, progress_path, selective, total_length, display_total, announce_port } })
+    Ok(Prepared { queue, workers, announcer, progress, pool, display_total, goal_pieces, timeout: options.timeout, partial_path, info: RunInfo { base_dir, progress_path, selective, total_length, display_total, announce_port } })
 }
 
 #[cfg(test)]
@@ -971,5 +987,39 @@ mod tests {
         assert_eq!(prepared.unwrap().workers.down_limit().map(|l| l.bytes_per_sec()), Some(2));
         assert_eq!(alone.seeder_up_limit().map(|l| l.bytes_per_sec()), Some(1));
         network.shutdown();
+    }
+
+    #[test]
+    fn the_blocks_a_stopped_run_kept_are_given_back_to_the_queue_and_the_file_is_cleared() {
+        use crate::downloader::partial;
+        let dir = tmp_dir("partial-kept");
+        let t = torrent();
+        let path = partial::partial_file_path(&dir, &t.info_hash);
+        // Piece 1 has 256 bytes: one block, received. Piece 7 does not exist. Piece 2 is 88 bytes.
+        let one_block = |len: usize| {
+            let mut a = crate::downloader::PieceAssembler::new(crate::downloader::PieceWork { index: 0, hash: [0; 20], length: len as u32, merkle: None });
+            a.record_block(0, &vec![9u8; len]).unwrap();
+            a.into_partial().unwrap()
+        };
+        partial::save(&path, &[(1, one_block(256)), (7, one_block(256))]).unwrap();
+        let mut services = Services::new();
+
+        let (prepared, log) = run_prepare(&t, &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        let prepared = prepared.unwrap();
+
+        assert!(log.logged("resuming: 1 block(s) of unfinished pieces kept from the last run"), "{:?}", log.lines.lock().unwrap());
+        assert_eq!(prepared.queue.partials().iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![1], "the piece that is wanted, and not one that is not there");
+        assert!(!path.exists(), "the file is taken up: the run that follows writes it again as it ends");
+    }
+
+    #[test]
+    fn a_partial_file_that_is_not_one_is_ignored() {
+        let dir = tmp_dir("partial-junk");
+        let t = torrent();
+        std::fs::write(crate::downloader::partial::partial_file_path(&dir, &t.info_hash), b"junk").unwrap();
+        let mut services = Services::new();
+        let (prepared, log) = run_prepare(&t, &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        assert!(prepared.unwrap().queue.partials().is_empty());
+        assert!(!log.logged("resuming: "), "nothing was resumed");
     }
 }

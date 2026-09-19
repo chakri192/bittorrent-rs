@@ -226,6 +226,19 @@ impl WorkQueue {
         lock(&self.inner).partial.remove(&index)
     }
 
+    /// Every stash held, to be kept across a stop (see [`crate::downloader::partial`]).
+    pub fn partials(&self) -> Vec<(u32, PartialPiece)> {
+        let mut all: Vec<(u32, PartialPiece)> = lock(&self.inner).partial.iter().map(|(&index, partial)| (index, partial.clone())).collect();
+        all.sort_by_key(|(index, _)| *index);
+        all
+    }
+
+    /// Whether the piece is still to be fetched (pending or being fetched).
+    pub fn is_wanted(&self, index: u32) -> bool {
+        let inner = lock(&self.inner);
+        !inner.done.contains(&index) && (inner.claimed.contains_key(&index) || inner.pending.iter().any(|w| w.index == index))
+    }
+
     /// Retires a piece everywhere after it has been verified and written.
     /// Returns `true` if this call was the first to mark it done (callers
     /// use this to avoid double-counting duplicate endgame completions).
@@ -766,5 +779,20 @@ mod tests {
         q.note_have(0);
         let order: Vec<u32> = std::iter::from_fn(|| piece_index(q.take_for(|_| true))).take(3).collect();
         assert_eq!(order, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn every_stash_can_be_listed_in_order_and_a_piece_is_wanted_until_it_is_done() {
+        let q = WorkQueue::new(vec![work(0), work(1), work(2)], 3);
+        q.stash_partial(2, partial_of(2, 1, PIECE));
+        q.stash_partial(0, partial_of(0, 2, PIECE));
+        let all = q.partials();
+        assert_eq!(all.iter().map(|(i, p)| (*i, p.blocks_held())).collect::<Vec<_>>(), vec![(0, 2), (2, 1)], "by piece, and the stash itself is untouched");
+        assert!(q.take_partial(0).is_some(), "listing took nothing");
+
+        assert!(q.is_wanted(1) && q.is_wanted(2));
+        assert!(!q.is_wanted(7), "a piece the queue does not have");
+        q.mark_done(1);
+        assert!(!q.is_wanted(1), "nor one that is done");
     }
 }

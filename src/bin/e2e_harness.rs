@@ -162,6 +162,9 @@ enum Kind {
     StoppedAnnounceIsBounded,
     /// A second signal during that wait exits at once with status 130.
     SecondSignalForcesExit,
+    /// A run stopped with a piece half fetched keeps its blocks: the next run asks only for the
+    /// blocks it lacks, of that piece and of the others.
+    ResumePartialPiece,
     /// BEP 12: a torrent whose announce list is [[a dead tracker, one that works], [another]] is
     /// announced to the first tier's working tracker and to no other, and that tracker alone hears
     /// `stopped`; with `--tracker-mode concurrent` every tracker is asked.
@@ -217,6 +220,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "seed-time-ends-seeding", kind: Kind::SeedTime },
     Scenario { name: "stopped-announce-is-bounded", kind: Kind::StoppedAnnounceIsBounded },
     Scenario { name: "second-signal-forces-exit", kind: Kind::SecondSignalForcesExit },
+    Scenario { name: "resume-partial-piece", kind: Kind::ResumePartialPiece },
     Scenario { name: "tracker-tiers", kind: Kind::TrackerTiers },
     Scenario { name: "daemon-two-torrents", kind: Kind::Daemon },
 ];
@@ -269,6 +273,7 @@ fn main() {
             Kind::SeedTime => run_seed_time(scenario.name),
             Kind::StoppedAnnounceIsBounded => run_stopped_announce_is_bounded(scenario.name),
             Kind::SecondSignalForcesExit => run_second_signal_forces_exit(scenario.name),
+            Kind::ResumePartialPiece => run_resume_partial_piece(scenario.name),
             Kind::TrackerTiers => run_tracker_tiers(scenario.name),
             Kind::Daemon => run_daemon(scenario.name),
         };
@@ -553,6 +558,8 @@ enum Behavior {
     /// but never answers another request, which is a client mid-download
     /// as far as the client can tell.
     StallAfter(usize),
+    /// Serves `n` blocks, whichever pieces they are of, then goes silent as `StallAfter` does.
+    StallAfterBlocks(usize),
     /// Serves `after_pieces` pieces in full, then on the next piece sends
     /// only the first block and hangs up. Opens `dropped` as it does.
     DropMidPiece { after_pieces: usize, dropped: Arc<Gate> },
@@ -843,6 +850,7 @@ fn serve_stream(stream: Box<dyn bittorrent_rs::peer::PeerStream>, over_utp: bool
                     log.requested_blocks.push((index, begin));
                     match behavior {
                         Behavior::StallAfter(limit) if log.served.len() >= *limit && !log.served.contains(&index) => continue, // read it, never answer
+                        Behavior::StallAfterBlocks(limit) if log.requested_blocks.len() > *limit => continue,
                         Behavior::DropMidPiece { after_pieces, .. } => {
                             if doomed.is_none() && log.served.len() >= *after_pieces && !log.served.contains(&index) {
                                 doomed = Some(index);
@@ -3563,4 +3571,58 @@ fn run_tracker_tiers(name: &str) -> Result<String, String> {
         return Err("--tracker-mode concurrent did not ask the second tier".to_string());
     }
     Ok("by tier: the first tier's dead tracker was passed over, its working one heard `started` and `stopped`, and the second tier heard nothing; concurrent: the second tier was asked too".to_string())
+}
+
+// ---- blocks kept across a stop ------------------------------------------
+
+fn run_resume_partial_piece(name: &str) -> Result<String, String> {
+    // Four pieces of four blocks each.
+    let fx = Fixture::build("partial.bin", &[("partial.bin", pattern(4 * 65536, 3))], 65536, false);
+    let dir = scratch_dir(name);
+    let out_dir = dir.join("out");
+    let partial = out_dir.join(format!(".{}.partial", hex(&fx.info_hash)));
+
+    // Run 1: the peer serves six blocks -- the whole of piece 0 and the first two of piece 1 -- and goes silent. The client
+    // is left to time out, which stops it cleanly, as a signal would.
+    let swarm1 = spawn_swarm(&fx, vec![Behavior::StallAfterBlocks(6)]);
+    let torrent1 = dir.join("run1.torrent");
+    fs::write(&torrent1, fx.torrent_bytes(swarm1.tracker_addr)).expect("write torrent file");
+    let mut child = client_command(&torrent1, &out_dir, &dir.join("run1.log"), 1).args(["--no-dht", "--timeout", "4"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !partial.exists() {
+        return Err(format!("the blocks of the unfinished piece were not kept: no {}", partial.display()));
+    }
+    let log1 = fs::read_to_string(dir.join("run1.log")).unwrap_or_default();
+    if !log1.contains("kept the blocks of 1 unfinished piece") {
+        return Err(format!("the first run's log does not say it kept the blocks of one piece: {}", log1));
+    }
+
+    // Run 2: a peer that serves everything. It must be asked only for what is missing.
+    let swarm2 = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let torrent2 = dir.join("run2.torrent");
+    fs::write(&torrent2, fx.torrent_bytes(swarm2.tracker_addr)).expect("write torrent file");
+    let mut child = client_command(&torrent2, &out_dir, &dir.join("run2.log"), 1).arg("--no-dht").stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    if !wait_or_kill(&mut child, RUN_LIMIT)?.success() {
+        return Err("the second run did not finish".to_string());
+    }
+    check_downloaded(&fx, &out_dir)?;
+    let asked: BTreeSet<(u32, u32)> = swarm2.logs[0].lock().unwrap().requested_blocks.iter().copied().collect();
+    let block = |piece: u32, n: u32| (piece, n * 16384);
+    for kept in [block(0, 0), block(0, 1), block(0, 2), block(0, 3), block(1, 0), block(1, 1)] {
+        if asked.contains(&kept) {
+            return Err(format!("the second run asked again for {:?}, which the first had fetched: asked {:?}", kept, asked));
+        }
+    }
+    let expected: BTreeSet<(u32, u32)> = [block(1, 2), block(1, 3)].into_iter().chain((2..4).flat_map(|p| (0..4).map(move |n| block(p, n)))).collect();
+    if asked != expected {
+        return Err(format!("the second run asked for {:?}, expected {:?}", asked, expected));
+    }
+    if partial.exists() {
+        return Err("the blocks kept were not cleared once the download was complete".to_string());
+    }
+    let log2 = fs::read_to_string(dir.join("run2.log")).unwrap_or_default();
+    if !log2.contains("resuming: 2 block(s) of unfinished pieces kept from the last run") {
+        return Err(format!("the second run's log does not say it resumed two blocks: {}", log2));
+    }
+    Ok("a run stopped with two blocks of a piece fetched kept them; the next asked only for the other two of that piece and for the pieces it had none of, and cleared them once it was done".to_string())
 }

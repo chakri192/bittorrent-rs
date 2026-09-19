@@ -88,6 +88,18 @@ impl PartialPiece {
     pub fn size(&self) -> usize {
         self.data.len()
     }
+
+    /// What it holds: the bytes of the whole piece (those of blocks not received are zeros) and which blocks were received.
+    pub fn parts(&self) -> (&[u8], &[bool]) {
+        (&self.data, &self.received)
+    }
+
+    /// A partial piece from `data` and which of its blocks `received`; `None` unless there is one flag for each block of
+    /// `data` and at least one is set.
+    pub fn from_parts(data: Vec<u8>, received: Vec<bool>) -> Option<PartialPiece> {
+        let blocks = data.len().div_ceil(BLOCK_SIZE as usize);
+        (received.len() == blocks && received.iter().any(|&r| r)).then_some(PartialPiece { data, received })
+    }
 }
 
 pub struct PieceAssembler {

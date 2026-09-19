@@ -45,6 +45,8 @@ pub struct Setup<'a> {
     pub goal_pieces: usize,
     /// Give up after this long (`--timeout`), if set.
     pub timeout: Option<Duration>,
+    /// Where to keep the blocks of pieces left unfinished when the run ends (see [`crate::downloader::partial`]).
+    pub partial_path: Option<std::path::PathBuf>,
 }
 
 /// How a [`Session::run`] ended.
@@ -80,6 +82,7 @@ pub struct Session<'a> {
     display_total: u64,
     goal_pieces: usize,
     timeout: Option<Duration>,
+    partial_path: Option<std::path::PathBuf>,
     run_start: Instant,
     pex_total: usize,
     fresh_since_announce: usize,
@@ -107,6 +110,7 @@ impl<'a> Session<'a> {
             display_total: setup.display_total,
             goal_pieces: setup.goal_pieces,
             timeout: setup.timeout,
+            partial_path: setup.partial_path,
             run_start: Instant::now(),
             pex_total: 0,
             fresh_since_announce: 0,
@@ -179,6 +183,16 @@ impl<'a> Session<'a> {
 
         for result in self.workers.shutdown() {
             self.progress.absorb(result, |m| sink.log(m));
+        }
+        // The blocks of pieces left half fetched are kept for the next run: the connections that held them have ended, and
+        // put what they had into the queue as they did.
+        if let Some(path) = &self.partial_path {
+            let partials = if self.queue.is_empty() { Vec::new() } else { self.queue.partials() };
+            match crate::downloader::partial::save(path, &partials) {
+                Ok(()) if !partials.is_empty() => sink.log(format!("kept the blocks of {} unfinished piece(s) for the next run", partials.len())),
+                Ok(()) => {}
+                Err(e) => sink.log(format!("could not keep the blocks of unfinished pieces: {}", e)),
+            }
         }
         // What the loop last published predates the pieces absorbed above,
         // so without this the final numbers shown -- and, in `--json`, the
@@ -515,6 +529,7 @@ mod tests {
             display_total: data.len() as u64,
             goal_pieces: PIECES,
             timeout,
+            partial_path: None,
         })
     }
 
@@ -534,6 +549,43 @@ mod tests {
             assert!(sink.lines.lock().unwrap().iter().any(|l| l.starts_with(&format!("piece {} verified (", piece))), "piece {} was reported", piece);
         }
         assert!(sink.snapshots.lock().unwrap().iter().any(|snap| snap.status == "downloading"), "and the dashboard saw it downloading");
+    }
+
+    /// A partial piece: the one block of piece `index` (the pieces here are one block long), received.
+    fn stash_of(index: u32) -> (u32, crate::downloader::PartialPiece) {
+        let mut assembler = crate::downloader::PieceAssembler::new(crate::downloader::PieceWork { index, hash: [0; 20], length: PIECE_LEN as u32, merkle: None });
+        assembler.record_block(0, &vec![1u8; PIECE_LEN]).unwrap();
+        (index, assembler.into_partial().unwrap())
+    }
+
+    #[test]
+    fn a_run_that_ends_with_pieces_unfinished_keeps_the_blocks_it_held_and_one_that_finishes_leaves_none() {
+        use crate::downloader::partial;
+        // No peer to fetch from, and a queue with a stash: the run times out with the piece unfinished.
+        let dir = tmp_dir("partial-kept-unfinished");
+        let path = dir.join("kept.partial");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let mut s = session(&sink, &services, &dir, &[dead_addr()], Some(Duration::from_millis(400)));
+        s.partial_path = Some(path.clone());
+        let (index, stash) = stash_of(2);
+        s.queue.stash_partial(index, stash.clone());
+
+        let report = s.run(&AtomicBool::new(false));
+
+        assert!(!report.complete);
+        assert_eq!(partial::load(&path), vec![(2, stash)], "what was held is on disk");
+        assert!(sink.logged("kept the blocks of 1 unfinished piece(s) for the next run"));
+
+        // A run that completes leaves nothing, and takes away what an earlier one left.
+        let dir = tmp_dir("partial-kept-complete");
+        let path = dir.join("kept.partial");
+        partial::save(&path, &[stash_of(0)]).unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        let mut s = session(&sink, &services, &dir, &[fake_peer(true)], None);
+        s.partial_path = Some(path.clone());
+        assert!(s.run(&AtomicBool::new(false)).complete);
+        assert!(!path.exists());
     }
 
     #[test]

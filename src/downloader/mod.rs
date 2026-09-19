@@ -1,4 +1,5 @@
 pub mod file_writer;
+pub mod partial;
 pub mod piece_assembler;
 pub mod queue;
 pub mod resume;
