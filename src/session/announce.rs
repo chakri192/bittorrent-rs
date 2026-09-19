@@ -2,7 +2,7 @@
 //! announce, the periodic re-announces, and the final "completed".
 
 use crate::tracker::{AnnounceRequest, Event};
-use crate::tracker_discovery::{announce_to_all, build_request, TrackerAttempt, TransferTotals};
+use crate::tracker_discovery::{announce_to_all, announce_to_all_within, build_request, TrackerAttempt, TransferTotals};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,13 @@ pub type Round = (Vec<SocketAddr>, Vec<TrackerAttempt>, Option<u32>);
 /// [`NetworkTrackers`]; tests script the replies instead.
 pub trait TrackerClient {
     fn announce(&self, urls: &[String], req: &AnnounceRequest) -> Round;
+
+    /// Like [`announce`](Self::announce), but giving up on trackers that
+    /// have not answered within `deadline`. The default ignores the
+    /// deadline, which suits a client that answers at once.
+    fn announce_within(&self, urls: &[String], req: &AnnounceRequest, _deadline: Duration) -> Round {
+        self.announce(urls, req)
+    }
 }
 
 /// Announces over HTTP, HTTPS and UDP, all trackers concurrently.
@@ -29,6 +36,10 @@ pub struct NetworkTrackers;
 impl TrackerClient for NetworkTrackers {
     fn announce(&self, urls: &[String], req: &AnnounceRequest) -> Round {
         announce_to_all(urls, req)
+    }
+
+    fn announce_within(&self, urls: &[String], req: &AnnounceRequest, deadline: Duration) -> Round {
+        announce_to_all_within(urls, req, deadline)
     }
 }
 
@@ -125,6 +136,19 @@ impl<C: TrackerClient> Announcer<C> {
         let _ = self.client.announce(&self.urls, &req);
     }
 
+    /// The `stopped` announce (BEP 3), sent as the client exits so trackers
+    /// drop it from their peer lists at once rather than when it times
+    /// out. Best effort, and bounded: trackers that have not answered
+    /// within `deadline` are left behind, since a dead tracker must not
+    /// hold up quitting.
+    pub fn stopped(&mut self, totals: TransferTotals, deadline: Duration) {
+        if self.urls.is_empty() {
+            return;
+        }
+        let req = build_request(self.info_hash, self.peer_id, self.port, totals, Some(Event::Stopped));
+        let _ = self.client.announce_within(&self.urls, &req, deadline);
+    }
+
     /// Restarts the re-announce clock without announcing, for when a
     /// session enters a new phase (seeding) with its own cadence.
     pub fn restart_clock(&mut self, now: Instant) {
@@ -165,6 +189,8 @@ mod tests {
     struct Scripted {
         replies: RefCell<VecDeque<Round>>,
         seen: RefCell<Vec<AnnounceRequest>>,
+        /// The deadline of each announce that was given one.
+        deadlines: RefCell<Vec<Duration>>,
     }
 
     impl Scripted {
@@ -179,6 +205,11 @@ mod tests {
         fn announce(&self, _urls: &[String], req: &AnnounceRequest) -> Round {
             self.seen.borrow_mut().push(req.clone());
             self.replies.borrow_mut().pop_front().unwrap_or_default()
+        }
+
+        fn announce_within(&self, urls: &[String], req: &AnnounceRequest, deadline: Duration) -> Round {
+            self.deadlines.borrow_mut().push(deadline);
+            self.announce(urls, req)
         }
     }
 
@@ -211,6 +242,29 @@ mod tests {
         assert_eq!(a.trackers_ok(), 2, "3 trackers, 1 failed");
         assert_eq!(client.seen.borrow()[0].event, Some(Event::Started));
         assert_eq!((client.seen.borrow()[0].uploaded, client.seen.borrow()[0].downloaded, client.seen.borrow()[0].left), (10, 20, 30));
+    }
+
+    #[test]
+    fn stopped_tells_every_tracker_within_the_deadline_what_the_session_moved() {
+        let t0 = Instant::now();
+        let client = Scripted::default();
+        let mut a = announcer(&client, 2, None, t0);
+
+        a.stopped(totals(), Duration::from_secs(3));
+
+        let seen = client.seen.borrow();
+        assert_eq!(seen.len(), 1, "one round, which reaches all trackers");
+        assert_eq!(seen[0].event, Some(Event::Stopped));
+        assert_eq!((seen[0].uploaded, seen[0].downloaded, seen[0].left), (10, 20, 30));
+        assert_eq!(*client.deadlines.borrow(), vec![Duration::from_secs(3)], "a dead tracker must not hold up quitting");
+    }
+
+    #[test]
+    fn stopped_with_no_trackers_sends_nothing() {
+        let client = Scripted::default();
+        let mut a = announcer(&client, 0, None, Instant::now());
+        a.stopped(totals(), Duration::from_secs(3));
+        assert!(client.seen.borrow().is_empty());
     }
 
     #[test]

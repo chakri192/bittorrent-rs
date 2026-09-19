@@ -429,10 +429,12 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             ui.finish(Ok(summary.clone()));
         }
 
+        session.announce_stopped();
         services.shutdown();
         Ok(summary)
     } else {
         let reason = format!("incomplete: {} piece(s) never downloaded ({} peer(s) dialed) -- rerun the same command to resume", report.remaining, report.dialed);
+        session.announce_stopped();
         services.shutdown();
         // If we're here because the user quit, don't flash a failure
         // banner -- main prints the "stopped" line.

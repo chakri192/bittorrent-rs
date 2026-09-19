@@ -58,6 +58,13 @@ pub struct TrackerAttempt {
 /// the max rather than the min means we never violate the slowest
 /// tracker's request just because a faster one also happened to answer.
 pub fn announce_to_all(tracker_urls: &[String], req: &AnnounceRequest) -> (Vec<SocketAddr>, Vec<TrackerAttempt>, Option<u32>) {
+    announce_to_all_within(tracker_urls, req, OVERALL_ANNOUNCE_DEADLINE)
+}
+
+/// [`announce_to_all`] with a caller-chosen deadline, for announces that
+/// must not hold anything up for long -- the `stopped` one sent as the
+/// client exits.
+pub fn announce_to_all_within(tracker_urls: &[String], req: &AnnounceRequest, deadline: Duration) -> (Vec<SocketAddr>, Vec<TrackerAttempt>, Option<u32>) {
     let (tx, rx) = mpsc::channel();
 
     for url in tracker_urls {
@@ -92,9 +99,9 @@ pub fn announce_to_all(tracker_urls: &[String], req: &AnnounceRequest) -> (Vec<S
     let mut max_interval: Option<u32> = None;
     let mut answered: HashSet<String> = HashSet::new();
 
-    let deadline = Instant::now() + OVERALL_ANNOUNCE_DEADLINE;
+    let give_up_at = Instant::now() + deadline;
     while answered.len() < tracker_urls.len() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = give_up_at.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
@@ -121,11 +128,20 @@ pub fn announce_to_all(tracker_urls: &[String], req: &AnnounceRequest) -> (Vec<S
     // happened instead of silently omitting slow trackers.
     for url in tracker_urls {
         if !answered.contains(url) {
-            failures.push(TrackerAttempt { url: url.clone(), error: format!("no response within {}s", OVERALL_ANNOUNCE_DEADLINE.as_secs()) });
+            failures.push(TrackerAttempt { url: url.clone(), error: format!("no response within {}", describe(deadline)) });
         }
     }
 
     (peers.into_iter().collect(), failures, max_interval)
+}
+
+/// A deadline as a person would say it: "20s", or "500ms" when under a second.
+fn describe(deadline: Duration) -> String {
+    if deadline.subsec_nanos() == 0 {
+        format!("{}s", deadline.as_secs())
+    } else {
+        format!("{}ms", deadline.as_millis())
+    }
 }
 
 /// Session transfer totals reported to trackers (BEP 3): `uploaded`/
@@ -178,6 +194,35 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert!(failures[0].error.contains("unsupported"));
         assert_eq!(interval, None);
+    }
+
+    /// A tracker that accepts the connection and never says a word.
+    fn silent_tracker() -> (String, std::net::TcpListener) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        (format!("http://{}/announce", listener.local_addr().unwrap()), listener)
+    }
+
+    #[test]
+    fn a_tracker_that_never_answers_is_given_up_on_at_the_deadline() {
+        let (url, _listener) = silent_tracker(); // connections queue in the backlog, unanswered
+        let req = build_started_request([0; 20], [0; 20], 6881, 1000);
+
+        let started = Instant::now();
+        let (peers, failures, _) = announce_to_all_within(std::slice::from_ref(&url), &req, Duration::from_millis(400));
+        let waited = started.elapsed();
+
+        assert!(peers.is_empty());
+        assert!(waited >= Duration::from_millis(400), "it waited the deadline out: {:?}", waited);
+        assert!(waited < Duration::from_secs(5), "and not the 15 s the request itself would allow: {:?}", waited);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].url, url);
+        assert_eq!(failures[0].error, "no response within 400ms");
+    }
+
+    #[test]
+    fn a_whole_second_deadline_is_described_in_seconds() {
+        assert_eq!(describe(Duration::from_secs(20)), "20s");
+        assert_eq!(describe(Duration::from_millis(1500)), "1500ms");
     }
 
     #[test]

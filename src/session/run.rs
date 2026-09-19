@@ -20,6 +20,11 @@ pub const UI_TICK: Duration = Duration::from_millis(250);
 /// running -- bounds "retry forever" against a genuinely dead swarm.
 pub const MAX_FRUITLESS_ROUNDS: u32 = 5;
 
+/// How long quitting waits for trackers to take the `stopped` announce.
+/// It is a courtesy (their peer lists would drop this client eventually),
+/// so it may not hold up the exit for long.
+pub const STOP_ANNOUNCE_DEADLINE: Duration = Duration::from_secs(3);
+
 /// Everything a [`Session`] is built from. The setup that produces these
 /// (resolving the torrent, resuming, starting the services) stays with the
 /// caller.
@@ -283,6 +288,14 @@ impl<'a> Session<'a> {
             let totals = TransferTotals { uploaded: self.uploaded_bytes(), downloaded: self.progress.bytes_this_run(), left: 0 };
             self.announcer.completed(Instant::now(), totals);
         }
+    }
+
+    /// Tells the trackers this client is leaving (BEP 3 `stopped`), with
+    /// what the session moved and what was still missing. Waits at most
+    /// [`STOP_ANNOUNCE_DEADLINE`].
+    pub fn announce_stopped(&mut self) {
+        let totals = TransferTotals { uploaded: self.uploaded_bytes(), downloaded: self.progress.bytes_this_run(), left: self.display_total.saturating_sub(self.progress.bytes_done()) };
+        self.announcer.stopped(totals, STOP_ANNOUNCE_DEADLINE);
     }
 
     /// Post-completion seeding: keep the listener and DHT alive,

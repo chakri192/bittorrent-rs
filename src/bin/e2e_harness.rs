@@ -12,7 +12,8 @@
 //! byte-for-byte check about what the client said to the peers, what it
 //! asked them for, and what it logged.
 //!
-//! Run with: `cargo run --bin e2e_harness`
+//! Run with: `cargo run --bin e2e_harness`, or with scenario names after
+//! `--` to run only those.
 
 use bittorrent_rs::downloader::progress_file_path;
 use bittorrent_rs::metadata::{MetadataMessage, METADATA_PIECE_SIZE};
@@ -86,6 +87,11 @@ enum Kind {
     /// SIGTERM mid-download, with the only peer silent: a prompt, clean exit
     /// that keeps the resume file.
     SigtermMidDownload,
+    /// A tracker that never answers the `stopped` announce delays the exit
+    /// by a few seconds and no more.
+    StoppedAnnounceIsBounded,
+    /// A second signal during that wait exits at once with status 130.
+    SecondSignalForcesExit,
 }
 
 struct Scenario {
@@ -111,11 +117,19 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "limit-upload", kind: Kind::LimitUpload },
     Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
     Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
+    Scenario { name: "stopped-announce-is-bounded", kind: Kind::StoppedAnnounceIsBounded },
+    Scenario { name: "second-signal-forces-exit", kind: Kind::SecondSignalForcesExit },
 ];
 
 fn main() {
+    // Scenario names on the command line select just those; none runs all.
+    let wanted: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(unknown) = wanted.iter().find(|name| !SCENARIOS.iter().any(|s| s.name == name.as_str())) {
+        eprintln!("no scenario called {:?}; they are: {}", unknown, SCENARIOS.iter().map(|s| s.name).collect::<Vec<_>>().join(", "));
+        std::process::exit(2);
+    }
     let mut failed = false;
-    for scenario in SCENARIOS {
+    for scenario in SCENARIOS.iter().filter(|s| wanted.is_empty() || wanted.iter().any(|name| name == s.name)) {
         let outcome = match scenario.kind {
             Kind::Download { private } => run_download(scenario.name, private),
             Kind::ResumeAfterKill => run_resume_after_kill(scenario.name),
@@ -133,6 +147,8 @@ fn main() {
             Kind::LimitUpload => run_limit_upload(scenario.name),
             Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
             Kind::SigtermMidDownload => run_sigterm_mid_download(scenario.name),
+            Kind::StoppedAnnounceIsBounded => run_stopped_announce_is_bounded(scenario.name),
+            Kind::SecondSignalForcesExit => run_second_signal_forces_exit(scenario.name),
         };
         match outcome {
             Ok(summary) => println!("PASS [{}]: {}", scenario.name, summary),
@@ -318,6 +334,17 @@ enum Behavior {
     Corrupt,
 }
 
+/// How the fake tracker treats the client's announces.
+#[derive(Clone, Copy, PartialEq)]
+enum TrackerMode {
+    /// Answers every announce.
+    Answer,
+    /// Answers all but `event=stopped`, which it receives and then leaves
+    /// hanging with the connection open: the client's exit has to cope with
+    /// a tracker that never replies.
+    IgnoreStopped,
+}
+
 struct Swarm {
     tracker_addr: SocketAddr,
     /// One log per peer, in the order the tracker lists them.
@@ -347,6 +374,11 @@ struct PeerContext {
 /// and records it) and one fake peer per entry of `behaviors`, all on
 /// loopback.
 fn spawn_swarm(fx: &Fixture, behaviors: Vec<Behavior>) -> Swarm {
+    spawn_swarm_with_tracker(fx, behaviors, TrackerMode::Answer)
+}
+
+/// [`spawn_swarm`] with a chosen way for the tracker to behave.
+fn spawn_swarm_with_tracker(fx: &Fixture, behaviors: Vec<Behavior>, mode: TrackerMode) -> Swarm {
     let tracker_listener = TcpListener::bind("127.0.0.1:0").expect("bind fake tracker");
     let tracker_addr = tracker_listener.local_addr().unwrap();
 
@@ -378,13 +410,21 @@ fn spawn_swarm(fx: &Fixture, behaviors: Vec<Behavior>) -> Swarm {
         body.push(b'e');
         let headers = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
 
+        // Connections left unanswered stay open until the harness exits.
+        let mut hung = Vec::new();
         // Runs until the harness exits; each announce is a fresh connection.
         for stream in tracker_listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let mut buf = [0u8; 4096];
             let n = stream.read(&mut buf).unwrap_or(0);
             let request = String::from_utf8_lossy(&buf[..n]);
-            tracker_announces.lock().unwrap().push(request.lines().next().unwrap_or("").to_string());
+            let request_line = request.lines().next().unwrap_or("").to_string();
+            let ignored = mode == TrackerMode::IgnoreStopped && announce_param(&request_line, "event").as_deref() == Some("stopped");
+            tracker_announces.lock().unwrap().push(request_line);
+            if ignored {
+                hung.push(stream);
+                continue;
+            }
             let _ = stream.write_all(headers.as_bytes());
             let _ = stream.write_all(&body);
         }
@@ -821,10 +861,10 @@ fn run_drop_mid_piece(name: &str) -> Result<String, String> {
 fn run_timeout_incomplete(name: &str) -> Result<String, String> {
     const STALL_AFTER: usize = 3;
     const TIMEOUT: Duration = Duration::from_secs(3);
-    // After the timeout the client waits for its workers, and one is
-    // blocked reading from the silent peer until its read timeout (10s)
-    // expires. Allow that and some slack, but not an indefinite hang.
-    const LONGEST_EXPECTED: Duration = Duration::from_secs(30);
+    // The client used to wait out the silent peer's read timeout (10 s)
+    // after the deadline; now it stops within a UI tick or two. Leave
+    // room for a loaded machine, but well under that old wait.
+    const LONGEST_EXPECTED: Duration = Duration::from_secs(3 + 5);
 
     let fx = Fixture::new(false);
     let swarm = spawn_swarm(&fx, vec![Behavior::StallAfter(STALL_AFTER)]);
@@ -883,7 +923,11 @@ fn run_timeout_incomplete(name: &str) -> Result<String, String> {
         return Err("the output file is complete although the download was reported incomplete".to_string());
     }
 
-    Ok(format!("stopped {:.0?} after a {}s --timeout with {} of {} pieces; exited 1, reported incomplete, resume file kept", elapsed, TIMEOUT.as_secs(), STALL_AFTER, fx.piece_count))
+    // It told the tracker it was leaving, and what was still missing.
+    let got = bytes_of_pieces(&fx, &served);
+    check_stopped_last(&swarm, got, fx.data.len() - got)?;
+
+    Ok(format!("stopped {:.0?} after a {}s --timeout with {} of {} pieces; exited 1, reported incomplete, resume file kept, tracker told", elapsed, TIMEOUT.as_secs(), STALL_AFTER, fx.piece_count))
 }
 
 /// Checks one announce request line against what the client should have
@@ -896,6 +940,19 @@ fn check_announce(line: &str, event: &str, downloaded: &str, left: &str) -> Resu
         }
     }
     Ok(())
+}
+
+/// How many bytes the given pieces of the fixture's data add up to.
+fn bytes_of_pieces(fx: &Fixture, pieces: &BTreeSet<u32>) -> usize {
+    pieces.iter().map(|&p| (fx.data.len() - p as usize * fx.piece_len).min(fx.piece_len)).sum()
+}
+
+/// Checks that the last thing the tracker heard was a `stopped` announce
+/// for a client that had downloaded `downloaded` bytes and still lacked `left`.
+fn check_stopped_last(swarm: &Swarm, downloaded: usize, left: usize) -> Result<(), String> {
+    let announces = swarm.announces.lock().unwrap().clone();
+    let last = announces.last().ok_or("the tracker heard nothing")?;
+    check_announce(last, "stopped", &downloaded.to_string(), &left.to_string())
 }
 
 /// Kills the client when dropped, so a scenario that leaves it running on
@@ -983,9 +1040,8 @@ fn leech_everything(fx: &Fixture, port: u16) -> Result<(), String> {
 /// `--seed`: once the download is done the client keeps running and serves
 /// the torrent to whoever connects.
 ///
-/// It cannot test the graceful stop. In plain (non-TTY) mode nothing ever
-/// sets the client's stop flag -- only the dashboard's `q` does, and there
-/// is no signal handler -- so the harness can only kill it.
+/// The harness ends the client by killing it; the stop itself is covered by
+/// the signal scenarios.
 fn run_seed_after_download(name: &str) -> Result<String, String> {
     let fx = Fixture::new(false);
     let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
@@ -1069,19 +1125,20 @@ fn run_magnet_download(name: &str) -> Result<String, String> {
         return Err("the peer was never asked for the metadata".to_string());
     }
 
-    // Three announces: the bootstrap one, made before the size is known
+    // Four announces: the bootstrap one, made before the size is known
     // (left=1, so the tracker sees a leecher); the real one once the
-    // metadata has arrived; and completed.
+    // metadata has arrived; completed; and stopped as it exits.
     let announces = swarm.announces.lock().unwrap().clone();
-    let [bootstrap, started, completed] = announces.as_slice() else {
-        return Err(format!("the tracker saw {} announces, expected bootstrap, started and completed: {:?}", announces.len(), announces));
+    let [bootstrap, started, completed, stopped] = announces.as_slice() else {
+        return Err(format!("the tracker saw {} announces, expected bootstrap, started, completed and stopped: {:?}", announces.len(), announces));
     };
     let total = fx.data.len().to_string();
     check_announce(bootstrap, "started", "0", "1")?;
     check_announce(started, "started", "0", &total)?;
     check_announce(completed, "completed", &total, "0")?;
+    check_announce(stopped, "stopped", &total, "0")?;
 
-    Ok(format!("magnet link -> metadata ({} piece) -> {} bytes, all matching; announced bootstrap, started, completed", served, fx.data.len()))
+    Ok(format!("magnet link -> metadata ({} piece) -> {} bytes, all matching; announced bootstrap, started, completed, stopped", served, fx.data.len()))
 }
 
 /// A torrent whose paths would escape the download directory, with correct
@@ -1381,7 +1438,14 @@ fn run_sigint_while_seeding(name: &str) -> Result<String, String> {
     if !stdout.contains("stopped") {
         return Err(format!("stdout should say the client stopped; it says {:?}", stdout.trim()));
     }
-    Ok(format!("SIGINT stopped a seeding client cleanly in {:.1?}: status 0 and a \"stopped\" message", took))
+    // Its last word to the tracker: leaving, having finished everything.
+    let announces = swarm.announces.lock().unwrap().clone();
+    let events: Vec<_> = announces.iter().map(|line| announce_param(line, "event").unwrap_or_default()).collect();
+    if events != ["started", "completed", "stopped"] {
+        return Err(format!("the tracker should hear started, completed, stopped; it heard {:?}", events));
+    }
+    check_stopped_last(&swarm, fx.data.len(), 0)?;
+    Ok(format!("SIGINT stopped a seeding client cleanly in {:.1?}: status 0, a \"stopped\" message, and a stopped announce to the tracker", took))
 }
 
 /// SIGTERM while downloading from a peer that has gone silent. The client
@@ -1432,5 +1496,91 @@ fn run_sigterm_mid_download(name: &str) -> Result<String, String> {
     if recorded.len() != STALL_AFTER {
         return Err(format!("the resume file should keep the {} pieces downloaded; it lists {:?}", STALL_AFTER, recorded));
     }
-    Ok(format!("SIGTERM mid-download stopped the client cleanly after {:.1?}: status 0, a \"stopped\" message, {} pieces kept for a resume", took, STALL_AFTER))
+    let got = bytes_of_pieces(&fx, &recorded);
+    check_stopped_last(&swarm, got, fx.data.len() - got)?;
+    Ok(format!("SIGTERM mid-download stopped the client cleanly after {:.1?}: status 0, a \"stopped\" message, {} pieces kept for a resume, tracker told what was left", took, STALL_AFTER))
+}
+
+/// A tracker that takes the `stopped` announce and never replies. The client
+/// must still finish, having waited a few seconds for it -- not the 15 s of
+/// the request's own timeout, and not forever.
+fn run_stopped_announce_is_bounded(name: &str) -> Result<String, String> {
+    const AT_LEAST: Duration = Duration::from_millis(2500);
+    const AT_MOST: Duration = Duration::from_secs(8);
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm_with_tracker(&fx, vec![Behavior::Serve], TrackerMode::IgnoreStopped);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let started = Instant::now();
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    let took = started.elapsed();
+
+    if status.code() != Some(0) {
+        return Err(format!("the client exited with {:?}; the unanswered stop must not fail the run", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+    let announces = swarm.announces.lock().unwrap().clone();
+    if announces.last().is_none_or(|line| announce_param(line, "event").as_deref() != Some("stopped")) {
+        return Err(format!("the tracker never got a stopped announce: {:?}", announces));
+    }
+    if took < AT_LEAST {
+        return Err(format!("the client exited after {:?}, so it did not wait for the tracker to answer stopped", took));
+    }
+    if took > AT_MOST {
+        return Err(format!("the client took {:?}; an unanswered stopped announce must not hold up the exit that long", took));
+    }
+    Ok(format!("a tracker that ignored the stopped announce delayed the exit to {:.1?}; the download was complete and the exit status 0", took))
+}
+
+/// While the client waits on a tracker that will not answer `stopped`, a
+/// second signal must end it at once with status 130.
+fn run_second_signal_forces_exit(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm_with_tracker(&fx, vec![Behavior::Serve], TrackerMode::IgnoreStopped);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let child = client_command(&torrent, &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .arg("--seed")
+        .args(["--port", "0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, "seeding e2e.bin on port", Duration::from_secs(20), &mut client.0)?;
+
+    send_signal(&client.0, "INT")?;
+    // The first signal starts a graceful stop, which ends up waiting for the
+    // tracker: wait until the tracker has been told, then check it is
+    // still waiting rather than gone.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !swarm.announces.lock().unwrap().iter().any(|line| announce_param(line, "event").as_deref() == Some("stopped")) {
+        if Instant::now() >= deadline {
+            return Err("the client never sent the stopped announce after the first signal".to_string());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(300));
+    if client.0.try_wait().map_err(|e| e.to_string())?.is_some() {
+        return Err("the client had already exited, so there was no slow shutdown for a second signal to cut short".to_string());
+    }
+
+    let again = Instant::now();
+    send_signal(&client.0, "INT")?;
+    let status = wait_or_kill(&mut client.0, Duration::from_secs(2))?;
+    if status.code() != Some(130) {
+        return Err(format!("a second signal should exit with status 130; got {:?}", status.code()));
+    }
+    Ok(format!("a second signal cut short the wait on a silent tracker: status 130, {:.1?} later", again.elapsed()))
 }
