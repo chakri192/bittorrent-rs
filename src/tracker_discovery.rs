@@ -26,7 +26,7 @@
 //! stragglers keep running in the background and are simply not waited
 //! on; their result (if any) is just never used for this particular call.
 
-use crate::tracker::{http, https, udp, AnnounceRequest, Event};
+use crate::tracker::{announce_http, udp, AnnounceRequest, Event};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::mpsc;
@@ -78,10 +78,8 @@ pub fn announce_to_all_within(tracker_urls: &[String], req: &AnnounceRequest, de
                 // trackers) -- strip it.
                 let host_port = host_port.split('/').next().unwrap_or(host_port).to_string();
                 udp::announce(&host_port, &req).map_err(|e| e.to_string())
-            } else if url.starts_with("https://") {
-                https::announce(&url, &req).map_err(|e| e.to_string())
-            } else if url.starts_with("http://") {
-                http::announce(&url, &req).map_err(|e| e.to_string())
+            } else if url.starts_with("https://") || url.starts_with("http://") {
+                announce_http(&url, &req).map_err(|e| e.to_string())
             } else {
                 Err(format!("unsupported tracker scheme: {}", url))
             };
@@ -240,5 +238,38 @@ mod tests {
         assert_eq!(req.left, 12345);
         assert_eq!(req.event, Some(Event::Started));
         assert!(req.compact);
+    }
+
+    #[test]
+    fn a_tracker_that_redirects_still_gives_its_peers_to_the_announce_round() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let Ok(mut stream) = stream else { continue };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                let reply: Vec<u8> = if head.starts_with(b"GET /old") {
+                    b"HTTP/1.1 301 Moved Permanently\r\nLocation: /new\r\nContent-Length: 0\r\n\r\n".to_vec()
+                } else {
+                    let body = b"d8:intervali900e5:peers6:\x0a\x00\x00\x07\x1a\xe1e";
+                    let mut r = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+                    r.extend_from_slice(body);
+                    r
+                };
+                let _ = stream.write_all(&reply);
+            }
+        });
+        let req = build_started_request([0; 20], [0; 20], 6881, 1000);
+
+        let (peers, failures, interval) = announce_to_all(&[format!("http://127.0.0.1:{}/old", port)], &req);
+
+        assert!(failures.is_empty(), "{:?}", failures);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(interval, Some(900));
     }
 }

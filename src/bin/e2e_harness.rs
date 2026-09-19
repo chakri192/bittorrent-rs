@@ -90,6 +90,9 @@ enum Kind {
     /// A torrent's empty files exist after the download, though no piece
     /// contains a byte of them; with `--only`, only the selected ones do.
     EmptyFiles,
+    /// A tracker that redirects every announce: the client follows it, and
+    /// the download is unaffected.
+    TrackerRedirect,
     /// A disk that cannot be written to ends the run at once with a message
     /// saying so, instead of dialing the same peers over and over.
     DiskFailure,
@@ -144,6 +147,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
     Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
     Scenario { name: "empty-files", kind: Kind::EmptyFiles },
+    Scenario { name: "tracker-redirect", kind: Kind::TrackerRedirect },
     Scenario { name: "disk-failure", kind: Kind::DiskFailure },
     Scenario { name: "prefer-files", kind: Kind::PreferFiles },
     Scenario { name: "json-events", kind: Kind::JsonEvents },
@@ -183,6 +187,7 @@ fn main() {
             Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
             Kind::SigtermMidDownload => run_sigterm_mid_download(scenario.name),
             Kind::EmptyFiles => run_empty_files(scenario.name),
+            Kind::TrackerRedirect => run_tracker_redirect(scenario.name),
             Kind::DiskFailure => run_disk_failure(scenario.name),
             Kind::PreferFiles => run_prefer_files(scenario.name),
             Kind::JsonEvents => run_json_events(scenario.name),
@@ -392,6 +397,9 @@ enum TrackerMode {
     /// hanging with the connection open: the client's exit has to cope with
     /// a tracker that never replies.
     IgnoreStopped,
+    /// Answers every announce to `/announce` with a 302 to `/announce2`,
+    /// which answers normally.
+    Redirect,
 }
 
 struct Swarm {
@@ -469,9 +477,14 @@ fn spawn_swarm_with_tracker(fx: &Fixture, behaviors: Vec<Behavior>, mode: Tracke
             let request = String::from_utf8_lossy(&buf[..n]);
             let request_line = request.lines().next().unwrap_or("").to_string();
             let ignored = mode == TrackerMode::IgnoreStopped && announce_param(&request_line, "event").as_deref() == Some("stopped");
+            let redirected = mode == TrackerMode::Redirect && request_line.starts_with("GET /announce?");
             tracker_announces.lock().unwrap().push(request_line);
             if ignored {
                 hung.push(stream);
+                continue;
+            }
+            if redirected {
+                let _ = stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /announce2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 continue;
             }
             let _ = stream.write_all(headers.as_bytes());
@@ -2181,4 +2194,36 @@ fn run_empty_files(name: &str) -> Result<String, String> {
         }
     }
     Ok("three empty files (one three directories deep) exist after the download, and under --only just the selected one".to_string())
+}
+
+/// The tracker answers every announce with a redirect. Before the client
+/// followed redirects, that was an error, no peer was found, and the
+/// download never started.
+fn run_tracker_redirect(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm_with_tracker(&fx, vec![Behavior::Serve], TrackerMode::Redirect);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1).arg("--no-dht").stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("download binary exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+
+    // Every announce went first to /announce and then, redirected, to
+    // /announce2, with the same event.
+    let announces = swarm.announces.lock().unwrap().clone();
+    if announces.is_empty() || announces.chunks(2).any(|pair| pair.len() != 2) {
+        return Err(format!("expected announces in pairs, got {}: {:?}", announces.len(), announces));
+    }
+    for pair in announces.chunks(2) {
+        let (first, second) = (&pair[0], &pair[1]);
+        if !first.starts_with("GET /announce?") || !second.starts_with("GET /announce2?") || announce_param(first, "event") != announce_param(second, "event") {
+            return Err(format!("an announce was not followed to its redirect: {:?} then {:?}", first, second));
+        }
+    }
+    Ok(format!("{} announces, each redirected from /announce to /announce2 and followed, and the file matches", announces.len() / 2))
 }
