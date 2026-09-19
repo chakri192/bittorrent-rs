@@ -90,6 +90,9 @@ enum Kind {
     /// `create_torrent` makes what an independently written builder makes,
     /// and the client downloads from it.
     CreateTorrent,
+    /// Two peers that each have only part of the torrent between them: the
+    /// download completes, and each is asked only for what it has.
+    PartialPeers,
     /// A leecher connected to the client's listener during the download is
     /// told of each piece as it is verified.
     HaveBroadcast,
@@ -129,6 +132,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
     Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
     Scenario { name: "create-torrent", kind: Kind::CreateTorrent },
+    Scenario { name: "partial-peers", kind: Kind::PartialPeers },
     Scenario { name: "have-broadcast", kind: Kind::HaveBroadcast },
     Scenario { name: "seed-ratio-ends-seeding", kind: Kind::SeedRatio },
     Scenario { name: "seed-time-ends-seeding", kind: Kind::SeedTime },
@@ -163,6 +167,7 @@ fn main() {
             Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
             Kind::SigtermMidDownload => run_sigterm_mid_download(scenario.name),
             Kind::CreateTorrent => run_create_torrent(scenario.name),
+            Kind::PartialPeers => run_partial_peers(scenario.name),
             Kind::HaveBroadcast => run_have_broadcast(scenario.name),
             Kind::SeedRatio => run_seed_ratio(scenario.name),
             Kind::SeedTime => run_seed_time(scenario.name),
@@ -351,6 +356,9 @@ enum Behavior {
     DropFirstConnection,
     /// Sends every block corrupted, so no piece ever verifies.
     Corrupt,
+    /// Serves normally but has only these pieces, and says so in its
+    /// bitfield: what a mid-download peer in a real swarm looks like.
+    Partial(BTreeSet<u32>),
 }
 
 /// How the fake tracker treats the client's announces.
@@ -484,7 +492,9 @@ fn serve_connection(mut stream: TcpStream, cx: &PeerContext, behavior: &Behavior
 
     let mut bits = vec![0u8; cx.piece_count.div_ceil(8)];
     for i in 0..cx.piece_count {
-        bits[i / 8] |= 1 << (7 - (i % 8));
+        if !matches!(behavior, Behavior::Partial(has) if !has.contains(&(i as u32))) {
+            bits[i / 8] |= 1 << (7 - (i % 8));
+        }
     }
     if Message::Bitfield(bits).write_to(&mut stream).is_err() {
         return;
@@ -1850,4 +1860,46 @@ fn run_create_torrent(name: &str) -> Result<String, String> {
     }
     check_downloaded(&fx, &out_dir)?;
     Ok(format!("create_torrent made the same info hash ({}) as the independent builder: {} pieces across 3 files, refused to overwrite, and the client downloaded it byte for byte", &bittorrent_rs::torrent::info_hash_hex(&parsed.info_hash)[..8], fx.piece_count))
+}
+
+/// Each of two peers has part of the torrent and they overlap on one
+/// piece; neither could supply a whole file. The client must combine them,
+/// and must ask each only for pieces it said it has.
+fn run_partial_peers(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    if fx.piece_count != 7 {
+        return Err(format!("this scenario assumes 7 pieces; the fixture has {}", fx.piece_count));
+    }
+    let first: BTreeSet<u32> = (0..=3).collect();
+    let second: BTreeSet<u32> = (3..=6).collect();
+    let swarm = spawn_swarm(&fx, vec![Behavior::Partial(first.clone()), Behavior::Partial(second.clone())]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let mut child = client_command(&torrent, &out_dir, &log_path, 2)
+        .arg("--no-dht")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("download binary exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+
+    for (label, log, offered) in [("first", &swarm.logs[0], &first), ("second", &swarm.logs[1], &second)] {
+        let log = log.lock().unwrap();
+        let asked: BTreeSet<u32> = log.requested.iter().copied().collect();
+        if let Some(stray) = asked.difference(offered).next() {
+            return Err(format!("the {} peer has only {:?} but was asked for piece {}", label, offered, stray));
+        }
+        if log.served.is_empty() {
+            return Err(format!("the {} peer supplied nothing; the download should have needed it", label));
+        }
+    }
+    let served_by_first = swarm.logs[0].lock().unwrap().served.clone();
+    let served_by_second = swarm.logs[1].lock().unwrap().served.clone();
+    Ok(format!("two partial peers ({:?} and {:?}) together supplied the whole file: {} pieces from the first, {} from the second, none requested that a peer lacked", first, second, served_by_first.len(), served_by_second.len()))
 }

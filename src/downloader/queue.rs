@@ -24,6 +24,18 @@ use std::collections::{HashMap, HashSet};
 use crate::sync::lock;
 use std::sync::Mutex;
 
+/// What [`WorkQueue::take_for`] found for a peer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Take {
+    /// A piece to download from this peer.
+    Piece(PieceWork),
+    /// Pieces remain, but this peer has none of them (yet): wait for it to
+    /// announce more, or let it go.
+    NothingForThisPeer,
+    /// Every piece is done.
+    Done,
+}
+
 struct Inner {
     /// Not yet done, not currently claimed by any worker.
     pending: Vec<PieceWork>,
@@ -62,26 +74,60 @@ impl WorkQueue {
     /// returns a **duplicate** of the rarest claimed piece (endgame).
     /// Returns `None` only when every piece is done.
     ///
-    /// Workers that can't service the piece they popped (peer doesn't
-    /// have it, download failed) call `push_back` to return it.
+    /// For a source that has every piece (a web seed). A peer that may
+    /// lack some should use [`take_for`](Self::take_for).
     pub fn pop(&self) -> Option<PieceWork> {
+        match self.take_for(|_| true) {
+            Take::Piece(work) => Some(work),
+            Take::NothingForThisPeer | Take::Done => None,
+        }
+    }
+
+    /// Hands out the rarest pending piece that `has` says this peer has,
+    /// and marks it claimed. If nothing pending is on offer from this peer
+    /// but some pieces are claimed, a duplicate of the rarest claimed one it
+    /// has (endgame).
+    ///
+    /// The choice has to be made among the pieces the peer has. Rarity says
+    /// which pieces matter most, and by definition few peers have the
+    /// rarest; a worker given the rarest piece regardless would find its
+    /// peer lacks it, and a peer holding only common pieces would sit idle
+    /// for as long as the rare ones were unclaimed.
+    ///
+    /// Workers that can't finish the piece they were given (the download
+    /// failed) call `push_back` to return it.
+    pub fn take_for(&self, has: impl Fn(u32) -> bool) -> Take {
         let mut inner = lock(&self.inner);
         let availability = lock(&self.availability);
         let rarity = |w: &PieceWork| availability.get(w.index as usize).copied().unwrap_or(0);
 
-        if !inner.pending.is_empty() {
-            let rarest_idx = inner.pending.iter().enumerate().min_by_key(|(_, w)| rarity(w)).map(|(i, _)| i)?;
+        let rarest_offered = inner.pending.iter().enumerate().filter(|(_, w)| has(w.index)).min_by_key(|(_, w)| rarity(w)).map(|(i, _)| i);
+        if let Some(index) = rarest_offered {
             // swap_remove is O(1) (vs. a true rarest-first-preserving
             // remove being O(n) regardless of representation) -- fine
-            // since pop makes no ordering promise among equal-rarity
+            // since there is no ordering promise among equal-rarity
             // pieces to begin with.
-            let work = inner.pending.swap_remove(rarest_idx);
+            let work = inner.pending.swap_remove(index);
             inner.claimed.insert(work.index, work.clone());
-            return Some(work);
+            return Take::Piece(work);
         }
 
-        // Endgame: duplicate-assign a still-unfinished claimed piece.
-        inner.claimed.values().min_by_key(|w| rarity(w)).cloned()
+        // Endgame: nothing is pending at all, so duplicate-assign a
+        // still-unfinished claimed piece this peer has. Only then: while
+        // pieces remain pending that this peer lacks, letting it duplicate
+        // claimed ones would have every partial peer in the swarm
+        // downloading the same few pieces.
+        if inner.pending.is_empty() {
+            if let Some(work) = inner.claimed.values().filter(|w| has(w.index)).min_by_key(|w| rarity(w)).cloned() {
+                return Take::Piece(work);
+            }
+        }
+
+        if inner.pending.is_empty() && inner.claimed.is_empty() {
+            Take::Done
+        } else {
+            Take::NothingForThisPeer
+        }
     }
 
     /// Returns a piece to the queue after a failed attempt. No-ops if the
@@ -391,5 +437,90 @@ mod tests {
         // Pieces 1, 2, 3 have no holder, so all of them come out before 0.
         let order: Vec<u32> = std::iter::from_fn(|| q.pop()).take(4).map(|w| w.index).collect();
         assert_eq!(order.last(), Some(&0));
+    }
+
+    // ---- take_for: choosing among what the peer has ----
+
+    fn has(set: &'static [u32]) -> impl Fn(u32) -> bool {
+        move |piece| set.contains(&piece)
+    }
+
+    fn piece_index(take: Take) -> Option<u32> {
+        match take {
+            Take::Piece(w) => Some(w.index),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn take_for_gives_the_rarest_piece_the_peer_has_not_the_rarest_overall() {
+        let q = WorkQueue::new(vec![work(0), work(1), work(2)], 3);
+        // Piece 0 is the rarest of all (nobody seen with it), then 1, then 2.
+        q.note_have(1);
+        q.note_have(2);
+        q.note_have(2);
+
+        // This peer lacks piece 0: rarest-first among 1 and 2 gives 1.
+        assert_eq!(piece_index(q.take_for(has(&[1, 2]))), Some(1));
+        assert_eq!(piece_index(q.take_for(has(&[2]))), Some(2));
+    }
+
+    #[test]
+    fn take_for_leaves_the_pieces_the_peer_lacks_for_others() {
+        let q = WorkQueue::new(vec![work(0), work(1)], 2);
+        assert_eq!(piece_index(q.take_for(has(&[1]))), Some(1));
+        assert_eq!(q.len(), 2, "piece 0 is still pending and piece 1 is claimed");
+        assert_eq!(piece_index(q.take_for(has(&[0]))), Some(0), "another peer gets the one this one lacked");
+    }
+
+    #[test]
+    fn a_peer_with_none_of_what_is_pending_is_told_so_and_nothing_changes() {
+        let q = WorkQueue::new(vec![work(0), work(1)], 2);
+
+        assert_eq!(q.take_for(has(&[7])), Take::NothingForThisPeer);
+        assert_eq!(q.take_for(|_| false), Take::NothingForThisPeer);
+
+        assert_eq!((q.len(), q.in_endgame()), (2, false), "nothing was claimed by asking");
+        assert!(piece_index(q.take_for(has(&[0, 1]))).is_some());
+    }
+
+    #[test]
+    fn done_is_reported_only_when_every_piece_is_done() {
+        let q = WorkQueue::new(vec![work(0)], 1);
+        assert_eq!(q.take_for(|_| false), Take::NothingForThisPeer, "a piece remains, even if this peer has nothing");
+        let w = q.pop().unwrap();
+        assert_eq!(q.take_for(|_| false), Take::NothingForThisPeer, "still claimed, not done");
+        q.mark_done(w.index);
+        assert_eq!(q.take_for(|_| false), Take::Done);
+        assert_eq!(q.take_for(|_| true), Take::Done);
+    }
+
+    #[test]
+    fn endgame_duplicates_go_only_to_peers_that_have_the_piece() {
+        let q = WorkQueue::new(vec![work(0), work(1)], 2);
+        q.pop();
+        q.pop(); // both claimed, nothing pending: endgame
+
+        assert_eq!(q.take_for(has(&[1])), Take::Piece(work(1)), "a peer with piece 1 duplicates piece 1");
+        assert_eq!(q.take_for(has(&[9])), Take::NothingForThisPeer, "a peer with neither gets nothing, and it is not Done");
+    }
+
+    #[test]
+    fn a_peer_lacking_the_pending_pieces_does_not_duplicate_claimed_ones() {
+        let q = WorkQueue::new(vec![work(0), work(1)], 2);
+        assert_eq!(piece_index(q.take_for(has(&[1]))), Some(1)); // piece 1 claimed, piece 0 pending
+        // Another peer has only piece 1. Piece 0 is pending, so this is not
+        // endgame, and it must not pile onto the piece already in progress.
+        assert_eq!(q.take_for(has(&[1])), Take::NothingForThisPeer);
+    }
+
+    #[test]
+    fn pop_still_serves_a_source_with_every_piece() {
+        let q = WorkQueue::new(vec![work(0), work(1)], 2);
+        assert!(q.pop().is_some() && q.pop().is_some());
+        assert!(q.pop().is_some(), "endgame duplicate");
+        q.mark_done(0);
+        q.mark_done(1);
+        assert!(q.pop().is_none());
     }
 }

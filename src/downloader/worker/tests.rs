@@ -580,3 +580,68 @@ fn a_peer_that_says_nothing_is_still_kept_to_a_cautious_queue() {
     assert!(most_waiting <= pipeline::DEFAULT_PEER_LIMIT, "{} waiting", most_waiting);
     assert!(most_waiting > 2, "and more than the minimum, or the rate was never used: {}", most_waiting);
 }
+
+// ---- a peer that has only some of the pieces ----
+
+/// A peer that has only the pieces in `has`, serves requests for them, and
+/// hangs up once it has served `hang_up_after` blocks.
+fn spawn_partial_peer(listener: TcpListener, info_hash: [u8; 20], pieces: Vec<Vec<u8>>, has: Vec<usize>, hang_up_after: usize) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut hs_buf = [0u8; 68];
+        std::io::Read::read_exact(&mut stream, &mut hs_buf).unwrap();
+        std::io::Write::write_all(&mut stream, &Handshake::new(info_hash, [0x99; 20], false).to_bytes()).unwrap();
+        let mut bits = vec![0u8; pieces.len().div_ceil(8)];
+        for &i in &has {
+            bits[i / 8] |= 1 << (7 - (i % 8));
+        }
+        WireMessage::Bitfield(bits).write_to(&mut stream).unwrap();
+        WireMessage::Unchoke.write_to(&mut stream).unwrap();
+
+        let mut served = 0;
+        while served < hang_up_after {
+            let Ok(msg) = WireMessage::read_from(&mut stream) else { return };
+            if let WireMessage::Request { index, begin, length } = msg {
+                if !has.contains(&(index as usize)) {
+                    continue; // asked for what it never had
+                }
+                let block = pieces[index as usize][begin as usize..(begin + length) as usize].to_vec();
+                if (WireMessage::Piece { index, begin, block }).write_to(&mut stream).is_err() {
+                    return;
+                }
+                served += 1;
+            }
+        }
+    })
+}
+
+#[test]
+fn a_peer_with_only_common_pieces_is_given_those_even_while_a_rarer_one_is_still_unclaimed() {
+    let pieces: Vec<Vec<u8>> = (0..3u8).map(|i| vec![0xA0 + i; 16384]).collect();
+    let info_hash = [0x63; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    // The peer has pieces 1 and 2, and hangs up after serving them.
+    let peer = spawn_partial_peer(listener, info_hash, pieces.clone(), vec![1, 2], 2);
+
+    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: 16384 }).collect();
+    let queue = Arc::new(WorkQueue::new(work, 3));
+    // Piece 0 is the rarest by a distance: the swarm has been seen with 1 and 2 twice.
+    for piece in [1, 2, 1, 2] {
+        queue.note_have(piece);
+    }
+    let dir = tmp_dir("partial-peer");
+    let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 3 * 16384)]));
+    let (tx, rx) = mpsc::channel();
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default() };
+
+    let result = run_worker(addr, &config, &queue, &spans, 16384, &tx, None);
+    peer.join().unwrap();
+
+    let mut got: Vec<u32> = rx.try_iter().map(|r| r.index).collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![1, 2], "the pieces it has were downloaded, though piece 0 was rarer and this peer lacks it");
+    assert!(matches!(result, Err(WorkerError::Connection { stage: "wait_for_relevant_have", .. })), "then it waited for something more from the peer, and the hang-up ended it: {:?}", result);
+    assert_eq!(queue.len(), 1, "piece 0 is untouched, for a peer that has it");
+    assert!(!queue.in_endgame(), "and was never claimed");
+}

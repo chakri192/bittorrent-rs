@@ -18,7 +18,7 @@ mod pipeline;
 mod tests;
 
 use crate::downloader::file_writer::{write_piece, FileSpan};
-use crate::downloader::queue::{PieceResult, WorkQueue};
+use crate::downloader::queue::{PieceResult, Take, WorkQueue};
 use crate::ratelimit::RateLimiter;
 use crate::peer::{ConnectionError, WireError};
 use connect::establish;
@@ -139,6 +139,10 @@ impl From<ConnectionError> for WorkerError {
     }
 }
 
+/// After this many consecutive cycles with nothing new on offer from a
+/// peer, its connection is given up.
+const MAX_IRRELEVANT_CYCLES: u32 = 50;
+
 /// Runs against a single peer until the work queue is drained or the
 /// connection fails. On failure, any piece this worker had partially
 /// claimed is pushed back to `queue` for another worker to retry -- the
@@ -156,53 +160,22 @@ pub fn run_worker(
     // The registration is held to the end of the run: dropping it is what lets the connection close.
     let (mut stream, mut state, _registration) = establish(peer_addr, config, queue, pex_tx)?;
 
-    /// After this many consecutive "peer doesn't have anything we still
-    /// need" cycles with no new relevant Have/Bitfield arriving, give up
-    /// on this connection rather than holding the slot indefinitely. A
-    /// peer that's alive but useless (or has gone silent without
-    /// formally disconnecting) would otherwise never free its slot for
-    /// the coordinator to try someone else.
-    const MAX_IRRELEVANT_CYCLES: u32 = 50;
     let mut irrelevant_cycles = 0u32;
     // How fast this peer delivers, which sets how many requests to queue.
     let mut throughput = Throughput::default();
 
-    while let Some(work) = queue.pop() {
-        let piece_index = work.index;
-        if !state.peer_has_pieces.get(piece_index as usize).copied().unwrap_or(false) {
-            queue.push_back(work);
-
-            // Rather than busy-looping on push_back/pop, actually read
-            // whatever the peer sends next -- a Have/Bitfield here might
-            // be exactly the piece we're waiting on, updating `state`
-            // as a side effect. A read timeout just means the peer's
-            // quiet right now, not that it's gone.
-            match crate::peer::connection::read_message(&mut stream) {
-                Ok(msg) => {
-                    // `absorb` returns true for any state-affecting
-                    // message (Choke/Unchoke/Have/Bitfield/...), which is
-                    // an approximation of "this peer is still doing
-                    // something" -- good enough for a stuck-connection
-                    // safety net without needing to prove the exact piece
-                    // we're blocked on became available this cycle.
-                    let peer_is_active = absorb(&msg, &mut state, queue, pex_tx);
-                    irrelevant_cycles = if peer_is_active { 0 } else { irrelevant_cycles + 1 };
-                }
-                Err(ref e) if is_read_timeout(e) => {
-                    irrelevant_cycles += 1;
-                }
-                Err(e) => return Err(WorkerError::Connection { stage: "wait_for_relevant_have", error: e }),
+    loop {
+        // The rarest piece *this peer has*: one it lacks is no use to it.
+        let work = match queue.take_for(|piece| state.peer_has_pieces.get(piece as usize).copied().unwrap_or(false)) {
+            Take::Piece(work) => work,
+            Take::Done => break,
+            Take::NothingForThisPeer => {
+                wait_for_a_piece_it_has(&mut stream, &mut state, queue, pex_tx, &mut irrelevant_cycles)?;
+                continue;
             }
-
-            if irrelevant_cycles >= MAX_IRRELEVANT_CYCLES {
-                return Err(WorkerError::Connection {
-                    stage: "peer_has_no_needed_pieces",
-                    error: ConnectionError::Wire(WireError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "peer never offered a piece we still need"))),
-                });
-            }
-            continue;
-        }
+        };
         irrelevant_cycles = 0;
+        let piece_index = work.index;
 
         match download_one_piece(&mut stream, &mut state, queue, work.clone(), config.pipeline_depth, &mut throughput, pex_tx, config.down_limit.as_deref()) {
             Ok(Some(data)) => {
@@ -232,6 +205,39 @@ pub fn run_worker(
                 return Err(e);
             }
         }
+    }
+    Ok(())
+}
+
+/// Pieces remain, but this peer has none of them. Rather than
+/// busy-looping, reads whatever the peer sends next: a Have or Bitfield
+/// might be exactly what is being waited for, and updates `state` as a side
+/// effect. A read timeout just means the peer is quiet, not that it has
+/// gone. After [`MAX_IRRELEVANT_CYCLES`] in a row with nothing new the
+/// connection is given up rather than holding its slot for good: a peer
+/// that is alive but useless (or silent without formally disconnecting)
+/// would otherwise never free it for the coordinator to try someone else.
+fn wait_for_a_piece_it_has(stream: &mut TcpStream, state: &mut crate::peer::PeerState, queue: &WorkQueue, pex_tx: Option<&PexSender>, irrelevant_cycles: &mut u32) -> Result<(), WorkerError> {
+    match crate::peer::connection::read_message(stream) {
+        Ok(msg) => {
+            // `absorb` returns true for any state-affecting message
+            // (Choke/Unchoke/Have/Bitfield/...), an approximation of
+            // "this peer is still doing something" that is good enough for
+            // a stuck-connection safety net.
+            let peer_is_active = absorb(&msg, state, queue, pex_tx);
+            *irrelevant_cycles = if peer_is_active { 0 } else { *irrelevant_cycles + 1 };
+        }
+        Err(ref e) if is_read_timeout(e) => {
+            *irrelevant_cycles += 1;
+        }
+        Err(e) => return Err(WorkerError::Connection { stage: "wait_for_relevant_have", error: e }),
+    }
+
+    if *irrelevant_cycles >= MAX_IRRELEVANT_CYCLES {
+        return Err(WorkerError::Connection {
+            stage: "peer_has_no_needed_pieces",
+            error: ConnectionError::Wire(WireError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "peer never offered a piece we still need"))),
+        });
     }
     Ok(())
 }
