@@ -131,7 +131,7 @@ impl Message {
     }
 
     /// Blocking read of exactly one framed message from `reader`.
-    pub fn read_from<R: Read>(reader: &mut R) -> Result<Message, WireError> {
+    pub fn read_from<R: Read + ?Sized>(reader: &mut R) -> Result<Message, WireError> {
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf)?;
         let len = u32::from_be_bytes(len_buf);
@@ -191,7 +191,7 @@ impl Message {
         })
     }
 
-    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<(), WireError> {
+    pub fn write_to<W: Write + ?Sized>(&self, writer: &mut W) -> Result<(), WireError> {
         writer.write_all(&self.to_bytes())?;
         Ok(())
     }

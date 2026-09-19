@@ -6,6 +6,7 @@
 
 use super::handshake::{Handshake, HandshakeError, HANDSHAKE_LEN};
 use super::message::{Message, WireError};
+use super::stream::PeerStream;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
@@ -58,12 +59,12 @@ pub fn connect_and_handshake(
     our_peer_id: [u8; 20],
     support_extensions: bool,
     timeout: Duration,
-) -> Result<(TcpStream, Handshake), ConnectionError> {
+) -> Result<(Box<dyn PeerStream>, Handshake), ConnectionError> {
     let stream = TcpStream::connect_timeout(&addr, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 
-    let mut stream = stream;
+    let mut stream: Box<dyn PeerStream> = Box::new(stream);
     let outbound = Handshake::new(info_hash, our_peer_id, support_extensions);
     stream.write_all(&outbound.to_bytes())?;
 
@@ -79,12 +80,12 @@ pub fn connect_and_handshake(
 }
 
 /// Reads the next framed message from an already-handshaken stream.
-pub fn read_message(stream: &mut TcpStream) -> Result<Message, ConnectionError> {
+pub fn read_message(stream: &mut dyn PeerStream) -> Result<Message, ConnectionError> {
     Ok(Message::read_from(stream)?)
 }
 
 /// Writes a framed message to an already-handshaken stream.
-pub fn send_message(stream: &mut TcpStream, msg: &Message) -> Result<(), ConnectionError> {
+pub fn send_message(stream: &mut dyn PeerStream, msg: &Message) -> Result<(), ConnectionError> {
     msg.write_to(stream)?;
     Ok(())
 }

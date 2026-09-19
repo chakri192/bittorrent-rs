@@ -27,7 +27,8 @@ use messages::{absorb, is_read_timeout};
 use piece::{download_one_piece, Meter};
 pub use peer_stats::{Activity, PeerRegistry, PeerRow, PeerStat};
 use pipeline::Throughput;
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use crate::peer::{Closer, PeerStream};
+use std::net::SocketAddr;
 use std::sync::mpsc::Sender;
 use crate::sync::lock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -70,7 +71,7 @@ pub struct WorkerConfig {
 pub struct Interrupt {
     triggered: AtomicBool,
     next_id: AtomicU64,
-    streams: Mutex<Vec<(u64, TcpStream)>>,
+    streams: Mutex<Vec<(u64, Arc<dyn Closer>)>>,
 }
 
 /// A connection tracked by an [`Interrupt`], untracked when dropped.
@@ -92,15 +93,15 @@ impl Interrupt {
     /// Tracks `stream` until the returned registration is dropped, so a
     /// trigger in the meantime can shut it down. If the interrupt has
     /// already been triggered, the stream is shut down now.
-    pub fn register(&self, stream: &TcpStream) -> Registration<'_> {
-        let Ok(clone) = stream.try_clone() else { return Registration { interrupt: self, id: None } };
+    pub fn register(&self, stream: &dyn PeerStream) -> Registration<'_> {
+        let Ok(closer) = stream.closer() else { return Registration { interrupt: self, id: None } };
         let mut streams = lock(&self.streams);
         if self.triggered.load(Ordering::SeqCst) {
-            let _ = clone.shutdown(Shutdown::Both);
+            closer.close();
             return Registration { interrupt: self, id: None };
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        streams.push((id, clone));
+        streams.push((id, closer));
         Registration { interrupt: self, id: Some(id) }
     }
 
@@ -108,8 +109,8 @@ impl Interrupt {
     pub fn trigger(&self) {
         let mut streams = lock(&self.streams);
         self.triggered.store(true, Ordering::SeqCst);
-        for (_, stream) in streams.drain(..) {
-            let _ = stream.shutdown(Shutdown::Both);
+        for (_, closer) in streams.drain(..) {
+            closer.close();
         }
     }
 
@@ -227,7 +228,7 @@ pub fn run_worker(
 /// connection is given up rather than holding its slot for good: a peer
 /// that is alive but useless (or silent without formally disconnecting)
 /// would otherwise never free it for the coordinator to try someone else.
-fn wait_for_a_piece_it_has(stream: &mut TcpStream, state: &mut crate::peer::PeerState, queue: &WorkQueue, pex_tx: Option<&PexSender>, irrelevant_cycles: &mut u32) -> Result<(), WorkerError> {
+fn wait_for_a_piece_it_has(stream: &mut dyn PeerStream, state: &mut crate::peer::PeerState, queue: &WorkQueue, pex_tx: Option<&PexSender>, irrelevant_cycles: &mut u32) -> Result<(), WorkerError> {
     match crate::peer::connection::read_message(stream) {
         Ok(msg) => {
             // `absorb` returns true for any state-affecting message

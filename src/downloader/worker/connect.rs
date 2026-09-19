@@ -3,7 +3,8 @@
 use super::{absorb, is_read_timeout, PexSender, Registration, WorkerConfig, WorkerError};
 use crate::downloader::queue::WorkQueue;
 use crate::peer::{connect_and_handshake, ConnectionError, ExtendedHandshake, Message, PeerState, WireError};
-use std::net::{SocketAddr, TcpStream};
+use crate::peer::PeerStream;
+use std::net::SocketAddr;
 
 /// How many read timeouts in a row to sit through while waiting for the
 /// peer to unchoke us before giving up on it.
@@ -20,13 +21,13 @@ pub(super) const MAX_UNCHOKE_WAIT_TIMEOUTS: u32 = 6;
 /// The connection is registered with the config's interrupt, so stopping
 /// the client can end the wait; the returned [`Registration`] must be kept
 /// as long as the connection is used.
-pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, queue: &WorkQueue, pex_tx: Option<&PexSender>) -> Result<(TcpStream, PeerState, Registration<'a>), WorkerError> {
+pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, queue: &WorkQueue, pex_tx: Option<&PexSender>) -> Result<(Box<dyn PeerStream>, PeerState, Registration<'a>), WorkerError> {
     let (mut stream, peer_handshake) =
         connect_and_handshake(peer_addr, config.info_hash, config.our_peer_id, true, config.connect_timeout).map_err(|e| WorkerError::Connection { stage: "connect_and_handshake", error: e })?;
 
     // Registered before anything else is read, so that stopping the client
     // ends a worker that is waiting on this peer instead of waiting it out.
-    let registration = config.interrupt.register(&stream);
+    let registration = config.interrupt.register(&*stream);
 
     let mut state = PeerState::for_torrent(queue.total_pieces());
     state.supports_extensions = peer_handshake.supports_extensions();
@@ -83,6 +84,7 @@ pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, que
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpStream;
     use crate::downloader::PieceWork;
     use crate::peer::handshake::Handshake;
     use std::io::{Read, Write};
