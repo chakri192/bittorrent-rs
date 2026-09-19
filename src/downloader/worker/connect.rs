@@ -20,7 +20,7 @@ pub(super) fn establish(peer_addr: SocketAddr, config: &WorkerConfig, queue: &Wo
     let (mut stream, peer_handshake) =
         connect_and_handshake(peer_addr, config.info_hash, config.our_peer_id, true, config.connect_timeout).map_err(|e| WorkerError::Connection { stage: "connect_and_handshake", error: e })?;
 
-    let mut state = PeerState::new();
+    let mut state = PeerState::for_torrent(queue.total_pieces());
     state.supports_extensions = peer_handshake.supports_extensions();
 
     if state.supports_extensions {
@@ -187,5 +187,19 @@ mod tests {
         let dead = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         let err = establish(dead, &config(), &queue(1), None).expect_err("nothing is listening");
         assert!(matches!(err, WorkerError::Connection { stage: "connect_and_handshake", .. }), "got {:?}", err);
+    }
+
+    #[test]
+    fn a_hostile_have_and_oversized_bitfield_cannot_grow_the_peers_state() {
+        let addr = fake_peer(false, |stream| {
+            Message::Have { piece_index: u32::MAX }.write_to(stream).unwrap();
+            Message::Bitfield(vec![0xff; 1000]).write_to(stream).unwrap();
+            Message::Unchoke.write_to(stream).unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let (_stream, state) = establish(addr, &config(), &queue(4), None).unwrap();
+
+        assert_eq!(state.peer_has_pieces.len(), 4, "the torrent has 4 pieces, whatever the peer claims");
     }
 }

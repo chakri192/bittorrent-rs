@@ -23,7 +23,15 @@ pub struct PeerState {
     /// not by `apply_message` (the extended handshake payload itself is
     /// parsed in Phase 4).
     pub supports_extensions: bool,
+    /// How many pieces `peer_has_pieces` may ever describe: the torrent's
+    /// piece count. Piece indices come off the wire, so without a bound a
+    /// single `have` for piece 4294967295 makes the client allocate 4 GiB.
+    piece_limit: usize,
 }
+
+/// The ceiling on pieces tracked when the torrent's real piece count is
+/// not known (16 Mi pieces, 16 MiB of state). Real torrents have far fewer.
+pub const MAX_TRACKED_PIECES: usize = 1 << 24;
 
 impl Default for PeerState {
     /// Per BEP 3: both sides start choked and not-interested.
@@ -35,6 +43,7 @@ impl Default for PeerState {
             peer_interested: false,
             peer_has_pieces: Vec::new(),
             supports_extensions: false,
+            piece_limit: MAX_TRACKED_PIECES,
         }
     }
 }
@@ -42,6 +51,12 @@ impl Default for PeerState {
 impl PeerState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// State for a peer of a torrent with `piece_count` pieces: anything a
+    /// peer says about a piece beyond that is ignored.
+    pub fn for_torrent(piece_count: usize) -> Self {
+        PeerState { piece_limit: piece_count.min(MAX_TRACKED_PIECES), ..Self::default() }
     }
 
     /// Ensures `peer_has_pieces` can index up to `piece_index` inclusive,
@@ -78,12 +93,19 @@ impl PeerState {
                 true
             }
             Message::Have { piece_index } => {
-                self.ensure_capacity(*piece_index as usize);
-                self.peer_has_pieces[*piece_index as usize] = true;
+                let index = *piece_index as usize;
+                if index >= self.piece_limit {
+                    return false; // a piece this torrent does not have: ignore it
+                }
+                self.ensure_capacity(index);
+                self.peer_has_pieces[index] = true;
                 true
             }
             Message::Bitfield(bits) => {
                 self.peer_has_pieces = bytes_to_bitfield(bits);
+                // A bitfield is padded to whole bytes, and a peer may send
+                // more than that; only the torrent's pieces count.
+                self.peer_has_pieces.truncate(self.piece_limit);
                 true
             }
             _ => false,
@@ -207,5 +229,48 @@ mod tests {
     #[test]
     fn encode_bitfield_empty_is_empty_bytes() {
         assert_eq!(PeerState::encode_bitfield(&[]), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn a_have_beyond_the_torrent_is_ignored_and_allocates_nothing() {
+        // One nine-byte message used to make the client allocate 4 GiB.
+        let mut s = PeerState::for_torrent(100);
+        assert!(!s.apply_message(&Message::Have { piece_index: u32::MAX }));
+        assert!(!s.apply_message(&Message::Have { piece_index: 100 }));
+        assert!(s.peer_has_pieces.is_empty(), "nothing grew: {}", s.peer_has_pieces.len());
+    }
+
+    #[test]
+    fn the_last_piece_is_tracked_and_the_one_after_it_is_not() {
+        let mut s = PeerState::for_torrent(100);
+        assert!(s.apply_message(&Message::Have { piece_index: 99 }));
+        assert!(s.peer_has_pieces[99]);
+        assert_eq!(s.peer_has_pieces.len(), 100);
+        assert!(!s.apply_message(&Message::Have { piece_index: 100 }));
+        assert_eq!(s.peer_has_pieces.len(), 100);
+    }
+
+    #[test]
+    fn without_a_known_piece_count_there_is_still_a_ceiling() {
+        let mut s = PeerState::new();
+        assert!(!s.apply_message(&Message::Have { piece_index: u32::MAX }));
+        assert!(!s.apply_message(&Message::Have { piece_index: MAX_TRACKED_PIECES as u32 }));
+        assert!(s.peer_has_pieces.is_empty());
+        assert!(PeerState::for_torrent(usize::MAX).piece_limit == MAX_TRACKED_PIECES, "a huge claimed count is capped too");
+    }
+
+    #[test]
+    fn a_bitfield_longer_than_the_torrent_is_cut_to_it() {
+        let mut s = PeerState::for_torrent(10);
+        assert!(s.apply_message(&Message::Bitfield(vec![0xff; 1000])));
+        assert_eq!(s.peer_has_pieces.len(), 10, "not 8000");
+        assert!(s.peer_has_pieces.iter().all(|&b| b));
+    }
+
+    #[test]
+    fn a_bitfield_within_the_torrent_is_kept_whole() {
+        let mut s = PeerState::for_torrent(100);
+        s.apply_message(&Message::Bitfield(vec![0b1010_0000]));
+        assert_eq!(&s.peer_has_pieces, &[true, false, true, false, false, false, false, false]);
     }
 }

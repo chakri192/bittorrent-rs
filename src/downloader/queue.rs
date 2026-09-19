@@ -149,11 +149,19 @@ impl WorkQueue {
     /// Records an entire bitfield at once (bit `i` = piece `i`, per BEP 3
     /// `bitfield` semantics already decoded by `PeerState`).
     pub fn note_bitfield(&self, have: &[bool]) {
-        for (i, &has_it) in have.iter().enumerate() {
+        // One lock for the lot, and only as many entries as there are
+        // pieces: a peer's bitfield can be far longer than the torrent.
+        let mut availability = lock(&self.availability);
+        for (count, &has_it) in availability.iter_mut().zip(have) {
             if has_it {
-                self.note_have(i as u32);
+                *count += 1;
             }
         }
+    }
+
+    /// How many pieces the torrent has (what the queue was built for).
+    pub fn total_pieces(&self) -> usize {
+        lock(&self.availability).len()
     }
 }
 
@@ -363,5 +371,25 @@ mod tests {
         assert!(q.pop().is_some());
         assert!(!q.is_empty());
         assert!(!q.in_endgame());
+    }
+
+    #[test]
+    fn a_bitfield_longer_than_the_torrent_counts_only_real_pieces() {
+        let q = WorkQueue::new((0..3).map(|i| PieceWork { index: i, hash: [0; 20], length: 16 }).collect(), 3);
+        assert_eq!(q.total_pieces(), 3);
+        q.note_bitfield(&vec![true; 1_000_000]); // far more entries than pieces
+        assert_eq!(q.total_pieces(), 3, "nothing grew");
+        // Every real piece was counted once, so none is rarer than another.
+        let popped: Vec<u32> = std::iter::from_fn(|| q.pop()).take(3).map(|w| w.index).collect();
+        assert_eq!(popped.len(), 3);
+    }
+
+    #[test]
+    fn a_short_bitfield_counts_the_pieces_it_covers() {
+        let q = WorkQueue::new((0..4).map(|i| PieceWork { index: i, hash: [0; 20], length: 16 }).collect(), 4);
+        q.note_bitfield(&[true, false]); // piece 0 only
+        // Pieces 1, 2, 3 have no holder, so all of them come out before 0.
+        let order: Vec<u32> = std::iter::from_fn(|| q.pop()).take(4).map(|w| w.index).collect();
+        assert_eq!(order.last(), Some(&0));
     }
 }
