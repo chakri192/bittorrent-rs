@@ -15,6 +15,7 @@
 //! Run with: `cargo run --bin e2e_harness`
 
 use bittorrent_rs::downloader::progress_file_path;
+use bittorrent_rs::metadata::{MetadataMessage, METADATA_PIECE_SIZE};
 use bittorrent_rs::peer::handshake::Handshake;
 use bittorrent_rs::peer::message::Message;
 use bittorrent_rs::peer::ExtendedHandshake;
@@ -57,6 +58,10 @@ enum Kind {
     /// `--seed`: after downloading, the client must stay up and serve the
     /// finished torrent to a peer that connects to it.
     SeedAfterDownload,
+    /// The client is given only a magnet link: it must find a peer through
+    /// the tracker, fetch and verify the metadata from it (BEP 9), and then
+    /// download the content.
+    MagnetDownload,
 }
 
 struct Scenario {
@@ -72,6 +77,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "drop-mid-piece", kind: Kind::DropMidPiece },
     Scenario { name: "timeout-incomplete", kind: Kind::TimeoutIncomplete },
     Scenario { name: "seed-after-download", kind: Kind::SeedAfterDownload },
+    Scenario { name: "magnet-download", kind: Kind::MagnetDownload },
 ];
 
 fn main() {
@@ -84,6 +90,7 @@ fn main() {
             Kind::DropMidPiece => run_drop_mid_piece(scenario.name),
             Kind::TimeoutIncomplete => run_timeout_incomplete(scenario.name),
             Kind::SeedAfterDownload => run_seed_after_download(scenario.name),
+            Kind::MagnetDownload => run_magnet_download(scenario.name),
         };
         match outcome {
             Ok(summary) => println!("PASS [{}]: {}", scenario.name, summary),
@@ -168,6 +175,13 @@ impl Fixture {
         Fixture { files, piece_count: pieces_concat.len() / 20, data, piece_len, info_bytes: v, info_hash }
     }
 
+    /// A magnet link for this torrent naming the tracker at `tracker_addr`.
+    fn magnet_uri(&self, tracker_addr: SocketAddr) -> String {
+        let hash: String = self.info_hash.iter().map(|b| format!("{:02x}", b)).collect();
+        let tracker = format!("http://{}/announce", tracker_addr).replace(':', "%3A").replace('/', "%2F");
+        format!("magnet:?xt=urn:btih:{}&dn=e2e.bin&tr={}", hash, tracker)
+    }
+
     /// The `.torrent` bytes announcing to `tracker_addr`. Only the
     /// announce URL differs between runs; the info hash never does.
     fn torrent_bytes(&self, tracker_addr: SocketAddr) -> Vec<u8> {
@@ -195,6 +209,8 @@ struct PeerLog {
     served: BTreeSet<u32>,
     /// The piece the peer hung up in the middle of, if it did.
     dropped_piece: Option<u32>,
+    /// ut_metadata pieces (BEP 9) the peer sent to a client that asked.
+    metadata_pieces_served: usize,
 }
 
 /// A latch one fake peer can open for another to wait on, to force an
@@ -259,6 +275,8 @@ fn announce_param(request_line: &str, key: &str) -> Option<String> {
 /// What a fake peer needs to know about the torrent it serves.
 struct PeerContext {
     data: Vec<u8>,
+    /// The bencoded info dict, served to clients that ask for it (BEP 9).
+    info_bytes: Vec<u8>,
     info_hash: [u8; 20],
     piece_len: usize,
     piece_count: usize,
@@ -278,7 +296,7 @@ fn spawn_swarm(fx: &Fixture, behaviors: Vec<Behavior>) -> Swarm {
         peer_addrs.push(listener.local_addr().unwrap());
         let log = Arc::new(Mutex::new(PeerLog::default()));
         logs.push(Arc::clone(&log));
-        let cx = PeerContext { data: fx.data.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count };
+        let cx = PeerContext { data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count };
         thread::spawn(move || run_fake_peer(listener, cx, behavior, log));
     }
 
@@ -314,10 +332,23 @@ fn spawn_swarm(fx: &Fixture, behaviors: Vec<Behavior>) -> Swarm {
     Swarm { tracker_addr, logs, announces }
 }
 
-/// One fake peer: accepts a single connection and plays `behavior` on it.
-fn run_fake_peer(listener: TcpListener, cx: PeerContext, behavior: Behavior, log: Arc<Mutex<PeerLog>>) {
-    let Ok((mut stream, _)) = listener.accept() else { return };
+/// The extended-message id the fake peer uses for ut_metadata. Deliberately
+/// not the id the client picks, so the client has to use the one it is told.
+const PEER_UT_METADATA_ID: u8 = 7;
 
+/// One fake peer: accepts connections for as long as the harness runs, and
+/// plays `behavior` on each. (A magnet download connects twice: once to
+/// fetch the metadata, once to download.)
+fn run_fake_peer(listener: TcpListener, cx: PeerContext, behavior: Behavior, log: Arc<Mutex<PeerLog>>) {
+    let (cx, behavior) = (Arc::new(cx), Arc::new(behavior));
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        let (cx, behavior, log) = (Arc::clone(&cx), Arc::clone(&behavior), Arc::clone(&log));
+        thread::spawn(move || serve_connection(stream, &cx, &behavior, &log));
+    }
+}
+
+fn serve_connection(mut stream: TcpStream, cx: &PeerContext, behavior: &Behavior, log: &Mutex<PeerLog>) {
     let mut hs_buf = [0u8; 68];
     if stream.read_exact(&mut hs_buf).is_err() {
         return;
@@ -338,7 +369,7 @@ fn run_fake_peer(listener: TcpListener, cx: PeerContext, behavior: Behavior, log
     if Message::Bitfield(bits).write_to(&mut stream).is_err() {
         return;
     }
-    if let Behavior::ChokedUntil(gate) = &behavior {
+    if let Behavior::ChokedUntil(gate) = behavior {
         gate.wait(GATE_LIMIT);
     }
     if Message::Unchoke.write_to(&mut stream).is_err() {
@@ -347,6 +378,8 @@ fn run_fake_peer(listener: TcpListener, cx: PeerContext, behavior: Behavior, log
 
     // The piece a `DropMidPiece` peer has decided to hang up in.
     let mut doomed: Option<u32> = None;
+    // The id the client gave ut_metadata in its extended handshake.
+    let mut client_ut_metadata_id: Option<u8> = None;
     loop {
         match Message::read_from(&mut stream) {
             Ok(Message::Request { index, begin, length }) => {
@@ -355,7 +388,7 @@ fn run_fake_peer(listener: TcpListener, cx: PeerContext, behavior: Behavior, log
                 let hang_up = {
                     let mut log = log.lock().unwrap();
                     log.requested.push(index);
-                    match &behavior {
+                    match behavior {
                         Behavior::StallAfter(limit) if log.served.len() >= *limit && !log.served.contains(&index) => continue, // read it, never answer
                         Behavior::DropMidPiece { after_pieces, .. } => {
                             if doomed.is_none() && log.served.len() >= *after_pieces && !log.served.contains(&index) {
@@ -376,7 +409,7 @@ fn run_fake_peer(listener: TcpListener, cx: PeerContext, behavior: Behavior, log
                     log.dropped_piece == Some(index)
                 };
                 if hang_up {
-                    if let Behavior::DropMidPiece { dropped, .. } = &behavior {
+                    if let Behavior::DropMidPiece { dropped, .. } = behavior {
                         dropped.open();
                     }
                     return; // the stream closes with the piece half-sent
@@ -389,6 +422,24 @@ fn run_fake_peer(listener: TcpListener, cx: PeerContext, behavior: Behavior, log
             Ok(Message::Extended { id: 0, payload }) => {
                 if let Ok(hs) = ExtendedHandshake::parse(&payload) {
                     log.lock().unwrap().pex_offered = Some(hs.peer_ut_pex_id().is_some());
+                    // A peer that has the whole torrent answers an extended
+                    // handshake with its own, so a client that started from a
+                    // magnet link can ask it for the info dict.
+                    client_ut_metadata_id = hs.peer_ut_metadata_id();
+                    let reply = ExtendedHandshake::build(PEER_UT_METADATA_ID, Some(cx.info_bytes.len() as i64));
+                    if (Message::Extended { id: 0, payload: reply }).write_to(&mut stream).is_err() {
+                        return;
+                    }
+                }
+            }
+            Ok(Message::Extended { id, payload }) if id == PEER_UT_METADATA_ID => {
+                let (Some(reply_id), Ok(MetadataMessage::Request { piece })) = (client_ut_metadata_id, MetadataMessage::decode(&payload)) else { continue };
+                let start = piece as usize * METADATA_PIECE_SIZE;
+                let end = (start + METADATA_PIECE_SIZE).min(cx.info_bytes.len());
+                let data = MetadataMessage::Data { piece, total_size: cx.info_bytes.len() as u32, data: cx.info_bytes[start..end].to_vec() };
+                log.lock().unwrap().metadata_pieces_served += 1;
+                if (Message::Extended { id: reply_id, payload: data.encode() }).write_to(&mut stream).is_err() {
+                    return;
                 }
             }
             Ok(_) => continue,
@@ -409,10 +460,10 @@ fn scratch_dir(name: &str) -> PathBuf {
 
 /// The client invoked as a user would, with the flags every scenario
 /// shares. The caller adds the DHT choice.
-fn client_command(torrent: &Path, out_dir: &Path, log: &Path, max_peers: usize) -> Command {
+fn client_command(source: impl AsRef<std::ffi::OsStr>, out_dir: &Path, log: &Path, max_peers: usize) -> Command {
     let download_bin = std::env::current_exe().expect("current exe").parent().expect("exe dir").join("download");
     let mut cmd = Command::new(download_bin);
-    cmd.arg(torrent).arg("--out").arg(out_dir).arg("--peers").arg(max_peers.to_string());
+    cmd.arg(source).arg("--out").arg(out_dir).arg("--peers").arg(max_peers.to_string());
     // Don't let a developer's ~/.config/bittorrent-rs.toml change what
     // this run does.
     cmd.arg("--no-config");
@@ -760,6 +811,18 @@ fn run_timeout_incomplete(name: &str) -> Result<String, String> {
     Ok(format!("stopped {:.0?} after a {}s --timeout with {} of {} pieces; exited 1, reported incomplete, resume file kept", elapsed, TIMEOUT.as_secs(), STALL_AFTER, fx.piece_count))
 }
 
+/// Checks one announce request line against what the client should have
+/// reported: its event and transfer counters.
+fn check_announce(line: &str, event: &str, downloaded: &str, left: &str) -> Result<(), String> {
+    for (key, want) in [("event", event), ("downloaded", downloaded), ("left", left)] {
+        let got = announce_param(line, key);
+        if got.as_deref() != Some(want) {
+            return Err(format!("{} announce has {}={:?}, expected {:?}: {}", event, key, got, want, line));
+        }
+    }
+    Ok(())
+}
+
 /// Kills the client when dropped, so a scenario that leaves it running on
 /// purpose can't leak it on an early return.
 struct KillOnDrop(Child);
@@ -883,14 +946,8 @@ fn run_seed_after_download(name: &str) -> Result<String, String> {
         return Err(format!("the tracker saw {} announces, expected started and completed: {:?}", announces.len(), announces));
     };
     let total = fx.data.len().to_string();
-    for (line, event, downloaded, left) in [(started, "started", "0", total.as_str()), (completed, "completed", total.as_str(), "0")] {
-        for (key, want) in [("event", event), ("downloaded", downloaded), ("left", left)] {
-            let got = announce_param(line, key);
-            if got.as_deref() != Some(want) {
-                return Err(format!("{} announce has {}={:?}, expected {:?}: {}", event, key, got, want, line));
-            }
-        }
-    }
+    check_announce(started, "started", "0", &total)?;
+    check_announce(completed, "completed", &total, "0")?;
 
     // Connect to the port the client told the tracker about and leech.
     let port: u16 = announce_param(started, "port").and_then(|p| p.parse().ok()).ok_or_else(|| format!("no port in the announce: {}", started))?;
@@ -905,4 +962,49 @@ fn run_seed_after_download(name: &str) -> Result<String, String> {
     }
 
     Ok(format!("finished, announced started+completed, kept running, and served all {} pieces to a leecher on port {}", fx.piece_count, port))
+}
+
+/// The client starts from a magnet link and nothing else: the tracker in the
+/// link gives it a peer, it fetches the info dict from that peer over
+/// BEP 9 and checks it against the link's hash, and then it downloads.
+fn run_magnet_download(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (out_dir, log_path) = (dir.join("out"), dir.join("client.log"));
+
+    let mut child = client_command(fx.magnet_uri(swarm.tracker_addr), &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("download binary exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+
+    let log = fs::read_to_string(&log_path).map_err(|e| format!("reading client log {:?}: {}", log_path, e))?;
+    for notice in ["querying 1 tracker(s) to bootstrap peer list", "metadata received and verified against magnet InfoHash"] {
+        if !log.contains(notice) {
+            return Err(format!("client log lacks {:?}", notice));
+        }
+    }
+    let served = swarm.logs[0].lock().unwrap().metadata_pieces_served;
+    if served == 0 {
+        return Err("the peer was never asked for the metadata".to_string());
+    }
+
+    // Three announces: the bootstrap one, made before the size is known
+    // (left=1, so the tracker sees a leecher); the real one once the
+    // metadata has arrived; and completed.
+    let announces = swarm.announces.lock().unwrap().clone();
+    let [bootstrap, started, completed] = announces.as_slice() else {
+        return Err(format!("the tracker saw {} announces, expected bootstrap, started and completed: {:?}", announces.len(), announces));
+    };
+    let total = fx.data.len().to_string();
+    check_announce(bootstrap, "started", "0", "1")?;
+    check_announce(started, "started", "0", &total)?;
+    check_announce(completed, "completed", &total, "0")?;
+
+    Ok(format!("magnet link -> metadata ({} piece) -> {} bytes, all matching; announced bootstrap, started, completed", served, fx.data.len()))
 }
