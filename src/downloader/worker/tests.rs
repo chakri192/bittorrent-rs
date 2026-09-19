@@ -459,3 +459,124 @@ fn a_worker_waiting_on_a_silent_peer_stops_when_interrupted() {
     let _ = release_tx.send(());
     peer.join().unwrap();
 }
+
+// ---- how many requests are kept in flight ----
+
+/// A peer with a long round trip: every request is answered `latency`
+/// after it arrived, however many are waiting, as a real link would. Tracks
+/// how many requests were outstanding at once. With `reqq`, sends an
+/// extended handshake saying how many it will queue.
+fn spawn_laggy_peer(listener: TcpListener, info_hash: [u8; 20], pieces: Vec<Vec<u8>>, latency: Duration, reqq: Option<u32>, max_outstanding: Arc<std::sync::atomic::AtomicUsize>) -> thread::JoinHandle<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut hs_buf = [0u8; 68];
+        std::io::Read::read_exact(&mut stream, &mut hs_buf).unwrap();
+        std::io::Write::write_all(&mut stream, &Handshake::new(info_hash, [0x99; 20], reqq.is_some()).to_bytes()).unwrap();
+        if let Some(reqq) = reqq {
+            let payload = format!("d1:mde4:reqqi{}ee", reqq).into_bytes();
+            WireMessage::Extended { id: 0, payload }.write_to(&mut stream).unwrap();
+        }
+        let mut bits = vec![0u8; pieces.len().div_ceil(8)];
+        for i in 0..pieces.len() {
+            bits[i / 8] |= 1 << (7 - (i % 8));
+        }
+        WireMessage::Bitfield(bits).write_to(&mut stream).unwrap();
+        WireMessage::Unchoke.write_to(&mut stream).unwrap();
+
+        // One thread reads requests as they come and stamps them; this one
+        // answers each when its time is up.
+        let outstanding = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+        let mut reader = stream.try_clone().unwrap();
+        let counted = Arc::clone(&outstanding);
+        thread::spawn(move || {
+            while let Ok(msg) = WireMessage::read_from(&mut reader) {
+                if let WireMessage::Request { index, begin, length } = msg {
+                    let now = counted.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_outstanding.fetch_max(now, Ordering::SeqCst);
+                    if tx.send((Instant::now(), index, begin, length)).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        while let Ok((arrived, index, begin, length)) = rx.recv() {
+            let due = arrived + latency;
+            if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                thread::sleep(wait);
+            }
+            let piece = &pieces[index as usize];
+            let block = piece[begin as usize..(begin + length) as usize].to_vec();
+            let reply = WireMessage::Piece { index, begin, block };
+            if reply.write_to(&mut stream).is_err() {
+                return;
+            }
+            outstanding.fetch_sub(1, Ordering::SeqCst);
+        }
+    })
+}
+
+/// Downloads `piece_count` pieces of `piece_len` bytes from a laggy peer,
+/// with the given minimum queue depth. Returns how long it took, the most
+/// requests the peer ever had waiting, and whether the pieces on disk are right.
+fn download_from_laggy_peer(name: &str, piece_count: usize, piece_len: usize, latency: Duration, reqq: Option<u32>, min_depth: usize) -> (Duration, usize, bool) {
+    let pieces: Vec<Vec<u8>> = (0..piece_count).map(|i| (0..piece_len).map(|b| (b as u8).wrapping_mul(7).wrapping_add(i as u8)).collect()).collect();
+    let info_hash = [0x62; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let max_outstanding = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peer = spawn_laggy_peer(listener, info_hash, pieces.clone(), latency, reqq, Arc::clone(&max_outstanding));
+
+    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: piece_len as u32 }).collect();
+    let queue = Arc::new(WorkQueue::new(work, piece_count));
+    let dir = tmp_dir(name);
+    let total = (piece_count * piece_len) as i64;
+    let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], total)]));
+    let (tx, _rx) = mpsc::channel();
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: min_depth, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default() };
+
+    let started = Instant::now();
+    run_worker(addr, &config, &queue, &spans, piece_len as u64, &tx, None).unwrap();
+    let took = started.elapsed();
+    peer.join().unwrap();
+
+    let mut on_disk = Vec::new();
+    fs::File::open(dir.join("out.bin")).unwrap().read_to_end(&mut on_disk).unwrap();
+    (took, max_outstanding.load(std::sync::atomic::Ordering::SeqCst), on_disk == pieces.concat())
+}
+
+#[test]
+fn a_long_round_trip_is_hidden_by_queueing_more_requests_to_a_peer_that_keeps_up() {
+    const LATENCY: Duration = Duration::from_millis(20);
+    const MIN_DEPTH: usize = 2;
+    let (pieces, piece_len) = (16, 256 * 1024);
+    let blocks = pieces * piece_len / 16384;
+
+    let (took, _, correct) = download_from_laggy_peer("adaptive-speed", pieces, piece_len, LATENCY, None, MIN_DEPTH);
+
+    assert!(correct, "every byte arrived intact");
+    // Kept at the minimum, one round trip fetches MIN_DEPTH blocks.
+    let at_the_minimum = LATENCY * (blocks / MIN_DEPTH) as u32;
+    assert!(took < at_the_minimum / 2, "took {:?}; a fixed queue of {} would need {:?}", took, MIN_DEPTH, at_the_minimum);
+}
+
+#[test]
+fn a_peer_is_never_sent_more_requests_than_it_said_it_will_queue() {
+    let (took, most_waiting, correct) = download_from_laggy_peer("reqq", 4, 64 * 1024, Duration::from_millis(5), Some(3), 2);
+
+    assert!(correct);
+    assert!(most_waiting <= 3, "the peer had {} requests waiting though it said it queues 3", most_waiting);
+    assert_eq!(most_waiting, 3, "and the queue did grow to what the peer allows ({:?})", took);
+}
+
+#[test]
+fn a_peer_that_says_nothing_is_still_kept_to_a_cautious_queue() {
+    // Fast enough and long enough that the rate asks for far more than the
+    // default limit; the peer must not be sent more than that.
+    let (_, most_waiting, correct) = download_from_laggy_peer("default-limit", 8, 256 * 1024, Duration::from_millis(10), None, 2);
+
+    assert!(correct);
+    assert!(most_waiting <= pipeline::DEFAULT_PEER_LIMIT, "{} waiting", most_waiting);
+    assert!(most_waiting > 2, "and more than the minimum, or the rate was never used: {}", most_waiting);
+}

@@ -23,6 +23,9 @@ pub struct PeerState {
     /// not by `apply_message` (the extended handshake payload itself is
     /// parsed in Phase 4).
     pub supports_extensions: bool,
+    /// The most outstanding requests the peer said it will queue (`reqq` in
+    /// its extended handshake), if it said.
+    pub peer_request_limit: Option<usize>,
     /// How many pieces `peer_has_pieces` may ever describe: the torrent's
     /// piece count. Piece indices come off the wire, so without a bound a
     /// single `have` for piece 4294967295 makes the client allocate 4 GiB.
@@ -43,6 +46,7 @@ impl Default for PeerState {
             peer_interested: false,
             peer_has_pieces: Vec::new(),
             supports_extensions: false,
+            peer_request_limit: None,
             piece_limit: MAX_TRACKED_PIECES,
         }
     }

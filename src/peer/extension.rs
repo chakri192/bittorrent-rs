@@ -29,6 +29,9 @@ pub struct ExtendedHandshake {
     pub metadata_size: Option<i64>,
     pub client_version: Option<String>,
     pub listen_port: Option<u16>,
+    /// `reqq`: how many outstanding requests the sender will queue without
+    /// dropping any. Only a positive number is kept.
+    pub reqq: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -114,8 +117,10 @@ impl ExtendedHandshake {
         let metadata_size = value.get("metadata_size").and_then(Bencode::as_int);
         let client_version = value.get("v").and_then(Bencode::as_str).map(str::to_string);
         let listen_port = value.get("p").and_then(Bencode::as_int).map(|p| p as u16);
+        // A zero, negative or absurd figure says nothing useful.
+        let reqq = value.get("reqq").and_then(Bencode::as_int).filter(|&n| n > 0).map(|n| n.min(u32::MAX as i64) as u32);
 
-        Ok(ExtendedHandshake { m, metadata_size, client_version, listen_port })
+        Ok(ExtendedHandshake { m, metadata_size, client_version, listen_port, reqq })
     }
 
     /// The peer's chosen id for `ut_metadata`, if they advertised support.
@@ -167,6 +172,18 @@ mod tests {
         assert_eq!(parsed.metadata_size, Some(34521));
         assert_eq!(parsed.listen_port, Some(6881));
         assert_eq!(parsed.client_version.as_deref(), Some("libtorrent/1"));
+        assert_eq!(parsed.reqq, Some(500));
+    }
+
+    #[test]
+    fn reqq_is_kept_only_when_it_is_a_usable_number() {
+        let with = |reqq: &str| ExtendedHandshake::parse(format!("d1:mde4:reqq{}e", reqq).as_bytes()).unwrap().reqq;
+        assert_eq!(with("i250e"), Some(250));
+        assert_eq!(with("i0e"), None, "zero requests would stall the download");
+        assert_eq!(with("i-5e"), None);
+        assert_eq!(with("i99999999999e"), Some(u32::MAX), "an absurd figure is clamped rather than wrapped");
+        assert_eq!(with("3:abc"), None, "not a number");
+        assert_eq!(ExtendedHandshake::parse(b"d1:mdee").unwrap().reqq, None, "absent");
     }
 
     #[test]

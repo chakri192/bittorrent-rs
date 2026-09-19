@@ -13,6 +13,7 @@
 mod connect;
 mod messages;
 mod piece;
+mod pipeline;
 #[cfg(test)]
 mod tests;
 
@@ -23,6 +24,7 @@ use crate::peer::{ConnectionError, WireError};
 use connect::establish;
 use messages::{absorb, is_read_timeout};
 use piece::download_one_piece;
+use pipeline::Throughput;
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::mpsc::Sender;
 use crate::sync::lock;
@@ -33,11 +35,12 @@ use std::time::Duration;
 pub struct WorkerConfig {
     pub info_hash: [u8; 20],
     pub our_peer_id: [u8; 20],
-    /// Max outstanding (requested, not-yet-received) blocks per piece.
-    /// 5 is the long-standing convention (mainline/libtorrent default
-    /// range is ~5-10) that keeps a 16 KiB*5 = 80 KiB window in flight --
-    /// enough to hide one round trip's latency without over-committing to
-    /// a peer that turns out to be slow.
+    /// The fewest outstanding (requested, not-yet-received) blocks to keep
+    /// with a peer. 5 is the long-standing convention (mainline and
+    /// libtorrent use roughly 5-10): an 80 KiB window, enough to start
+    /// without over-committing to a peer that turns out to be slow. A peer
+    /// that proves fast is sent more, up to what it says it will queue:
+    /// see [`pipeline`].
     pub pipeline_depth: usize,
     pub connect_timeout: Duration,
     /// Shared limit on the bytes downloaded across every connection
@@ -161,6 +164,8 @@ pub fn run_worker(
     /// the coordinator to try someone else.
     const MAX_IRRELEVANT_CYCLES: u32 = 50;
     let mut irrelevant_cycles = 0u32;
+    // How fast this peer delivers, which sets how many requests to queue.
+    let mut throughput = Throughput::default();
 
     while let Some(work) = queue.pop() {
         let piece_index = work.index;
@@ -199,7 +204,7 @@ pub fn run_worker(
         }
         irrelevant_cycles = 0;
 
-        match download_one_piece(&mut stream, &mut state, queue, work.clone(), config.pipeline_depth, pex_tx, config.down_limit.as_deref()) {
+        match download_one_piece(&mut stream, &mut state, queue, work.clone(), config.pipeline_depth, &mut throughput, pex_tx, config.down_limit.as_deref()) {
             Ok(Some(data)) => {
                 if let Err(e) = write_piece(spans, piece_index, piece_length, &data) {
                     // Disk failure isn't the peer's fault; requeue and bail

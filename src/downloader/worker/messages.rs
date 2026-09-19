@@ -2,7 +2,7 @@
 
 use super::PexSender;
 use crate::downloader::queue::WorkQueue;
-use crate::peer::extension::OUR_UT_PEX_ID;
+use crate::peer::extension::{ExtendedHandshake, OUR_UT_PEX_ID};
 use crate::peer::pex::parse_ut_pex;
 use crate::peer::{ConnectionError, Message, PeerState, WireError};
 
@@ -35,6 +35,13 @@ pub(super) fn absorb(msg: &Message, state: &mut PeerState, queue: &WorkQueue, pe
             queue.note_bitfield(&scratch.peer_has_pieces);
         }
         Message::Have { piece_index } => queue.note_have(*piece_index),
+        // The peer's extended handshake (BEP 10): the one thing the worker
+        // takes from it is how many requests the peer will queue.
+        Message::Extended { id: 0, payload } => {
+            if let Ok(handshake) = ExtendedHandshake::parse(payload) {
+                state.peer_request_limit = handshake.reqq.map(|n| n as usize);
+            }
+        }
         Message::Extended { id, payload } if *id == OUR_UT_PEX_ID => {
             // Peers push these unprompted once we advertise ut_pex in the
             // extended handshake -- free peer addresses for the dial
@@ -97,6 +104,37 @@ mod tests {
         // first, so this fails if the bitfield is not fed to it.)
         let order = pop_order(&q);
         assert_eq!(order.iter().take(2).copied().collect::<std::collections::BTreeSet<_>>(), [1, 2].into(), "got {:?}", order);
+    }
+
+    fn extended_handshake(body: &str) -> Message {
+        Message::Extended { id: 0, payload: body.as_bytes().to_vec() }
+    }
+
+    #[test]
+    fn the_peers_extended_handshake_tells_the_worker_how_many_requests_it_queues() {
+        let q = queue(1);
+        let mut state = PeerState::new();
+        assert_eq!(state.peer_request_limit, None);
+
+        absorb(&extended_handshake("d1:mde4:reqqi42ee"), &mut state, &q, None);
+
+        assert_eq!(state.peer_request_limit, Some(42));
+    }
+
+    #[test]
+    fn a_handshake_without_reqq_or_with_nonsense_leaves_no_limit_and_never_costs_the_connection() {
+        let q = queue(1);
+        let mut state = PeerState::new();
+
+        absorb(&extended_handshake("d1:mdee"), &mut state, &q, None);
+        assert_eq!(state.peer_request_limit, None, "no reqq, no limit");
+
+        state.peer_request_limit = Some(7);
+        absorb(&extended_handshake("this is not bencode"), &mut state, &q, None);
+        assert_eq!(state.peer_request_limit, Some(7), "garbage changes nothing");
+
+        absorb(&extended_handshake("d1:mde4:reqqi0ee"), &mut state, &q, None);
+        assert_eq!(state.peer_request_limit, None, "a zero reqq is no limit at all");
     }
 
     #[test]

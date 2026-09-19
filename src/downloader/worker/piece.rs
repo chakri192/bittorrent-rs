@@ -1,20 +1,28 @@
 //! Downloading one piece from a peer: pipelining its block requests,
 //! assembling the blocks, and verifying the result.
 
+use super::pipeline::{depth_for, Throughput};
 use super::{absorb, PexSender, WorkerError};
 use crate::downloader::piece_assembler::PieceAssembler;
 use crate::downloader::queue::WorkQueue;
 use crate::peer::{Message, PeerState};
 use crate::ratelimit::RateLimiter;
+use std::time::Instant;
 
 /// Downloads one piece. Returns `Ok(None)` if the piece was abandoned
 /// because another worker completed it first (endgame duplicate).
+///
+/// `min_depth` requests are kept in flight at least; how many more depends
+/// on how fast this peer has been delivering (`throughput`, which carries
+/// over from piece to piece) and on what it says it will queue.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn download_one_piece(
     stream: &mut std::net::TcpStream,
     state: &mut PeerState,
     queue: &WorkQueue,
     work: crate::downloader::piece_assembler::PieceWork,
-    pipeline_depth: usize,
+    min_depth: usize,
+    throughput: &mut Throughput,
     pex_tx: Option<&PexSender>,
     limiter: Option<&RateLimiter>,
 ) -> Result<Option<Vec<u8>>, WorkerError> {
@@ -36,8 +44,9 @@ pub(super) fn download_one_piece(
             return Ok(None);
         }
 
-        while in_flight.len() < pipeline_depth {
-            let reqs = assembler.next_requests(pipeline_depth - in_flight.len());
+        let depth = depth_for(throughput.rate(Instant::now()), min_depth, state.peer_request_limit);
+        while in_flight.len() < depth {
+            let reqs = assembler.next_requests(depth - in_flight.len());
             if reqs.is_empty() {
                 break;
             }
@@ -58,6 +67,7 @@ pub(super) fn download_one_piece(
                 let _ = assembler.record_block(*begin, block);
                 in_flight.retain(|&(b, _)| b != *begin);
                 blocks_received += 1;
+                throughput.record(Instant::now(), block.len());
                 // Reading slowly is backpressure: the peer's window fills.
                 if let Some(limiter) = limiter {
                     limiter.acquire(block.len());
