@@ -18,6 +18,7 @@ mod tests;
 
 use crate::downloader::file_writer::{write_piece, FileSpan};
 use crate::downloader::queue::{PieceResult, WorkQueue};
+use crate::ratelimit::RateLimiter;
 use crate::peer::{ConnectionError, WireError};
 use connect::establish;
 use messages::{absorb, is_read_timeout};
@@ -37,6 +38,9 @@ pub struct WorkerConfig {
     /// a peer that turns out to be slow.
     pub pipeline_depth: usize,
     pub connect_timeout: Duration,
+    /// Shared limit on the bytes downloaded across every connection
+    /// (`--max-down`), if any.
+    pub down_limit: Option<Arc<RateLimiter>>,
 }
 
 /// Addresses learned from a peer via ut_pex (BEP 11), reported back to
@@ -126,7 +130,7 @@ pub fn run_worker(
         }
         irrelevant_cycles = 0;
 
-        match download_one_piece(&mut stream, &mut state, queue, work.clone(), config.pipeline_depth, pex_tx) {
+        match download_one_piece(&mut stream, &mut state, queue, work.clone(), config.pipeline_depth, pex_tx, config.down_limit.as_deref()) {
             Ok(Some(data)) => {
                 if let Err(e) = write_piece(spans, piece_index, piece_length, &data) {
                     // Disk failure isn't the peer's fault; requeue and bail

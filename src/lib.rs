@@ -19,6 +19,7 @@ pub mod magnet_fetch;
 pub mod metadata;
 pub mod peer;
 pub mod portmap;
+pub mod ratelimit;
 pub mod seeder;
 pub mod selection;
 pub mod session;

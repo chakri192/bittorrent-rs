@@ -119,7 +119,7 @@ mod tests {
 
     /// A real seeder on an ephemeral loopback-reachable port, serving nothing.
     fn idle_seeder() -> SeederHandle {
-        seeder::start(0, [0x11; 20], [0x22; 20], Arc::new(Vec::new()), 16384, 0, Arc::new(HaveMap::new(0))).expect("start seeder")
+        seeder::start(0, [0x11; 20], [0x22; 20], Arc::new(Vec::new()), 16384, 0, Arc::new(HaveMap::new(0)), None).expect("start seeder")
     }
 
     #[test]

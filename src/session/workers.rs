@@ -70,9 +70,10 @@ impl Workers {
         for url in urls {
             let (url, name, files) = (url.clone(), name.to_string(), Arc::clone(&files));
             let (queue, spans, tx, stop, log) = (Arc::clone(&self.queue), Arc::clone(&self.spans), self.results_tx.clone(), Arc::clone(&self.web_stop), Arc::clone(&self.log));
+            let limiter = self.config.down_limit.clone();
             let piece_length = self.piece_length;
             self.web_seeds.push(thread::spawn(move || {
-                run_web_worker(&url, &name, &files, multi_file, &queue, &spans, piece_length, total_length, &tx, &stop, move |m| log(m));
+                run_web_worker(&url, &name, &files, multi_file, limiter.as_deref(), &queue, &spans, piece_length, total_length, &tx, &stop, move |m| log(m));
             }));
         }
     }
@@ -176,7 +177,7 @@ mod tests {
     }
 
     fn workers(queue: Arc<WorkQueue>, max_peers: usize, private: bool, log: Log) -> Workers {
-        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2) });
+        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None });
         Workers::new(queue, Arc::new(Vec::new()), config, 16, max_peers, private, log)
     }
 

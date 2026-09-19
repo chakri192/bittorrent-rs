@@ -3,6 +3,7 @@
 //! the first tracker announce, and the workers.
 
 use crate::downloader::{any_data_on_disk, build_file_spans, load_and_verify, progress_file_path, rewrite_compact, scan_all, ResumeWriter, WorkQueue, WorkerConfig};
+use crate::ratelimit::RateLimiter;
 use crate::seeder::{self, HaveMap};
 use crate::session::peer_pool::RetryPolicy;
 use crate::session::{Announcer, DownloadPlan, Log, Outstanding, PeerPool, Progress, ProgressSink, Services, Session, Setup, Workers};
@@ -56,6 +57,12 @@ pub struct Options {
     pub no_webseed: bool,
     /// Give up after this long (`--timeout`).
     pub timeout: Option<Duration>,
+    /// Limit on the bytes downloaded per second across every connection
+    /// (`--max-down`).
+    pub max_down: Option<u64>,
+    /// Limit on the bytes uploaded per second across every peer
+    /// (`--max-up`).
+    pub max_up: Option<u64>,
     /// Check every piece against the files on disk instead of trusting the
     /// resume file (`--recheck`). This happens by itself when there is data
     /// on disk but no resume file, such as after a completed download or
@@ -186,7 +193,9 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     for &idx in &confirmed_resumed {
         have.set(idx);
     }
-    match seeder::start(options.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have)) {
+    let up_limit = options.max_up.map(|rate| Arc::new(RateLimiter::new(rate)));
+    let down_limit = options.max_down.map(|rate| Arc::new(RateLimiter::new(rate)));
+    match seeder::start(options.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit) {
         Ok(handle) => {
             sink.log(format!("listening for inbound peers on port {}", handle.port));
             services.attach_seeder(handle);
@@ -241,7 +250,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
         sink.log(format!("skipped {} IPv6 peer(s) with no local route (pass --ipv6 to force)", pool.skipped_ipv6()));
     }
 
-    let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: options.pipeline_depth, connect_timeout: options.connect_timeout });
+    let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: options.pipeline_depth, connect_timeout: options.connect_timeout, down_limit });
     let mut workers = Workers::new(Arc::clone(&queue), Arc::clone(&spans), config, piece_length, options.max_peers, torrent.private, shared_log(sink));
 
     // Web-seed workers: one thread per url-list entry, draining the same
@@ -314,6 +323,8 @@ mod tests {
             no_portmap: true, // nothing here may touch the LAN gateway
             no_webseed: false,
             timeout: None,
+            max_down: None,
+            max_up: None,
             recheck: false,
             retry_delay: Duration::from_secs(15),
             pipeline_depth: 5,

@@ -86,7 +86,7 @@ mod tests {
     const INFO_HASH: [u8; 20] = [0x42; 20];
 
     fn config() -> WorkerConfig {
-        WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2) }
+        WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None }
     }
 
     fn queue(pieces: usize) -> WorkQueue {

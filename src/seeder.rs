@@ -78,6 +78,8 @@ struct SeederShared {
     piece_length: u64,
     total_length: u64,
     have: Arc<HaveMap>,
+    /// Shared limit on the bytes uploaded across every peer (`--max-up`).
+    up_limit: Option<Arc<crate::ratelimit::RateLimiter>>,
     running: Arc<AtomicBool>,
     uploaded: Arc<AtomicU64>,
     active_conns: AtomicUsize,
@@ -122,6 +124,7 @@ pub fn start(
     piece_length: u64,
     total_length: u64,
     have: Arc<HaveMap>,
+    up_limit: Option<Arc<crate::ratelimit::RateLimiter>>,
 ) -> std::io::Result<SeederHandle> {
     // Preferred port first (conventionally 6881), ephemeral fallback --
     // another client on the same machine owning 6881 shouldn't stop this
@@ -139,6 +142,7 @@ pub fn start(
         piece_length,
         total_length,
         have,
+        up_limit,
         running: Arc::clone(&running),
         uploaded: Arc::clone(&uploaded),
         active_conns: AtomicUsize::new(0),
@@ -250,6 +254,9 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
                     continue; // request for data we don't have / can't have; ignore
                 }
                 let block = read_block(&shared.spans, index, shared.piece_length, begin, length)?;
+                if let Some(limit) = &shared.up_limit {
+                    limit.acquire(length as usize);
+                }
                 Message::Piece { index, begin, block }.write_to(&mut stream).map_err(wire_to_io)?;
                 shared.uploaded.fetch_add(length as u64, Ordering::Relaxed);
                 last_sent = Instant::now();
@@ -310,6 +317,10 @@ mod tests {
     }
 
     fn start_test_seeder(dir: &std::path::Path, pieces: &[Vec<u8>], piece_length: u64, have_indices: &[u32]) -> (SeederHandle, [u8; 20]) {
+        start_limited_seeder(dir, pieces, piece_length, have_indices, None)
+    }
+
+    fn start_limited_seeder(dir: &std::path::Path, pieces: &[Vec<u8>], piece_length: u64, have_indices: &[u32], up_limit: Option<Arc<crate::ratelimit::RateLimiter>>) -> (SeederHandle, [u8; 20]) {
         let total: i64 = pieces.iter().map(|p| p.len() as i64).sum();
         let files = vec![(vec!["seed.bin".to_string()], total)];
         let spans = Arc::new(build_file_spans(dir, &files));
@@ -321,7 +332,7 @@ mod tests {
             have.set(i);
         }
         let info_hash = [0x66; 20];
-        let handle = start(0, info_hash, [0x20; 20], spans, piece_length, total as u64, have).unwrap();
+        let handle = start(0, info_hash, [0x20; 20], spans, piece_length, total as u64, have, up_limit).unwrap();
         (handle, info_hash)
     }
 
@@ -438,5 +449,32 @@ mod tests {
         assert!(have.get(1) && have.get(2) && !have.get(0));
         assert_eq!(have.count(), 2);
         assert_eq!(have.snapshot(), vec![false, true, true, false]);
+    }
+
+    #[test]
+    fn an_upload_limit_slows_what_a_leecher_receives_but_not_its_correctness() {
+        // Two 16 KiB blocks at 20,000 B/s: the first fits the burst, the
+        // second waits out the rest.
+        let dir = tmp_dir("limited");
+        let pieces = vec![vec![0x11u8; 16384], vec![0x22u8; 16384]];
+        let limiter = Arc::new(crate::ratelimit::RateLimiter::new(20_000));
+        let (mut handle, info_hash) = start_limited_seeder(&dir, &pieces, 16384, &[0, 1], Some(limiter));
+        let (mut stream, _) = leech_connect(handle.port, info_hash);
+        Message::Interested.write_to(&mut stream).unwrap();
+        while !matches!(Message::read_from(&mut stream).unwrap(), Message::Unchoke) {}
+
+        let started = std::time::Instant::now();
+        for (i, piece) in pieces.iter().enumerate() {
+            Message::Request { index: i as u32, begin: 0, length: 16384 }.write_to(&mut stream).unwrap();
+            let block = loop {
+                if let Message::Piece { block, .. } = Message::read_from(&mut stream).unwrap() {
+                    break block;
+                }
+            };
+            assert_eq!(&block, piece);
+        }
+
+        assert!(started.elapsed() >= Duration::from_millis(500), "32 KiB at 20,000 B/s cannot take {:?}", started.elapsed());
+        handle.stop();
     }
 }

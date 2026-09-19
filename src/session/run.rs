@@ -410,7 +410,7 @@ mod tests {
         let work = data.chunks(PIECE_LEN).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32 }).collect();
         let queue = Arc::new(WorkQueue::new(work, PIECES));
         let spans = Arc::new(build_file_spans(dir, &[(vec!["f.bin".to_string()], data.len() as i64)]));
-        let config = Arc::new(WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(1) });
+        let config = Arc::new(WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(1), down_limit: None });
         let log: Log = {
             let sink = Arc::clone(sink);
             Arc::new(move |m| sink.log(m))
@@ -672,7 +672,7 @@ mod tests {
         let dir = tmp_dir("uploaded");
         let sink = Arc::new(RecordingSink::default());
         let mut services = Services::new();
-        services.attach_seeder(seeder::start(0, INFO_HASH, [2; 20], Arc::new(Vec::new()), PIECE_LEN as u64, 0, Arc::new(HaveMap::new(0))).unwrap());
+        services.attach_seeder(seeder::start(0, INFO_HASH, [2; 20], Arc::new(Vec::new()), PIECE_LEN as u64, 0, Arc::new(HaveMap::new(0)), None).unwrap());
         services.uploaded_counter().unwrap().store(42, Ordering::SeqCst);
         let mut s = session(&sink, &services, &dir, &[], None);
 

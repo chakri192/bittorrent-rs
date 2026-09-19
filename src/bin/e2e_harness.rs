@@ -77,6 +77,10 @@ enum Kind {
     /// A finished download with one damaged piece: exactly that piece must
     /// be fetched again.
     RepairCorruptedFile,
+    /// `--max-down`: the download must take as long as the limit says.
+    LimitDownload,
+    /// `--max-up`: so must serving the finished torrent to a leecher.
+    LimitUpload,
 }
 
 struct Scenario {
@@ -98,6 +102,8 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "ban-corrupt-peer", kind: Kind::BanCorruptPeer },
     Scenario { name: "rerun-after-complete", kind: Kind::RerunAfterComplete },
     Scenario { name: "repair-corrupted-file", kind: Kind::RepairCorruptedFile },
+    Scenario { name: "limit-download", kind: Kind::LimitDownload },
+    Scenario { name: "limit-upload", kind: Kind::LimitUpload },
 ];
 
 fn main() {
@@ -116,6 +122,8 @@ fn main() {
             Kind::BanCorruptPeer => run_ban_corrupt_peer(scenario.name),
             Kind::RerunAfterComplete => run_rerun(scenario.name, None),
             Kind::RepairCorruptedFile => run_rerun(scenario.name, Some(3)),
+            Kind::LimitDownload => run_limit_download(scenario.name),
+            Kind::LimitUpload => run_limit_upload(scenario.name),
         };
         match outcome {
             Ok(summary) => println!("PASS [{}]: {}", scenario.name, summary),
@@ -1251,4 +1259,71 @@ fn run_rerun(name: &str, damage_piece: Option<usize>) -> Result<String, String> 
         None => format!("the finished download was verified in place ({} pieces) and nothing was fetched", fx.piece_count),
         Some(p) => format!("one damaged piece ({}) was found among {} and only it was fetched; the file matches", p, fx.piece_count),
     })
+}
+
+/// `--max-down 500` on a 1710-byte torrent: a full second's worth (500
+/// bytes) is free, the other 1210 take 2.4s at 500 B/s. Unlimited, the same
+/// download takes a few hundredths of a second.
+fn run_limit_download(name: &str) -> Result<String, String> {
+    const RATE: u64 = 500;
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let started = Instant::now();
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .args(["--max-down", &RATE.to_string()])
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    let elapsed = started.elapsed();
+    if !status.success() {
+        return Err(format!("download binary exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+
+    let floor = Duration::from_secs_f64((fx.data.len() as f64 - RATE as f64) / RATE as f64 * 0.85);
+    if elapsed < floor {
+        return Err(format!("{} bytes at --max-down {} took only {:?}; at least {:?} was expected", fx.data.len(), RATE, elapsed, floor));
+    }
+    Ok(format!("{} bytes at --max-down {} took {:.1?} (at least {:.1?}), and match exactly", fx.data.len(), RATE, elapsed, floor))
+}
+
+/// `--max-up 600`: a leecher pulling all 1710 bytes from the seeding
+/// client gets the first 600 free and waits for the rest.
+fn run_limit_upload(name: &str) -> Result<String, String> {
+    const RATE: u64 = 600;
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let child = client_command(&torrent, &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .arg("--seed")
+        .args(["--port", "0"])
+        .args(["--max-up", &RATE.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, "seeding e2e.bin on port", Duration::from_secs(20), &mut client.0)?;
+
+    let announces = swarm.announces.lock().unwrap().clone();
+    let port: u16 = announces.first().and_then(|line| announce_param(line, "port")).and_then(|p| p.parse().ok()).ok_or("no port in the client's first announce")?;
+    let started = Instant::now();
+    leech_everything(&fx, port)?; // checks every byte too
+    let elapsed = started.elapsed();
+
+    let floor = Duration::from_secs_f64((fx.data.len() as f64 - RATE as f64) / RATE as f64 * 0.85);
+    if elapsed < floor {
+        return Err(format!("serving {} bytes at --max-up {} took only {:?}; at least {:?} was expected", fx.data.len(), RATE, elapsed, floor));
+    }
+    Ok(format!("a leecher took {:.1?} (at least {:.1?}) to pull {} bytes at --max-up {}, every byte correct", elapsed, floor, fx.data.len(), RATE))
 }

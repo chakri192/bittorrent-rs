@@ -62,6 +62,9 @@ struct Args {
     retry_delay: Duration,
     /// Verify every piece on disk instead of trusting the resume file.
     recheck: bool,
+    /// Bytes per second limits on download and upload, if set.
+    max_down: Option<u64>,
+    max_up: Option<u64>,
     verbosity: Verbosity,
     timeout: Option<Duration>,
     port: u16,
@@ -121,6 +124,8 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
     let mut reannounce_override = cfg.reannounce;
     let mut retry_delay = Duration::from_secs(15);
     let mut recheck = false;
+    let mut max_down = None;
+    let mut max_up = None;
     let mut verbosity = Verbosity::Normal;
     let mut timeout = None;
     let mut port = cfg.port.unwrap_or(DEFAULT_PORT);
@@ -155,6 +160,14 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
                 reannounce_override = Some(n.parse().map_err(|_| format!("--reannounce: not a number: {}", n))?);
             }
             "--recheck" => recheck = true,
+            "--max-down" => {
+                let v = argv.next().ok_or("--max-down requires a rate such as 500K or 2M")?;
+                max_down = Some(bittorrent_rs::ratelimit::parse_rate(&v).map_err(|e| format!("--max-down: {}", e))?);
+            }
+            "--max-up" => {
+                let v = argv.next().ok_or("--max-up requires a rate such as 500K or 2M")?;
+                max_up = Some(bittorrent_rs::ratelimit::parse_rate(&v).map_err(|e| format!("--max-up: {}", e))?);
+            }
             "--retry-delay" => {
                 let n = argv.next().ok_or("--retry-delay requires a number of seconds")?;
                 retry_delay = Duration::from_secs(n.parse().map_err(|_| format!("--retry-delay: not a number: {}", n))?);
@@ -216,11 +229,11 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
         }
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, verbosity, timeout, port, seed, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
+    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, max_down, max_up, verbosity, timeout, port, seed, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -373,6 +386,8 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         reannounce_override: args.reannounce_override.map(Duration::from_secs),
         retry_delay: args.retry_delay,
         recheck: args.recheck,
+        max_down: args.max_down,
+        max_up: args.max_up,
         ipv6: args.ipv6,
         no_portmap: args.no_portmap,
         no_webseed: args.no_webseed,

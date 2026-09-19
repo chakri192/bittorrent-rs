@@ -5,6 +5,7 @@ use super::{absorb, PexSender, WorkerError};
 use crate::downloader::piece_assembler::PieceAssembler;
 use crate::downloader::queue::WorkQueue;
 use crate::peer::{Message, PeerState};
+use crate::ratelimit::RateLimiter;
 
 /// Downloads one piece. Returns `Ok(None)` if the piece was abandoned
 /// because another worker completed it first (endgame duplicate).
@@ -15,6 +16,7 @@ pub(super) fn download_one_piece(
     work: crate::downloader::piece_assembler::PieceWork,
     pipeline_depth: usize,
     pex_tx: Option<&PexSender>,
+    limiter: Option<&RateLimiter>,
 ) -> Result<Option<Vec<u8>>, WorkerError> {
     let piece_index = work.index;
     let mut assembler = PieceAssembler::new(work);
@@ -56,6 +58,10 @@ pub(super) fn download_one_piece(
                 let _ = assembler.record_block(*begin, block);
                 in_flight.retain(|&(b, _)| b != *begin);
                 blocks_received += 1;
+                // Reading slowly is backpressure: the peer's window fills.
+                if let Some(limiter) = limiter {
+                    limiter.acquire(block.len());
+                }
             }
             Message::Piece { .. } => {
                 // A block for some *other* piece -- typically a straggler

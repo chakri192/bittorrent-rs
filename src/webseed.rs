@@ -145,6 +145,7 @@ pub fn run_web_worker<L: Fn(String)>(
     name: &str,
     files: &[(Vec<String>, i64)],
     multi_file: bool,
+    limiter: Option<&crate::ratelimit::RateLimiter>,
     queue: &Arc<WorkQueue>,
     spans: &Arc<Vec<FileSpan>>,
     piece_length: u64,
@@ -168,6 +169,9 @@ pub fn run_web_worker<L: Fn(String)>(
 
         match fetch_piece(&agent, &targets, idx, piece_length, total_length) {
             Ok(data) => {
+                if let Some(limiter) = limiter {
+                    limiter.acquire(data.len());
+                }
                 let mut h = Sha1::new();
                 h.update(&data);
                 let got: [u8; 20] = h.finalize().into();
