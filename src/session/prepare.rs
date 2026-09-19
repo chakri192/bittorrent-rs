@@ -139,7 +139,9 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     }
 
     let tracker_urls = torrent.tracker_urls();
-    let base_dir = if torrent.files.len() > 1 { options.out_dir.join(&torrent.name) } else { options.out_dir.clone() };
+    // A multi-file torrent's name is the directory its files go under,
+    // however many files it lists (one is legal and common).
+    let base_dir = if torrent.multi_file { options.out_dir.join(&torrent.name) } else { options.out_dir.clone() };
     let spans = Arc::new(build_file_spans(&base_dir, &torrent.files));
 
     // Resume: re-verify any pieces a previous run claimed complete against
@@ -221,7 +223,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // shared queue into the same verify-write-record pipeline as peers.
     if !web_seeds.is_empty() {
         sink.log(format!("web seed: {} url(s) from the torrent's url-list", web_seeds.len()));
-        workers.start_web_seeds(&web_seeds, &torrent.name, &torrent.files, total_length);
+        workers.start_web_seeds(&web_seeds, &torrent.name, &torrent.files, torrent.multi_file, total_length);
     }
 
     let progress = Progress::new(have, resume_writer, goal_pieces, pieces_done, bytes_already_done);
@@ -477,5 +479,22 @@ mod tests {
         assert!(!report.complete);
         assert_eq!(report.remaining, 3);
         assert!(recorder.snapshots.lock().unwrap().iter().all(|s| s.total_length == 600));
+    }
+
+    #[test]
+    fn a_multi_file_torrent_with_one_entry_still_goes_under_its_name() {
+        // Deciding by the file count would write `only.bin` straight into
+        // the output directory and lose the torrent's own folder.
+        let mut bytes = b"d4:infod5:filesld6:lengthi300e4:pathl8:only.bineee4:name5:Album12:piece lengthi256e6:pieces40:".to_vec();
+        bytes.extend_from_slice(&[0xAB; 40]);
+        bytes.extend_from_slice(b"ee");
+        let one_file = parse_torrent_file(&bytes).unwrap();
+        assert!(one_file.multi_file && one_file.files.len() == 1);
+        let dir = tmp_dir("onefile");
+        let mut services = Services::new();
+
+        let (prepared, _) = run_prepare(&one_file, &[true], vec![dead_addr()], &options(&dir), &mut services);
+
+        assert_eq!(prepared.unwrap().info.base_dir, dir.join("Album"));
     }
 }

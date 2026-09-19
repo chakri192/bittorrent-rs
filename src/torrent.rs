@@ -15,6 +15,11 @@ pub struct TorrentFile {
     /// (path_components, length) for each file. Single-file torrents get
     /// one entry whose path is just [name].
     pub files: Vec<(Vec<String>, i64)>,
+    /// Whether the info dict is in the multi-file form (a `files` list),
+    /// in which case `name` is the directory the files go under, even if
+    /// the list has only one entry. A single-file torrent's `name` is the
+    /// file itself.
+    pub multi_file: bool,
     /// BEP 19 web seeds (`url-list`): HTTP(S) base URLs the content can
     /// also be fetched from. Empty for magnet-derived torrents.
     pub url_list: Vec<String>,
@@ -32,6 +37,13 @@ pub enum TorrentError {
     PiecesLengthNotMultipleOf20,
     InvalidLength(&'static str),
     InfoHashMismatch,
+    /// A name or file path that is not a plain relative path: it could
+    /// write outside the download directory.
+    UnsafePath(String),
+    /// The number of piece hashes does not match the torrent's length.
+    PieceCountMismatch { pieces: usize, expected: u64 },
+    /// A length beyond what is sane to handle (or that overflows).
+    TooLarge(&'static str),
 }
 
 impl From<DecodeError> for TorrentError {
@@ -50,11 +62,34 @@ impl std::fmt::Display for TorrentError {
             TorrentError::PiecesLengthNotMultipleOf20 => write!(f, "'pieces' length is not a multiple of 20"),
             TorrentError::InvalidLength(k) => write!(f, "'{}' must be a positive/non-negative integer", k),
             TorrentError::InfoHashMismatch => write!(f, "assembled info dict's SHA-1 does not match the expected InfoHash"),
+            TorrentError::UnsafePath(p) => write!(f, "unsafe path in torrent ({:?}): it could write outside the download directory", p),
+            TorrentError::PieceCountMismatch { pieces, expected } => write!(f, "torrent lists {} piece hashes but its length needs {}", pieces, expected),
+            TorrentError::TooLarge(what) => write!(f, "'{}' is unreasonably large", what),
         }
     }
 }
 
 impl std::error::Error for TorrentError {}
+
+/// The largest piece length accepted, 1 GiB. Real torrents use 16 KiB to
+/// 64 MiB. A whole piece is held in memory while it downloads, and its
+/// length is carried as a `u32` further down.
+pub const MAX_PIECE_LENGTH: i64 = 1 << 30;
+
+/// Whether `part` is exactly one ordinary path component: not empty, not
+/// `.` or `..`, no separator of either kind, no NUL, and not absolute or a
+/// drive prefix on the platform we are running on.
+///
+/// This is what stands between a hostile torrent and files written outside
+/// the download directory: `PathBuf::join` with an absolute component
+/// *replaces* the path, and `..` climbs out of it.
+fn is_safe_component(part: &str) -> bool {
+    if part.is_empty() || part.contains(['/', '\\', '\0']) {
+        return false;
+    }
+    let mut components = std::path::Path::new(part).components();
+    matches!((components.next(), components.next()), (Some(std::path::Component::Normal(_)), None))
+}
 
 /// Scans a top-level bencoded dict buffer for `key` and returns the byte
 /// span `[value_start, value_end)` of its value, WITHOUT going through the
@@ -185,7 +220,7 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
     if pieces_raw.len() % 20 != 0 {
         return Err(TorrentError::PiecesLengthNotMultipleOf20);
     }
-    let pieces = pieces_raw
+    let pieces: Vec<[u8; 20]> = pieces_raw
         .chunks_exact(20)
         .map(|c| {
             let mut h = [0u8; 20];
@@ -194,8 +229,17 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
         })
         .collect();
 
-    let name = info.get("name").and_then(Bencode::as_str).ok_or(TorrentError::MissingKey("name"))?.to_string();
+    if piece_length > MAX_PIECE_LENGTH {
+        return Err(TorrentError::TooLarge("piece length"));
+    }
 
+    let name = info.get("name").and_then(Bencode::as_str).ok_or(TorrentError::MissingKey("name"))?.to_string();
+    // The name is the file's name, or the directory the files go under.
+    if !is_safe_component(&name) {
+        return Err(TorrentError::UnsafePath(name));
+    }
+
+    let multi_file = info.get("length").and_then(Bencode::as_int).is_none() && info.get("files").is_some();
     let files = if let Some(len) = info.get("length").and_then(Bencode::as_int) {
         // Single-file torrent.
         if len < 0 {
@@ -211,19 +255,35 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
                 if length < 0 {
                     return Err(TorrentError::InvalidLength("length"));
                 }
-                let path = f
+                let path: Vec<String> = f
                     .get("path")
                     .and_then(Bencode::as_list)
                     .ok_or(TorrentError::MissingKey("path"))?
                     .iter()
                     .filter_map(|p| p.as_str().map(str::to_string))
                     .collect();
+                if path.is_empty() {
+                    return Err(TorrentError::UnsafePath(String::new()));
+                }
+                if let Some(bad) = path.iter().find(|part| !is_safe_component(part)) {
+                    return Err(TorrentError::UnsafePath(bad.clone()));
+                }
                 Ok::<_, TorrentError>((path, length))
             })
             .collect::<Result<Vec<_>, _>>()?
     } else {
         return Err(TorrentError::MissingKey("length|files"));
     };
+
+    // The piece math trusts these numbers, so cross-check them here: the
+    // total must not overflow, and the piece count must be what that total
+    // needs (the last piece's length is `total - piece_length * (n - 1)`,
+    // which underflows if there are more pieces than the data can fill).
+    let total: u64 = files.iter().try_fold(0u64, |sum, (_, len)| sum.checked_add(*len as u64)).ok_or(TorrentError::TooLarge("total length"))?;
+    let expected_pieces = total.div_ceil(piece_length as u64);
+    if pieces.len() as u64 != expected_pieces {
+        return Err(TorrentError::PieceCountMismatch { pieces: pieces.len(), expected: expected_pieces });
+    }
 
     // BEP 27 specifies `private=1`, but libtorrent treats any non-zero
     // value as private. Erring toward private is the safe direction: the
@@ -240,6 +300,7 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
         pieces,
         name,
         files,
+        multi_file,
         url_list,
         private,
     })
@@ -472,5 +533,166 @@ mod tests {
         let raw_info = b"d6:lengthi5e4:name1:a12:piece lengthi5e6:pieces20:00000000000000000000e";
         let wrong_hash = [0xFFu8; 20];
         assert!(matches!(from_info_dict_bytes(raw_info, wrong_hash, None, vec![]), Err(TorrentError::InfoHashMismatch)));
+    }
+
+    // ---- hostile torrents ------------------------------------------------
+
+    /// A bencoded string.
+    fn bstr(b: &[u8]) -> Vec<u8> {
+        let mut v = format!("{}:", b.len()).into_bytes();
+        v.extend_from_slice(b);
+        v
+    }
+
+    /// A single-file `.torrent` with the given name, length, piece length
+    /// and number of piece hashes.
+    fn single(name: &[u8], length: i64, piece_length: i64, pieces: usize) -> Vec<u8> {
+        let mut v = b"d4:infod".to_vec();
+        v.extend_from_slice(format!("6:lengthi{}e4:name", length).as_bytes());
+        v.extend_from_slice(&bstr(name));
+        v.extend_from_slice(format!("12:piece lengthi{}e6:pieces{}:", piece_length, pieces * 20).as_bytes());
+        v.extend_from_slice(&vec![0xAB; pieces * 20]);
+        v.extend_from_slice(b"ee");
+        v
+    }
+
+    /// A multi-file `.torrent`: `files` are (path components, length).
+    fn multi(name: &[u8], files: &[(&[&[u8]], i64)], piece_length: i64, pieces: usize) -> Vec<u8> {
+        let mut v = b"d4:infod5:filesl".to_vec();
+        for (path, length) in files {
+            v.extend_from_slice(format!("d6:lengthi{}e4:pathl", length).as_bytes());
+            for part in *path {
+                v.extend_from_slice(&bstr(part));
+            }
+            v.extend_from_slice(b"ee");
+        }
+        v.extend_from_slice(b"e4:name");
+        v.extend_from_slice(&bstr(name));
+        v.extend_from_slice(format!("12:piece lengthi{}e6:pieces{}:", piece_length, pieces * 20).as_bytes());
+        v.extend_from_slice(&vec![0xAB; pieces * 20]);
+        v.extend_from_slice(b"ee");
+        v
+    }
+
+    fn is_unsafe(result: Result<TorrentFile, TorrentError>) -> bool {
+        matches!(result, Err(TorrentError::UnsafePath(_)))
+    }
+
+    /// Names and path components that would escape the download directory
+    /// or mean something other than one plain file or directory name.
+    const HOSTILE: &[&[u8]] = &[b"..", b".", b"", b"a/b", b"a\\b", b"/etc/passwd", b"../x", b"..\\x", b"x\0y", b"/", b"a/../b"];
+
+    #[test]
+    fn a_single_file_torrent_named_to_escape_is_refused() {
+        for name in HOSTILE {
+            assert!(is_unsafe(parse_torrent_file(&single(name, 100, 16384, 1))), "name {:?} must be refused", String::from_utf8_lossy(name));
+        }
+    }
+
+    #[test]
+    fn a_multi_file_torrent_naming_its_directory_to_escape_is_refused() {
+        let file: (&[&[u8]], i64) = (&[b"ok.bin"], 100);
+        for name in HOSTILE {
+            assert!(is_unsafe(parse_torrent_file(&multi(name, &[file], 16384, 1))), "directory {:?} must be refused", String::from_utf8_lossy(name));
+        }
+    }
+
+    #[test]
+    fn a_file_path_component_that_would_escape_is_refused() {
+        for bad in HOSTILE {
+            let path: &[&[u8]] = &[b"fine", bad, b"file.bin"];
+            assert!(is_unsafe(parse_torrent_file(&multi(b"t", &[(path, 100)], 16384, 1))), "component {:?} must be refused", String::from_utf8_lossy(bad));
+        }
+    }
+
+    #[test]
+    fn a_file_with_no_path_is_refused() {
+        // It would be written to the download directory's own path.
+        assert!(is_unsafe(parse_torrent_file(&multi(b"t", &[(&[], 100)], 16384, 1))));
+    }
+
+    #[test]
+    fn a_path_of_only_undecodable_components_is_refused_too() {
+        // Components that are not UTF-8 are dropped, leaving no path at all.
+        assert!(is_unsafe(parse_torrent_file(&multi(b"t", &[(&[b"\xff\xfe"], 100)], 16384, 1))));
+    }
+
+    #[test]
+    fn ordinary_names_and_nested_paths_are_accepted() {
+        assert!(parse_torrent_file(&single(b"movie (2024).mkv", 100, 16384, 1)).is_ok());
+        assert!(parse_torrent_file(&single(b".hidden", 100, 16384, 1)).is_ok());
+        assert!(parse_torrent_file(&single("naïve café.txt".as_bytes(), 100, 16384, 1)).is_ok());
+        let nested: &[&[u8]] = &[b"season 1", b"episode 01.mkv"];
+        assert!(parse_torrent_file(&multi(b"show", &[(nested, 100)], 16384, 1)).is_ok());
+    }
+
+    #[test]
+    fn metadata_fetched_for_a_magnet_link_is_checked_the_same_way() {
+        // The info-hash only proves the metadata is what its creator
+        // published; it says nothing about whether it is safe.
+        let hostile = single(b"../../.ssh/authorized_keys", 100, 16384, 1);
+        let start = hostile.windows(6).position(|w| w == b"4:info").unwrap() + 6;
+        let raw_info = &hostile[start..hostile.len() - 1];
+        let hash: [u8; 20] = Sha1::digest(raw_info).into();
+        assert!(is_unsafe(from_info_dict_bytes(raw_info, hash, None, Vec::new())));
+    }
+
+    #[test]
+    fn the_piece_count_must_match_the_length() {
+        assert!(parse_torrent_file(&single(b"f", 40000, 16384, 3)).is_ok(), "40000 bytes in 16384s is 3 pieces");
+        for wrong in [0, 1, 2, 4, 1000] {
+            let result = parse_torrent_file(&single(b"f", 40000, 16384, wrong));
+            assert!(matches!(result, Err(TorrentError::PieceCountMismatch { pieces, expected: 3 }) if pieces == wrong), "{} hashes: {:?}", wrong, result.err());
+        }
+        // The exact boundary: 32768 bytes is 2 pieces, one more byte is 3.
+        assert!(parse_torrent_file(&single(b"f", 32768, 16384, 2)).is_ok());
+        assert!(parse_torrent_file(&single(b"f", 32769, 16384, 3)).is_ok());
+    }
+
+    #[test]
+    fn an_empty_torrent_has_no_pieces() {
+        assert!(parse_torrent_file(&single(b"f", 0, 16384, 0)).is_ok());
+        assert!(matches!(parse_torrent_file(&single(b"f", 0, 16384, 1)), Err(TorrentError::PieceCountMismatch { .. })));
+    }
+
+    #[test]
+    fn more_pieces_than_the_data_can_fill_can_no_longer_underflow_the_last_piece() {
+        // piece_len() computes total - piece_length * (n - 1) for the last
+        // piece. With 1000 hashes for 10 bytes that used to be a u64
+        // underflow: a panic in debug builds, a wrong length in release.
+        assert!(parse_torrent_file(&single(b"f", 10, 16384, 1000)).is_err());
+    }
+
+    #[test]
+    fn every_piece_of_an_accepted_torrent_has_a_length_that_fits() {
+        let t = parse_torrent_file(&single(b"f", 40000, 16384, 3)).unwrap();
+        let lengths: Vec<u64> = (0..t.pieces.len()).map(|i| t.piece_len(i)).collect();
+        assert_eq!(lengths, vec![16384, 16384, 40000 - 2 * 16384]);
+        assert_eq!(lengths.iter().sum::<u64>(), t.total_length());
+    }
+
+    #[test]
+    fn an_absurd_piece_length_is_refused() {
+        assert!(parse_torrent_file(&single(b"f", 100, MAX_PIECE_LENGTH, 1)).is_ok());
+        assert!(matches!(parse_torrent_file(&single(b"f", 100, MAX_PIECE_LENGTH + 1, 1)), Err(TorrentError::TooLarge("piece length"))));
+        assert!(matches!(parse_torrent_file(&single(b"f", 100, i64::MAX, 1)), Err(TorrentError::TooLarge("piece length"))));
+    }
+
+    #[test]
+    fn file_lengths_that_overflow_when_added_are_refused() {
+        let files: &[(&[&[u8]], i64)] = &[(&[b"a"], i64::MAX), (&[b"b"], i64::MAX), (&[b"c"], i64::MAX)];
+        assert!(matches!(parse_torrent_file(&multi(b"t", files, 16384, 1)), Err(TorrentError::TooLarge("total length"))));
+    }
+
+    #[test]
+    fn the_form_of_the_info_dict_is_recorded_not_guessed_from_the_file_count() {
+        assert!(!parse_torrent_file(&single(b"f", 100, 16384, 1)).unwrap().multi_file, "a `length` key means a single file");
+        let one: &[(&[&[u8]], i64)] = &[(&[b"only.bin"], 100)];
+        let two: &[(&[&[u8]], i64)] = &[(&[b"a.bin"], 50), (&[b"b.bin"], 50)];
+        assert!(parse_torrent_file(&multi(b"dir", two, 16384, 1)).unwrap().multi_file);
+        assert!(
+            parse_torrent_file(&multi(b"dir", one, 16384, 1)).unwrap().multi_file,
+            "a `files` list with a single entry is still the multi-file form, and its name is a directory"
+        );
     }
 }

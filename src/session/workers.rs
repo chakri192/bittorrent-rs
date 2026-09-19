@@ -48,14 +48,14 @@ impl Workers {
 
     /// Starts one worker per BEP 19 web seed, each dialing nobody: they
     /// fetch ranges over HTTP into the same queue.
-    pub fn start_web_seeds(&mut self, urls: &[String], name: &str, files: &[(Vec<String>, i64)], total_length: u64) {
+    pub fn start_web_seeds(&mut self, urls: &[String], name: &str, files: &[(Vec<String>, i64)], multi_file: bool, total_length: u64) {
         let files = Arc::new(files.to_vec());
         for url in urls {
             let (url, name, files) = (url.clone(), name.to_string(), Arc::clone(&files));
             let (queue, spans, tx, stop, log) = (Arc::clone(&self.queue), Arc::clone(&self.spans), self.results_tx.clone(), Arc::clone(&self.web_stop), Arc::clone(&self.log));
             let piece_length = self.piece_length;
             self.web_seeds.push(thread::spawn(move || {
-                run_web_worker(&url, &name, &files, &queue, &spans, piece_length, total_length, &tx, &stop, move |m| log(m));
+                run_web_worker(&url, &name, &files, multi_file, &queue, &spans, piece_length, total_length, &tx, &stop, move |m| log(m));
             }));
         }
     }
@@ -255,7 +255,7 @@ mod tests {
         let url = format!("http://{}/", dead_addr());
         let files = vec![(vec!["a.bin".to_string()], 16)];
 
-        w.start_web_seeds(&[url], "t", &files, 16);
+        w.start_web_seeds(&[url], "t", &files, false, 16);
         wait_until("the web seed to give up", || !w.web_active());
         w.shutdown();
 

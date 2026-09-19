@@ -571,7 +571,7 @@ mod tests {
         let services = Services::new();
         let mut s = session(&sink, &services, &dir, &[], None);
         let len = data().len() as i64;
-        s.workers.start_web_seeds(&[stalled_web_seed()], "t", &[(vec!["f.bin".to_string()], len)], len as u64);
+        s.workers.start_web_seeds(&[stalled_web_seed()], "t", &[(vec!["f.bin".to_string()], len)], false, len as u64);
         assert!(s.workers.web_active());
         s.fruitless_rounds = MAX_FRUITLESS_ROUNDS - 1;
 

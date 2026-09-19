@@ -62,6 +62,9 @@ enum Kind {
     /// the tracker, fetch and verify the metadata from it (BEP 9), and then
     /// download the content.
     MagnetDownload,
+    /// A torrent whose file paths would write outside the download
+    /// directory: the client must refuse it and write nothing.
+    HostileTorrent,
 }
 
 struct Scenario {
@@ -78,6 +81,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "timeout-incomplete", kind: Kind::TimeoutIncomplete },
     Scenario { name: "seed-after-download", kind: Kind::SeedAfterDownload },
     Scenario { name: "magnet-download", kind: Kind::MagnetDownload },
+    Scenario { name: "hostile-torrent", kind: Kind::HostileTorrent },
 ];
 
 fn main() {
@@ -91,6 +95,7 @@ fn main() {
             Kind::TimeoutIncomplete => run_timeout_incomplete(scenario.name),
             Kind::SeedAfterDownload => run_seed_after_download(scenario.name),
             Kind::MagnetDownload => run_magnet_download(scenario.name),
+            Kind::HostileTorrent => run_hostile_torrent(scenario.name),
         };
         match outcome {
             Ok(summary) => println!("PASS [{}]: {}", scenario.name, summary),
@@ -137,7 +142,14 @@ impl Fixture {
     /// One file is a single-file torrent named after it; several make a
     /// multi-file torrent named `name`, with the files under `name/`.
     fn build(name: &str, files: &[(&str, Vec<u8>)], piece_len: usize, private: bool) -> Self {
-        let single = files.len() == 1;
+        let files: Vec<(Vec<&str>, Vec<u8>)> = files.iter().map(|(fname, content)| (vec![*fname], content.clone())).collect();
+        Self::build_paths(name, &files, piece_len, private, files.len() > 1)
+    }
+
+    /// As [`build`](Self::build), with each file's path given as its
+    /// components, and `multi` forcing the multi-file form even for one file.
+    fn build_paths(name: &str, files: &[(Vec<&str>, Vec<u8>)], piece_len: usize, private: bool, multi: bool) -> Self {
+        let single = !multi;
         let data: Vec<u8> = files.iter().flat_map(|(_, content)| content.iter().copied()).collect();
 
         let mut pieces_concat = Vec::new();
@@ -153,8 +165,12 @@ impl Fixture {
             v.extend_from_slice(format!("6:lengthi{}e", data.len()).as_bytes());
         } else {
             v.extend_from_slice(b"5:filesl");
-            for (fname, content) in files {
-                v.extend_from_slice(format!("d6:lengthi{}e4:pathl{}:{}ee", content.len(), fname.len(), fname).as_bytes());
+            for (path, content) in files {
+                v.extend_from_slice(format!("d6:lengthi{}e4:pathl", content.len()).as_bytes());
+                for part in path {
+                    v.extend_from_slice(format!("{}:{}", part.len(), part).as_bytes());
+                }
+                v.extend_from_slice(b"ee");
             }
             v.extend_from_slice(b"e");
         }
@@ -170,7 +186,7 @@ impl Fixture {
 
         let files = files
             .iter()
-            .map(|(fname, content)| (if single { fname.to_string() } else { format!("{}/{}", name, fname) }, content.clone()))
+            .map(|(path, content)| (if single { path.join("/") } else { format!("{}/{}", name, path.join("/")) }, content.clone()))
             .collect();
         Fixture { files, piece_count: pieces_concat.len() / 20, data, piece_len, info_bytes: v, info_hash }
     }
@@ -1007,4 +1023,61 @@ fn run_magnet_download(name: &str) -> Result<String, String> {
     check_announce(completed, "completed", &total, "0")?;
 
     Ok(format!("magnet link -> metadata ({} piece) -> {} bytes, all matching; announced bootstrap, started, completed", served, fx.data.len()))
+}
+
+/// A torrent whose paths would escape the download directory, with correct
+/// piece hashes and a peer that would happily serve it, so that if the
+/// client did not refuse it the download would succeed and write outside.
+/// It must fail cleanly, before contacting anyone, and write nothing.
+fn run_hostile_torrent(name: &str) -> Result<String, String> {
+    // Canary files where the hostile paths would put their data. The output
+    // directory is <tmp>/e2e_harness_<name>/out/<torrent name>, so three
+    // `..` land in <tmp>; watching the directory above it as well means a
+    // change to where files go cannot hide an escape.
+    let tmp = std::env::temp_dir();
+    let above_tmp = tmp.parent().map(Path::to_path_buf).unwrap_or_else(|| tmp.clone());
+    let escape_canaries = [tmp.join("e2e_hostile_escape.bin"), above_tmp.join("e2e_hostile_escape.bin")];
+    let absolute_canary = tmp.join("e2e_hostile_absolute.bin");
+    for canary in escape_canaries.iter().chain([&absolute_canary]) {
+        let _ = fs::remove_file(canary);
+    }
+    let absolute = absolute_canary.to_string_lossy().to_string();
+
+    let cases: [(&str, Vec<&str>, Vec<&PathBuf>); 2] = [
+        ("parent-directory traversal", vec!["..", "..", "..", "e2e_hostile_escape.bin"], escape_canaries.iter().collect()),
+        ("absolute path", vec![absolute.as_str()], vec![&absolute_canary]),
+    ];
+
+    for (label, path, canaries) in cases {
+        let fx = Fixture::build_paths("multi", &[(path, pattern(512, 7))], 256, false, true);
+        let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+        let dir = scratch_dir(&format!("{}-{}", name, label.replace(' ', "-")));
+        let (torrent, out_dir, log_path, stderr_path) = (dir.join("hostile.torrent"), dir.join("out"), dir.join("client.log"), dir.join("stderr.txt"));
+        fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+        let mut child = client_command(&torrent, &out_dir, &log_path, 1)
+            .arg("--no-dht")
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&stderr_path).expect("create stderr file"))
+            .spawn()
+            .map_err(|e| format!("failed to spawn the client: {}", e))?;
+        let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+
+        if let Some(written) = canaries.iter().find(|c| c.exists()) {
+            let _ = fs::remove_file(written);
+            return Err(format!("{}: the client wrote {:?}, outside the download directory", label, written));
+        }
+        if status.code() != Some(1) {
+            return Err(format!("{}: client exited with {:?}; a hostile torrent must be refused with status 1", label, status.code()));
+        }
+        let stderr = fs::read_to_string(&stderr_path).map_err(|e| format!("reading {:?}: {}", stderr_path, e))?;
+        if !stderr.contains("unsafe path in torrent") {
+            return Err(format!("{}: stderr should say why; it says {:?}", label, stderr.trim()));
+        }
+        if !swarm.announces.lock().unwrap().is_empty() || !swarm.logs[0].lock().unwrap().requested.is_empty() {
+            return Err(format!("{}: the client contacted the swarm before refusing the torrent", label));
+        }
+    }
+
+    Ok("parent-traversal and absolute paths were refused with status 1 before any network use, and nothing was written outside".to_string())
 }

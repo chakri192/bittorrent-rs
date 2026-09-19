@@ -50,8 +50,10 @@ fn encode_segment(seg: &str) -> String {
 ///    otherwise the base *is* the file's direct URL.
 ///  - multi-file: the base is a directory; each file's URL is
 ///    `base[/] + name + '/' + path segments`.
-pub fn build_targets(base_url: &str, name: &str, files: &[(Vec<String>, i64)]) -> Vec<FileTarget> {
-    let multi = files.len() > 1;
+///
+/// `multi` is the torrent's form, not its file count: a multi-file torrent
+/// with one entry still lives under its name.
+pub fn build_targets(base_url: &str, name: &str, files: &[(Vec<String>, i64)], multi: bool) -> Vec<FileTarget> {
     let mut targets = Vec::with_capacity(files.len());
     let mut cursor = 0u64;
 
@@ -142,6 +144,7 @@ pub fn run_web_worker<L: Fn(String)>(
     base_url: &str,
     name: &str,
     files: &[(Vec<String>, i64)],
+    multi_file: bool,
     queue: &Arc<WorkQueue>,
     spans: &Arc<Vec<FileSpan>>,
     piece_length: u64,
@@ -150,7 +153,7 @@ pub fn run_web_worker<L: Fn(String)>(
     stop: &AtomicBool,
     log: L,
 ) {
-    let targets = build_targets(base_url, name, files);
+    let targets = build_targets(base_url, name, files, multi_file);
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
     let mut consecutive_failures = 0u32;
 
@@ -214,7 +217,7 @@ mod tests {
 
     #[test]
     fn single_file_direct_url_when_base_has_no_trailing_slash() {
-        let t = build_targets("http://mirror.test/movie.mkv", "movie.mkv", &files_single());
+        let t = build_targets("http://mirror.test/movie.mkv", "movie.mkv", &files_single(), false);
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].url, "http://mirror.test/movie.mkv");
         assert_eq!((t[0].start, t[0].end), (0, 1000));
@@ -222,13 +225,13 @@ mod tests {
 
     #[test]
     fn single_file_appends_name_when_base_is_a_directory() {
-        let t = build_targets("http://mirror.test/dir/", "movie.mkv", &files_single());
+        let t = build_targets("http://mirror.test/dir/", "movie.mkv", &files_single(), false);
         assert_eq!(t[0].url, "http://mirror.test/dir/movie.mkv");
     }
 
     #[test]
     fn multi_file_urls_include_name_and_encoded_path() {
-        let t = build_targets("http://mirror.test/pub", "Show", &files_multi());
+        let t = build_targets("http://mirror.test/pub", "Show", &files_multi(), true);
         assert_eq!(t.len(), 2);
         // Note the space in "ep 1.mkv" is percent-encoded, and the base
         // gained a '/'.
@@ -241,7 +244,7 @@ mod tests {
     #[test]
     fn piece_requests_map_within_a_single_file() {
         // single file 1000 bytes, piece_length 250 -> piece 1 = [250,500).
-        let t = build_targets("http://m.test/f", "f", &files_single());
+        let t = build_targets("http://m.test/f", "f", &files_single(), false);
         let reqs = piece_requests(&t, 1, 250, 1000);
         assert_eq!(reqs, vec![("http://m.test/f".to_string(), 250, 250)]);
     }
@@ -251,7 +254,7 @@ mod tests {
         // multi: file0 [0,600), file1 [600,1200). piece_length 500 ->
         // piece 1 = [500,1000): 100 bytes from file0 (offset 500) + 400
         // from file1 (offset 0).
-        let t = build_targets("http://m.test/", "Show", &files_multi());
+        let t = build_targets("http://m.test/", "Show", &files_multi(), true);
         let reqs = piece_requests(&t, 1, 500, 1200);
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0], (t[0].url.clone(), 500, 100));
@@ -261,7 +264,7 @@ mod tests {
     #[test]
     fn last_piece_is_clamped_to_total_length() {
         // single file 1000, piece_length 400 -> piece 2 = [800,1000) = 200B.
-        let t = build_targets("http://m.test/f", "f", &files_single());
+        let t = build_targets("http://m.test/f", "f", &files_single(), false);
         let reqs = piece_requests(&t, 2, 400, 1000);
         assert_eq!(reqs, vec![("http://m.test/f".to_string(), 800, 200)]);
     }
@@ -270,5 +273,17 @@ mod tests {
     fn encode_segment_escapes_reserved_and_keeps_unreserved() {
         assert_eq!(encode_segment("a b/c?"), "a%20b%2Fc%3F");
         assert_eq!(encode_segment("Ep.01-final_v2~"), "Ep.01-final_v2~");
+    }
+
+    #[test]
+    fn a_multi_file_torrent_with_one_entry_is_still_under_its_name() {
+        // BEP 19: the form decides, not the file count. Treating this as a
+        // single-file torrent would ask the server for `base/file` instead
+        // of `base/name/file`.
+        let files = vec![(vec!["only.bin".to_string()], 500)];
+        let t = build_targets("http://m.test/pub/", "Album", &files, true);
+        assert_eq!(t[0].url, "http://m.test/pub/Album/only.bin");
+        let as_single = build_targets("http://m.test/pub/", "only.bin", &files, false);
+        assert_eq!(as_single[0].url, "http://m.test/pub/only.bin");
     }
 }
