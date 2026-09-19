@@ -344,3 +344,82 @@ fn a_claimed_metadata_size_is_only_ever_accepted_within_its_bounds() {
         }
     }
 }
+
+#[test]
+fn local_discovery_announcements_survive_hostile_input_and_round_trip() {
+    use crate::lsd::{announcement, parse};
+    let host = std::net::SocketAddr::from(([239, 192, 152, 143], 6771));
+    let seeds = vec![announcement(host, 6881, &[0xAB; 20], "cookie"), announcement(host, 1, &[0x00; 20], ""), b"BT-SEARCH * HTTP/1.1\nport: 5\ninfohash: ABABABABABABABABABABABABABABABABABABABAB\n\n".to_vec()];
+    hammer(&seeds, ITERATIONS, |input| {
+        if let Ok(parsed) = parse(input) {
+            assert!(parsed.port != 0 && !parsed.info_hashes.is_empty() && parsed.info_hashes.len() <= 16);
+            assert!(parsed.cookie.as_deref().is_none_or(|c| c.len() <= 64));
+        }
+    });
+}
+
+#[test]
+fn utp_packets_survive_hostile_input_and_round_trip_what_they_accept() {
+    use crate::utp::packet::{Packet, PacketType};
+    let base = Packet { kind: PacketType::Data, connection_id: 0x1234, timestamp: 99, timestamp_diff: 7, wnd_size: 1 << 20, seq_nr: 65535, ack_nr: 3, sack: Vec::new(), payload: b"payload".to_vec() };
+    let seeds = vec![base.encode(), Packet { kind: PacketType::State, sack: vec![0b101, 0, 0, 0x80], payload: Vec::new(), ..base.clone() }.encode(), Packet { kind: PacketType::Syn, payload: Vec::new(), ..base.clone() }.encode(), Packet { kind: PacketType::Fin, ..base.clone() }.encode()];
+    hammer(&seeds, ITERATIONS, |input| {
+        if let Ok(packet) = Packet::decode(input) {
+            assert_eq!(Packet::decode(&packet.encode()).as_ref(), Ok(&packet), "what is accepted means the same written out and read back");
+        }
+    });
+}
+
+/// A connection is fed packets that are damaged versions of real ones, in
+/// both of its states, with time passing. It must not panic (an arithmetic
+/// slip on a hostile acknowledgement would) nor let its bookkeeping go wrong.
+#[test]
+fn a_utp_connection_survives_hostile_packets_and_time() {
+    use crate::utp::conn::Connection;
+    use crate::utp::packet::{Packet, PacketType};
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    // Real traffic of both kinds, from a real pair of connections.
+    let mut a = Connection::connect(start, 100);
+    let syn = Packet::decode(&a.take_outgoing()[0]).unwrap();
+    let mut b = Connection::accept(start, &syn, 5000);
+    let mut seeds = Vec::new();
+    let mut now = start;
+    a.write(&vec![7u8; 60_000]);
+    for _ in 0..200 {
+        now += Duration::from_millis(30);
+        for bytes in b.take_outgoing() {
+            seeds.push(bytes.clone());
+            a.on_packet(now, &Packet::decode(&bytes).unwrap());
+        }
+        a.on_tick(now);
+        for bytes in a.take_outgoing() {
+            seeds.push(bytes.clone());
+            b.on_packet(now, &Packet::decode(&bytes).unwrap());
+        }
+        b.on_tick(now);
+    }
+    seeds.push(Packet { kind: PacketType::Reset, connection_id: 100, timestamp: 0, timestamp_diff: 0, wnd_size: 0, seq_nr: 0, ack_nr: 0, sack: vec![0xFF; 8], payload: Vec::new() }.encode());
+    assert!(seeds.len() > 20, "the pair produced traffic to damage: {} packets, a {:?} b {:?}", seeds.len(), a.state(), b.state());
+
+    hammer(&seeds, 200, |input| {
+        let Ok(packet) = Packet::decode(input) else { return };
+        for mut conn in [Connection::connect(start, 1), Connection::accept(start, &syn, 9)] {
+            conn.write(&[1u8; 3000]);
+            let mut at = start;
+            for step in 0..6 {
+                at += Duration::from_millis(400 * (step + 1));
+                conn.on_packet(at, &packet);
+                conn.on_tick(at);
+                conn.flush(at);
+                let _ = conn.take_outgoing();
+                let mut buf = [0u8; 256];
+                let _ = conn.read(&mut buf);
+                let _ = conn.next_timeout();
+            }
+            conn.close();
+            conn.on_tick(at + Duration::from_secs(120));
+        }
+    });
+}

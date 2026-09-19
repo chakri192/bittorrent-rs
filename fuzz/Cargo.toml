@@ -68,3 +68,17 @@ path = "fuzz_targets/pex_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "lsd_announcement"
+path = "fuzz_targets/lsd_announcement.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "utp_packet"
+path = "fuzz_targets/utp_packet.rs"
+test = false
+doc = false
+bench = false
