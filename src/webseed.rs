@@ -103,7 +103,12 @@ pub fn piece_requests(targets: &[FileTarget], piece_index: u32, piece_length: u6
     let ps = piece_index as u64 * piece_length;
     let pe = (ps + piece_length).min(total_length);
     let mut reqs = Vec::new();
-    for t in targets {
+    // Targets are in order and contiguous: skip those that end before the
+    // piece starts by binary search, and stop at the first that starts
+    // after it ends, so a torrent of many files costs only the files the
+    // piece touches.
+    let first = targets.partition_point(|t| t.end <= ps);
+    for t in targets[first..].iter().take_while(|t| t.start < pe) {
         let seg_start = ps.max(t.start);
         let seg_end = pe.min(t.end);
         if seg_start >= seg_end {
@@ -672,5 +677,52 @@ mod tests {
 
         assert_eq!(end, WebEnd::Stopped);
         assert_eq!(mirror.requests.load(Ordering::SeqCst), 0);
+    }
+
+    /// The obvious way to map a piece onto files, for `piece_requests` to
+    /// agree with.
+    fn piece_requests_by_scanning(targets: &[FileTarget], piece_index: u32, piece_length: u64, total_length: u64) -> Vec<(String, u64, u64)> {
+        let ps = piece_index as u64 * piece_length;
+        let pe = (ps + piece_length).min(total_length);
+        targets.iter().filter_map(|t| {
+            let (s, e) = (ps.max(t.start), pe.min(t.end));
+            (s < e).then(|| (t.url.clone(), s - t.start, e - s))
+        }).collect()
+    }
+
+    fn targets_of(lengths: &[u64]) -> Vec<FileTarget> {
+        let mut cursor = 0;
+        lengths.iter().enumerate().map(|(i, &len)| {
+            let t = FileTarget { url: format!("http://m/{}", i), start: cursor, end: cursor + len };
+            cursor += len;
+            t
+        }).collect()
+    }
+
+    #[test]
+    fn piece_requests_agree_with_a_plain_scan_over_awkward_layouts() {
+        // Empty files first, between and last; files smaller and larger than a piece.
+        let lengths = [0, 3, 0, 0, 10, 1, 25, 0, 2, 0];
+        let targets = targets_of(&lengths);
+        let total: u64 = lengths.iter().sum();
+        for piece_length in [1u64, 4, 7, 16, 100] {
+            let pieces = total.div_ceil(piece_length) as u32;
+            for piece in 0..pieces {
+                assert_eq!(piece_requests(&targets, piece, piece_length, total), piece_requests_by_scanning(&targets, piece, piece_length, total), "piece {} of length {}", piece, piece_length);
+            }
+        }
+    }
+
+    #[test]
+    fn a_hundred_thousand_files_are_mapped_without_scanning_them_all() {
+        let targets = targets_of(&vec![10; 100_000]);
+        let total = 1_000_000u64;
+        let started = Instant::now();
+        let mut requests = 0usize;
+        for piece in 0..100_000u32 {
+            requests += piece_requests(&targets, piece, 10, total).len();
+        }
+        assert_eq!(requests, 100_000);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
     }
 }

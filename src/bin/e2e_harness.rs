@@ -87,6 +87,9 @@ enum Kind {
     /// SIGTERM mid-download, with the only peer silent: a prompt, clean exit
     /// that keeps the resume file.
     SigtermMidDownload,
+    /// A torrent's empty files exist after the download, though no piece
+    /// contains a byte of them; with `--only`, only the selected ones do.
+    EmptyFiles,
     /// A disk that cannot be written to ends the run at once with a message
     /// saying so, instead of dialing the same peers over and over.
     DiskFailure,
@@ -140,6 +143,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "limit-upload", kind: Kind::LimitUpload },
     Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
     Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
+    Scenario { name: "empty-files", kind: Kind::EmptyFiles },
     Scenario { name: "disk-failure", kind: Kind::DiskFailure },
     Scenario { name: "prefer-files", kind: Kind::PreferFiles },
     Scenario { name: "json-events", kind: Kind::JsonEvents },
@@ -178,6 +182,7 @@ fn main() {
             Kind::LimitUpload => run_limit_upload(scenario.name),
             Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
             Kind::SigtermMidDownload => run_sigterm_mid_download(scenario.name),
+            Kind::EmptyFiles => run_empty_files(scenario.name),
             Kind::DiskFailure => run_disk_failure(scenario.name),
             Kind::PreferFiles => run_prefer_files(scenario.name),
             Kind::JsonEvents => run_json_events(scenario.name),
@@ -2123,4 +2128,57 @@ fn run_disk_failure(name: &str) -> Result<String, String> {
         return Err("the log does not say why the run ended".to_string());
     }
     Ok(format!("a directory in the way of the file ended the run in {:.1?} with status 1 and \"cannot write to disk\", with two peers ready to serve", took))
+}
+
+/// Empty files (`.gitkeep`, `__init__.py`) are part of a torrent but no
+/// piece holds a byte of them, so nothing downloads them: the client has to
+/// create them itself.
+fn run_empty_files(name: &str) -> Result<String, String> {
+    let files = [
+        (vec!["a.bin"], pattern(600, 1)),
+        (vec!["empty.txt"], Vec::new()),
+        (vec!["sub", "deeper", ".gitkeep"], Vec::new()),
+        (vec!["sub", "b.bin"], pattern(500, 2)),
+        (vec!["zzz-empty"], Vec::new()),
+    ];
+    let fx = Fixture::build_paths("pack", &files, 256, false, true);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1).arg("--no-dht").stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("download binary exited with {:?}", status.code()));
+    }
+    // check_downloaded reads every file, the empty ones included, so a
+    // missing one is an error.
+    check_downloaded(&fx, &out_dir)?;
+    for empty in ["pack/empty.txt", "pack/sub/deeper/.gitkeep", "pack/zzz-empty"] {
+        let meta = fs::metadata(out_dir.join(empty)).map_err(|e| format!("{} was not created: {}", empty, e))?;
+        if !meta.is_file() || meta.len() != 0 {
+            return Err(format!("{} should be an empty file", empty));
+        }
+    }
+
+    // With --only, an empty file that was not selected is not created.
+    let only_swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let only_torrent = dir.join("only.torrent");
+    fs::write(&only_torrent, fx.torrent_bytes(only_swarm.tracker_addr)).expect("write torrent file");
+    let only_out = dir.join("only-out");
+    let mut child = client_command(&only_torrent, &only_out, &dir.join("only.log"), 1).args(["--no-dht", "--only", "b.bin", "--only", "empty.txt"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("--only run exited with {:?}", status.code()));
+    }
+    if !only_out.join("pack/empty.txt").is_file() {
+        return Err("--only selected empty.txt, which should have been created".to_string());
+    }
+    for unselected in ["pack/sub/deeper/.gitkeep", "pack/zzz-empty"] {
+        if only_out.join(unselected).exists() {
+            return Err(format!("{} was not selected but was created", unselected));
+        }
+    }
+    Ok("three empty files (one three directories deep) exist after the download, and under --only just the selected one".to_string())
 }

@@ -2,7 +2,7 @@
 //! the file selection, resuming from disk, the listener and port mapping,
 //! the first tracker announce, and the workers.
 
-use crate::downloader::{any_data_on_disk, build_file_spans, load_and_verify, progress_file_path, rewrite_compact, scan_all, Order, ResumeWriter, WorkQueue, WorkerConfig};
+use crate::downloader::{any_data_on_disk, build_file_spans, create_empty_files, load_and_verify, progress_file_path, rewrite_compact, scan_all, Order, ResumeWriter, WorkQueue, WorkerConfig};
 use crate::ratelimit::RateLimiter;
 use crate::seeder::{self, HaveMap};
 use crate::session::peer_pool::RetryPolicy;
@@ -164,6 +164,8 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // however many files it lists (one is legal and common).
     let base_dir = if torrent.multi_file { options.out_dir.join(&torrent.name) } else { options.out_dir.clone() };
     let spans = Arc::new(build_file_spans(&base_dir, &torrent.files));
+    // Empty files are in no piece, so nothing would ever create them.
+    create_empty_files(&spans, |file| mask.get(file).copied().unwrap_or(false)).map_err(|e| format!("creating an empty file under {}: {}", base_dir.display(), e))?;
 
     // Resume: work out which pieces are already on disk. Normally that is
     // the pieces a previous run recorded as complete, each re-verified
