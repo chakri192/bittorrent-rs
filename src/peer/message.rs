@@ -2,6 +2,7 @@
 //! Frame: `length_prefix(u32 BE) [ message_id(u8) payload... ]`.
 //! `length_prefix == 0` is a keep-alive with no id/payload.
 
+use crate::bytes::be_u32;
 use std::io::{self, Read, Write};
 
 const MSG_CHOKE: u8 = 0;
@@ -117,8 +118,8 @@ impl Message {
                 payload.push(*ext_id);
                 payload.extend_from_slice(ext_payload);
             }
-            Message::Choke | Message::Unchoke | Message::Interested | Message::NotInterested => {}
-            Message::KeepAlive => unreachable!(),
+            // No payload. (KeepAlive has no id and returned above.)
+            Message::Choke | Message::Unchoke | Message::Interested | Message::NotInterested | Message::KeepAlive => {}
         }
 
         let len = 1 + payload.len() as u32; // +1 for the id byte
@@ -197,10 +198,7 @@ impl Message {
 }
 
 fn read_u32(payload: &[u8], offset: usize) -> Result<u32, WireError> {
-    if payload.len() < offset + 4 {
-        return Err(WireError::Truncated { expected: offset + 4, got: payload.len() });
-    }
-    Ok(u32::from_be_bytes(payload[offset..offset + 4].try_into().unwrap()))
+    be_u32(payload, offset).ok_or(WireError::Truncated { expected: offset.saturating_add(4), got: payload.len() })
 }
 
 #[cfg(test)]

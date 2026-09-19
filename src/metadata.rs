@@ -203,12 +203,10 @@ impl MetadataAssembler {
     /// Concatenates all pieces once complete. Does not itself check the
     /// InfoHash -- use `assemble_and_verify` for that.
     pub fn assemble(&self) -> Result<Vec<u8>, MetadataError> {
-        if !self.is_complete() {
-            return Err(MetadataError::IncompleteAssembly);
-        }
         let mut out = Vec::with_capacity(self.total_size);
         for piece in &self.pieces {
-            out.extend_from_slice(piece.as_ref().unwrap());
+            let Some(piece) = piece else { return Err(MetadataError::IncompleteAssembly) };
+            out.extend_from_slice(piece);
         }
         Ok(out)
     }

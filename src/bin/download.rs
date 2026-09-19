@@ -13,6 +13,7 @@
 //! `tui` dashboard (or plain status lines when stdout isn't a TTY);
 //! high-volume detail goes to a log file. Usage:
 //!   download <file.torrent | magnet:?xt=urn:btih:...> [options]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 use bittorrent_rs::config::Config;
 use bittorrent_rs::magnet::parse_magnet_uri;

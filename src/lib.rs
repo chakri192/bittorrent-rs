@@ -1,4 +1,12 @@
+//! A BitTorrent client written from the specifications.
+//!
+//! Untrusted input reaches almost every module, so production code must not
+//! panic on it: `unwrap()` and `expect()` are linted against outside tests
+//! (CI runs clippy with warnings as errors).
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod bencode;
+pub mod bytes;
 pub mod config;
 pub mod dht;
 pub mod downloader;

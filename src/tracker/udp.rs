@@ -4,6 +4,7 @@
 //! `std::net::UdpSocket` and manual big-endian packing.
 
 use super::{parse_compact_peers, AnnounceRequest, AnnounceResponse, Event, TrackerError};
+use crate::bytes::{be_u32, be_u64};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
@@ -22,13 +23,18 @@ fn build_connect_request(transaction_id: u32) -> [u8; 16] {
     pkt
 }
 
+/// A big-endian `u32` field of a tracker response.
+fn field_u32(resp: &[u8], at: usize) -> Result<u32, TrackerError> {
+    be_u32(resp, at).ok_or(TrackerError::MalformedResponse("response too short for its fields"))
+}
+
 /// Returns `connection_id` on success.
 fn parse_connect_response(resp: &[u8], expected_txn: u32) -> Result<u64, TrackerError> {
     if resp.len() < 16 {
         return Err(TrackerError::MalformedResponse("connect response too short"));
     }
-    let action = u32::from_be_bytes(resp[0..4].try_into().unwrap());
-    let txn = u32::from_be_bytes(resp[4..8].try_into().unwrap());
+    let action = field_u32(resp, 0)?;
+    let txn = field_u32(resp, 4)?;
     if txn != expected_txn {
         return Err(TrackerError::MalformedResponse("connect response transaction_id mismatch"));
     }
@@ -39,7 +45,7 @@ fn parse_connect_response(resp: &[u8], expected_txn: u32) -> Result<u64, Tracker
     if action != ACTION_CONNECT {
         return Err(TrackerError::MalformedResponse("unexpected action in connect response"));
     }
-    Ok(u64::from_be_bytes(resp[8..16].try_into().unwrap()))
+    be_u64(resp, 8).ok_or(TrackerError::MalformedResponse("connect response too short"))
 }
 
 fn event_code(event: Option<Event>) -> u32 {
@@ -76,8 +82,8 @@ fn parse_announce_response(resp: &[u8], expected_txn: u32) -> Result<AnnounceRes
     if resp.len() < 20 {
         return Err(TrackerError::MalformedResponse("announce response too short"));
     }
-    let action = u32::from_be_bytes(resp[0..4].try_into().unwrap());
-    let txn = u32::from_be_bytes(resp[4..8].try_into().unwrap());
+    let action = field_u32(resp, 0)?;
+    let txn = field_u32(resp, 4)?;
     if txn != expected_txn {
         return Err(TrackerError::MalformedResponse("announce response transaction_id mismatch"));
     }
@@ -88,9 +94,9 @@ fn parse_announce_response(resp: &[u8], expected_txn: u32) -> Result<AnnounceRes
     if action != ACTION_ANNOUNCE {
         return Err(TrackerError::MalformedResponse("unexpected action in announce response"));
     }
-    let interval = u32::from_be_bytes(resp[8..12].try_into().unwrap());
-    let incomplete = u32::from_be_bytes(resp[12..16].try_into().unwrap());
-    let complete = u32::from_be_bytes(resp[16..20].try_into().unwrap());
+    let interval = field_u32(resp, 8)?;
+    let incomplete = field_u32(resp, 12)?;
+    let complete = field_u32(resp, 16)?;
     // BEP 15 (UDP tracker) is IPv4-only in this client -- see the doc
     // comment on `parse_compact_peers_v6` for why IPv6 UDP (BEP 32) isn't
     // implemented. `.map(SocketAddr::V4)` just widens the type to match

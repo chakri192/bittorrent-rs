@@ -1,5 +1,6 @@
 //! Usage: infohash <path-to.torrent>
 //! Prints the InfoHash and basic metadata. Sanity-check tool for Phase 1.
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 use bittorrent_rs::torrent::{info_hash_hex, parse_torrent_file};
 use std::env;
