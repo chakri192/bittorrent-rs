@@ -250,6 +250,18 @@ pub fn info_hash_hex(hash: &[u8; 20]) -> String {
 }
 
 impl TorrentFile {
+    /// Every tracker URL the torrent names, `announce` and every tier of
+    /// `announce-list`, without duplicates.
+    pub fn tracker_urls(&self) -> Vec<String> {
+        let mut urls: Vec<String> = self.announce.iter().cloned().collect();
+        for tier in &self.announce_list {
+            urls.extend(tier.iter().cloned());
+        }
+        urls.sort();
+        urls.dedup();
+        urls
+    }
+
     /// Sum of every file's length -- the total number of bytes the torrent
     /// contains, which the last piece's length is derived from.
     pub fn total_length(&self) -> u64 {

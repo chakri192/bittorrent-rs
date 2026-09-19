@@ -7,17 +7,21 @@
 pub mod announce;
 pub mod metadata;
 pub mod peer_pool;
+pub mod prepare;
 pub mod plan;
 pub mod progress;
 pub mod rate;
 pub mod run;
 pub mod services;
 pub mod sink;
+#[cfg(test)]
+mod testing;
 pub mod workers;
 
 pub use announce::{Announcer, NetworkTrackers, TrackerClient};
 pub use metadata::{fetch_metadata, resolve_magnet, Fetched, MetadataConfig};
 pub use peer_pool::PeerPool;
+pub use prepare::{has_ipv6_egress, prepare, Ipv6Mode, Options, Prepared, RunInfo};
 pub use plan::{DownloadPlan, Outstanding};
 pub use progress::Progress;
 pub use rate::RateSampler;

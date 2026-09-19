@@ -7,7 +7,7 @@ use crate::ui::Snapshot;
 /// numbers behind the dashboard. The terminal dashboard implements it;
 /// tests use a recording implementation, so a session can run with no
 /// terminal at all.
-pub trait ProgressSink {
+pub trait ProgressSink: Send + Sync {
     fn log(&self, msg: String);
     /// The frame of numbers the dashboard shows now.
     fn set_snapshot(&self, snapshot: Snapshot);

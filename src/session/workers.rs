@@ -105,6 +105,12 @@ impl Workers {
         self.pex_rx.try_iter()
     }
 
+    /// Whether peer workers get a PEX channel: false for a private torrent.
+    #[cfg(test)]
+    pub(crate) fn pex_enabled(&self) -> bool {
+        self.pex_tx.is_some()
+    }
+
     /// Puts a result on the channel as a finished worker would, for tests
     /// of what happens to results nobody has collected yet.
     #[cfg(test)]
@@ -128,15 +134,9 @@ impl Workers {
 mod tests {
     use super::*;
     use crate::downloader::PieceWork;
-    use std::net::TcpListener;
+    use crate::session::testing::dead_addr;
     use std::sync::Mutex;
     use std::time::Instant;
-
-    /// A loopback address nothing is listening on: connecting is refused
-    /// straight away, so a worker dialing it fails fast.
-    fn dead_addr() -> SocketAddr {
-        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
-    }
 
     fn queue_with(pieces: usize) -> Arc<WorkQueue> {
         let work = (0..pieces).map(|i| PieceWork { index: i as u32, hash: [0; 20], length: 16 }).collect();

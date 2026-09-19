@@ -15,24 +15,20 @@
 //!   download <file.torrent | magnet:?xt=urn:btih:...> [options]
 
 use bittorrent_rs::config::Config;
-use bittorrent_rs::downloader::{build_file_spans, load_and_verify, progress_file_path, rewrite_compact, ResumeWriter, WorkQueue, WorkerConfig};
 use bittorrent_rs::magnet::parse_magnet_uri;
-use bittorrent_rs::seeder::{self, HaveMap};
-use bittorrent_rs::session::{resolve_magnet, Announcer, DownloadPlan, Log, MetadataConfig, Outstanding, PeerPool, Progress, Services, Session, Setup, Workers};
-use bittorrent_rs::torrent::{self, TorrentFile};
+use bittorrent_rs::session::{prepare, resolve_magnet, Ipv6Mode, MetadataConfig, Options, ProgressSink, Services};
+use bittorrent_rs::torrent;
 use bittorrent_rs::tracker::generate_peer_id;
-use bittorrent_rs::tracker_discovery::TransferTotals;
 use bittorrent_rs::tui::{self, Ui};
 use bittorrent_rs::ui::{self, Logger};
 use std::fs;
 use std::io::IsTerminal;
-use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Conventional BitTorrent port: preferred TCP listen port for the
 /// seeder and UDP bind for the DHT node (both fall back to ephemeral if
@@ -54,31 +50,6 @@ enum Verbosity {
     Quiet,
     Normal,
     Verbose,
-}
-
-/// Whether to dial IPv6 peers. `Auto` probes for a local IPv6 route once
-/// at startup and enables v6 only if one exists -- dialing v6 addresses
-/// on a v4-only host just burns connect timeouts on guaranteed
-/// `NetworkUnreachable`/`HostUnreachable` failures (the dominant failure
-/// mode observed in the wild).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ipv6Mode {
-    Auto,
-    Always,
-    Never,
-}
-
-/// Probes for outbound IPv6 connectivity without sending a single packet:
-/// a UDP `connect` only resolves a route and fixes the default
-/// destination. No route (v4-only host) fails immediately with
-/// `NetworkUnreachable`, so this is a cheap, side-effect-free egress test.
-fn has_ipv6_egress() -> bool {
-    match UdpSocket::bind("[::]:0") {
-        // 2001:4860:4860::8888 is a well-known global v6 address (Google
-        // DNS); we never talk to it, only ask the kernel if it's routable.
-        Ok(sock) => sock.connect("[2001:4860:4860::8888]:53").is_ok(),
-        Err(_) => false,
-    }
 }
 
 struct Args {
@@ -374,10 +345,6 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     ui.set_title(torrent.name.clone());
     ui.log(format!("torrent: {} ({}, {} pieces)", torrent.name, ui::format_bytes(torrent.total_length()), torrent.pieces.len()));
 
-    let total_pieces = torrent.pieces.len();
-    let total_length = torrent.total_length();
-    let piece_length = torrent.piece_length as u64;
-
     // File selection (--only / --files). `--list` prints the file table
     // and exits without downloading anything.
     let mask = bittorrent_rs::selection::build_mask(&torrent.files, &args.files_sel, &args.only).map_err(|e| finish_err(ui, e))?;
@@ -387,121 +354,32 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         ui.finish(Ok(listing.clone()));
         return Ok(listing);
     }
-    // `display_total` / `goal_pieces` drive the progress UI for the
-    // selected subset. The *true* torrent length still governs on-disk
-    // piece math (spans, seeder), so those stay `total_length`.
-    let plan = DownloadPlan::new(&torrent, &mask);
-    let (selective, display_total, goal_pieces) = (plan.is_selective(), plan.display_total(), plan.goal_pieces());
-    if selective {
-        ui.log(format!("selective download: {} of {} file(s), {} piece(s), {}", mask.iter().filter(|&&b| b).count(), torrent.files.len(), goal_pieces, ui::format_bytes(display_total)));
-    }
-
-    let tracker_urls = collect_tracker_urls(&torrent);
-    let base_dir = if torrent.files.len() > 1 { args.out_dir.join(&torrent.name) } else { args.out_dir.clone() };
-    let spans = Arc::new(build_file_spans(&base_dir, &torrent.files));
-
-    // Resume: re-verify any pieces a previous run claimed complete against
-    // their actual current bytes on disk before trusting them.
-    fs::create_dir_all(&args.out_dir).map_err(|e| finish_err(ui, format!("creating output directory {}: {}", args.out_dir.display(), e)))?;
-    let progress_path = progress_file_path(&args.out_dir, &torrent.info_hash);
-    let confirmed_resumed = load_and_verify(&progress_path, &spans, &torrent);
-    if !confirmed_resumed.is_empty() {
-        ui.log(format!("resuming: {} piece(s) already verified on disk", confirmed_resumed.len()));
-        rewrite_compact(&progress_path, &confirmed_resumed).map_err(|e| finish_err(ui, format!("writing resume file: {}", e)))?;
-    }
-    let resume_writer = ResumeWriter::create(&progress_path).map_err(|e| finish_err(ui, format!("opening resume file: {}", e)))?;
-
-    // Upload side: serve verified pieces to inbound peers for the whole
-    // run. A bind failure downgrades to download-only with a warning.
-    let have = Arc::new(HaveMap::new(total_pieces));
-    for &idx in &confirmed_resumed {
-        have.set(idx);
-    }
-    match seeder::start(args.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have)) {
-        Ok(handle) => {
-            ui.log(format!("listening for inbound peers on port {}", handle.port));
-            services.attach_seeder(handle);
-        }
-        Err(e) => ui.log(format!("warning: could not start listener (download-only): {}", e)),
-    }
-    let announce_port = services.announce_port(args.port);
-    // A separate handle on the upload counter, so it stays readable
-    // whatever happens to the seeder itself.
-    let uploaded_counter = services.uploaded_counter();
-    let uploaded = || uploaded_counter.as_ref().map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
-
-    // Best-effort port forwarding (UPnP/NAT-PMP) so inbound peers and DHT
-    // queries reach us behind a home router. Runs on its own thread and
-    // never blocks; silently no-ops if the router doesn't cooperate.
-    if !args.no_portmap {
-        let logger = ui.clone();
-        services.start_portmap(move |m| logger.log(m));
-    }
-
-    // Only wanted pieces enter the queue and the progress totals; already-
-    // verified wanted pieces count as done from the start. (Resumed
-    // *unwanted* pieces from a prior full run stay advertised for seeding
-    // via `have` above, but don't count toward this run's goal.)
-    let Outstanding { work, pieces_done, bytes_done: bytes_already_done } = plan.outstanding(&torrent, &confirmed_resumed);
-    let queue = Arc::new(WorkQueue::new(work, total_pieces));
-
-    let allow_ipv6 = match args.ipv6 {
-        Ipv6Mode::Always => true,
-        Ipv6Mode::Never => false,
-        Ipv6Mode::Auto => has_ipv6_egress(),
+    let options = Options {
+        out_dir: args.out_dir.clone(),
+        port: args.port,
+        max_peers: args.max_peers,
+        reannounce_override: args.reannounce_override.map(Duration::from_secs),
+        ipv6: args.ipv6,
+        no_portmap: args.no_portmap,
+        no_webseed: args.no_webseed,
+        timeout: args.timeout,
+        pipeline_depth: PIPELINE_DEPTH,
+        connect_timeout: CONNECT_TIMEOUT,
     };
-    ui.log(if allow_ipv6 {
-        "IPv6 peers enabled".to_string()
-    } else {
-        format!("IPv6 peers disabled ({})", if args.ipv6 == Ipv6Mode::Never { "--no-ipv6" } else { "no local IPv6 route" })
-    });
-    let mut pool = PeerPool::new(allow_ipv6);
-    pool.add(bootstrap_peers);
-
-    // First real announce, now that the true size is known.
-    let mut announcer = Announcer::new(tracker_urls, torrent.info_hash, our_peer_id, announce_port, args.reannounce_override.map(Duration::from_secs), Instant::now());
-    let first_totals = TransferTotals { uploaded: uploaded(), downloaded: 0, left: display_total.saturating_sub(bytes_already_done) };
-    pool.add(announcer.start(Instant::now(), first_totals, |m| ui.log(m)));
-
-    // BEP 19 web seeds (from the torrent's url-list). These can carry the
-    // whole download even with zero peers, so their presence keeps the run
-    // alive below.
-    let web_seeds: Vec<String> = if args.no_webseed { Vec::new() } else { torrent.url_list.clone() };
-
-    if pool.known_count() == 0 && services.dht().is_none() && web_seeds.is_empty() {
-        return Err(finish_err(ui, "no peers found from any tracker (and DHT + web seeds unavailable)".to_string()));
-    }
-    ui.log(format!("{} peer(s) known; dialing up to {} concurrently", pool.known_count(), args.max_peers));
-    if pool.skipped_ipv6() > 0 {
-        ui.log(format!("skipped {} IPv6 peer(s) with no local route (pass --ipv6 to force)", pool.skipped_ipv6()));
-    }
-
-    let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: PIPELINE_DEPTH, connect_timeout: CONNECT_TIMEOUT });
-    let worker_log: Log = {
-        let ui = ui.clone();
-        Arc::new(move |m: String| ui.log(m))
-    };
-    let mut workers = Workers::new(Arc::clone(&queue), Arc::clone(&spans), config, piece_length, args.max_peers, torrent.private, worker_log);
-
-    // Web-seed workers: one thread per url-list entry, draining the same
-    // shared queue into the same verify-write-record pipeline as peers.
-    if !web_seeds.is_empty() {
-        ui.log(format!("web seed: {} url(s) from the torrent's url-list", web_seeds.len()));
-        workers.start_web_seeds(&web_seeds, &torrent.name, &torrent.files, total_length);
-    }
-
-    let progress = Progress::new(Arc::clone(&have), resume_writer, goal_pieces, pieces_done, bytes_already_done);
-    let mut session = Session::new(Setup { sink: ui, services: &services, queue: Arc::clone(&queue), workers, announcer, progress, pool, display_total, goal_pieces, timeout: args.timeout });
+    let sink: Arc<dyn ProgressSink> = Arc::new(ui.clone());
+    let prepared = prepare(&torrent, &mask, bootstrap_peers, our_peer_id, &options, &mut services, &sink).map_err(|e| finish_err(ui, e))?;
+    let info = prepared.info.clone();
+    let mut session = prepared.into_session(&*sink, &services);
     let report = session.run(stop);
 
     if report.complete {
-        bittorrent_rs::downloader::resume::clear(&progress_path);
-        let scope = if selective { format!("{} selected", ui::format_bytes(display_total)) } else { ui::format_bytes(total_length) };
+        bittorrent_rs::downloader::resume::clear(&info.progress_path);
+        let scope = if info.selective { format!("{} selected", ui::format_bytes(info.display_total)) } else { ui::format_bytes(info.total_length) };
         let avg = report.bytes_this_run as f64 / report.elapsed.as_secs_f64().max(0.001);
         let summary = format!(
             "download complete: {} -> {}\n  {} in {} \u{b7} {} avg \u{b7} {} uploaded",
             torrent.name,
-            base_dir.display(),
+            info.base_dir.display(),
             scope,
             ui::format_duration(report.elapsed.as_secs()),
             ui::format_rate(avg),
@@ -513,8 +391,8 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
 
         if args.seed && services.has_seeder() {
             // Keep the UI live and seeding until the user quits. The UI
-            // totals reflect the selected subset (display_total/goal).
-            session.seed(&torrent.name, announce_port, stop);
+            // totals reflect the selected subset (info.display_total/goal).
+            session.seed(&torrent.name, info.announce_port, stop);
         } else {
             ui.finish(Ok(summary.clone()));
         }
@@ -540,12 +418,3 @@ fn finish_err(ui: &Ui, reason: String) -> String {
     reason
 }
 
-fn collect_tracker_urls(torrent: &TorrentFile) -> Vec<String> {
-    let mut urls: Vec<String> = torrent.announce.iter().cloned().collect();
-    for tier in &torrent.announce_list {
-        urls.extend(tier.iter().cloned());
-    }
-    urls.sort();
-    urls.dedup();
-    urls
-}

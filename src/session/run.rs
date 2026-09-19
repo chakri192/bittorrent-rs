@@ -316,6 +316,7 @@ mod tests {
     use crate::peer::message::Message;
     use crate::seeder::{self, HaveMap};
     use crate::session::sink::RecordingSink;
+    use crate::session::testing::dead_addr;
     use crate::session::Log;
     use sha1::{Digest, Sha1};
     use std::io::{Read, Write};
@@ -451,11 +452,6 @@ mod tests {
         assert!(!report.complete);
         assert_eq!((report.remaining, report.dialed, report.bytes_this_run), (PIECES, 0, 0));
         assert!(report.elapsed < Duration::from_secs(1));
-    }
-
-    /// A loopback address nothing listens on: dialing it is refused at once.
-    fn dead_addr() -> SocketAddr {
-        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
     }
 
     /// A web seed that accepts the connection and then says nothing, so
