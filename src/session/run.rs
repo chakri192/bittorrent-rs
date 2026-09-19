@@ -718,8 +718,8 @@ mod tests {
     /// A session with a seeder whose upload counter reads `uploaded`, and a
     /// stop flag that sets itself after `stop_after` so that a seed which
     /// ignores its limits fails rather than hangs.
-    fn seed_with(uploaded: u64, limits: SeedLimits, stop_after: Duration) -> (Option<SeedEnd>, Duration, Arc<RecordingSink>) {
-        let dir = tmp_dir("seed-limits");
+    fn seed_with(name: &str, uploaded: u64, limits: SeedLimits, stop_after: Duration) -> (Option<SeedEnd>, Duration, Arc<RecordingSink>) {
+        let dir = tmp_dir(name);
         let sink = Arc::new(RecordingSink::default());
         let mut services = Services::new();
         services.attach_seeder(seeder::start(0, INFO_HASH, [2; 20], Arc::new(Vec::new()), PIECE_LEN as u64, 0, Arc::new(HaveMap::new(0)), None).unwrap());
@@ -743,7 +743,7 @@ mod tests {
         let size = data().len() as u64;
         let limits = SeedLimits { ratio: Some(1.0), time: None };
 
-        let (end, took, sink) = seed_with(size, limits, Duration::from_secs(20));
+        let (end, took, sink) = seed_with("seed-ratio-reached", size, limits, Duration::from_secs(20));
 
         assert_eq!(end, Some(SeedEnd::Ratio(1.0)));
         assert!(took < Duration::from_secs(5), "it stopped on its own, not when the flag was set: {:?}", took);
@@ -756,7 +756,7 @@ mod tests {
         let size = data().len() as u64;
         let limits = SeedLimits { ratio: Some(1.0), time: None };
 
-        let (end, took, _) = seed_with(size - 1, limits, Duration::from_millis(700));
+        let (end, took, _) = seed_with("seed-ratio-short", size - 1, limits, Duration::from_millis(700));
 
         assert_eq!(end, None, "one byte short of the ratio");
         assert!(took >= Duration::from_millis(600), "it ran until the flag: {:?}", took);
@@ -766,7 +766,7 @@ mod tests {
     fn seeding_ends_by_itself_once_the_time_is_up() {
         let limits = SeedLimits { ratio: None, time: Some(Duration::from_millis(600)) };
 
-        let (end, took, sink) = seed_with(0, limits, Duration::from_secs(20));
+        let (end, took, sink) = seed_with("seed-time-up", 0, limits, Duration::from_secs(20));
 
         assert_eq!(end, Some(SeedEnd::Time(Duration::from_millis(600))));
         assert!(took >= Duration::from_millis(600), "not before the time: {:?}", took);

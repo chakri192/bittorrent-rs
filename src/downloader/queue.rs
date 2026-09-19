@@ -19,7 +19,7 @@
 //! crawls" tail. First verified copy wins: `mark_done` retires the piece
 //! everywhere, and late duplicate downloads abandon via `is_done`.
 
-use crate::downloader::piece_assembler::PieceWork;
+use crate::downloader::piece_assembler::{PartialPiece, PieceWork};
 use std::collections::{HashMap, HashSet};
 use crate::sync::lock;
 use std::sync::Mutex;
@@ -58,7 +58,15 @@ struct Inner {
     claimed: HashMap<u32, PieceWork>,
     /// Verified and written to disk.
     done: HashSet<u32>,
+    /// Blocks of pieces whose connection failed part-way, for the next
+    /// connection to start from. Bounded by [`MAX_STASHED_BYTES`].
+    partial: HashMap<u32, PartialPiece>,
 }
+
+/// The most memory the queue keeps in partly downloaded pieces. Without a
+/// bound, peers that keep failing part-way through different pieces could
+/// leave a good part of the torrent held in memory.
+pub const MAX_STASHED_BYTES: usize = 64 << 20;
 
 pub struct WorkQueue {
     inner: Mutex<Inner>,
@@ -79,7 +87,7 @@ impl WorkQueue {
     /// present in `pieces` (in practice: `torrent.pieces.len()`).
     pub fn new(pieces: Vec<PieceWork>, total_pieces: usize) -> Self {
         WorkQueue {
-            inner: Mutex::new(Inner { pending: pieces, claimed: HashMap::new(), done: HashSet::new() }),
+            inner: Mutex::new(Inner { pending: pieces, claimed: HashMap::new(), done: HashSet::new(), partial: HashMap::new() }),
             availability: Mutex::new(vec![0u32; total_pieces]),
             order: Order::default(),
         }
@@ -174,6 +182,36 @@ impl WorkQueue {
         }
     }
 
+    /// Keeps the blocks of a piece a connection had received when it failed,
+    /// for whichever connection takes the piece next (see
+    /// [`take_partial`](Self::take_partial)). Ignored if the piece is
+    /// already done, or if keeping it would go over [`MAX_STASHED_BYTES`]
+    /// (unless it replaces a smaller stash of the same piece). Where there
+    /// is already a stash for the piece, the one with more blocks is kept.
+    pub fn stash_partial(&self, index: u32, partial: PartialPiece) {
+        let mut inner = lock(&self.inner);
+        if inner.done.contains(&index) {
+            return;
+        }
+        let held: usize = inner.partial.iter().filter(|(&i, _)| i != index).map(|(_, p)| p.size()).sum();
+        if held + partial.size() > MAX_STASHED_BYTES {
+            return;
+        }
+        match inner.partial.get(&index) {
+            Some(existing) if existing.blocks_held() >= partial.blocks_held() => {}
+            _ => {
+                inner.partial.insert(index, partial);
+            }
+        }
+    }
+
+    /// Takes the stashed blocks of `index`, if any. Whoever takes them owns
+    /// them: a second caller gets nothing, so two connections never
+    /// resume the same stash.
+    pub fn take_partial(&self, index: u32) -> Option<PartialPiece> {
+        lock(&self.inner).partial.remove(&index)
+    }
+
     /// Retires a piece everywhere after it has been verified and written.
     /// Returns `true` if this call was the first to mark it done (callers
     /// use this to avoid double-counting duplicate endgame completions).
@@ -182,6 +220,7 @@ impl WorkQueue {
         let newly_done = inner.done.insert(index);
         inner.claimed.remove(&index);
         inner.pending.retain(|w| w.index != index);
+        inner.partial.remove(&index);
         newly_done
     }
 
@@ -591,5 +630,68 @@ mod tests {
         // 2 and 3 are equally rare, and rarer than 0 and 1.
         let order: Vec<u32> = std::iter::from_fn(|| piece_index(q.take_for(|_| true))).take(4).collect();
         assert_eq!(order, vec![2, 3, 0, 1], "rarity first, then index, however the list was arranged");
+    }
+
+    // ---- partly downloaded pieces ----
+
+    fn partial_of(index: u32, blocks: u32, length: u32) -> PartialPiece {
+        let mut a = crate::downloader::piece_assembler::PieceAssembler::new(PieceWork { index, hash: [0; 20], length });
+        for n in 0..blocks {
+            let begin = n * crate::downloader::piece_assembler::BLOCK_SIZE;
+            let len = (length - begin).min(crate::downloader::piece_assembler::BLOCK_SIZE) as usize;
+            a.record_block(begin, &vec![n as u8; len]).unwrap();
+        }
+        a.into_partial().expect("at least one block")
+    }
+
+    const PIECE: u32 = 4 * 16384;
+
+    #[test]
+    fn a_stashed_partial_is_taken_once_by_whoever_asks_first() {
+        let q = WorkQueue::new(vec![work(0), work(1)], 2);
+        q.stash_partial(1, partial_of(1, 2, PIECE));
+
+        assert!(q.take_partial(0).is_none(), "another piece's");
+        let got = q.take_partial(1).expect("the stash");
+        assert_eq!(got.blocks_held(), 2);
+        assert!(q.take_partial(1).is_none(), "gone: two connections never resume the same one");
+    }
+
+    #[test]
+    fn a_finished_piece_has_no_stash_and_takes_none() {
+        let q = WorkQueue::new(vec![work(0)], 1);
+        q.stash_partial(0, partial_of(0, 1, PIECE));
+        q.mark_done(0);
+        assert!(q.take_partial(0).is_none(), "retiring the piece dropped it");
+
+        q.stash_partial(0, partial_of(0, 1, PIECE));
+        assert!(q.take_partial(0).is_none(), "and one arriving after is not kept");
+    }
+
+    #[test]
+    fn where_there_are_two_stashes_the_fuller_one_is_kept() {
+        let q = WorkQueue::new(vec![work(0)], 1);
+        q.stash_partial(0, partial_of(0, 3, PIECE));
+        q.stash_partial(0, partial_of(0, 1, PIECE));
+        assert_eq!(q.take_partial(0).unwrap().blocks_held(), 3, "a smaller one does not replace it");
+
+        q.stash_partial(0, partial_of(0, 1, PIECE));
+        q.stash_partial(0, partial_of(0, 2, PIECE));
+        assert_eq!(q.take_partial(0).unwrap().blocks_held(), 2, "a fuller one does");
+    }
+
+    #[test]
+    fn the_stash_is_bounded_so_failing_peers_cannot_fill_memory() {
+        // Two stashes of 40 MiB: the second would take it past the limit.
+        let big = 40 << 20;
+        let q = WorkQueue::new(vec![work(0), work(1)], 2);
+        q.stash_partial(0, partial_of(0, 1, big));
+        q.stash_partial(1, partial_of(1, 1, big));
+
+        assert!(q.take_partial(0).is_some(), "the first fits");
+        assert!(q.take_partial(1).is_none(), "the second does not");
+        // Space freed by taking one makes room again.
+        q.stash_partial(1, partial_of(1, 1, big));
+        assert!(q.take_partial(1).is_some());
     }
 }

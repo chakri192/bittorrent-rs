@@ -43,6 +43,27 @@ impl std::error::Error for AssemblerError {}
 /// matching the fields of `Message::Request`.
 pub type BlockRequest = (u32, u32, u32);
 
+/// The blocks of a piece that arrived before the connection they came
+/// over failed: what a later connection can start from instead of asking
+/// for them again. Not verified -- only the whole piece has a hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialPiece {
+    data: Vec<u8>,
+    received: Vec<bool>,
+}
+
+impl PartialPiece {
+    /// How many blocks are in it.
+    pub fn blocks_held(&self) -> usize {
+        self.received.iter().filter(|&&r| r).count()
+    }
+
+    /// Bytes of memory it holds on to.
+    pub fn size(&self) -> usize {
+        self.data.len()
+    }
+}
+
 pub struct PieceAssembler {
     work: PieceWork,
     buf: Vec<u8>,
@@ -57,6 +78,24 @@ impl PieceAssembler {
     pub fn new(work: PieceWork) -> Self {
         let num_blocks = work.length.div_ceil(BLOCK_SIZE);
         PieceAssembler { buf: vec![0u8; work.length as usize], received: vec![false; num_blocks as usize], next_unrequested_block: 0, work }
+    }
+
+    /// An assembler that starts from `partial`, so that only the blocks it
+    /// lacks are requested. A partial that does not fit `work` (a different
+    /// length) is ignored and the piece starts from nothing.
+    pub fn resume(work: PieceWork, partial: PartialPiece) -> Self {
+        let mut fresh = PieceAssembler::new(work);
+        if partial.data.len() == fresh.buf.len() && partial.received.len() == fresh.received.len() {
+            fresh.buf = partial.data;
+            fresh.received = partial.received;
+        }
+        fresh
+    }
+
+    /// What has arrived so far, to be handed on. `None` if nothing has.
+    pub fn into_partial(self) -> Option<PartialPiece> {
+        let partial = PartialPiece { data: self.buf, received: self.received };
+        (partial.blocks_held() > 0).then_some(partial)
     }
 
     pub fn piece_index(&self) -> u32 {
@@ -274,5 +313,68 @@ mod tests {
 
         assert_eq!(again.iter().map(|&(index, begin, _)| (index, begin)).collect::<Vec<_>>(), vec![(9, BLOCK_SIZE), (9, 3 * BLOCK_SIZE)], "blocks 1 and 3, the ones that never arrived");
         assert!(a.next_requests(4).is_empty());
+    }
+
+    // ---- handing a partly downloaded piece on ----
+
+    fn four_block_piece() -> (Vec<u8>, PieceWork) {
+        let data: Vec<u8> = (0..(BLOCK_SIZE * 4) as usize).map(|i| (i as u8).wrapping_mul(7)).collect();
+        let work = PieceWork { index: 3, hash: hash_of(&data), length: data.len() as u32 };
+        (data, work)
+    }
+
+    fn block(data: &[u8], n: u32) -> &[u8] {
+        &data[(n * BLOCK_SIZE) as usize..((n + 1) * BLOCK_SIZE) as usize]
+    }
+
+    #[test]
+    fn a_partial_piece_resumes_asking_only_for_what_is_missing_and_still_verifies() {
+        let (data, work) = four_block_piece();
+        let mut first = PieceAssembler::new(work.clone());
+        first.next_requests(4);
+        first.record_block(0, block(&data, 0)).unwrap();
+        first.record_block(2 * BLOCK_SIZE, block(&data, 2)).unwrap();
+        let partial = first.into_partial().expect("two blocks arrived");
+        assert_eq!((partial.blocks_held(), partial.size()), (2, data.len()));
+
+        let mut second = PieceAssembler::resume(work, partial);
+        let asked: Vec<u32> = second.next_requests(10).iter().map(|&(_, begin, _)| begin).collect();
+
+        assert_eq!(asked, vec![BLOCK_SIZE, 3 * BLOCK_SIZE], "blocks 1 and 3");
+        second.record_block(BLOCK_SIZE, block(&data, 1)).unwrap();
+        second.record_block(3 * BLOCK_SIZE, block(&data, 3)).unwrap();
+        assert_eq!(second.finish().unwrap(), data, "the two halves make the piece");
+    }
+
+    #[test]
+    fn nothing_received_means_nothing_to_hand_on() {
+        let (_, work) = four_block_piece();
+        assert!(PieceAssembler::new(work).into_partial().is_none());
+    }
+
+    #[test]
+    fn a_partial_that_does_not_fit_the_piece_is_ignored() {
+        let (data, work) = four_block_piece();
+        let mut other = PieceAssembler::new(PieceWork { index: 3, hash: [0; 20], length: BLOCK_SIZE * 2 });
+        other.record_block(0, block(&data, 0)).unwrap();
+        let partial = other.into_partial().unwrap();
+
+        let mut resumed = PieceAssembler::resume(work, partial);
+
+        assert_eq!(resumed.next_requests(10).len(), 4, "started from nothing");
+    }
+
+    #[test]
+    fn a_resumed_piece_with_a_bad_block_fails_its_hash_like_any_other() {
+        let (data, work) = four_block_piece();
+        let mut first = PieceAssembler::new(work.clone());
+        let mut bad = block(&data, 0).to_vec();
+        bad[10] ^= 0xFF;
+        first.record_block(0, &bad).unwrap();
+        let mut second = PieceAssembler::resume(work, first.into_partial().unwrap());
+        for n in 1..4 {
+            second.record_block(n * BLOCK_SIZE, block(&data, n)).unwrap();
+        }
+        assert_eq!(second.finish(), Err(AssemblerError::HashMismatch));
     }
 }

@@ -837,3 +837,133 @@ fn stopping_does_not_wait_for_a_worker_held_back_by_the_download_limit() {
     assert!(ended.is_ok(), "the worker should stop within seconds, not sleep out the limit");
     assert!(stopped_at.elapsed() < Duration::from_secs(2), "{:?}", stopped_at.elapsed());
 }
+
+// ---- handing a piece on when a peer fails part-way ----
+
+#[derive(Clone, Copy, PartialEq)]
+enum Fault {
+    None,
+    /// The first block it sends has a byte wrong.
+    FirstBlockWrong,
+    /// Every block it sends has a byte wrong.
+    EveryBlockWrong,
+}
+
+/// A peer that has every piece, records each request it gets as
+/// `(piece, begin)`, hangs up after serving `hang_up_after` blocks (never,
+/// with `None`), and can send wrong bytes.
+fn spawn_recording_peer(listener: TcpListener, info_hash: [u8; 20], pieces: Vec<Vec<u8>>, hang_up_after: Option<usize>, fault: Fault, requests: Arc<std::sync::Mutex<Vec<(u32, u32)>>>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut hs_buf = [0u8; 68];
+        std::io::Read::read_exact(&mut stream, &mut hs_buf).unwrap();
+        std::io::Write::write_all(&mut stream, &Handshake::new(info_hash, [0x99; 20], false).to_bytes()).unwrap();
+        let mut bits = vec![0u8; pieces.len().div_ceil(8)];
+        for i in 0..pieces.len() {
+            bits[i / 8] |= 1 << (7 - (i % 8));
+        }
+        WireMessage::Bitfield(bits).write_to(&mut stream).unwrap();
+        WireMessage::Unchoke.write_to(&mut stream).unwrap();
+
+        let mut served = 0usize;
+        while hang_up_after.is_none_or(|limit| served < limit) {
+            let Ok(msg) = WireMessage::read_from(&mut stream) else { return };
+            if let WireMessage::Request { index, begin, length } = msg {
+                requests.lock().unwrap().push((index, begin));
+                let mut block = pieces[index as usize][begin as usize..(begin + length) as usize].to_vec();
+                if fault == Fault::EveryBlockWrong || (fault == Fault::FirstBlockWrong && served == 0) {
+                    block[0] ^= 0xFF;
+                }
+                if (WireMessage::Piece { index, begin, block }).write_to(&mut stream).is_err() {
+                    return;
+                }
+                served += 1;
+            }
+        }
+    })
+}
+
+/// One piece of four blocks; a first peer with `first_fault` that hangs up
+/// after `first_serves` blocks, then a second with `second_fault` that stays.
+/// Returns what each was asked for, what the workers returned, and whether
+/// the piece arrived.
+struct HandOver {
+    first_asked: Vec<(u32, u32)>,
+    second_asked: Vec<(u32, u32)>,
+    first_result: Result<(), WorkerError>,
+    second_result: Result<(), WorkerError>,
+    delivered: bool,
+    queue_len_after_first: usize,
+}
+
+fn hand_a_piece_over(name: &str, first_serves: usize, first_fault: Fault, second_fault: Fault) -> HandOver {
+    let piece: Vec<u8> = (0..4 * 16384).map(|b| (b as u8).wrapping_mul(13).wrapping_add(1)).collect();
+    let info_hash = [0x68; 20];
+    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: sha1_of(&piece), length: piece.len() as u32 }], 1));
+    let dir = tmp_dir(name);
+    let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], piece.len() as i64)]));
+    let (tx, rx) = mpsc::channel();
+    // Four requests at once, so that whatever the first peer serves is a
+    // known prefix of the piece.
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default() };
+
+    let run = |hang_up_after: Option<usize>, fault: Fault| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let peer = spawn_recording_peer(listener, info_hash, vec![piece.clone()], hang_up_after, fault, Arc::clone(&requests));
+        let result = run_worker(addr, &config, &queue, &spans, piece.len() as u64, &tx, None);
+        peer.join().unwrap();
+        let asked = requests.lock().unwrap().clone();
+        (result, asked)
+    };
+
+    let (first_result, first_asked) = run(Some(first_serves), first_fault);
+    let queue_len_after_first = queue.len();
+    let (second_result, second_asked) = run(None, second_fault);
+    let delivered = rx.try_iter().any(|r| r.index == 0 && r.data == piece);
+    HandOver { first_asked, second_asked, first_result, second_result, delivered, queue_len_after_first }
+}
+
+#[test]
+fn a_piece_a_peer_dropped_part_way_is_finished_by_the_next_asking_only_for_what_is_missing() {
+    let h = hand_a_piece_over("hand-over", 2, Fault::None, Fault::None);
+
+    assert!(h.first_result.is_err(), "the first peer hung up");
+    assert_eq!(h.queue_len_after_first, 1, "the piece is back on the queue");
+    assert!(h.first_asked.len() >= 2, "it was asked for blocks and served the first two before it left");
+    let mut second: Vec<u32> = h.second_asked.iter().map(|&(_, begin)| begin).collect();
+    second.sort_unstable();
+    assert_eq!(second, vec![2 * 16384, 3 * 16384], "the second was asked only for blocks 2 and 3");
+    assert!(h.second_result.is_ok());
+    assert!(h.delivered, "and the piece verifies and arrives whole");
+}
+
+#[test]
+fn a_peer_that_dropped_before_any_block_leaves_nothing_and_the_next_asks_for_everything() {
+    let h = hand_a_piece_over("hand-over-nothing", 0, Fault::None, Fault::None);
+
+    assert_eq!(h.second_asked.len(), 4);
+    assert!(h.delivered);
+}
+
+#[test]
+fn a_bad_block_from_the_first_peer_costs_the_second_a_refetch_not_its_reputation() {
+    // The first peer sends block 0 with a byte wrong, then blocks 1, then leaves.
+    let h = hand_a_piece_over("hand-over-bad-block", 2, Fault::FirstBlockWrong, Fault::None);
+
+    assert!(h.second_result.is_ok(), "the second peer is not blamed for the first one's block: {:?}", h.second_result);
+    assert!(h.delivered, "the piece was fetched again from the second peer and verified");
+    let mut second: Vec<u32> = h.second_asked.iter().map(|&(_, begin)| begin).collect();
+    second.sort_unstable();
+    assert_eq!(second, vec![0, 16384, 2 * 16384, 2 * 16384, 3 * 16384, 3 * 16384], "blocks 2 and 3 first, then all four again from this peer alone");
+}
+
+#[test]
+fn a_peer_that_is_itself_wrong_is_blamed_once_the_piece_has_been_fetched_from_it_alone() {
+    let h = hand_a_piece_over("hand-over-liar", 2, Fault::None, Fault::EveryBlockWrong);
+
+    assert!(matches!(h.second_result, Err(WorkerError::PieceHashMismatch)), "{:?}", h.second_result);
+    assert!(!h.delivered, "nothing unverified was accepted");
+    assert_eq!(h.second_asked.len(), 2 + 4, "blocks 2 and 3 on top of the first peer's, then the whole piece again from it alone");
+}

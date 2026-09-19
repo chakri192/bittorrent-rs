@@ -4,7 +4,7 @@
 use super::connect::MAX_UNCHOKE_WAIT_TIMEOUTS;
 use super::pipeline::{depth_for, Throughput};
 use super::{absorb, is_read_timeout, PexSender, WorkerConfig, WorkerError};
-use crate::downloader::piece_assembler::PieceAssembler;
+use crate::downloader::piece_assembler::{PieceAssembler, PieceWork};
 use crate::downloader::queue::WorkQueue;
 use crate::peer::{Message, PeerState};
 use std::time::Instant;
@@ -15,17 +15,86 @@ use std::time::Instant;
 /// `config.pipeline_depth` requests are kept in flight at least; how many more depends
 /// on how fast this peer has been delivering (`throughput`, which carries
 /// over from piece to piece) and on what it says it will queue.
+///
+/// If an earlier connection failed part-way through this piece, its blocks
+/// are picked up from the queue and only the missing ones are requested;
+/// and if this connection fails part-way, what it received is left there
+/// for the next. Blocks from another connection cannot be blamed on this
+/// peer, so if a piece assembled from them fails its hash it is fetched
+/// again from this peer alone, and only a failure of *that* is the peer's.
 pub(super) fn download_one_piece(
     stream: &mut std::net::TcpStream,
     state: &mut PeerState,
     queue: &WorkQueue,
-    work: crate::downloader::piece_assembler::PieceWork,
+    work: PieceWork,
     config: &WorkerConfig,
     throughput: &mut Throughput,
     pex_tx: Option<&PexSender>,
 ) -> Result<Option<Vec<u8>>, WorkerError> {
-    let piece_index = work.index;
-    let mut assembler = PieceAssembler::new(work);
+    let (assembler, resumed) = match queue.take_partial(work.index) {
+        Some(partial) => (PieceAssembler::resume(work.clone(), partial), true),
+        None => (PieceAssembler::new(work.clone()), false),
+    };
+    let mut link = Link { stream, state, queue, config, throughput, pex_tx };
+    match attempt(&mut link, assembler)? {
+        Attempt::Verified(data) => Ok(Some(data)),
+        Attempt::Abandoned => Ok(None),
+        Attempt::Mismatch if resumed => match attempt(&mut link, PieceAssembler::new(work))? {
+            Attempt::Verified(data) => Ok(Some(data)),
+            Attempt::Abandoned => Ok(None),
+            Attempt::Mismatch => Err(WorkerError::PieceHashMismatch),
+        },
+        Attempt::Mismatch => Err(WorkerError::PieceHashMismatch),
+    }
+}
+
+/// The connection and the shared things a piece download works with.
+struct Link<'a> {
+    stream: &'a mut std::net::TcpStream,
+    state: &'a mut PeerState,
+    queue: &'a WorkQueue,
+    config: &'a WorkerConfig,
+    throughput: &'a mut Throughput,
+    pex_tx: Option<&'a PexSender>,
+}
+
+enum Attempt {
+    /// Every block arrived and the piece matches its hash.
+    Verified(Vec<u8>),
+    /// Another worker finished the piece first.
+    Abandoned,
+    /// Every block arrived and the piece does not match its hash.
+    Mismatch,
+}
+
+/// Fetches what `assembler` lacks and checks the result. If the connection
+/// fails first, the blocks that did arrive are left in the queue.
+fn attempt(link: &mut Link, mut assembler: PieceAssembler) -> Result<Attempt, WorkerError> {
+    let piece_index = assembler.piece_index();
+    match fetch_blocks(link, &mut assembler) {
+        Ok(Fetched::Complete) => Ok(match assembler.finish() {
+            Ok(data) => Attempt::Verified(data),
+            Err(_) => Attempt::Mismatch,
+        }),
+        Ok(Fetched::Abandoned) => Ok(Attempt::Abandoned),
+        Err(e) => {
+            if let Some(partial) = assembler.into_partial() {
+                link.queue.stash_partial(piece_index, partial);
+            }
+            Err(e)
+        }
+    }
+}
+
+enum Fetched {
+    Complete,
+    Abandoned,
+}
+
+/// Requests and receives blocks until `assembler` has them all.
+fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler) -> Result<Fetched, WorkerError> {
+    let Link { stream, state, queue, config, throughput, pex_tx } = link;
+    let piece_index = assembler.piece_index();
     let mut blocks_received = 0u32;
     // Outstanding (begin, length) requests -- what we'd need to Cancel
     // (BEP 3) if this piece completes elsewhere mid-flight.
@@ -41,7 +110,7 @@ pub(super) fn download_one_piece(
             for &(begin, length) in &in_flight {
                 let _ = crate::peer::connection::send_message(stream, &Message::Cancel { index: piece_index, begin, length });
             }
-            return Ok(None);
+            return Ok(Fetched::Abandoned);
         }
 
         if state.peer_choking {
@@ -109,12 +178,12 @@ pub(super) fn download_one_piece(
                 // the whole piece on a hash mismatch; drop it instead.
             }
             other => {
-                absorb(other, state, queue, pex_tx);
+                absorb(other, state, queue, *pex_tx);
             }
         }
     }
 
-    assembler.finish().map(Some).map_err(|_| WorkerError::PieceHashMismatch)
+    Ok(Fetched::Complete)
 }
 
 /// Bakes "how many blocks of this piece we'd already received before this

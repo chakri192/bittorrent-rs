@@ -303,6 +303,8 @@ struct PeerLog {
     pex_offered: Option<bool>,
     /// Every piece index the client asked for, in order (repeats included).
     requested: Vec<u32>,
+    /// Every block requested as (piece, offset within the piece), in order.
+    requested_blocks: Vec<(u32, u32)>,
     /// Pieces the peer sent in full.
     served: BTreeSet<u32>,
     /// The piece the peer hung up in the middle of, if it did.
@@ -531,6 +533,7 @@ fn serve_connection(mut stream: TcpStream, cx: &PeerContext, behavior: &Behavior
                 let hang_up = {
                     let mut log = log.lock().unwrap();
                     log.requested.push(index);
+                    log.requested_blocks.push((index, begin));
                     match behavior {
                         Behavior::StallAfter(limit) if log.served.len() >= *limit && !log.served.contains(&index) => continue, // read it, never answer
                         Behavior::DropMidPiece { after_pieces, .. } => {
@@ -881,12 +884,19 @@ fn run_drop_mid_piece(name: &str) -> Result<String, String> {
         return Err(format!("the healthy peer was asked for pieces {:?}; expected exactly the {:?} the flaky peer never completed (it hung up on piece {})", asked_of_healthy, expected, dropped_piece));
     }
 
+    // The flaky peer delivered the first block of the piece it dropped, and
+    // the client kept it: the healthy peer is asked only for the second.
+    let asked_for_dropped: Vec<u32> = healthy.lock().unwrap().requested_blocks.iter().filter(|&&(piece, _)| piece == dropped_piece).map(|&(_, begin)| begin).collect();
+    if asked_for_dropped != [16384] {
+        return Err(format!("the healthy peer was asked for blocks {:?} of piece {}; the first block had already arrived, so only the block at 16384 was needed", asked_for_dropped, dropped_piece));
+    }
+
     let log = fs::read_to_string(&log_path).map_err(|e| format!("reading client log {:?}: {}", log_path, e))?;
     if !log.contains("disconnected") {
         return Err("client log doesn't mention the dropped peer".to_string());
     }
 
-    Ok(format!("peer hung up mid-piece {}; the other peer supplied the remaining {} pieces and the file matches", dropped_piece, expected.len()))
+    Ok(format!("peer hung up mid-piece {}; the other peer supplied the remaining {} pieces, fetching only the block of piece {} that had not arrived, and the file matches", dropped_piece, expected.len(), dropped_piece))
 }
 
 /// `--timeout` with a peer that stops answering partway: the run must end
