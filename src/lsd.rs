@@ -570,12 +570,19 @@ mod tests {
                 return;
             }
         };
-        let ports = |service: &LsdService| -> Vec<u16> { service.peers_rx.recv_timeout(Duration::from_secs(5)).map(|batch| batch.iter().map(|p| p.port()).collect()).unwrap_or_default() };
-        let (heard_by_a, heard_by_b) = (ports(&a), ports(&b));
+        // Everything each hears for up to eight seconds, or until both have heard something.
+        let (mut heard_by_a, mut heard_by_b) = (Vec::new(), Vec::new());
+        let until = Instant::now() + Duration::from_secs(8);
+        while (heard_by_a.is_empty() || heard_by_b.is_empty()) && Instant::now() < until {
+            heard_by_a.extend(a.peers_rx.try_iter().flatten().map(|p| p.port()));
+            heard_by_b.extend(b.peers_rx.try_iter().flatten().map(|p| p.port()));
+            thread::sleep(Duration::from_millis(50));
+        }
         if heard_by_a.is_empty() && heard_by_b.is_empty() {
             eprintln!("multicast joined but nothing came back (a firewall, or loopback of multicast is off); the group is not tested");
         } else {
-            assert_eq!((heard_by_a, heard_by_b), (vec![2222], vec![1111]), "each hears the other and not itself");
+            assert!(heard_by_a.iter().all(|&p| p == 2222) && heard_by_b.iter().all(|&p| p == 1111), "each hears the other and never itself: A heard {:?}, B heard {:?}", heard_by_a, heard_by_b);
+            assert!(!heard_by_a.is_empty() && !heard_by_b.is_empty(), "and both do hear: A heard {:?}, B heard {:?}", heard_by_a, heard_by_b);
         }
         a.stop();
         b.stop();

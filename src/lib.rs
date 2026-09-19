@@ -34,4 +34,5 @@ pub mod tracker_discovery;
 pub mod tui;
 pub mod sync;
 pub mod ui;
+pub mod utp;
 pub mod webseed;
