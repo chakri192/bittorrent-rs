@@ -19,13 +19,12 @@ use crate::peer::pex::parse_ut_pex;
 use crate::peer::state::PeerState;
 use crate::torrent::parse_torrent_file;
 use crate::tracker::{parse_compact_peers, parse_compact_peers_v6};
-use std::net::SocketAddrV4;
 use std::path::{Component, Path};
 
 /// Mutations tried per seed. Every prefix of each seed is tried as well.
 const ITERATIONS: usize = 4000;
 
-fn v4(s: &str) -> SocketAddrV4 {
+fn v4(s: &str) -> std::net::SocketAddr {
     s.parse().unwrap()
 }
 
@@ -77,6 +76,17 @@ fn krpc_seeds() -> Vec<Vec<u8>> {
         KrpcMessage::Query { t: b"ad".to_vec(), query: Query::AnnouncePeer { id, info_hash: [0x44; 20], port: 6881, token: b"tok".to_vec(), implied_port: true } }.encode(),
         KrpcMessage::Response { t: b"ae".to_vec(), response: Response { id, nodes: vec![node.clone(), node], values: vec![v4("1.2.3.4:5678")], token: Some(b"tok".to_vec()) } }.encode(),
         KrpcMessage::Error { t: b"af".to_vec(), code: 203, message: "bad token".to_string() }.encode(),
+        // BEP 32: nodes6, and values of both sizes.
+        KrpcMessage::Response {
+            t: b"ag".to_vec(),
+            response: Response {
+                id,
+                nodes: vec![CompactNode { id: [0x33; 20], addr: "[2001:db8::3]:6881".parse().unwrap() }, CompactNode { id: [0x22; 20], addr: v4("10.0.0.2:6881") }],
+                values: vec!["[2001:db8::4]:5678".parse().unwrap(), v4("1.2.3.4:5678")],
+                token: Some(b"tok".to_vec()),
+            },
+        }
+        .encode(),
     ]
 }
 
@@ -222,6 +232,7 @@ fn krpc_survives_hostile_input_and_round_trips_what_it_accepts() {
             assert_eq!(KrpcMessage::decode(&message.encode()).ok(), Some(message.clone()), "re-reading what we would send back gives the same message");
         }
         let _ = parse_compact_nodes(input);
+        let _ = crate::dht::krpc::parse_compact_nodes6(input);
     });
 }
 

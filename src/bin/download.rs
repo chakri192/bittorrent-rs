@@ -416,6 +416,23 @@ fn lsd_config() -> bittorrent_rs::lsd::LsdConfig {
     }
 }
 
+/// Whether the DHT gets an IPv6 node (BEP 32): when peers over IPv6 are wanted,
+/// as `--ipv6` and `--no-ipv6` and a probe for a route decide.
+fn dht_ipv6(args: &Args) -> bool {
+    match args.ipv6 {
+        bittorrent_rs::session::Ipv6Mode::Always => true,
+        bittorrent_rs::session::Ipv6Mode::Never => false,
+        bittorrent_rs::session::Ipv6Mode::Auto => bittorrent_rs::session::has_ipv6_egress(),
+    }
+}
+
+/// The DHT's routers to start from: the public ones, unless
+/// `BITTORRENT_RS_DHT_BOOTSTRAP` lists others (`host:port`, separated by
+/// commas), which is how the end-to-end tests keep it on loopback.
+fn dht_bootstrap() -> Vec<String> {
+    std::env::var("BITTORRENT_RS_DHT_BOOTSTRAP").map(|list| list.split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect()).unwrap_or_default()
+}
+
 /// The whole download, start to finish, publishing to `ui`. Returns a
 /// human-readable completion summary (`Ok`) or a failure reason (`Err`);
 /// either way it also calls `ui.finish` so the dashboard can wind down
@@ -434,7 +451,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             services.start_utp(args.port, |m| ui.log(m));
         }
         if !args.no_dht {
-            services.start_dht(args.port, magnet.info_hash, |m| ui.log(m));
+            services.start_dht(args.port, magnet.info_hash, dht_ipv6(&args), dht_bootstrap(), |m| ui.log(m));
         }
         if magnet.trackers.is_empty() && magnet.peers.is_empty() && services.dht().is_none() {
             return Err(finish_err(ui, "magnet link has no trackers or peers and DHT is disabled (--no-dht) -- no way to find any peer".to_string()));
@@ -464,7 +481,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             services.start_utp(args.port, |m| ui.log(m));
         }
         if !args.no_dht && !args.list && !args.verify && !torrent.private {
-            services.start_dht(args.port, torrent.info_hash, |m| ui.log(m));
+            services.start_dht(args.port, torrent.info_hash, dht_ipv6(&args), dht_bootstrap(), |m| ui.log(m));
         }
         (torrent, Vec::new())
     };

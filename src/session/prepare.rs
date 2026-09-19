@@ -223,11 +223,17 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // (BEP 9), but only if it re-encodes to what the hash was taken over.
     let info_bytes = crate::bencode::encode(&torrent.info);
     let metadata = (Sha1::digest(&info_bytes).as_slice() == torrent.info_hash).then(|| Arc::new(info_bytes));
+    // Whether IPv6 is in use at all: peers are dialed over it, and the listener takes it.
+    let allow_ipv6 = match options.ipv6 {
+        Ipv6Mode::Always => true,
+        Ipv6Mode::Never => false,
+        Ipv6Mode::Auto => has_ipv6_egress(),
+    };
     let piece_lengths = (!torrent.v2_pieces.is_empty()).then(|| Arc::new(torrent.v2_pieces.iter().map(|p| p.length).collect::<Vec<u32>>()));
-    let seeder_options = seeder::SeederOptions { metadata, encryption: options.encryption.unwrap_or(crate::peer::Encryption::Prefer), utp: services.utp(), piece_lengths, ..Default::default() };
+    let seeder_options = seeder::SeederOptions { metadata, encryption: options.encryption.unwrap_or(crate::peer::Encryption::Prefer), utp: services.utp(), piece_lengths, ipv6: allow_ipv6, ..Default::default() };
     match seeder::start_with(options.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options) {
         Ok(handle) => {
-            sink.log(format!("listening for inbound peers on port {}", handle.port));
+            sink.log(format!("listening for inbound peers on port {}{}", handle.port, if handle.ipv6 { " (IPv4 and IPv6)" } else { "" }));
             if let Some(utp) = services.utp() {
                 let udp_port = utp.local_addr().map(|a| a.port()).unwrap_or(0);
                 if udp_port != handle.port {
@@ -264,11 +270,6 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     let preferred = if options.prefer.iter().any(|&p| p) { crate::selection::selected_pieces_of(torrent, &options.prefer).0 } else { Default::default() };
     let queue = Arc::new(WorkQueue::new(work, total_pieces).with_order(if options.sequential { Order::Sequential } else { Order::RarestFirst }).with_preferred(preferred));
 
-    let allow_ipv6 = match options.ipv6 {
-        Ipv6Mode::Always => true,
-        Ipv6Mode::Never => false,
-        Ipv6Mode::Auto => has_ipv6_egress(),
-    };
     sink.log(if allow_ipv6 {
         "IPv6 peers enabled".to_string()
     } else {
@@ -862,5 +863,25 @@ mod tests {
         assert_eq!(first_taken(Vec::new()), 0, "no preference: the lowest index among equals");
         // The torrent's second file (bytes 256..600) is pieces 1 and 2.
         assert_eq!(first_taken(vec![false, true]), 1, "preferring it brings its first piece out ahead of piece 0");
+    }
+
+    #[test]
+    fn when_ipv6_is_in_use_the_listener_takes_it_and_the_log_says_so() {
+        let dir = tmp_dir("v6-listener");
+        let mut with6 = options(&dir);
+        with6.ipv6 = Ipv6Mode::Always;
+        let mut services = Services::new();
+        let (prepared, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &with6, &mut services);
+        assert!(prepared.is_ok());
+        let port = services.announce_port(0);
+        if std::net::TcpListener::bind("[::1]:0").is_ok() {
+            assert!(log.logged(&format!("listening for inbound peers on port {} (IPv4 and IPv6)", port)), "{:?}", log.lines.lock().unwrap());
+            assert!(std::net::TcpStream::connect(("::1", port)).is_ok(), "and it is reachable over IPv6");
+        }
+
+        let dir = tmp_dir("v4-listener");
+        let mut services = Services::new();
+        let (_, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        assert!(log.logged(&format!("listening for inbound peers on port {}", services.announce_port(0))) && !log.logged("(IPv4 and IPv6)"), "--no-ipv6 keeps it to IPv4");
     }
 }

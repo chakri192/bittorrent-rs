@@ -157,7 +157,10 @@ pub struct SeederHandle {
     pub port: u16,
     pub uploaded: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
+    /// Whether IPv6 connections are taken too, on the same port.
+    pub ipv6: bool,
     accept_thread: Option<thread::JoinHandle<()>>,
+    accept6_thread: Option<thread::JoinHandle<()>>,
     rechoke_thread: Option<thread::JoinHandle<()>>,
     utp_thread: Option<thread::JoinHandle<()>>,
 }
@@ -165,7 +168,7 @@ pub struct SeederHandle {
 impl SeederHandle {
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        for thread in [self.accept_thread.take(), self.rechoke_thread.take(), self.utp_thread.take()].into_iter().flatten() {
+        for thread in [self.accept_thread.take(), self.accept6_thread.take(), self.rechoke_thread.take(), self.utp_thread.take()].into_iter().flatten() {
             let _ = thread.join();
         }
     }
@@ -190,13 +193,16 @@ pub struct SeederOptions {
     /// The length of every piece, where they are not all `piece_length` but for
     /// the last (a v2 torrent, whose pieces never span files).
     pub piece_lengths: Option<Arc<Vec<u32>>>,
+    /// Take IPv6 connections too, on the same port number (BEP 32 announces IPv6
+    /// addresses, which are of no use if nothing listens on them).
+    pub ipv6: bool,
 }
 
 impl Default for SeederOptions {
     fn default() -> Self {
         // Both are accepted by default: a peer that offers encryption is
         // taken up on it, and one that does not is served all the same.
-        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL, encryption: crate::peer::Encryption::Prefer, metadata: None, utp: None, piece_lengths: None }
+        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL, encryption: crate::peer::Encryption::Prefer, metadata: None, utp: None, piece_lengths: None, ipv6: false }
     }
 }
 
@@ -271,37 +277,13 @@ pub fn start_with(
     });
 
     let accept_shared = Arc::clone(&shared);
-    let accept_thread = thread::spawn(move || {
-        while accept_shared.running.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _addr)) => {
-                    // The listener is non-blocking so that it can notice a stop,
-                    // and where an accepted socket inherits that (macOS, the
-                    // BSDs) each read on it would fail at once when nothing has
-                    // arrived yet: a peer whose handshake came after the accept
-                    // would be dropped. The serving thread wants to block, with
-                    // its own read timeout.
-                    if stream.set_nonblocking(false).is_err() {
-                        continue;
-                    }
-                    if accept_shared.active_conns.load(Ordering::SeqCst) >= MAX_INBOUND_PEERS {
-                        drop(stream); // over cap: close immediately
-                        continue;
-                    }
-                    accept_shared.active_conns.fetch_add(1, Ordering::SeqCst);
-                    let conn_shared = Arc::clone(&accept_shared);
-                    thread::spawn(move || {
-                        let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
-                        let _ = serve_peer(Box::new(stream), peer_ip, &conn_shared);
-                        conn_shared.active_conns.fetch_sub(1, Ordering::SeqCst);
-                    });
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(200));
-                }
-                Err(_) => thread::sleep(Duration::from_millis(200)), // transient accept failure; keep listening
-            }
-        }
+    let accept_thread = thread::spawn(move || accept_loop(listener, accept_shared));
+    // The same, on IPv6, if that is wanted and the port is free there. (Not a failure if it is not.)
+    let listener6 = if options.ipv6 { bind_tcp_v6_only(port).ok().filter(|l| l.set_nonblocking(true).is_ok()) } else { None };
+    let ipv6 = listener6.is_some();
+    let accept6_thread = listener6.map(|listener| {
+        let accept_shared = Arc::clone(&shared);
+        thread::spawn(move || accept_loop(listener, accept_shared))
     });
 
     // uTP connections, if there is a socket for them: served just as TCP ones are.
@@ -325,7 +307,84 @@ pub fn start_with(
         })
     });
 
-    Ok(SeederHandle { port, uploaded, running, accept_thread: Some(accept_thread), rechoke_thread: Some(rechoke_thread), utp_thread })
+    Ok(SeederHandle { port, uploaded, running, ipv6, accept_thread: Some(accept_thread), accept6_thread, rechoke_thread: Some(rechoke_thread), utp_thread })
+}
+
+/// Takes connections on `listener` (non-blocking) until the seeder stops, each served on a thread of its own.
+fn accept_loop(listener: TcpListener, shared: Arc<SeederShared>) {
+    while shared.running.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                // The listener is non-blocking so that it can notice a stop,
+                // and where an accepted socket inherits that (macOS, the
+                // BSDs) each read on it would fail at once when nothing has
+                // arrived yet: a peer whose handshake came after the accept
+                // would be dropped. The serving thread wants to block, with
+                // its own read timeout.
+                if stream.set_nonblocking(false).is_err() {
+                    continue;
+                }
+                if shared.active_conns.load(Ordering::SeqCst) >= MAX_INBOUND_PEERS {
+                    drop(stream); // over cap: close immediately
+                    continue;
+                }
+                shared.active_conns.fetch_add(1, Ordering::SeqCst);
+                let conn_shared = Arc::clone(&shared);
+                thread::spawn(move || {
+                    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
+                    let _ = serve_peer(Box::new(stream), peer_ip, &conn_shared);
+                    conn_shared.active_conns.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(_) => thread::sleep(Duration::from_millis(200)), // transient accept failure; keep listening
+        }
+    }
+}
+
+/// A TCP listener on `[::]:port` for IPv6 only, so that it does not also try to take the IPv4 port.
+#[cfg(unix)]
+fn bind_tcp_v6_only(port: u16) -> std::io::Result<TcpListener> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain socket calls with valid arguments; the descriptor is closed
+    // on every failure path and otherwise handed to the TcpListener.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fail = |fd: libc::c_int| {
+            let error = std::io::Error::last_os_error();
+            libc::close(fd);
+            Err(error)
+        };
+        let on: libc::c_int = 1;
+        let size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        for (level, option) in [(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY), (libc::SOL_SOCKET, libc::SO_REUSEADDR)] {
+            if libc::setsockopt(fd, level, option, &on as *const libc::c_int as *const libc::c_void, size) < 0 {
+                return fail(fd);
+            }
+        }
+        let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
+        sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        sa.sin6_port = port.to_be();
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+        {
+            sa.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+        }
+        if libc::bind(fd, &sa as *const libc::sockaddr_in6 as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t) < 0 || libc::listen(fd, 128) < 0 {
+            return fail(fd);
+        }
+        Ok(TcpListener::from_raw_fd(fd))
+    }
+}
+
+#[cfg(not(unix))]
+fn bind_tcp_v6_only(port: u16) -> std::io::Result<TcpListener> {
+    // Where IPv6 sockets are IPv6 only by default (Windows).
+    TcpListener::bind(("::", port))
 }
 
 /// Serves one inbound peer: handshake, bitfield, then Request/Piece until
@@ -1490,6 +1549,54 @@ mod tests {
         Message::Request { index: 1, begin: 0, length: 100 }.write_to(&mut stream).unwrap();
         stream.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
         assert!(Message::read_from(&mut stream).is_err(), "nothing comes back for a request longer than the piece is");
+        seeder.stop();
+    }
+
+    /// A seeder over one 256-byte piece, with `options`.
+    fn tiny_seeder(name: &str, options: SeederOptions) -> (SeederHandle, [u8; 20]) {
+        let dir = tmp_dir(name);
+        let spans = Arc::new(build_file_spans(&dir, &[(vec!["seed.bin".to_string()], 256)]));
+        write_piece(&spans, 0, 256, &[7u8; 256]).unwrap();
+        let have = Arc::new(HaveMap::new(1));
+        have.set(0);
+        let info_hash = [0x69; 20];
+        (start_with(0, info_hash, [0x20; 20], spans, 256, 256, have, None, options).unwrap(), info_hash)
+    }
+
+    fn handshake_over(addr: SocketAddr, info_hash: [u8; 20]) -> std::io::Result<Handshake> {
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.write_all(&Handshake::new(info_hash, [0x21; 20], false).to_bytes())?;
+        let mut hs = [0u8; HANDSHAKE_LEN];
+        stream.read_exact(&mut hs)?;
+        Ok(Handshake::from_bytes(&hs).unwrap())
+    }
+
+    #[test]
+    fn with_ipv6_the_seeder_takes_ipv6_connections_on_the_same_port_and_says_so() {
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            eprintln!("no IPv6 here; skipped");
+            return;
+        }
+        let (mut seeder, info_hash) = tiny_seeder("v6-seeder", SeederOptions { ipv6: true, ..Default::default() });
+        assert!(seeder.ipv6);
+        let over6 = handshake_over(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, seeder.port)), info_hash).expect("served over IPv6");
+        assert_eq!(over6.info_hash, info_hash);
+        let over4 = handshake_over(SocketAddr::from(([127, 0, 0, 1], seeder.port)), info_hash).expect("and over IPv4 still");
+        assert_eq!(over4.info_hash, info_hash);
+        seeder.stop();
+        assert!(handshake_over(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, seeder.port)), info_hash).is_err(), "and stopping closes it");
+    }
+
+    #[test]
+    fn without_ipv6_asked_for_the_seeder_listens_on_ipv4_only() {
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            return;
+        }
+        let (mut seeder, info_hash) = tiny_seeder("v4-seeder", SeederOptions::default());
+        assert!(!seeder.ipv6);
+        assert!(handshake_over(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, seeder.port)), info_hash).is_err(), "nothing listens on IPv6");
+        assert!(handshake_over(SocketAddr::from(([127, 0, 0, 1], seeder.port)), info_hash).is_ok());
         seeder.stop();
     }
 }

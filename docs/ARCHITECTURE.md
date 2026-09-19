@@ -49,7 +49,7 @@ behind locks.
 | one per peer | `downloader::worker::run_worker` | queue empty, connection fails, or interrupted |
 | one per web seed | `webseed::run_web_worker` | queue empty or told to stop |
 | seeder accept, one per inbound peer, and one for the choking rounds | `seeder` | `SeederHandle::stop` |
-| DHT | `dht::service` | `Services::shutdown` |
+| DHT, one for IPv4 and one for IPv6 (BEP 32) | `dht::service` | `Services::shutdown` |
 | local discovery | `lsd` | `Services::shutdown` |
 | uTP | `utp::socket` (one thread for every connection) | `Services::shutdown` |
 
@@ -179,5 +179,5 @@ seeding half of tit-for-tat, since inbound peers are never downloaded from;
 trackers are asked concurrently rather than by BEP 12 tier; a piece
 interrupted part-way is handed to the next peer within a run but not saved
 across runs; one piece is downloaded at a time per connection, so a request
-pipeline drains at each piece boundary; no BEP 32, uTP and local discovery are IPv4 only (and uTP is
+pipeline drains at each piece boundary; uTP and local discovery are IPv4 only (and uTP is
 unproven against other clients), and BEP 52 (v2) needs the piece layers in the .torrent (no hash-request messages), so a v2 torrent without them, or a v2-only magnet link, cannot be downloaded.

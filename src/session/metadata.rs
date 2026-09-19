@@ -150,7 +150,7 @@ pub fn fetch_metadata(info_hash: [u8; 20], our_peer_id: [u8; 20], initial_peers:
         // Keep the dashboard alive during resolution.
         sink.set_snapshot(Snapshot {
             known_peers: known.len(),
-            dht_nodes: dht.map(|d| d.nodes.load(Ordering::SeqCst)).unwrap_or(0),
+            dht_nodes: dht.map(|d| d.node_count()).unwrap_or(0),
             status: "resolving",
             ..Default::default()
         });

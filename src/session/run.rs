@@ -295,7 +295,7 @@ impl<'a> Session<'a> {
             endgame: self.queue.in_endgame(),
             trackers_ok: self.announcer.trackers_ok(),
             trackers_total: self.announcer.tracker_count(),
-            dht_nodes: self.services.dht().map(|d| d.nodes.load(Ordering::SeqCst)).unwrap_or(0),
+            dht_nodes: self.services.dht().map(|d| d.node_count()).unwrap_or(0),
             pex_total: self.pex_total,
             web_seeds: self.workers.web_running(),
             eta_secs,

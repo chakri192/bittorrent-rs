@@ -42,16 +42,23 @@ impl Services {
 
     /// Starts the DHT node on UDP `port` for `info_hash`. Failure to bind
     /// is not fatal: `log` says so and the session goes on without one.
-    pub fn start_dht(&mut self, port: u16, info_hash: [u8; 20], log: impl Fn(String)) {
-        let bootstrap = dht::DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect();
+    ///
+    /// With `ipv6` a second node runs on an IPv6 socket (BEP 32). `bootstrap`
+    /// names the routers to start from as `host:port`; empty means the public
+    /// ones.
+    pub fn start_dht(&mut self, port: u16, info_hash: [u8; 20], ipv6: bool, bootstrap: Vec<String>, log: impl Fn(String)) {
+        let bootstrap = if bootstrap.is_empty() { dht::DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect() } else { bootstrap };
         // With a uTP socket, the DHT uses its port, as peers expect one port to do both.
         let started = match self.shared_dht_transport() {
-            Some((transport, udp_port)) => dht::spawn_service_on(transport, udp_port, bootstrap, info_hash, Arc::clone(&self.dht_announce_port)),
-            None => dht::spawn_service(port, bootstrap, info_hash, Arc::clone(&self.dht_announce_port)),
+            Some((transport, udp_port)) => dht::spawn_service_on(transport, udp_port, bootstrap, info_hash, Arc::clone(&self.dht_announce_port), ipv6),
+            None => dht::spawn_service(port, bootstrap, info_hash, Arc::clone(&self.dht_announce_port), ipv6),
         };
         match started {
             Ok(service) => {
-                log(format!("DHT node running on UDP port {}", service.port));
+                log(match service.port6 {
+                    Some(port6) => format!("DHT nodes running on UDP port {} (IPv4) and {} (IPv6)", service.port, port6),
+                    None => format!("DHT node running on UDP port {}", service.port),
+                });
                 self.dht = Some(service);
             }
             Err(e) => log(format!("DHT disabled (couldn't bind UDP socket): {}", e)),

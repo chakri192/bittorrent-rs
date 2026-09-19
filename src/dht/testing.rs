@@ -4,7 +4,7 @@ use super::krpc::{CompactNode, KrpcMessage, NodeId, Query, Response};
 use super::Transport;
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -16,35 +16,45 @@ pub(super) struct MockTransport {
     inbox: Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
     sent: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
     script: Mutex<HashMap<SocketAddr, ScriptedNode>>,
+    ipv6: bool,
 }
 
 #[derive(Clone)]
 pub(super) struct ScriptedNode {
     pub(super) id: NodeId,
     pub(super) nodes: Vec<CompactNode>,
-    pub(super) values: Vec<SocketAddrV4>,
+    pub(super) values: Vec<SocketAddr>,
     pub(super) token: Option<Vec<u8>>,
 }
 
 impl MockTransport {
     pub(super) fn new() -> Self {
-        MockTransport { inbox: Mutex::new(VecDeque::new()), sent: Mutex::new(Vec::new()), script: Mutex::new(HashMap::new()) }
+        MockTransport { inbox: Mutex::new(VecDeque::new()), sent: Mutex::new(Vec::new()), script: Mutex::new(HashMap::new()), ipv6: false }
     }
 
-    pub(super) fn script_node(&self, addr: SocketAddrV4, node: ScriptedNode) {
-        self.script.lock().unwrap().insert(SocketAddr::V4(addr), node);
+    /// A transport that says it is an IPv6 socket.
+    pub(super) fn new_v6() -> Self {
+        MockTransport { ipv6: true, ..MockTransport::new() }
     }
 
-    pub(super) fn push_inbound(&self, data: Vec<u8>, from: SocketAddrV4) {
-        self.inbox.lock().unwrap().push_back((data, SocketAddr::V4(from)));
+    pub(super) fn script_node(&self, addr: SocketAddr, node: ScriptedNode) {
+        self.script.lock().unwrap().insert(addr, node);
     }
 
-    pub(super) fn sent_to(&self, addr: SocketAddrV4) -> Vec<Vec<u8>> {
-        self.sent.lock().unwrap().iter().filter(|(_, a)| *a == SocketAddr::V4(addr)).map(|(d, _)| d.clone()).collect()
+    pub(super) fn push_inbound(&self, data: Vec<u8>, from: SocketAddr) {
+        self.inbox.lock().unwrap().push_back((data, from));
+    }
+
+    pub(super) fn sent_to(&self, addr: SocketAddr) -> Vec<Vec<u8>> {
+        self.sent.lock().unwrap().iter().filter(|(_, a)| *a == addr).map(|(d, _)| d.clone()).collect()
     }
 }
 
 impl Transport for &MockTransport {
+    fn ipv6(&self) -> bool {
+        self.ipv6
+    }
+
     fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<()> {
         self.sent.lock().unwrap().push((data.to_vec(), addr));
         if let Some(node) = self.script.lock().unwrap().get(&addr).cloned() {
@@ -66,6 +76,6 @@ impl Transport for &MockTransport {
     }
 }
 
-pub(super) fn v4(s: &str) -> SocketAddrV4 {
+pub(super) fn v4(s: &str) -> SocketAddr {
     s.parse().unwrap()
 }

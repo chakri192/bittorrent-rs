@@ -111,6 +111,10 @@ enum Kind {
     /// lists it, `--verify` passes intact files and names a damaged one, and
     /// a download of a copy without its piece layers is refused, saying why.
     V2Torrents,
+    /// BEP 32: the DHT's IPv6 node. A torrent with no tracker finds its only
+    /// peer, which listens on `[::1]`, from a fake DHT node on `[::1]` that
+    /// answers `get_peers` with an 18-byte value; with `--no-ipv6` it does not.
+    DhtIpv6,
     /// BitTorrent v2 (BEP 52) downloads: a v2-only torrent (built by hand,
     /// with piece layers and multi-block pieces) is downloaded from a fake
     /// peer byte for byte, and the client as a seeder serves it to a
@@ -191,6 +195,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "encryption", kind: Kind::Encryption },
     Scenario { name: "v2-torrents", kind: Kind::V2Torrents },
     Scenario { name: "v2-download", kind: Kind::V2Download },
+    Scenario { name: "dht-ipv6", kind: Kind::DhtIpv6 },
     Scenario { name: "utp", kind: Kind::Utp },
     Scenario { name: "local-discovery", kind: Kind::LocalDiscovery },
     Scenario { name: "fast-extension", kind: Kind::FastExtension },
@@ -240,6 +245,7 @@ fn main() {
             Kind::Encryption => run_encryption(scenario.name),
             Kind::V2Torrents => run_v2_torrents(scenario.name),
             Kind::V2Download => run_v2_download(scenario.name),
+            Kind::DhtIpv6 => run_dht_ipv6(scenario.name),
             Kind::Utp => run_utp(scenario.name),
             Kind::LocalDiscovery => run_local_discovery(scenario.name),
             Kind::FastExtension => run_fast_extension(scenario.name),
@@ -2672,6 +2678,96 @@ fn run_v2_torrents(name: &str) -> Result<String, String> {
         return Err(format!("a v2-only torrent without piece layers should be refused, saying why; exit {:?}, stderr {:?}", refused.status.code(), stderr.trim()));
     }
     Ok(format!("create_torrent --v2 made the independently built info hash ({}), --list named the files, --verify passed intact ones and caught a wrong byte to the piece, and a copy without its piece layers was refused for a download, with the reason", &bittorrent_rs::torrent::info_hash_hex(&parsed.info_hash)[..8]))
+}
+
+/// BEP 32. The client is given a torrent with no tracker and a DHT router on
+/// `[::1]`; the only peer, listening on `[::1]` too, is known to that router
+/// alone, and is named in an 18-byte `values` entry. The client's IPv6 DHT node
+/// must ask, be told, dial an IPv6 peer, and download; and with `--no-ipv6` it
+/// must not have an IPv6 node at all.
+fn run_dht_ipv6(name: &str) -> Result<String, String> {
+    use std::net::UdpSocket;
+    if TcpListener::bind("[::1]:0").is_err() || UdpSocket::bind("[::1]:0").is_err() {
+        return Ok("skipped: this machine has no IPv6 loopback".to_string());
+    }
+    let fx = Fixture::new(false);
+    let dir = scratch_dir(name);
+
+    // The peer, on [::1].
+    let listener = TcpListener::bind("[::1]:0").map_err(|e| e.to_string())?;
+    let peer_port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let log = Arc::new(Mutex::new(PeerLog::default()));
+    let cx = PeerContext { encryption: bittorrent_rs::peer::Encryption::Off, data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count, pieces: None };
+    let peer_log = Arc::clone(&log);
+    thread::spawn(move || run_fake_peer(listener, cx, Behavior::Serve, peer_log));
+
+    // The DHT router, on [::1], written by hand from BEP 5 and BEP 32.
+    let router = UdpSocket::bind("[::1]:0").map_err(|e| e.to_string())?;
+    router.set_read_timeout(Some(Duration::from_millis(100))).map_err(|e| e.to_string())?;
+    let router_addr = router.local_addr().map_err(|e| e.to_string())?;
+    let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&queries);
+    let ours = [0x5A; 20];
+    thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, from) = match router.recv_from(&mut buf) {
+                Ok(received) => received,
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+                Err(_) => break,
+            };
+            let Ok(message) = bittorrent_rs::bencode::decode_lenient(&buf[..n]) else { continue };
+            let (Some(t), Some(q)) = (message.get("t").and_then(|v| v.as_bytes()), message.get("q").and_then(|v| v.as_str())) else { continue };
+            seen.lock().unwrap().push(q.to_string());
+            let mut r = b"d1:rd2:id20:".to_vec();
+            r.extend_from_slice(&ours);
+            if q == "get_peers" {
+                r.extend_from_slice(b"5:token2:tk6:valuesl18:");
+                r.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+                r.extend_from_slice(&peer_port.to_be_bytes());
+                r.extend_from_slice(b"e");
+            }
+            r.extend_from_slice(format!("e1:t{}:", t.len()).as_bytes());
+            r.extend_from_slice(t);
+            r.extend_from_slice(b"1:y1:re");
+            let _ = router.send_to(&r, from);
+        }
+    });
+
+    // A torrent that names no tracker.
+    let torrent = dir.join("e2e.torrent");
+    let mut bytes = b"d4:info".to_vec();
+    bytes.extend_from_slice(&fx.info_bytes);
+    bytes.push(b'e');
+    fs::write(&torrent, bytes).expect("write torrent file");
+    let bootstrap = format!("[::1]:{}", router_addr.port());
+
+    // With IPv6 wanted: found, dialed, downloaded.
+    let out_dir = dir.join("out");
+    let log_path = dir.join("client.log");
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1).args(["--dht", "--ipv6", "--timeout", "40"]).env("BITTORRENT_RS_DHT_BOOTSTRAP", &bootstrap).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    let text = fs::read_to_string(&log_path).unwrap_or_default();
+    if !status.success() {
+        return Err(format!("the client exited with {:?}; its log: {}", status.code(), text.lines().rev().take(6).collect::<Vec<_>>().join(" | ")));
+    }
+    check_downloaded(&fx, &out_dir)?;
+    if !text.contains("(IPv6)") || !text.contains("DHT: 1 new peer address(es)") {
+        return Err(format!("the log should show an IPv6 DHT node and a peer from the DHT: {}", text.lines().take(12).collect::<Vec<_>>().join(" | ")));
+    }
+    if !queries.lock().unwrap().iter().any(|q| q == "get_peers") {
+        return Err("the router was never asked for peers".to_string());
+    }
+
+    // With IPv6 off, the DHT has no IPv6 node, so this router is out of reach and there is nobody to ask.
+    let before = queries.lock().unwrap().len();
+    let mut child = client_command(&torrent, &dir.join("out2"), &dir.join("client2.log"), 1).args(["--dht", "--no-ipv6", "--timeout", "6"]).env("BITTORRENT_RS_DHT_BOOTSTRAP", &bootstrap).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    let text2 = fs::read_to_string(dir.join("client2.log")).unwrap_or_default();
+    if status.success() || text2.contains("(IPv6)") || queries.lock().unwrap().len() != before {
+        return Err(format!("--no-ipv6 should leave the DHT with no IPv6 node and the router unasked; exit {:?}, {} more queries, log {:?}", status.code(), queries.lock().unwrap().len() - before, text2.lines().take(8).collect::<Vec<_>>().join(" | ")));
+    }
+    Ok(format!("a peer known only to a DHT router on [::1], named in an 18-byte value, was found by the client's IPv6 DHT node, dialed on [::1] and downloaded from ({} bytes); --no-ipv6 left the DHT without an IPv6 node", fx.data.len()))
 }
 
 /// A v2-only torrent is downloaded. The fake peer serves pieces by the v2

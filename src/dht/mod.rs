@@ -43,7 +43,7 @@ use routing::RoutingTable;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::io;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use token::TokenSecrets;
 
@@ -63,11 +63,13 @@ pub struct Dht<T: Transport> {
     node_id: NodeId,
     table: RoutingTable,
     transport: T,
+    /// Whether this node lives on IPv6 (BEP 32), and so only knows IPv6 nodes.
+    ipv6: bool,
     txid_counter: u16,
     tokens: TokenSecrets,
     /// info_hash -> peers other nodes announced to us. Bounded per hash;
     /// this client is a downloader first, storage node second.
-    peer_store: HashMap<NodeId, Vec<SocketAddrV4>>,
+    peer_store: HashMap<NodeId, Vec<SocketAddr>>,
 }
 
 impl<T: Transport> Dht<T> {
@@ -76,6 +78,7 @@ impl<T: Transport> Dht<T> {
         Dht {
             node_id,
             table: RoutingTable::new(node_id),
+            ipv6: transport.ipv6(),
             transport,
             txid_counter: 0,
             tokens: TokenSecrets::new(Instant::now()),
@@ -92,8 +95,10 @@ impl<T: Transport> Dht<T> {
     }
 
     /// Directly seeds the routing table (tests, cached-nodes files).
-    pub fn seed_node(&mut self, id: NodeId, addr: SocketAddrV4) {
-        self.table.insert(id, addr);
+    pub fn seed_node(&mut self, id: NodeId, addr: SocketAddr) {
+        if self.is_our_family(&addr) {
+            self.table.insert(id, addr);
+        }
     }
 
     fn next_txid(&mut self) -> Vec<u8> {
@@ -101,10 +106,16 @@ impl<T: Transport> Dht<T> {
         self.txid_counter.to_be_bytes().to_vec()
     }
 
-    fn send_query(&mut self, query: Query, addr: SocketAddrV4) -> io::Result<Vec<u8>> {
+    /// Whether `addr` is of the family this node lives on. A node of the other
+    /// family cannot be reached from this socket, so it is not to be remembered.
+    fn is_our_family(&self, addr: &SocketAddr) -> bool {
+        addr.is_ipv6() == self.ipv6
+    }
+
+    fn send_query(&mut self, query: Query, addr: SocketAddr) -> io::Result<Vec<u8>> {
         let t = self.next_txid();
         let msg = KrpcMessage::Query { t: t.clone(), query };
-        self.transport.send_to(&msg.encode(), SocketAddr::V4(addr))?;
+        self.transport.send_to(&msg.encode(), addr)?;
         Ok(t)
     }
 }

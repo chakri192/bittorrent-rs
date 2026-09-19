@@ -4,6 +4,8 @@
 #   * downloading from aria2 (plain, then with encryption required of both)
 #   * aria2 downloading from this client (plain, then encrypted), and
 #     fetching the metadata of a magnet link from it (BEP 9)
+#   * the DHT, over IPv4 and over IPv6 (BEP 32), with an aria2 node as the
+#     router, in both directions
 #   * local service discovery (BEP 14) in both directions, over the real
 #     multicast group -- skipped unless INTEROP_LSD=1, since it needs
 #     multicast to work on this machine and takes some seconds
@@ -132,6 +134,54 @@ if [ "${INTEROP_LSD:-0}" = 1 ]; then
 else
     echo "SKIP  local service discovery (set INTEROP_LSD=1 to try it)"
 fi
+
+# ---- 4. the DHT, over IPv4 and over IPv6 (BEP 32), on loopback ------------
+# An aria2 node R is the router; aria2 S seeds through it, and this client finds S by asking R;
+# then this client seeds through R and aria2 L finds it. Nothing leaves the machine: the routers
+# are named with BITTORRENT_RS_DHT_BOOTSTRAP, and aria2's tables are kept under $WORK.
+python3 -c "import os; open('$WORK/filler.bin', 'wb').write(os.urandom(200000))"
+"$BIN/create_torrent" "$WORK/filler.bin" --out "$WORK/filler.torrent" --piece-length 256K --no-date --quiet
+dht_family() { # 4 or 6
+    local fam=$1 router entry flags
+    local rport=$((45000 + RANDOM % 4000)) sport=$((49000 + RANDOM % 1000))
+    if [ "$fam" = 6 ]; then
+        python3 -c "import socket; socket.socket(socket.AF_INET6, socket.SOCK_DGRAM).bind(('::1', 0))" 2>/dev/null || { echo "SKIP  DHT over IPv6 (no IPv6 loopback)"; return; }
+        router="[::1]:$rport"; entry=(--dht-entry-point6="$router"); flags=(--enable-dht=false --enable-dht6=true --dht-listen-addr6=::1)
+        ours_flags=(--ipv6)
+    else
+        router="127.0.0.1:$rport"; entry=(--dht-entry-point="$router"); flags=(--enable-dht=true --enable-dht6=false)
+        ours_flags=(--no-ipv6)
+    fi
+    rm -f "$WORK"/*.dat
+    # R: the router, seeding something else.
+    rm -rf "$WORK/rdir"; mkdir -p "$WORK/rdir"; cp "$WORK/filler.bin" "$WORK/rdir/"
+    aria2c --enable-dht=true --enable-dht6=true --dht-listen-port="$rport" --dht-listen-addr6=::1 --dht-file-path="$WORK/r4.dat" --dht-file-path6="$WORK/r6.dat"         --bt-enable-lpd=false --enable-peer-exchange=false --listen-port=$((rport + 100)) --seed-ratio=0.0 --seed-time=10 -d "$WORK/rdir" --bt-seed-unverified=true         --console-log-level=error "$WORK/filler.torrent" >/dev/null 2>&1 &
+    PIDS+=($!)
+    sleep 3
+
+    # S seeds through R; this client, asking R, finds it.
+    rm -rf "$WORK/seed" "$WORK/out"; mkdir -p "$WORK/seed"; cp "$WORK/data.bin" "$WORK/seed/"
+    aria2c "${flags[@]}" ${entry[@]+"${entry[@]}"} --dht-listen-port="$sport" --dht-file-path="$WORK/s4.dat" --dht-file-path6="$WORK/s6.dat" \
+        --bt-enable-lpd=false --enable-peer-exchange=false --listen-port=$((sport + 100)) --seed-ratio=0.0 --seed-time=10 -d "$WORK/seed" --bt-seed-unverified=true \
+        --console-log-level=error "$WORK/untracked.torrent" >/dev/null 2>&1 &
+    PIDS+=($!)
+    sleep 15
+    BITTORRENT_RS_DHT_BOOTSTRAP="$router" timeout 90 "$BIN/download" "$WORK/untracked.torrent" --out "$WORK/out" --dht "${ours_flags[@]}" --no-lsd --no-portmap --no-tui --no-config --no-log >/dev/null 2>&1
+    check "this client finds an aria2 seeder through the DHT (IPv$fam)" same "$WORK/out/data.bin" "$WORK/data.bin"
+    stop_last
+
+    # This client seeds through R; aria2 L, asking R, finds it.
+    rm -rf "$WORK/ours" "$WORK/leech"; mkdir -p "$WORK/ours" "$WORK/leech"; cp "$WORK/data.bin" "$WORK/ours/"
+    BITTORRENT_RS_DHT_BOOTSTRAP="$router" "$BIN/download" "$WORK/untracked.torrent" --out "$WORK/ours" --dht "${ours_flags[@]}" --no-lsd --no-portmap --no-tui --no-config --no-log --seed --port "$OURS_PORT" >/dev/null 2>&1 &
+    PIDS+=($!)
+    sleep 8
+    timeout 90 aria2c "${flags[@]}" ${entry[@]+"${entry[@]}"} --dht-listen-port=$((sport + 1)) --dht-file-path="$WORK/l4.dat" --dht-file-path6="$WORK/l6.dat" \
+        --bt-enable-lpd=false --enable-peer-exchange=false --listen-port=$((sport + 101)) --seed-time=0 -d "$WORK/leech" --console-log-level=error "$WORK/untracked.torrent" >/dev/null 2>&1
+    check "aria2 finds this client through the DHT (IPv$fam)" same "$WORK/leech/data.bin" "$WORK/data.bin"
+    stop_last; stop_last
+}
+dht_family 4
+dht_family 6
 
 echo "interop: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

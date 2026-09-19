@@ -6,6 +6,12 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
 pub trait Transport: Send {
+    /// Whether this is an IPv6 socket, which talks to IPv6 nodes only (BEP 32:
+    /// a node keeps a routing table for each family, and does not mix them).
+    fn ipv6(&self) -> bool {
+        false
+    }
+
     fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<()>;
     /// Blocks up to `timeout`; `Ok(None)` on timeout (not an error).
     fn recv(&self, timeout: Duration) -> io::Result<Option<(Vec<u8>, SocketAddr)>>;
@@ -22,12 +28,29 @@ impl UdpTransport {
         Ok(UdpTransport { socket })
     }
 
+    /// Binds `[::]:port` for IPv6 only (BEP 32), falling back to an ephemeral
+    /// port if taken. Left to the system a wildcard IPv6 socket may also take
+    /// IPv4, which would put the IPv4 DHT node's traffic on this one.
+    pub fn bind_v6(port: u16) -> io::Result<Self> {
+        let socket = bind_v6_only(port).or_else(|_| bind_v6_only(0))?;
+        Ok(UdpTransport { socket })
+    }
+
+    /// Wraps a socket already bound, of either family.
+    pub fn from_socket(socket: UdpSocket) -> Self {
+        UdpTransport { socket }
+    }
+
     pub fn local_port(&self) -> u16 {
         self.socket.local_addr().map(|a| a.port()).unwrap_or(0)
     }
 }
 
 impl Transport for UdpTransport {
+    fn ipv6(&self) -> bool {
+        self.socket.local_addr().is_ok_and(|a| a.is_ipv6())
+    }
+
     fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<()> {
         self.socket.send_to(data, addr).map(|_| ())
     }
@@ -41,6 +64,45 @@ impl Transport for UdpTransport {
             Err(e) => Err(e),
         }
     }
+}
+
+#[cfg(unix)]
+fn bind_v6_only(port: u16) -> io::Result<UdpSocket> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain socket calls with valid arguments; the descriptor is closed
+    // on every failure path and otherwise handed to the UdpSocket.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fail = |fd: libc::c_int| {
+            let error = io::Error::last_os_error();
+            libc::close(fd);
+            Err(error)
+        };
+        let on: libc::c_int = 1;
+        if libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &on as *const libc::c_int as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t) < 0 {
+            return fail(fd);
+        }
+        let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
+        sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        sa.sin6_port = port.to_be();
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+        {
+            sa.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+        }
+        if libc::bind(fd, &sa as *const libc::sockaddr_in6 as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t) < 0 {
+            return fail(fd);
+        }
+        Ok(UdpSocket::from_raw_fd(fd))
+    }
+}
+
+#[cfg(not(unix))]
+fn bind_v6_only(port: u16) -> io::Result<UdpSocket> {
+    // Where IPv6 sockets are IPv6 only by default (Windows).
+    UdpSocket::bind(("::", port))
 }
 
 /// A DHT transport that shares a UDP port with uTP: it sends through the
@@ -136,5 +198,50 @@ mod tests {
         // A DHT thread waiting on it must find out, and not wait out its timeouts for ever.
         let err = shared.recv(Duration::from_secs(5)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// Whether this machine has IPv6 on loopback, without which the tests of the IPv6 socket say so and pass.
+    fn has_ipv6_loopback() -> bool {
+        UdpSocket::bind("[::1]:0").is_ok()
+    }
+
+    #[test]
+    fn an_ipv6_transport_says_so_and_an_ipv4_one_does_not() {
+        assert!(!UdpTransport::bind(0).unwrap().ipv6());
+        if !has_ipv6_loopback() {
+            eprintln!("no IPv6 here; skipped");
+            return;
+        }
+        assert!(UdpTransport::bind_v6(0).unwrap().ipv6());
+    }
+
+    #[test]
+    fn a_datagram_crosses_ipv6_loopback_between_two_transports() {
+        if !has_ipv6_loopback() {
+            eprintln!("no IPv6 here; skipped");
+            return;
+        }
+        let a = UdpTransport::bind_v6(0).unwrap();
+        let b = UdpTransport::bind_v6(0).unwrap();
+        a.send_to(b"hello6", SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, b.local_port()))).unwrap();
+        let (bytes, from) = b.recv(Duration::from_secs(5)).unwrap().expect("it arrives");
+        assert_eq!(bytes, b"hello6");
+        assert_eq!(from, SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, a.local_port())));
+    }
+
+    #[test]
+    fn an_ipv6_only_socket_does_not_take_ipv4_traffic() {
+        // The IPv4 node has its own socket; a wildcard IPv6 one that also took IPv4
+        // would put that traffic in the wrong routing table.
+        if !has_ipv6_loopback() {
+            eprintln!("no IPv6 here; skipped");
+            return;
+        }
+        let six = UdpTransport::bind_v6(0).unwrap();
+        let four = UdpSocket::bind("127.0.0.1:0").unwrap();
+        four.send_to(b"v4", ("127.0.0.1", six.local_port())).unwrap();
+        assert!(six.recv(Duration::from_millis(300)).unwrap().is_none(), "nothing arrives");
+        // (And the port is free for an IPv4 socket, which is what lets both nodes use one number.)
+        assert!(UdpSocket::bind(("0.0.0.0", six.local_port())).is_ok());
     }
 }
