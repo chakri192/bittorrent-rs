@@ -7,7 +7,7 @@ use super::pipeline::{depth_for, Throughput};
 use super::{absorb, is_read_timeout, PexSender, WorkerConfig, WorkerError};
 use crate::downloader::piece_assembler::{PieceAssembler, PieceWork};
 use crate::downloader::queue::WorkQueue;
-use crate::peer::{Message, PeerState};
+use crate::peer::{Message, PeerState, PeerStream};
 use std::time::Instant;
 
 /// Downloads one piece. Returns `Ok(None)` if the piece was abandoned
@@ -24,7 +24,7 @@ use std::time::Instant;
 /// peer, so if a piece assembled from them fails its hash it is fetched
 /// again from this peer alone, and only a failure of *that* is the peer's.
 pub(super) fn download_one_piece(
-    stream: &mut std::net::TcpStream,
+    stream: &mut dyn PeerStream,
     state: &mut PeerState,
     queue: &WorkQueue,
     work: PieceWork,
@@ -58,7 +58,7 @@ pub(super) struct Meter<'a> {
 
 /// The connection and the shared things a piece download works with.
 struct Link<'a> {
-    stream: &'a mut std::net::TcpStream,
+    stream: &'a mut dyn PeerStream,
     state: &'a mut PeerState,
     queue: &'a WorkQueue,
     config: &'a WorkerConfig,
@@ -116,7 +116,7 @@ fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler) -> Result<Fetch
         // the peer's upload slots go to blocks somebody actually needs.
         if queue.is_done(piece_index) {
             for &(begin, length) in &in_flight {
-                let _ = crate::peer::connection::send_message(stream, &Message::Cancel { index: piece_index, begin, length });
+                let _ = crate::peer::connection::send_message(&mut **stream, &Message::Cancel { index: piece_index, begin, length });
             }
             return Ok(Fetched::Abandoned);
         }
@@ -140,7 +140,7 @@ fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler) -> Result<Fetch
                     break;
                 }
                 for (index, begin, length) in reqs {
-                    crate::peer::connection::send_message(stream, &Message::Request { index, begin, length })
+                    crate::peer::connection::send_message(&mut **stream, &Message::Request { index, begin, length })
                         .map_err(|e| WorkerError::Connection { stage: stage_label("send_request", blocks_received), error: e })?;
                     in_flight.push((begin, length));
                 }
@@ -151,7 +151,7 @@ fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler) -> Result<Fetch
             break;
         }
 
-        let msg = match crate::peer::connection::read_message(stream) {
+        let msg = match crate::peer::connection::read_message(&mut **stream) {
             Ok(msg) => msg,
             // Waiting out a choke is not a failure -- peers unchoke in
             // rounds of 10-30 seconds -- so a quiet spell is put up with
@@ -164,7 +164,7 @@ fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler) -> Result<Fetch
                         error: crate::peer::ConnectionError::Wire(crate::peer::WireError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "peer stayed choked through the whole wait budget"))),
                     });
                 }
-                crate::peer::connection::send_message(stream, &Message::KeepAlive).map_err(|e| WorkerError::Connection { stage: "keepalive_while_choked", error: e })?;
+                crate::peer::connection::send_message(&mut **stream, &Message::KeepAlive).map_err(|e| WorkerError::Connection { stage: "keepalive_while_choked", error: e })?;
                 continue;
             }
             Err(e) => return Err(WorkerError::Connection { stage: stage_label("read_message_during_piece_download", blocks_received), error: e }),

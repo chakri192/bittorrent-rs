@@ -10,7 +10,7 @@ use crate::peer::message::Message as WireMessage;
 use sha1::{Digest, Sha1};
 use std::fs;
 use std::io::Read;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
