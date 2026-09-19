@@ -23,6 +23,7 @@ pub mod ratelimit;
 pub mod seeder;
 pub mod selection;
 pub mod session;
+pub mod signal;
 pub mod torrent;
 pub mod tracker;
 pub mod tracker_discovery;

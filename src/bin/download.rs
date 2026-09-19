@@ -280,6 +280,9 @@ fn main() -> ExitCode {
     // `--list` is a quick print-and-exit; never spin up the dashboard for it.
     let interactive = !quiet && !args.no_tui && !args.list && std::io::stdout().is_terminal();
     let stop = Arc::new(AtomicBool::new(false));
+    // Ctrl-C and `kill` wind the client down like the dashboard's `q`, even
+    // with no terminal: the port mapping is removed, not left on the router.
+    bittorrent_rs::signal::install(Arc::clone(&stop));
 
     let orchestration = {
         let ui = ui.clone();
@@ -299,7 +302,7 @@ fn main() -> ExitCode {
 
     let result = orchestration.join().unwrap_or_else(|_| Err("download thread panicked".to_string()));
 
-    if user_quit {
+    if user_quit || bittorrent_rs::signal::received() {
         if !quiet {
             println!("stopped \u{2014} rerun the same command to resume.");
         }

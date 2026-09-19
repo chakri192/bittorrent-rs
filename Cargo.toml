@@ -28,6 +28,10 @@ getrandom = "0.2"
 # no async runtime -- fits the one-thread-per-source model.
 ureq = "2"
 
+# Signal handling on Unix (already in the tree via sha1 and crossterm).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lib]
 name = "bittorrent_rs"
 path = "src/lib.rs"

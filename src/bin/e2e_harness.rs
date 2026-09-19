@@ -81,6 +81,12 @@ enum Kind {
     LimitDownload,
     /// `--max-up`: so must serving the finished torrent to a leecher.
     LimitUpload,
+    /// SIGINT while seeding, with no terminal: a clean exit, status 0.
+    SigintWhileSeeding,
+    /// SIGTERM mid-download: a clean exit that keeps the resume file.
+    SigtermMidDownload,
+    /// A second signal while shutting down: exit at once with status 130.
+    SecondSignalForcesExit,
 }
 
 struct Scenario {
@@ -104,6 +110,9 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "repair-corrupted-file", kind: Kind::RepairCorruptedFile },
     Scenario { name: "limit-download", kind: Kind::LimitDownload },
     Scenario { name: "limit-upload", kind: Kind::LimitUpload },
+    Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
+    Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
+    Scenario { name: "second-signal-forces-exit", kind: Kind::SecondSignalForcesExit },
 ];
 
 fn main() {
@@ -124,6 +133,9 @@ fn main() {
             Kind::RepairCorruptedFile => run_rerun(scenario.name, Some(3)),
             Kind::LimitDownload => run_limit_download(scenario.name),
             Kind::LimitUpload => run_limit_upload(scenario.name),
+            Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
+            Kind::SigtermMidDownload => run_signal_mid_download(scenario.name, false),
+            Kind::SecondSignalForcesExit => run_signal_mid_download(scenario.name, true),
         };
         match outcome {
             Ok(summary) => println!("PASS [{}]: {}", scenario.name, summary),
@@ -1326,4 +1338,109 @@ fn run_limit_upload(name: &str) -> Result<String, String> {
         return Err(format!("serving {} bytes at --max-up {} took only {:?}; at least {:?} was expected", fx.data.len(), RATE, elapsed, floor));
     }
     Ok(format!("a leecher took {:.1?} (at least {:.1?}) to pull {} bytes at --max-up {}, every byte correct", elapsed, floor, fx.data.len(), RATE))
+}
+
+/// Sends `signal` ("INT", "TERM") to the client, as a user or a service
+/// manager would.
+fn send_signal(child: &Child, signal: &str) -> Result<(), String> {
+    let status = Command::new("kill").args(["-s", signal, &child.id().to_string()]).status().map_err(|e| format!("running kill: {}", e))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("kill -s {} {} failed", signal, child.id()))
+    }
+}
+
+/// SIGINT to a seeding client with no terminal. Before signal handling the
+/// process was simply killed: no cleanup, no message, and the router's port
+/// mapping left behind. Now it must stop the way the dashboard's `q` does.
+fn run_sigint_while_seeding(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path, stdout_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"), dir.join("stdout.txt"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let child = client_command(&torrent, &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .arg("--seed")
+        .args(["--port", "0"])
+        .stdout(fs::File::create(&stdout_path).expect("create stdout file"))
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, "seeding e2e.bin on port", Duration::from_secs(20), &mut client.0)?;
+
+    let signalled = Instant::now();
+    send_signal(&client.0, "INT")?;
+    let status = wait_or_kill(&mut client.0, Duration::from_secs(10))?;
+    let took = signalled.elapsed();
+
+    if status.code() != Some(0) {
+        return Err(format!("the client exited with {:?} after SIGINT; a clean stop is status 0", status.code()));
+    }
+    let stdout = fs::read_to_string(&stdout_path).map_err(|e| e.to_string())?;
+    if !stdout.contains("stopped") {
+        return Err(format!("stdout should say the client stopped; it says {:?}", stdout.trim()));
+    }
+    Ok(format!("SIGINT stopped a seeding client cleanly in {:.1?}: status 0 and a \"stopped\" message", took))
+}
+
+/// A signal while downloading from a peer that has gone silent. With
+/// `second_signal`, a second one follows half a second later.
+fn run_signal_mid_download(name: &str, second_signal: bool) -> Result<String, String> {
+    const STALL_AFTER: usize = 3;
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::StallAfter(STALL_AFTER)]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, stdout_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("stdout.txt"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let sidecar = progress_file_path(&out_dir, &fx.info_hash);
+
+    let child = client_command(&torrent, &out_dir, &dir.join("client.log"), 1)
+        .arg("--no-dht")
+        .stdout(fs::File::create(&stdout_path).expect("create stdout file"))
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while read_recorded(&sidecar).len() < STALL_AFTER {
+        if Instant::now() >= deadline || client.0.try_wait().map_err(|e| e.to_string())?.is_some() {
+            return Err(format!("the client recorded only {} of {} pieces", read_recorded(&sidecar).len(), STALL_AFTER));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    send_signal(&client.0, if second_signal { "INT" } else { "TERM" })?;
+    if second_signal {
+        // The first signal starts a graceful stop that waits on the silent
+        // peer; the second must not wait.
+        thread::sleep(Duration::from_millis(500));
+        let again = Instant::now();
+        send_signal(&client.0, "INT")?;
+        let status = wait_or_kill(&mut client.0, Duration::from_secs(5))?;
+        if status.code() != Some(130) {
+            return Err(format!("a second signal should exit with status 130; got {:?}", status.code()));
+        }
+        return Ok(format!("a second signal ended the client at once (status 130, {:.1?} later) instead of waiting on the silent peer", again.elapsed()));
+    }
+
+    let signalled = Instant::now();
+    // Shutdown waits for the worker blocked on the silent peer, up to its
+    // 10s read timeout, so allow for that.
+    let status = wait_or_kill(&mut client.0, Duration::from_secs(25))?;
+    if status.code() != Some(0) {
+        return Err(format!("the client exited with {:?} after SIGTERM; a clean stop is status 0", status.code()));
+    }
+    let stdout = fs::read_to_string(&stdout_path).map_err(|e| e.to_string())?;
+    if !stdout.contains("stopped") {
+        return Err(format!("stdout should say the client stopped; it says {:?}", stdout.trim()));
+    }
+    let recorded = read_recorded(&sidecar);
+    if recorded.len() != STALL_AFTER {
+        return Err(format!("the resume file should keep the {} pieces downloaded; it lists {:?}", STALL_AFTER, recorded));
+    }
+    Ok(format!("SIGTERM mid-download stopped the client cleanly after {:.1?}: status 0, a \"stopped\" message, {} pieces kept for a resume", signalled.elapsed(), STALL_AFTER))
 }
