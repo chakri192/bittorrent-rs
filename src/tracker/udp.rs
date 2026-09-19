@@ -276,4 +276,28 @@ mod tests {
         assert_eq!(parsed.complete, Some(7));
         assert_eq!(parsed.peers.len(), 2);
     }
+
+    #[test]
+    fn hostile_udp_tracker_replies_never_panic_and_peers_match_their_length() {
+        let txn = 0x1234_5678u32;
+        let mut connect = 0u32.to_be_bytes().to_vec();
+        connect.extend_from_slice(&txn.to_be_bytes());
+        connect.extend_from_slice(&0xDEAD_BEEF_u64.to_be_bytes());
+        let mut announce = 1u32.to_be_bytes().to_vec();
+        announce.extend_from_slice(&txn.to_be_bytes());
+        for n in [1800u32, 5, 9] {
+            announce.extend_from_slice(&n.to_be_bytes());
+        }
+        announce.extend_from_slice(&[10, 0, 0, 1, 0x1a, 0xe1, 10, 0, 0, 2, 0x1a, 0xe2]);
+        let mut error = 3u32.to_be_bytes().to_vec();
+        error.extend_from_slice(&txn.to_be_bytes());
+        error.extend_from_slice(b"go away");
+
+        crate::fuzz::hammer(&[connect, announce, error], 4000, |input| {
+            let _ = parse_connect_response(input, txn);
+            if let Ok(response) = parse_announce_response(input, txn) {
+                assert_eq!(response.peers.len() * 6, input.len() - 20, "one peer per six bytes after the 20-byte header");
+            }
+        });
+    }
 }

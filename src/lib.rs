@@ -10,6 +10,10 @@ pub mod bytes;
 pub mod config;
 pub mod dht;
 pub mod downloader;
+#[cfg(test)]
+mod fuzz;
+#[cfg(test)]
+mod robustness;
 pub mod magnet;
 pub mod magnet_fetch;
 pub mod metadata;

@@ -348,4 +348,23 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
         assert_eq!(read_http_response_body(&mut response.as_slice()).unwrap(), b"abcde");
     }
+
+    #[test]
+    fn hostile_http_responses_and_announce_bodies_never_panic() {
+        let body = b"d8:intervali1800e5:peers12:\x0a\x00\x00\x01\x1a\xe1\x0a\x00\x00\x02\x1a\xe2e".to_vec();
+        let plain = [format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes(), body.clone()].concat();
+        let chunked = [b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(), format!("{:x}\r\n", body.len()).into_bytes(), body.clone(), b"\r\n0\r\n\r\n".to_vec()].concat();
+        let closed = [b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec(), body.clone()].concat();
+        let failure = b"HTTP/1.1 200 OK\r\n\r\nd14:failure reason7:go awaye".to_vec();
+
+        crate::fuzz::hammer(&[plain, chunked, closed, failure], 4000, |input| {
+            let mut reader = input;
+            if let Ok(body) = read_http_response_body(&mut reader) {
+                let _ = parse_announce_body(&body);
+            }
+        });
+        crate::fuzz::hammer(&[body, b"d14:failure reason7:go awaye".to_vec(), b"d8:intervali60e5:peersld2:ip7:1.2.3.44:porti80eeee".to_vec()], 4000, |input| {
+            let _ = parse_announce_body(input);
+        });
+    }
 }
