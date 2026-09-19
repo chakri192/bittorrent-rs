@@ -927,7 +927,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let mut services = Services::new();
         let listen = SocketAddr::from(([127, 0, 0, 1], 0));
-        services.start_lsd(crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen, join: None, share_port: false, interval: Duration::from_secs(3600) }, INFO_HASH, 6881, |_| {});
+        services.start_lsd(crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen, join: None, share_port: false, interval: Duration::from_secs(3600), reply_interval: Duration::from_secs(3600) }, INFO_HASH, 6881, |_| {});
         let heard_at = services.lsd().expect("the service started").listen_addr;
         let neighbour = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         neighbour.send_to(&crate::lsd::announcement(heard_at, 5555, &INFO_HASH, "the-neighbour"), heard_at).unwrap();
@@ -948,7 +948,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let mut services = Services::new();
         let listen = SocketAddr::from(([127, 0, 0, 1], 0));
-        let config = crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen, join: None, share_port: false, interval: Duration::from_secs(3600) };
+        let config = crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen, join: None, share_port: false, interval: Duration::from_secs(3600), reply_interval: Duration::from_secs(3600) };
         services.start_lsd(config, INFO_HASH, 6881, |_| {});
         let heard_at = services.lsd().expect("the service started").listen_addr;
         let peer = fake_peer(true);

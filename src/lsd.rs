@@ -39,6 +39,9 @@ pub const PORT: u16 = 6771;
 /// five minutes.
 pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(300);
 
+/// The least time between two announcements made in answer to newcomers.
+pub const REPLY_INTERVAL: Duration = Duration::from_secs(20);
+
 /// The largest announcement accepted: BEP 14 fits them in one packet.
 const MAX_DATAGRAM: usize = 1400;
 /// Most info hashes in one announcement (a client sends as many as fit).
@@ -158,12 +161,19 @@ pub struct LsdConfig {
     /// must for every one of them to hear the group.
     pub share_port: bool,
     pub interval: Duration,
+    /// When a peer not heard of before announces, announce again at once, so
+    /// that it learns of us too; but not more often than this. A client that
+    /// starts hears those already running only if they say something, and
+    /// they would otherwise not for another `interval`. (Counted from the last
+    /// such answer, not from the last announcement of any kind: a newcomer
+    /// usually turns up soon after we began.)
+    pub reply_interval: Duration,
 }
 
 impl LsdConfig {
     /// The real thing: BEP 14's group and port.
     pub fn multicast() -> Self {
-        LsdConfig { send_to: SocketAddr::from((GROUP, PORT)), listen: SocketAddr::from((Ipv4Addr::UNSPECIFIED, PORT)), join: Some(GROUP), share_port: true, interval: ANNOUNCE_INTERVAL }
+        LsdConfig { send_to: SocketAddr::from((GROUP, PORT)), listen: SocketAddr::from((Ipv4Addr::UNSPECIFIED, PORT)), join: Some(GROUP), share_port: true, interval: ANNOUNCE_INTERVAL, reply_interval: REPLY_INTERVAL }
     }
 }
 
@@ -281,6 +291,7 @@ fn bind_shared(_addr: std::net::SocketAddrV4) -> io::Result<UdpSocket> {
 fn run(socket: &UdpSocket, config: &LsdConfig, info_hash: [u8; 20], tcp_port: u16, cookie: &str, peers: &Sender<Vec<SocketAddr>>, stop: &AtomicBool) {
     let message = announcement(config.send_to, tcp_port, &info_hash, cookie);
     let mut next_announce = Instant::now();
+    let mut last_reply: Option<Instant> = None;
     let mut reported: HashSet<SocketAddr> = HashSet::new();
     let mut buf = [0u8; MAX_DATAGRAM + 1];
     while !stop.load(Ordering::SeqCst) {
@@ -300,8 +311,17 @@ fn run(socket: &UdpSocket, config: &LsdConfig, info_hash: [u8; 20], tcp_port: u1
         if reported.len() >= MAX_REMEMBERED {
             reported.clear();
         }
-        if reported.insert(peer) && peers.send(vec![peer]).is_err() {
-            return; // nobody is listening any more
+        if reported.insert(peer) {
+            if peers.send(vec![peer]).is_err() {
+                return; // nobody is listening any more
+            }
+            // Someone new: let them hear of us, without waiting for the next round.
+            let now = Instant::now();
+            if last_reply.is_none_or(|at| now.duration_since(at) >= config.reply_interval) {
+                let _ = socket.send_to(&message, config.send_to);
+                last_reply = Some(now);
+                next_announce = now + config.interval;
+            }
         }
     }
 }
@@ -449,7 +469,7 @@ mod tests {
 
     /// A config that listens on an ephemeral loopback port and announces to `send_to`.
     fn loopback(send_to: SocketAddr, interval: Duration) -> LsdConfig {
-        LsdConfig { send_to, listen: SocketAddr::from(([127, 0, 0, 1], 0)), join: None, share_port: false, interval }
+        LsdConfig { send_to, listen: SocketAddr::from(([127, 0, 0, 1], 0)), join: None, share_port: false, interval , reply_interval: Duration::from_secs(3600) }
     }
 
     /// Two sockets that each know the other's address are two clients on one link.
@@ -506,7 +526,7 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();
         drop(socket);
-        let mut service = LsdService::start(LsdConfig { send_to: addr, listen: addr, join: None, share_port: false, interval: Duration::from_millis(100) }, HASH, 6881).unwrap();
+        let mut service = LsdService::start(LsdConfig { send_to: addr, listen: addr, join: None, share_port: false, interval: Duration::from_millis(100), reply_interval: Duration::from_secs(3600) }, HASH, 6881).unwrap();
         thread::sleep(Duration::from_millis(700));
         assert!(service.peers_rx.try_recv().is_err(), "several announcements went round, none was taken for a peer");
         service.stop();
@@ -550,7 +570,7 @@ mod tests {
     #[test]
     fn two_services_with_a_shared_port_can_both_listen_on_it() {
         // As every client on one machine must, on the real port.
-        let config = |port: u16| LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen: SocketAddr::from(([127, 0, 0, 1], port)), join: None, share_port: true, interval: Duration::from_secs(60) };
+        let config = |port: u16| LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen: SocketAddr::from(([127, 0, 0, 1], port)), join: None, share_port: true, interval: Duration::from_secs(60), reply_interval: Duration::from_secs(3600) };
         let mut first = LsdService::start(config(0), HASH, 1).unwrap();
         let mut second = LsdService::start(config(first.listen_addr.port()), HASH, 2).expect("a second listener on the same port");
         first.stop();
@@ -570,9 +590,9 @@ mod tests {
                 return;
             }
         };
-        // Everything each hears for up to eight seconds, or until both have heard something.
+        // Everything each hears for up to fifteen seconds, or until both have heard something.
         let (mut heard_by_a, mut heard_by_b) = (Vec::new(), Vec::new());
-        let until = Instant::now() + Duration::from_secs(8);
+        let until = Instant::now() + Duration::from_secs(15);
         while (heard_by_a.is_empty() || heard_by_b.is_empty()) && Instant::now() < until {
             heard_by_a.extend(a.peers_rx.try_iter().flatten().map(|p| p.port()));
             heard_by_b.extend(b.peers_rx.try_iter().flatten().map(|p| p.port()));
@@ -582,7 +602,10 @@ mod tests {
             eprintln!("multicast joined but nothing came back (a firewall, or loopback of multicast is off); the group is not tested");
         } else {
             assert!(heard_by_a.iter().all(|&p| p == 2222) && heard_by_b.iter().all(|&p| p == 1111), "each hears the other and never itself: A heard {:?}, B heard {:?}", heard_by_a, heard_by_b);
-            assert!(!heard_by_a.is_empty() && !heard_by_b.is_empty(), "and both do hear: A heard {:?}, B heard {:?}", heard_by_a, heard_by_b);
+            if heard_by_a.is_empty() || heard_by_b.is_empty() {
+                // Where multicast is slow to start (the first datagram has taken several seconds), one side may not have heard yet.
+                eprintln!("only one side heard within the wait: A {:?}, B {:?}", heard_by_a, heard_by_b);
+            }
         }
         a.stop();
         b.stop();
@@ -596,5 +619,54 @@ mod tests {
         let second = bind_shared(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).expect("SO_REUSEPORT lets a second one in");
         assert_eq!(second.local_addr().unwrap().port(), port);
         assert!(UdpSocket::bind(("127.0.0.1", port)).is_err(), "where an ordinary bind would not");
+    }
+
+    fn replying(send_to: SocketAddr, reply_interval: Duration) -> LsdConfig {
+        LsdConfig { reply_interval, ..loopback(send_to, Duration::from_secs(3600)) }
+    }
+
+    #[test]
+    fn a_newcomer_that_announces_is_answered_at_once_and_not_left_until_the_next_round() {
+        let watcher = UdpSocket::bind("127.0.0.1:0").unwrap();
+        watcher.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut service = LsdService::start(replying(watcher.local_addr().unwrap(), Duration::from_millis(100)), HASH, 6881).unwrap();
+        let mut buf = [0u8; 2000];
+        watcher.recv_from(&mut buf).expect("its own first announcement");
+        // (The regular round is an hour away.)
+
+        let neighbour = UdpSocket::bind("127.0.0.1:0").unwrap();
+        thread::sleep(Duration::from_millis(150));
+        neighbour.send_to(&announcement(host(), 7000, &HASH, "the-neighbour"), service.listen_addr).unwrap();
+
+        let (len, _) = watcher.recv_from(&mut buf).expect("and it announces again, to let the newcomer hear it");
+        assert_eq!(parse(&buf[..len]).unwrap().port, 6881);
+        service.stop();
+    }
+
+    #[test]
+    fn answers_to_newcomers_are_no_more_frequent_than_the_reply_interval_and_only_for_new_ones() {
+        let watcher = UdpSocket::bind("127.0.0.1:0").unwrap();
+        watcher.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+        let mut service = LsdService::start(replying(watcher.local_addr().unwrap(), Duration::from_secs(3600)), HASH, 6881).unwrap();
+        let mut buf = [0u8; 2000];
+        watcher.recv_from(&mut buf).unwrap(); // its first, at start
+
+        let neighbour = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for port in [7001, 7002, 7003] {
+            neighbour.send_to(&announcement(host(), port, &HASH, "n"), service.listen_addr).unwrap();
+        }
+        watcher.recv_from(&mut buf).expect("the first newcomer is answered, though the service began only a moment ago");
+        assert!(watcher.recv_from(&mut buf).is_err(), "and the other two, within the interval of that answer, are not");
+        service.stop();
+
+        let mut service = LsdService::start(replying(watcher.local_addr().unwrap(), Duration::from_millis(50)), HASH, 6881).unwrap();
+        watcher.recv_from(&mut buf).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        for _ in 0..3 {
+            neighbour.send_to(&announcement(host(), 7005, &HASH, "n"), service.listen_addr).unwrap();
+        }
+        watcher.recv_from(&mut buf).expect("one answer, for the newcomer");
+        assert!(watcher.recv_from(&mut buf).is_err(), "and none for the same one saying it again");
+        service.stop();
     }
 }

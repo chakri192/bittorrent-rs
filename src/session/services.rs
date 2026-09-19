@@ -250,7 +250,7 @@ mod tests {
     }
 
     fn loopback_lsd(listen_port: u16) -> LsdConfig {
-        LsdConfig { send_to: std::net::SocketAddr::from(([127, 0, 0, 1], 9)), listen: std::net::SocketAddr::from(([127, 0, 0, 1], listen_port)), join: None, share_port: false, interval: std::time::Duration::from_secs(3600) }
+        LsdConfig { send_to: std::net::SocketAddr::from(([127, 0, 0, 1], 9)), listen: std::net::SocketAddr::from(([127, 0, 0, 1], listen_port)), join: None, share_port: false, interval: std::time::Duration::from_secs(3600), reply_interval: std::time::Duration::from_secs(3600) }
     }
 
     #[test]

@@ -566,7 +566,7 @@ mod tests {
     /// Local discovery on loopback, as a test can have it.
     fn lsd_options(dir: &std::path::Path) -> Options {
         let mut with = options(dir);
-        with.lsd = Some(crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen: SocketAddr::from(([127, 0, 0, 1], 0)), join: None, share_port: false, interval: Duration::from_secs(3600) });
+        with.lsd = Some(crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen: SocketAddr::from(([127, 0, 0, 1], 0)), join: None, share_port: false, interval: Duration::from_secs(3600), reply_interval: Duration::from_secs(3600) });
         with
     }
 
