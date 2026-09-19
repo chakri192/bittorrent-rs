@@ -580,7 +580,10 @@ fn a_long_round_trip_is_hidden_by_queueing_more_requests_to_a_peer_that_keeps_up
 
 #[test]
 fn a_peer_is_never_sent_more_requests_than_it_said_it_will_queue() {
-    let (took, most_waiting, correct) = download_from_laggy_peer("reqq", 4, 64 * 1024, Duration::from_millis(5), Some(3), 2);
+    // A round trip long enough that three requests are in flight together whatever the scheduler does
+    // (at 5 ms a busy machine, a CI runner, did not always have them overlap), and enough blocks for
+    // the rate to be known and the queue to have grown.
+    let (took, most_waiting, correct) = download_from_laggy_peer("reqq", 6, 64 * 1024, Duration::from_millis(30), Some(3), 2);
 
     assert!(correct);
     assert!(most_waiting <= 3, "the peer had {} requests waiting though it said it queues 3", most_waiting);
