@@ -35,7 +35,9 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync;
-use std::sync::{Arc, RwLock};
+use crate::sync::lock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -124,14 +126,13 @@ struct SeederShared {
     have: Arc<HaveMap>,
     /// Shared limit on the bytes uploaded across every peer (`--max-up`).
     up_limit: Option<Arc<crate::ratelimit::RateLimiter>>,
+    /// Cleared when this torrent stops being served.
     running: Arc<AtomicBool>,
     uploaded: Arc<AtomicU64>,
-    active_conns: AtomicUsize,
     /// Who is unchoked.
     choker: Arc<Choker>,
     /// The info dictionary, for peers that ask for it.
     metadata: Option<Arc<Vec<u8>>>,
-    encryption: crate::peer::Encryption,
     piece_lengths: Option<Arc<Vec<u32>>>,
 }
 
@@ -148,28 +149,201 @@ impl SeederShared {
     }
 }
 
-/// Handle to a running seeder. Dropping it does NOT stop the seeder;
-/// call `stop()` (idempotent) or flip the shared `running` flag.
+/// The torrents a listener serves, and the connections it has taken. One
+/// listener serves any number of torrents on its one port: a peer says which
+/// it wants in its handshake.
+struct Registry {
+    torrents: Mutex<HashMap<[u8; 20], Arc<SeederShared>>>,
+    /// Peers being served, over every torrent.
+    active_conns: AtomicUsize,
+    /// Whether encrypted connections (MSE) are accepted, and whether plain ones are.
+    encryption: crate::peer::Encryption,
+    /// Cleared when the listener stops.
+    running: AtomicBool,
+}
+
+impl Registry {
+    fn hashes(&self) -> Vec<[u8; 20]> {
+        lock(&self.torrents).keys().copied().collect()
+    }
+
+    fn get(&self, info_hash: &[u8; 20]) -> Option<Arc<SeederShared>> {
+        lock(&self.torrents).get(info_hash).cloned()
+    }
+}
+
+/// How a listener is set up: what it takes, on which port. What it serves is
+/// registered on it afterwards.
+#[derive(Debug, Clone)]
+pub struct ListenerOptions {
+    /// Whether encrypted connections (MSE) are accepted, and whether plain ones are.
+    pub encryption: crate::peer::Encryption,
+    /// Take IPv6 connections too, on the same port number (BEP 32 announces IPv6
+    /// addresses, which are of no use if nothing listens on them).
+    pub ipv6: bool,
+    /// A uTP socket to take connections on as well as TCP ones (BEP 29).
+    pub utp: Option<Arc<crate::utp::UtpSocket>>,
+}
+
+impl Default for ListenerOptions {
+    fn default() -> Self {
+        // Both kinds are accepted by default: a peer that offers encryption is
+        // taken up on it, and one that does not is served all the same.
+        ListenerOptions { encryption: crate::peer::Encryption::Prefer, ipv6: false, utp: None }
+    }
+}
+
+/// A port that takes inbound peers for any number of torrents, each
+/// [registered](Listener::register) on it. It stops when [`stop`](Listener::stop)
+/// is called (dropping it does not stop it).
+pub struct Listener {
+    /// The port actually bound -- differs from the requested port if that
+    /// was taken and the listener fell back to an ephemeral one. This is
+    /// the port to put in tracker announces.
+    pub port: u16,
+    /// Whether IPv6 connections are taken too, on the same port.
+    pub ipv6: bool,
+    registry: Arc<Registry>,
+    threads: Vec<thread::JoinHandle<()>>,
+}
+
+impl Listener {
+    /// Binds `preferred_port` (or, if that is taken, an ephemeral one) and starts
+    /// taking connections. Nothing is served until a torrent is registered.
+    pub fn start(preferred_port: u16, options: ListenerOptions) -> std::io::Result<Listener> {
+        // Preferred port first (conventionally 6881), ephemeral fallback --
+        // another client on the same machine owning 6881 shouldn't stop this
+        // one from seeding at all.
+        let listener = TcpListener::bind(("0.0.0.0", preferred_port)).or_else(|_| TcpListener::bind(("0.0.0.0", 0)))?;
+        let port = listener.local_addr()?.port();
+        listener.set_nonblocking(true)?;
+        let registry = Arc::new(Registry { torrents: Mutex::new(HashMap::new()), active_conns: AtomicUsize::new(0), encryption: options.encryption, running: AtomicBool::new(true) });
+
+        let mut threads = Vec::new();
+        let accepting = Arc::clone(&registry);
+        threads.push(thread::spawn(move || accept_loop(listener, accepting)));
+        // The same, on IPv6, if that is wanted and the port is free there. (Not a failure if it is not.)
+        let listener6 = if options.ipv6 { bind_tcp_v6_only(port).ok().filter(|l| l.set_nonblocking(true).is_ok()) } else { None };
+        let ipv6 = listener6.is_some();
+        if let Some(listener) = listener6 {
+            let accepting = Arc::clone(&registry);
+            threads.push(thread::spawn(move || accept_loop(listener, accepting)));
+        }
+
+        // uTP connections, if there is a socket for them: served just as TCP ones are.
+        if let Some(utp) = options.utp.clone() {
+            utp.listen();
+            let accepting = Arc::clone(&registry);
+            threads.push(thread::spawn(move || {
+                while accepting.running.load(Ordering::SeqCst) {
+                    let Some(stream) = utp.accept(Duration::from_millis(200)) else { continue };
+                    let peer_ip = Some(stream.peer_addr().ip());
+                    admit(&accepting, Box::new(stream), peer_ip);
+                }
+            }));
+        }
+        Ok(Listener { port, ipv6, registry, threads })
+    }
+
+    /// Starts serving a torrent on this listener: peers that ask for `info_hash`
+    /// get its verified pieces, with the choking policy and metadata `options`
+    /// give. (Its `encryption`, `utp` and `ipv6` belong to the listener and are
+    /// not looked at here.) Registering the same info hash again replaces it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register(&self, info_hash: [u8; 20], our_peer_id: [u8; 20], spans: Arc<Vec<FileSpan>>, piece_length: u64, total_length: u64, have: Arc<HaveMap>, up_limit: Option<Arc<crate::ratelimit::RateLimiter>>, options: SeederOptions) -> SeederHandle {
+        let running = Arc::new(AtomicBool::new(true));
+        let uploaded = Arc::new(AtomicU64::new(0));
+        let shared = Arc::new(SeederShared {
+            info_hash,
+            our_peer_id,
+            spans,
+            piece_length,
+            total_length,
+            have,
+            up_limit,
+            running: Arc::clone(&running),
+            uploaded: Arc::clone(&uploaded),
+            choker: Arc::new(Choker::new(options.unchoke_slots)),
+            metadata: options.metadata.clone(),
+            piece_lengths: options.piece_lengths.clone(),
+        });
+
+        // The rounds: who is served changes here, and each connection notices
+        // within a read timeout and tells its peer.
+        let rechoke_shared = Arc::clone(&shared);
+        let rechoke_interval = options.rechoke_interval;
+        let rechoke_thread = thread::spawn(move || {
+            let mut waited = Duration::ZERO;
+            while rechoke_shared.running.load(Ordering::SeqCst) {
+                let slice = Duration::from_millis(50);
+                thread::sleep(slice);
+                waited += slice;
+                if waited >= rechoke_interval {
+                    waited = Duration::ZERO;
+                    rechoke_shared.choker.rechoke();
+                }
+            }
+        });
+
+        if let Some(replaced) = lock(&self.registry.torrents).insert(info_hash, Arc::clone(&shared)) {
+            replaced.running.store(false, Ordering::SeqCst);
+        }
+        SeederHandle { port: self.port, uploaded, ipv6: self.ipv6, info_hash, torrent: shared, registry: Arc::clone(&self.registry), rechoke_thread: Some(rechoke_thread), owned: None }
+    }
+
+    /// How many torrents are registered.
+    pub fn torrent_count(&self) -> usize {
+        lock(&self.registry.torrents).len()
+    }
+
+    /// Stops taking connections (those under way end within a read timeout) and
+    /// forgets every torrent. Safe to call twice.
+    pub fn stop(&mut self) {
+        self.registry.running.store(false, Ordering::SeqCst);
+        for torrent in lock(&self.registry.torrents).drain().map(|(_, t)| t) {
+            torrent.running.store(false, Ordering::SeqCst);
+        }
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Handle to one torrent being served. Dropping it does NOT stop serving;
+/// call `stop()` (idempotent).
 pub struct SeederHandle {
     /// The port actually bound -- differs from the requested port if that
     /// was taken and the seeder fell back to an ephemeral one. This is
     /// the port to put in tracker announces.
     pub port: u16,
     pub uploaded: Arc<AtomicU64>,
-    running: Arc<AtomicBool>,
     /// Whether IPv6 connections are taken too, on the same port.
     pub ipv6: bool,
-    accept_thread: Option<thread::JoinHandle<()>>,
-    accept6_thread: Option<thread::JoinHandle<()>>,
+    info_hash: [u8; 20],
+    torrent: Arc<SeederShared>,
+    registry: Arc<Registry>,
     rechoke_thread: Option<thread::JoinHandle<()>>,
-    utp_thread: Option<thread::JoinHandle<()>>,
+    /// The listener, if this seeder has one to itself and so ends it too.
+    owned: Option<Listener>,
 }
 
 impl SeederHandle {
+    /// Stops serving this torrent: peers already connected are let go within a
+    /// read timeout, and new ones asking for it are refused.
     pub fn stop(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
-        for thread in [self.accept_thread.take(), self.accept6_thread.take(), self.rechoke_thread.take(), self.utp_thread.take()].into_iter().flatten() {
+        self.torrent.running.store(false, Ordering::SeqCst);
+        {
+            let mut torrents = lock(&self.registry.torrents);
+            // (Only if it is still this torrent: registering again replaces it.)
+            if torrents.get(&self.info_hash).is_some_and(|t| Arc::ptr_eq(t, &self.torrent)) {
+                torrents.remove(&self.info_hash);
+            }
+        }
+        if let Some(thread) = self.rechoke_thread.take() {
             let _ = thread.join();
+        }
+        if let Some(mut listener) = self.owned.take() {
+            listener.stop();
         }
     }
 }
@@ -233,86 +407,16 @@ pub fn start_with(
     up_limit: Option<Arc<crate::ratelimit::RateLimiter>>,
     options: SeederOptions,
 ) -> std::io::Result<SeederHandle> {
-    // Preferred port first (conventionally 6881), ephemeral fallback --
-    // another client on the same machine owning 6881 shouldn't stop this
-    // one from seeding at all.
-    let listener = TcpListener::bind(("0.0.0.0", preferred_port)).or_else(|_| TcpListener::bind(("0.0.0.0", 0)))?;
-    let port = listener.local_addr()?.port();
-    listener.set_nonblocking(true)?;
-
-    let running = Arc::new(AtomicBool::new(true));
-    let uploaded = Arc::new(AtomicU64::new(0));
-    let shared = Arc::new(SeederShared {
-        info_hash,
-        our_peer_id,
-        spans,
-        piece_length,
-        total_length,
-        have,
-        up_limit,
-        running: Arc::clone(&running),
-        uploaded: Arc::clone(&uploaded),
-        active_conns: AtomicUsize::new(0),
-        choker: Arc::new(Choker::new(options.unchoke_slots)),
-        metadata: options.metadata.clone(),
-        encryption: options.encryption,
-        piece_lengths: options.piece_lengths.clone(),
-    });
-
-    // The rounds: who is served changes here, and each connection notices
-    // within a read timeout and tells its peer.
-    let rechoke_shared = Arc::clone(&shared);
-    let rechoke_interval = options.rechoke_interval;
-    let rechoke_thread = thread::spawn(move || {
-        let mut waited = Duration::ZERO;
-        while rechoke_shared.running.load(Ordering::SeqCst) {
-            let slice = Duration::from_millis(50);
-            thread::sleep(slice);
-            waited += slice;
-            if waited >= rechoke_interval {
-                waited = Duration::ZERO;
-                rechoke_shared.choker.rechoke();
-            }
-        }
-    });
-
-    let accept_shared = Arc::clone(&shared);
-    let accept_thread = thread::spawn(move || accept_loop(listener, accept_shared));
-    // The same, on IPv6, if that is wanted and the port is free there. (Not a failure if it is not.)
-    let listener6 = if options.ipv6 { bind_tcp_v6_only(port).ok().filter(|l| l.set_nonblocking(true).is_ok()) } else { None };
-    let ipv6 = listener6.is_some();
-    let accept6_thread = listener6.map(|listener| {
-        let accept_shared = Arc::clone(&shared);
-        thread::spawn(move || accept_loop(listener, accept_shared))
-    });
-
-    // uTP connections, if there is a socket for them: served just as TCP ones are.
-    let utp_thread = options.utp.clone().map(|utp| {
-        utp.listen();
-        let utp_shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            while utp_shared.running.load(Ordering::SeqCst) {
-                let Some(stream) = utp.accept(Duration::from_millis(200)) else { continue };
-                if utp_shared.active_conns.load(Ordering::SeqCst) >= MAX_INBOUND_PEERS {
-                    continue; // over cap: dropped, which closes it
-                }
-                utp_shared.active_conns.fetch_add(1, Ordering::SeqCst);
-                let conn_shared = Arc::clone(&utp_shared);
-                thread::spawn(move || {
-                    let peer_ip = Some(stream.peer_addr().ip());
-                    let _ = serve_peer(Box::new(stream), peer_ip, &conn_shared);
-                    conn_shared.active_conns.fetch_sub(1, Ordering::SeqCst);
-                });
-            }
-        })
-    });
-
-    Ok(SeederHandle { port, uploaded, running, ipv6, accept_thread: Some(accept_thread), accept6_thread, rechoke_thread: Some(rechoke_thread), utp_thread })
+    // One listener, for this torrent alone: it goes when the torrent's seeder does.
+    let listener = Listener::start(preferred_port, ListenerOptions { encryption: options.encryption, ipv6: options.ipv6, utp: options.utp.clone() })?;
+    let mut handle = listener.register(info_hash, our_peer_id, spans, piece_length, total_length, have, up_limit, options);
+    handle.owned = Some(listener);
+    Ok(handle)
 }
 
-/// Takes connections on `listener` (non-blocking) until the seeder stops, each served on a thread of its own.
-fn accept_loop(listener: TcpListener, shared: Arc<SeederShared>) {
-    while shared.running.load(Ordering::SeqCst) {
+/// Takes connections on `listener` (non-blocking) until it stops, each served on a thread of its own.
+fn accept_loop(listener: TcpListener, registry: Arc<Registry>) {
+    while registry.running.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _addr)) => {
                 // The listener is non-blocking so that it can notice a stop,
@@ -324,17 +428,8 @@ fn accept_loop(listener: TcpListener, shared: Arc<SeederShared>) {
                 if stream.set_nonblocking(false).is_err() {
                     continue;
                 }
-                if shared.active_conns.load(Ordering::SeqCst) >= MAX_INBOUND_PEERS {
-                    drop(stream); // over cap: close immediately
-                    continue;
-                }
-                shared.active_conns.fetch_add(1, Ordering::SeqCst);
-                let conn_shared = Arc::clone(&shared);
-                thread::spawn(move || {
-                    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
-                    let _ = serve_peer(Box::new(stream), peer_ip, &conn_shared);
-                    conn_shared.active_conns.fetch_sub(1, Ordering::SeqCst);
-                });
+                let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
+                admit(&registry, Box::new(stream), peer_ip);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(200));
@@ -342,6 +437,19 @@ fn accept_loop(listener: TcpListener, shared: Arc<SeederShared>) {
             Err(_) => thread::sleep(Duration::from_millis(200)), // transient accept failure; keep listening
         }
     }
+}
+
+/// Serves `stream` on a thread of its own, unless too many are being served.
+fn admit(registry: &Arc<Registry>, stream: Box<dyn PeerStream>, peer_ip: Option<std::net::IpAddr>) {
+    if registry.active_conns.load(Ordering::SeqCst) >= MAX_INBOUND_PEERS {
+        return; // over cap: dropped, which closes it
+    }
+    registry.active_conns.fetch_add(1, Ordering::SeqCst);
+    let registry = Arc::clone(registry);
+    thread::spawn(move || {
+        let _ = serve_peer(stream, peer_ip, &registry);
+        registry.active_conns.fetch_sub(1, Ordering::SeqCst);
+    });
 }
 
 /// A TCP listener on `[::]:port` for IPv6 only, so that it does not also try to take the IPv4 port.
@@ -389,23 +497,25 @@ fn bind_tcp_v6_only(port: u16) -> std::io::Result<TcpListener> {
 
 /// Serves one inbound peer: handshake, bitfield, then Request/Piece until
 /// the peer leaves, goes idle too long, or the seeder shuts down.
-fn serve_peer(stream: Box<dyn PeerStream>, peer_ip: Option<std::net::IpAddr>, shared: &SeederShared) -> std::io::Result<()> {
+fn serve_peer(stream: Box<dyn PeerStream>, peer_ip: Option<std::net::IpAddr>, registry: &Registry) -> std::io::Result<()> {
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
 
     // Plain or encrypted (MSE), whichever the peer began with; from here on
     // it makes no difference to what follows.
-    let (mut stream, _encrypted) = crate::peer::mse::accept(stream, &[shared.info_hash], shared.encryption).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    // (Encrypted, the peer names its torrent by proving it knows the info hash, so every one served is a candidate.)
+    let (mut stream, _encrypted) = crate::peer::mse::accept(stream, &registry.hashes(), registry.encryption).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
-    // Inbound side of the BEP 3 handshake: they send first, we validate
-    // the info_hash and answer. A mismatch (peer wants a torrent this
-    // seeder isn't serving) just closes the connection.
+    // Inbound side of the BEP 3 handshake: they send first and say which
+    // torrent they want, we look it up and answer. A torrent this listener
+    // isn't serving just closes the connection.
     let mut hs_buf = [0u8; HANDSHAKE_LEN];
     stream.read_exact(&mut hs_buf)?;
     let their_hs = Handshake::from_bytes(&hs_buf).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed inbound handshake"))?;
-    if their_hs.info_hash != shared.info_hash {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "inbound handshake for a different info_hash"));
-    }
+    let Some(shared) = registry.get(&their_hs.info_hash) else {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "inbound handshake for a torrent not being served"));
+    };
+    let shared = &*shared;
     // Extensions are offered only when there is something to offer through
     // them: the info dictionary, for a peer that has only a magnet link.
     let ours = Handshake::new(shared.info_hash, shared.our_peer_id, shared.metadata.is_some()).with_fast(true);
@@ -716,7 +826,7 @@ mod tests {
     fn a_seeder_without_a_utp_socket_does_not_listen_for_utp() {
         let dir = tmp_dir("no-utp");
         let (mut seeder, _) = start_test_seeder(&dir, &[vec![1u8; 256]], 256, &[0]);
-        assert!(seeder.utp_thread.is_none());
+        assert_eq!(seeder.owned.as_ref().map(|l| l.threads.len()), Some(1), "one thread taking TCP connections, none for uTP");
         seeder.stop();
     }
 
@@ -1598,5 +1708,199 @@ mod tests {
         assert!(handshake_over(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, seeder.port)), info_hash).is_err(), "nothing listens on IPv6");
         assert!(handshake_over(SocketAddr::from(([127, 0, 0, 1], seeder.port)), info_hash).is_ok());
         seeder.stop();
+    }
+
+    // ---- one listener, several torrents ----
+
+    /// A torrent of one 256-byte piece filled with `fill`, registered on `listener`.
+    fn register_tiny(listener: &Listener, name: &str, hash: [u8; 20], fill: u8) -> SeederHandle {
+        let dir = tmp_dir(name);
+        let spans = Arc::new(build_file_spans(&dir, &[(vec![format!("{}.bin", name)], 256)]));
+        write_piece(&spans, 0, 256, &[fill; 256]).unwrap();
+        let have = Arc::new(HaveMap::new(1));
+        have.set(0);
+        listener.register(hash, [0x20; 20], spans, 256, 256, have, None, SeederOptions::default())
+    }
+
+    /// Asks the listener at `port` for piece 0 of `hash`, as a leecher would.
+    fn fetch_piece(port: u16, hash: [u8; 20]) -> std::io::Result<Vec<u8>> {
+        let (mut stream, _) = std::panic::catch_unwind(|| leech_connect(port, hash)).map_err(|_| std::io::Error::other("the listener would not take that torrent"))?;
+        Message::Interested.write_to(&mut stream).map_err(|e| std::io::Error::other(format!("{:?}", e)))?;
+        loop {
+            match Message::read_from(&mut stream) {
+                Ok(Message::Unchoke) => break,
+                Ok(_) => continue,
+                Err(e) => return Err(std::io::Error::other(format!("{:?}", e))),
+            }
+        }
+        Message::Request { index: 0, begin: 0, length: 256 }.write_to(&mut stream).map_err(|e| std::io::Error::other(format!("{:?}", e)))?;
+        loop {
+            match Message::read_from(&mut stream) {
+                Ok(Message::Piece { block, .. }) => return Ok(block),
+                Ok(_) => continue,
+                Err(e) => return Err(std::io::Error::other(format!("{:?}", e))),
+            }
+        }
+    }
+
+    #[test]
+    fn one_listener_serves_each_of_its_torrents_its_own_data_on_the_one_port() {
+        let mut listener = Listener::start(0, ListenerOptions::default()).unwrap();
+        let (a, b) = ([0xA1; 20], [0xB2; 20]);
+        let mut first = register_tiny(&listener, "multi-a", a, 0x11);
+        let mut second = register_tiny(&listener, "multi-b", b, 0x22);
+        assert_eq!((first.port, second.port), (listener.port, listener.port), "the same port, to announce for both");
+        assert_eq!(listener.torrent_count(), 2);
+
+        assert_eq!(fetch_piece(listener.port, a).unwrap(), vec![0x11; 256]);
+        assert_eq!(fetch_piece(listener.port, b).unwrap(), vec![0x22; 256]);
+
+        first.stop();
+        second.stop();
+        listener.stop();
+    }
+
+    #[test]
+    fn a_torrent_that_is_not_registered_is_refused_at_the_handshake() {
+        let mut listener = Listener::start(0, ListenerOptions::default()).unwrap();
+        let mut only = register_tiny(&listener, "multi-only", [0xA1; 20], 0x11);
+        let mut stream = TcpStream::connect(("127.0.0.1", listener.port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.write_all(&Handshake::new([0xEE; 20], [0x21; 20], false).to_bytes()).unwrap();
+        let mut buf = [0u8; HANDSHAKE_LEN];
+        assert!(stream.read_exact(&mut buf).is_err(), "no handshake back: the connection is closed");
+        only.stop();
+        listener.stop();
+    }
+
+    #[test]
+    fn stopping_one_torrent_stops_serving_it_and_leaves_the_others() {
+        let mut listener = Listener::start(0, ListenerOptions::default()).unwrap();
+        let (a, b) = ([0xA1; 20], [0xB2; 20]);
+        let mut first = register_tiny(&listener, "stop-a", a, 0x11);
+        let mut second = register_tiny(&listener, "stop-b", b, 0x22);
+
+        first.stop();
+
+        assert_eq!(listener.torrent_count(), 1);
+        assert!(fetch_piece(listener.port, a).is_err(), "the one that was stopped is refused");
+        assert_eq!(fetch_piece(listener.port, b).unwrap(), vec![0x22; 256], "and the other is served as before");
+        first.stop(); // and again is harmless
+        second.stop();
+        listener.stop();
+    }
+
+    #[test]
+    fn a_torrent_registered_after_the_listener_is_running_is_served() {
+        let mut listener = Listener::start(0, ListenerOptions::default()).unwrap();
+        assert_eq!(listener.torrent_count(), 0);
+        let mut late = register_tiny(&listener, "late", [0xC3; 20], 0x33);
+        assert_eq!(fetch_piece(listener.port, [0xC3; 20]).unwrap(), vec![0x33; 256]);
+        late.stop();
+        listener.stop();
+    }
+
+    #[test]
+    fn registering_a_torrent_again_replaces_it_and_the_old_handle_does_not_take_the_new_one_down() {
+        let mut listener = Listener::start(0, ListenerOptions::default()).unwrap();
+        let hash = [0xD4; 20];
+        let mut old = register_tiny(&listener, "again-1", hash, 0x11);
+        let (mut connected, _) = leech_connect(listener.port, hash);
+        connected.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut new = register_tiny(&listener, "again-2", hash, 0x44);
+        assert_eq!(listener.torrent_count(), 1);
+        while Message::read_from(&mut connected).is_ok() {} // what was connected to the old registration is let go
+        assert!(!old.torrent.running.load(Ordering::SeqCst) && new.torrent.running.load(Ordering::SeqCst));
+        old.stop();
+        assert_eq!(fetch_piece(listener.port, hash).unwrap(), vec![0x44; 256], "what the second registration serves");
+        new.stop();
+        listener.stop();
+    }
+
+    #[test]
+    fn encrypted_peers_reach_the_torrent_they_prove_they_know_among_several() {
+        use crate::peer::{connect_and_handshake_with, Encryption, Transport};
+        let mut listener = Listener::start(0, ListenerOptions { encryption: Encryption::Prefer, ..Default::default() }).unwrap();
+        let (a, b) = ([0xA1; 20], [0xB2; 20]);
+        let mut first = register_tiny(&listener, "mse-a", a, 0x11);
+        let mut second = register_tiny(&listener, "mse-b", b, 0x22);
+        for (hash, fill) in [(a, 0x11u8), (b, 0x22)] {
+            let addr = SocketAddr::from(([127, 0, 0, 1], listener.port));
+            let (mut stream, theirs) = connect_and_handshake_with(addr, hash, [0x21; 20], false, false, Duration::from_secs(5), Encryption::Require, &Transport::default()).expect("an encrypted connection for one of several torrents");
+            assert_eq!(theirs.info_hash, hash);
+            Message::Interested.write_to(&mut stream).unwrap();
+            let unchoked = loop {
+                match Message::read_from(&mut stream).unwrap() {
+                    Message::Unchoke => break true,
+                    _ => continue,
+                }
+            };
+            assert!(unchoked);
+            Message::Request { index: 0, begin: 0, length: 256 }.write_to(&mut stream).unwrap();
+            let block = loop {
+                if let Message::Piece { block, .. } = Message::read_from(&mut stream).unwrap() {
+                    break block;
+                }
+            };
+            assert_eq!(block, vec![fill; 256]);
+        }
+        first.stop();
+        second.stop();
+        listener.stop();
+    }
+
+    #[test]
+    fn a_listener_that_requires_encryption_turns_plain_peers_away_whatever_they_ask_for() {
+        let mut listener = Listener::start(0, ListenerOptions { encryption: crate::peer::Encryption::Require, ..Default::default() }).unwrap();
+        let mut only = register_tiny(&listener, "require", [0xA1; 20], 0x11);
+        assert!(fetch_piece(listener.port, [0xA1; 20]).is_err());
+        only.stop();
+        listener.stop();
+    }
+
+    #[test]
+    fn a_connected_peer_is_let_go_when_its_torrent_stops() {
+        let mut listener = Listener::start(0, ListenerOptions::default()).unwrap();
+        let mut only = register_tiny(&listener, "letgo", [0xA1; 20], 0x11);
+        let (mut stream, _) = leech_connect(listener.port, [0xA1; 20]);
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        only.stop();
+
+        let started = Instant::now();
+        let ended = loop {
+            match Message::read_from(&mut stream) {
+                Ok(_) => continue,
+                Err(_) => break true,
+            }
+        };
+        assert!(ended && started.elapsed() < Duration::from_secs(5), "the connection ends: {:?}", started.elapsed());
+        listener.stop();
+    }
+
+    #[test]
+    fn the_cap_on_peers_served_is_for_the_listener_as_a_whole_not_each_torrent() {
+        let mut listener = Listener::start(0, ListenerOptions::default()).unwrap();
+        let mut first = register_tiny(&listener, "cap-a", [0xA1; 20], 0x11);
+        let mut second = register_tiny(&listener, "cap-b", [0xB2; 20], 0x22);
+        // Forty peers that connect and say nothing hold every place there is.
+        let idle: Vec<TcpStream> = (0..MAX_INBOUND_PEERS).map(|_| TcpStream::connect(("127.0.0.1", listener.port)).unwrap()).collect();
+        let until = Instant::now() + Duration::from_secs(5);
+        while listener.registry.active_conns.load(Ordering::SeqCst) < MAX_INBOUND_PEERS && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(listener.registry.active_conns.load(Ordering::SeqCst), MAX_INBOUND_PEERS);
+
+        assert!(fetch_piece(listener.port, [0xA1; 20]).is_err() && fetch_piece(listener.port, [0xB2; 20]).is_err(), "neither torrent gets a place");
+
+        drop(idle); // the places free up
+        let until = Instant::now() + Duration::from_secs(15);
+        while fetch_piece(listener.port, [0xB2; 20]).is_err() {
+            assert!(Instant::now() < until, "a place never came free");
+            thread::sleep(Duration::from_millis(200));
+        }
+        first.stop();
+        second.stop();
+        listener.stop();
     }
 }
