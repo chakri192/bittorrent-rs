@@ -12,6 +12,7 @@ pub mod plan;
 pub mod progress;
 pub mod rate;
 pub mod run;
+pub mod seed_limits;
 pub mod services;
 pub mod sink;
 #[cfg(test)]
@@ -26,6 +27,7 @@ pub use plan::{DownloadPlan, Outstanding};
 pub use progress::Progress;
 pub use rate::RateSampler;
 pub use run::{Report, Session, Setup};
+pub use seed_limits::{SeedEnd, SeedLimits};
 pub use services::Services;
 pub use sink::ProgressSink;
 pub use workers::{Log, Workers};

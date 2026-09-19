@@ -14,6 +14,8 @@
 //! dht = true
 //! ipv6 = "auto"      # "auto" | "always" | "never"
 //! reannounce = 900
+//! seed_ratio = 2.0   # stop seeding at this ratio ...
+//! seed_time = "12h"  # ... or after this long, whichever comes first
 //! tui = true
 //! ```
 
@@ -36,6 +38,11 @@ pub struct Config {
     /// `"auto"` | `"always"` | `"never"`.
     pub ipv6: Option<String>,
     pub reannounce: Option<u64>,
+    /// Stop seeding once this much has been uploaded relative to the
+    /// torrent's size (`--seed-ratio`). Implies `seed`.
+    pub seed_ratio: Option<f64>,
+    /// Stop seeding after this long, e.g. `"12h"` (`--seed-time`). Implies `seed`.
+    pub seed_time: Option<String>,
     pub log: Option<PathBuf>,
     /// Live dashboard on/off (default on). `false` is equivalent to `--no-tui`.
     pub tui: Option<bool>,

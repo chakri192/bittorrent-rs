@@ -87,6 +87,11 @@ enum Kind {
     /// SIGTERM mid-download, with the only peer silent: a prompt, clean exit
     /// that keeps the resume file.
     SigtermMidDownload,
+    /// `--seed-ratio`: seeding ends by itself once that much has been
+    /// uploaded, and not before.
+    SeedRatio,
+    /// `--seed-time`: seeding ends by itself after that long.
+    SeedTime,
     /// A tracker that never answers the `stopped` announce delays the exit
     /// by a few seconds and no more.
     StoppedAnnounceIsBounded,
@@ -117,6 +122,8 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "limit-upload", kind: Kind::LimitUpload },
     Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
     Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
+    Scenario { name: "seed-ratio-ends-seeding", kind: Kind::SeedRatio },
+    Scenario { name: "seed-time-ends-seeding", kind: Kind::SeedTime },
     Scenario { name: "stopped-announce-is-bounded", kind: Kind::StoppedAnnounceIsBounded },
     Scenario { name: "second-signal-forces-exit", kind: Kind::SecondSignalForcesExit },
 ];
@@ -147,6 +154,8 @@ fn main() {
             Kind::LimitUpload => run_limit_upload(scenario.name),
             Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
             Kind::SigtermMidDownload => run_sigterm_mid_download(scenario.name),
+            Kind::SeedRatio => run_seed_ratio(scenario.name),
+            Kind::SeedTime => run_seed_time(scenario.name),
             Kind::StoppedAnnounceIsBounded => run_stopped_announce_is_bounded(scenario.name),
             Kind::SecondSignalForcesExit => run_second_signal_forces_exit(scenario.name),
         };
@@ -988,6 +997,11 @@ fn wait_for_log(path: &Path, needle: &str, limit: Duration, child: &mut Child) -
 /// checks the client advertises every piece, and downloads them all,
 /// comparing each against the source.
 fn leech_everything(fx: &Fixture, port: u16) -> Result<(), String> {
+    leech_pieces(fx, port, 0..fx.piece_count)
+}
+
+/// [`leech_everything`], but downloading only the pieces in `wanted`.
+fn leech_pieces(fx: &Fixture, port: u16, wanted: std::ops::Range<usize>) -> Result<(), String> {
     let wire = |what: &str, e: bittorrent_rs::peer::message::WireError| format!("{}: {:?}", what, e);
     let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connecting to the client's listener on port {}: {}", port, e))?;
     stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
@@ -1020,7 +1034,7 @@ fn leech_everything(fx: &Fixture, port: u16) -> Result<(), String> {
         }
     }
 
-    for index in 0..fx.piece_count {
+    for index in wanted {
         let start = index * fx.piece_len;
         let end = (start + fx.piece_len).min(fx.data.len());
         Message::Request { index: index as u32, begin: 0, length: (end - start) as u32 }.write_to(&mut stream).map_err(|e| wire("requesting a piece", e))?;
@@ -1583,4 +1597,95 @@ fn run_second_signal_forces_exit(name: &str) -> Result<String, String> {
         return Err(format!("a second signal should exit with status 130; got {:?}", status.code()));
     }
     Ok(format!("a second signal cut short the wait on a silent tracker: status 130, {:.1?} later", again.elapsed()))
+}
+
+/// `--seed-ratio 1` on its own turns seeding on. Half the torrent uploaded
+/// is not enough; all of it is, and then the client stops by itself, tells
+/// the tracker, and exits with status 0.
+fn run_seed_ratio(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path, stdout_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"), dir.join("stdout.txt"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let child = client_command(&torrent, &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .args(["--seed-ratio", "1"])
+        .args(["--port", "0"])
+        .stdout(fs::File::create(&stdout_path).expect("create stdout file"))
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, "seeding e2e.bin on port", Duration::from_secs(20), &mut client.0)?;
+    let announces = swarm.announces.lock().unwrap().clone();
+    let port: u16 = announces.first().and_then(|line| announce_param(line, "port")).and_then(|p| p.parse().ok()).ok_or("no port in the client's first announce")?;
+
+    // Half the torrent: the ratio is 0.5, so the client must carry on.
+    leech_pieces(&fx, port, 0..fx.piece_count / 2)?;
+    thread::sleep(Duration::from_millis(800));
+    if client.0.try_wait().map_err(|e| e.to_string())?.is_some() {
+        return Err("the client stopped seeding at about half the ratio".to_string());
+    }
+
+    // The rest brings it to 1.0.
+    leech_pieces(&fx, port, fx.piece_count / 2..fx.piece_count)?;
+    let status = wait_or_kill(&mut client.0, Duration::from_secs(10))?;
+    if status.code() != Some(0) {
+        return Err(format!("the client exited with {:?} at its seed ratio; that is a success, status 0", status.code()));
+    }
+    let stdout = fs::read_to_string(&stdout_path).map_err(|e| e.to_string())?;
+    if !stdout.contains("seed ratio 1.00 reached") {
+        return Err(format!("stdout should say the seed ratio was reached; it says {:?}", stdout.trim()));
+    }
+    let log = fs::read_to_string(&log_path).map_err(|e| e.to_string())?;
+    if !log.contains("will stop seeding at ratio 1.00") {
+        return Err("the log does not say when seeding will stop".to_string());
+    }
+    check_stopped_last(&swarm, fx.data.len(), 0)?;
+    Ok(format!("--seed-ratio 1 kept seeding at half the ratio, then stopped by itself once all {} bytes had been uploaded: status 0, tracker told", fx.data.len()))
+}
+
+/// `--seed-time 2s`: the client seeds for about that long, then stops by
+/// itself with status 0.
+fn run_seed_time(name: &str) -> Result<String, String> {
+    const SEED_FOR: Duration = Duration::from_secs(2);
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path, stdout_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"), dir.join("stdout.txt"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let child = client_command(&torrent, &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .args(["--seed-time", &SEED_FOR.as_secs().to_string()])
+        .args(["--port", "0"])
+        .stdout(fs::File::create(&stdout_path).expect("create stdout file"))
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, "seeding e2e.bin on port", Duration::from_secs(20), &mut client.0)?;
+    let seeding_since = Instant::now();
+
+    let status = wait_or_kill(&mut client.0, Duration::from_secs(15))?;
+    let seeded_for = seeding_since.elapsed();
+    if status.code() != Some(0) {
+        return Err(format!("the client exited with {:?} when its seed time was up; that is a success, status 0", status.code()));
+    }
+    // A little slack below: the log line is read some milliseconds after it is written.
+    if seeded_for < SEED_FOR - Duration::from_millis(300) {
+        return Err(format!("the client stopped after seeding for only {:?} of {:?}", seeded_for, SEED_FOR));
+    }
+    if seeded_for > SEED_FOR + Duration::from_secs(5) {
+        return Err(format!("the client seeded for {:?}, well past its {:?} limit", seeded_for, SEED_FOR));
+    }
+    let stdout = fs::read_to_string(&stdout_path).map_err(|e| e.to_string())?;
+    if !stdout.contains("seed time of 2s reached") {
+        return Err(format!("stdout should say the seed time was reached; it says {:?}", stdout.trim()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+    check_stopped_last(&swarm, fx.data.len(), 0)?;
+    Ok(format!("--seed-time {}s stopped a seeding client by itself after {:.1?}: status 0, tracker told", SEED_FOR.as_secs(), seeded_for))
 }

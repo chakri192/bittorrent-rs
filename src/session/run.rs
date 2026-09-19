@@ -3,7 +3,8 @@
 
 use crate::downloader::WorkQueue;
 use crate::session::peer_pool::Decision;
-use crate::session::{Announcer, PeerPool, ProgressSink, Progress, RateSampler, Services, Workers};
+use crate::session::{Announcer, PeerPool, ProgressSink, Progress, RateSampler, SeedEnd, SeedLimits, Services, Workers};
+use crate::ui::format_bytes;
 use crate::tracker_discovery::TransferTotals;
 use crate::ui::Snapshot;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -300,10 +301,15 @@ impl<'a> Session<'a> {
 
     /// Post-completion seeding: keep the listener and DHT alive,
     /// re-announce with `left = 0` on the tracker interval, publish upload
-    /// stats. Returns when `stop` is set (user quit).
-    pub fn seed(&mut self, name: &str, port: u16, stop: &AtomicBool) {
+    /// stats. Returns when `stop` is set (user quit), with `None`, or when
+    /// one of `limits` is reached, with which.
+    pub fn seed(&mut self, name: &str, port: u16, stop: &AtomicBool, limits: SeedLimits) -> Option<SeedEnd> {
         let sink = self.sink;
         sink.log(format!("seeding {} on port {} -- press q to stop", name, port));
+        if limits.is_set() {
+            sink.log(format!("will stop seeding at {}", limits));
+        }
+        let seeding_since = Instant::now();
 
         // Seeding has its own cadence: count the interval from here.
         self.announcer.restart_clock(Instant::now());
@@ -328,12 +334,18 @@ impl<'a> Session<'a> {
                 ..Default::default()
             });
 
+            if let Some(end) = limits.reached(self.uploaded_bytes(), self.display_total, seeding_since.elapsed()) {
+                sink.log(format!("{}: uploaded {} of a {} torrent, stopping", end, format_bytes(self.uploaded_bytes()), format_bytes(self.display_total)));
+                return Some(end);
+            }
+
             if self.announcer.has_trackers() && self.announcer.is_due(Instant::now(), false) {
                 let totals = TransferTotals { uploaded: self.uploaded_bytes(), downloaded: self.progress.bytes_this_run(), left: 0 };
                 let _ = self.announcer.reannounce(Instant::now(), totals, |m| sink.log(m));
             }
             thread::sleep(UI_TICK);
         }
+        None
     }
 }
 
@@ -670,7 +682,7 @@ mod tests {
             })
         };
 
-        s.seed("f.bin", 6881, &stop);
+        assert_eq!(s.seed("f.bin", 6881, &stop, SeedLimits::default()), None, "stopped by the flag, not by a limit");
         stopper.join().unwrap();
 
         assert!(sink.logged("seeding f.bin on port 6881 -- press q to stop"));
@@ -678,6 +690,65 @@ mod tests {
         assert_eq!(snap.status, "seeding");
         assert_eq!((snap.verified, snap.total_pieces, snap.done_bytes, snap.total_length), (PIECES, PIECES, data().len() as u64, data().len() as u64));
         assert!(!sink.rates.lock().unwrap().is_empty(), "upload rate was sampled while seeding");
+    }
+
+    /// A session with a seeder whose upload counter reads `uploaded`, and a
+    /// stop flag that sets itself after `stop_after` so that a seed which
+    /// ignores its limits fails rather than hangs.
+    fn seed_with(uploaded: u64, limits: SeedLimits, stop_after: Duration) -> (Option<SeedEnd>, Duration, Arc<RecordingSink>) {
+        let dir = tmp_dir("seed-limits");
+        let sink = Arc::new(RecordingSink::default());
+        let mut services = Services::new();
+        services.attach_seeder(seeder::start(0, INFO_HASH, [2; 20], Arc::new(Vec::new()), PIECE_LEN as u64, 0, Arc::new(HaveMap::new(0)), None).unwrap());
+        services.uploaded_counter().unwrap().store(uploaded, Ordering::SeqCst);
+        let mut s = session(&sink, &services, &dir, &[], None);
+        let stop = Arc::new(AtomicBool::new(false));
+        // Left to finish its sleep on its own: joining it would make every
+        // test that ends early wait out `stop_after`.
+        let flag = Arc::clone(&stop);
+        thread::spawn(move || {
+            thread::sleep(stop_after);
+            flag.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let end = s.seed("f.bin", 6881, &stop, limits);
+        (end, started.elapsed(), sink)
+    }
+
+    #[test]
+    fn seeding_ends_by_itself_once_the_ratio_is_reached() {
+        let size = data().len() as u64;
+        let limits = SeedLimits { ratio: Some(1.0), time: None };
+
+        let (end, took, sink) = seed_with(size, limits, Duration::from_secs(20));
+
+        assert_eq!(end, Some(SeedEnd::Ratio(1.0)));
+        assert!(took < Duration::from_secs(5), "it stopped on its own, not when the flag was set: {:?}", took);
+        assert!(sink.logged("will stop seeding at ratio 1.00"));
+        assert!(sink.logged("seed ratio 1.00 reached: uploaded"), "the log says why it stopped");
+    }
+
+    #[test]
+    fn seeding_below_the_ratio_carries_on_until_told_to_stop() {
+        let size = data().len() as u64;
+        let limits = SeedLimits { ratio: Some(1.0), time: None };
+
+        let (end, took, _) = seed_with(size - 1, limits, Duration::from_millis(700));
+
+        assert_eq!(end, None, "one byte short of the ratio");
+        assert!(took >= Duration::from_millis(600), "it ran until the flag: {:?}", took);
+    }
+
+    #[test]
+    fn seeding_ends_by_itself_once_the_time_is_up() {
+        let limits = SeedLimits { ratio: None, time: Some(Duration::from_millis(600)) };
+
+        let (end, took, sink) = seed_with(0, limits, Duration::from_secs(20));
+
+        assert_eq!(end, Some(SeedEnd::Time(Duration::from_millis(600))));
+        assert!(took >= Duration::from_millis(600), "not before the time: {:?}", took);
+        assert!(took < Duration::from_secs(5), "and then promptly: {:?}", took);
+        assert!(sink.logged("seed time of 0s reached: uploaded"), "the log says why it stopped");
     }
 
     #[test]

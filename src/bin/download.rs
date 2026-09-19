@@ -17,7 +17,7 @@
 
 use bittorrent_rs::config::Config;
 use bittorrent_rs::magnet::parse_magnet_uri;
-use bittorrent_rs::session::{prepare, resolve_magnet, Ipv6Mode, MetadataConfig, Options, ProgressSink, Services};
+use bittorrent_rs::session::{prepare, resolve_magnet, seed_limits, Ipv6Mode, MetadataConfig, Options, ProgressSink, SeedEnd, SeedLimits, Services};
 use bittorrent_rs::torrent;
 use bittorrent_rs::tracker::generate_peer_id;
 use bittorrent_rs::tui::{self, Ui};
@@ -69,6 +69,8 @@ struct Args {
     timeout: Option<Duration>,
     port: u16,
     seed: bool,
+    /// When to stop seeding on its own; unset means only when told to.
+    seed_limits: SeedLimits,
     no_dht: bool,
     no_portmap: bool,
     no_webseed: bool,
@@ -111,7 +113,10 @@ fn load_config_from_args() -> Result<Config, String> {
 }
 
 fn parse_args(cfg: &Config) -> Result<Args, String> {
-    let mut argv = std::env::args().skip(1);
+    parse_args_from(cfg, std::env::args().skip(1))
+}
+
+fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
     let source = argv.next().ok_or_else(usage)?;
     if source == "--help" || source == "-h" {
         return Err(usage());
@@ -130,6 +135,11 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
     let mut timeout = None;
     let mut port = cfg.port.unwrap_or(DEFAULT_PORT);
     let mut seed = cfg.seed.unwrap_or(false);
+    let mut seed_limits = SeedLimits {
+        ratio: cfg.seed_ratio.map(seed_limits::check_ratio).transpose().map_err(|e| format!("config seed_ratio: {}", e))?,
+        time: cfg.seed_time.as_deref().map(seed_limits::parse_duration).transpose().map_err(|e| format!("config seed_time: {}", e))?,
+    };
+    let mut no_seed_flag = false;
     let mut no_dht = !cfg.dht.unwrap_or(true);
     let mut no_portmap = !cfg.portmap.unwrap_or(true);
     let mut no_webseed = !cfg.webseed.unwrap_or(true);
@@ -185,7 +195,18 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
             "--no-log" => no_log = true,
             "--no-tui" => no_tui = true,
             "--seed" => seed = true,
-            "--no-seed" => seed = false,
+            "--no-seed" => {
+                seed = false;
+                no_seed_flag = true;
+            }
+            "--seed-ratio" => {
+                let v = argv.next().ok_or("--seed-ratio requires a ratio such as 1 or 2.5")?;
+                seed_limits.ratio = Some(seed_limits::parse_ratio(&v).map_err(|e| format!("--seed-ratio: {}", e))?);
+            }
+            "--seed-time" => {
+                let v = argv.next().ok_or("--seed-time requires a duration such as 30m, 12h or 1d")?;
+                seed_limits.time = Some(seed_limits::parse_duration(&v).map_err(|e| format!("--seed-time: {}", e))?);
+            }
             "--no-dht" => no_dht = true,
             "--dht" => no_dht = false,
             "--no-portmap" => no_portmap = true,
@@ -229,11 +250,19 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
         }
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, max_down, max_up, verbosity, timeout, port, seed, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
+    // A seeding limit is a request to seed.
+    if seed_limits.is_set() {
+        if no_seed_flag {
+            return Err("--no-seed cannot be combined with --seed-ratio or --seed-time".to_string());
+        }
+        seed = true;
+    }
+
+    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -408,23 +437,35 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         bittorrent_rs::downloader::resume::clear(&info.progress_path);
         let scope = if info.selective { format!("{} selected", ui::format_bytes(info.display_total)) } else { ui::format_bytes(info.total_length) };
         let avg = report.bytes_this_run as f64 / report.elapsed.as_secs_f64().max(0.001);
-        let summary = format!(
-            "download complete: {} -> {}\n  {} in {} \u{b7} {} avg \u{b7} {} uploaded",
-            torrent.name,
-            info.base_dir.display(),
-            scope,
-            ui::format_duration(report.elapsed.as_secs()),
-            ui::format_rate(avg),
-            ui::format_bytes(session.uploaded_bytes()),
-        );
+        // Built again after seeding, when there is more to say about uploads.
+        let summarize = |uploaded: u64, seed_end: Option<SeedEnd>| {
+            let mut text = format!(
+                "download complete: {} -> {}\n  {} in {} \u{b7} {} avg \u{b7} {} uploaded",
+                torrent.name,
+                info.base_dir.display(),
+                scope,
+                ui::format_duration(report.elapsed.as_secs()),
+                ui::format_rate(avg),
+                ui::format_bytes(uploaded),
+            );
+            if let Some(end) = seed_end {
+                text.push_str(&format!("\n  {}, seeding finished", end));
+            }
+            text
+        };
+        let mut summary = summarize(session.uploaded_bytes(), None);
         ui.log("download complete");
 
         session.announce_completed();
 
         if args.seed && services.has_seeder() {
-            // Keep the UI live and seeding until the user quits. The UI
-            // totals reflect the selected subset (info.display_total/goal).
-            session.seed(&torrent.name, info.announce_port, stop);
+            // Keep the UI live and seeding until the user quits or a seed
+            // limit is reached. The UI totals reflect the selected subset
+            // (info.display_total/goal).
+            if let Some(end) = session.seed(&torrent.name, info.announce_port, stop, args.seed_limits) {
+                summary = summarize(session.uploaded_bytes(), Some(end));
+                ui.finish(Ok(summary.clone()));
+            }
         } else {
             ui.finish(Ok(summary.clone()));
         }
@@ -452,3 +493,76 @@ fn finish_err(ui: &Ui, reason: String) -> String {
     reason
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn parse(cfg: &Config, args: &[&str]) -> Result<Args, String> {
+        parse_args_from(cfg, args.iter().map(|a| a.to_string()))
+    }
+
+    fn cfg_from(toml: &str) -> Config {
+        toml::from_str(toml).unwrap()
+    }
+
+    #[test]
+    fn seeding_is_off_and_unlimited_unless_asked_for() {
+        let args = parse(&Config::default(), &["x.torrent"]).unwrap();
+        assert!(!args.seed);
+        assert!(!args.seed_limits.is_set());
+    }
+
+    #[test]
+    fn a_seed_limit_on_the_command_line_turns_seeding_on() {
+        let args = parse(&Config::default(), &["x.torrent", "--seed-ratio", "1.5"]).unwrap();
+        assert!(args.seed);
+        assert_eq!(args.seed_limits, SeedLimits { ratio: Some(1.5), time: None });
+
+        let args = parse(&Config::default(), &["x.torrent", "--seed-time", "90m"]).unwrap();
+        assert!(args.seed);
+        assert_eq!(args.seed_limits, SeedLimits { ratio: None, time: Some(Duration::from_secs(5400)) });
+    }
+
+    #[test]
+    fn both_limits_can_be_given_and_seed_is_not_needed_beside_them() {
+        let args = parse(&Config::default(), &["x.torrent", "--seed", "--seed-ratio", "2", "--seed-time", "1h"]).unwrap();
+        assert!(args.seed);
+        assert_eq!(args.seed_limits, SeedLimits { ratio: Some(2.0), time: Some(Duration::from_secs(3600)) });
+    }
+
+    #[test]
+    fn a_seed_limit_contradicts_no_seed() {
+        for args in [["x.torrent", "--no-seed", "--seed-ratio", "2"], ["x.torrent", "--seed-time", "2h", "--no-seed"]] {
+            let err = parse(&Config::default(), &args).err().expect("refused");
+            assert!(err.contains("--no-seed"), "{}", err);
+        }
+    }
+
+    #[test]
+    fn a_bad_limit_is_refused_naming_the_flag() {
+        assert!(parse(&Config::default(), &["x.torrent", "--seed-ratio", "0"]).err().unwrap().starts_with("--seed-ratio:"));
+        assert!(parse(&Config::default(), &["x.torrent", "--seed-time", "soon"]).err().unwrap().starts_with("--seed-time:"));
+        assert!(parse(&Config::default(), &["x.torrent", "--seed-ratio"]).err().unwrap().contains("requires"));
+        assert!(parse(&Config::default(), &["x.torrent", "--seed-time"]).err().unwrap().contains("requires"));
+    }
+
+    #[test]
+    fn the_config_file_can_set_the_limits_and_the_command_line_overrides_them() {
+        let cfg = cfg_from("seed_ratio = 3.0\nseed_time = \"12h\"\n");
+
+        let args = parse(&cfg, &["x.torrent"]).unwrap();
+        assert!(args.seed, "a limit in the config file means seeding too");
+        assert_eq!(args.seed_limits, SeedLimits { ratio: Some(3.0), time: Some(Duration::from_secs(12 * 3600)) });
+
+        let args = parse(&cfg, &["x.torrent", "--seed-ratio", "1"]).unwrap();
+        assert_eq!(args.seed_limits.ratio, Some(1.0), "the flag wins");
+        assert_eq!(args.seed_limits.time, Some(Duration::from_secs(12 * 3600)), "what it does not mention stays");
+    }
+
+    #[test]
+    fn a_bad_limit_in_the_config_file_is_refused_naming_the_key() {
+        assert!(parse(&cfg_from("seed_ratio = -1.0"), &["x.torrent"]).err().unwrap().starts_with("config seed_ratio:"));
+        assert!(parse(&cfg_from("seed_time = \"later\""), &["x.torrent"]).err().unwrap().starts_with("config seed_time:"));
+    }
+}
