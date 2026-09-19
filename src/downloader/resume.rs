@@ -36,7 +36,7 @@ pub fn load_and_verify(path: &Path, spans: &[FileSpan], torrent: &TorrentFile) -
 /// Whether piece `index`'s bytes are on disk and hash to the torrent's
 /// value for it. A missing file, a short file, or different bytes all just
 /// mean "no": the piece will be fetched again.
-fn piece_is_on_disk(spans: &[FileSpan], torrent: &TorrentFile, index: u32) -> bool {
+pub fn piece_is_on_disk(spans: &[FileSpan], torrent: &TorrentFile, index: u32) -> bool {
     if index as usize >= torrent.pieces.len() {
         return false; // stale entry from a different torrent/layout
     }
@@ -87,10 +87,9 @@ fn read_piece_bytes(spans: &[FileSpan], piece_index: u32, piece_stride: u64, pie
     let mut offset = piece_index as u64 * piece_stride;
 
     while filled < buf.len() {
-        let span = spans
-            .iter()
-            .find(|s| offset >= s.start && offset < s.end)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "offset outside known files"))?;
+        // A binary search, as in the writer: a scan of every file for every
+        // piece made checking a torrent of many files quadratic.
+        let span = crate::downloader::file_writer::span_at(spans, offset).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "offset outside known files"))?;
         let file_offset = offset - span.start;
         let available = (span.end - offset) as usize;
         let to_read = (buf.len() - filled).min(available);

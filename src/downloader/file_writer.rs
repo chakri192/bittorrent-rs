@@ -37,7 +37,7 @@ pub fn build_file_spans(base_dir: &Path, files: &[(Vec<String>, i64)]) -> Vec<Fi
 /// order and contiguous, so this is a binary search: a torrent of tens of
 /// thousands of files would otherwise cost a scan of all of them for every
 /// piece written. Empty files (start == end) hold no byte and are skipped.
-fn span_at(spans: &[FileSpan], offset: u64) -> Option<&FileSpan> {
+pub(crate) fn span_at(spans: &[FileSpan], offset: u64) -> Option<&FileSpan> {
     let first_ending_after = spans.partition_point(|s| s.end <= offset);
     spans.get(first_ending_after).filter(|s| s.start <= offset)
 }

@@ -15,6 +15,7 @@ pub mod run;
 pub mod seed_limits;
 pub mod services;
 pub mod sink;
+pub mod verify;
 #[cfg(test)]
 mod testing;
 pub mod workers;
