@@ -54,6 +54,6 @@ jobs:
       - name: Fuzz targets compile and run against seed inputs
         working-directory: fuzz
         run: |
-          for target in bencode_decode magnet_parse torrent_parse; do
+          for target in bencode_decode magnet_parse torrent_parse krpc_decode peer_message extension_handshake metadata_message pex_parse; do
             cargo +nightly fuzz run "$target" -- -runs=1000
           done

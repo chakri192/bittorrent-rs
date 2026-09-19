@@ -33,3 +33,38 @@ path = "fuzz_targets/torrent_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "krpc_decode"
+path = "fuzz_targets/krpc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_message"
+path = "fuzz_targets/peer_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extension_handshake"
+path = "fuzz_targets/extension_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata_message"
+path = "fuzz_targets/metadata_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pex_parse"
+path = "fuzz_targets/pex_parse.rs"
+test = false
+doc = false
+bench = false
