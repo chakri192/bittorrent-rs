@@ -1287,7 +1287,9 @@ mod tests {
             blocks
         });
         // Meanwhile the others are told in turn, as the optimistic slot moves.
-        let turns = next_choke_message(&mut waiting, Duration::from_secs(3)).is_some() | next_choke_message(&mut idle, Duration::from_millis(50)).is_some();
+        // (The turns come every few rounds, 100 ms each; the wait is long so that a machine busy with other tests, as a CI
+        // runner is, does not decide the outcome.)
+        let turns = next_choke_message(&mut waiting, Duration::from_secs(8)).is_some() | next_choke_message(&mut idle, Duration::from_millis(50)).is_some();
         let blocks = downloader.join().unwrap();
 
         assert!(blocks > 10, "the busy peer was actually served: {}", blocks);
