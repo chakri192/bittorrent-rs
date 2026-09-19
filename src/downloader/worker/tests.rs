@@ -808,3 +808,32 @@ fn a_peer_that_chokes_and_never_unchokes_is_given_up_on_and_the_piece_goes_back(
     assert_eq!(queue.len(), 1, "the piece is back on the queue for another peer");
     assert!(!queue.in_endgame());
 }
+
+#[test]
+fn stopping_does_not_wait_for_a_worker_held_back_by_the_download_limit() {
+    // 10 B/s: the one 16 KiB block just read must be paid for over about
+    // 1600 seconds. The interrupt has to cut that short.
+    let piece = vec![0x3Cu8; 16384];
+    let info_hash = [0x67; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _mock = spawn_mock_peer(listener, info_hash, vec![piece.clone()], Duration::ZERO);
+    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: sha1_of(&piece), length: 16384 }], 1));
+    let dir = tmp_dir("limit-interrupt");
+    let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 16384)]));
+    let (tx, _rx) = mpsc::channel();
+    let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: Some(Arc::new(RateLimiter::new(10))), interrupt: Default::default() });
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker_config = Arc::clone(&config);
+    thread::spawn(move || {
+        let _ = done_tx.send(run_worker(addr, &worker_config, &queue, &spans, 16384, &tx, None));
+    });
+    thread::sleep(Duration::from_millis(500)); // the block has arrived and the worker is paying for it
+    let stopped_at = Instant::now();
+    config.interrupt.trigger();
+
+    let ended = done_rx.recv_timeout(Duration::from_secs(5));
+    assert!(ended.is_ok(), "the worker should stop within seconds, not sleep out the limit");
+    assert!(stopped_at.elapsed() < Duration::from_secs(2), "{:?}", stopped_at.elapsed());
+}

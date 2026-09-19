@@ -60,9 +60,18 @@ impl RateLimiter {
 
     /// Blocks until `n` more bytes may be moved.
     pub fn acquire(&self, n: usize) {
-        let wait = self.reserve(n, Instant::now());
-        if !wait.is_zero() {
-            thread::sleep(wait);
+        self.acquire_while(n, || true);
+    }
+
+    /// As [`acquire`](Self::acquire), but stops waiting as soon as
+    /// `keep_going` says no, checked every tenth of a second: a wait that
+    /// may last many seconds must not hold up stopping the client.
+    pub fn acquire_while(&self, n: usize, keep_going: impl Fn() -> bool) {
+        let mut wait = self.reserve(n, Instant::now());
+        while !wait.is_zero() && keep_going() {
+            let slice = wait.min(Duration::from_millis(100));
+            thread::sleep(slice);
+            wait = wait.saturating_sub(slice);
         }
     }
 }
@@ -197,5 +206,42 @@ mod tests {
             assert!(parse_rate(bad).is_err(), "{:?} should be refused", bad);
         }
         assert!(parse_rate("5X").unwrap_err().contains("unit"));
+    }
+
+    #[test]
+    fn acquire_while_gives_up_waiting_when_told_to() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let l = RateLimiter::new(10);
+        l.acquire(10); // empties the bucket
+        let stop = AtomicBool::new(false);
+
+        let started = Instant::now();
+        // 100 more bytes at 10 B/s is a ten-second wait; stop after a moment.
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(250));
+                stop.store(true, Ordering::SeqCst);
+            });
+            l.acquire_while(100, || !stop.load(Ordering::SeqCst));
+        });
+
+        assert!(started.elapsed() < Duration::from_secs(2), "returned when told to, not after ten seconds: {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn acquire_while_still_waits_the_full_time_while_it_may_carry_on() {
+        let l = RateLimiter::new(1000);
+        l.acquire(1000);
+        let started = Instant::now();
+        l.acquire_while(300, || true);
+        assert!(started.elapsed() >= Duration::from_millis(280), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn acquire_while_does_not_wait_at_all_when_there_is_nothing_to_wait_for() {
+        let l = RateLimiter::new(1000);
+        let started = Instant::now();
+        l.acquire_while(500, || true);
+        assert!(started.elapsed() < Duration::from_millis(50));
     }
 }

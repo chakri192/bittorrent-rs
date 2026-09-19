@@ -177,7 +177,7 @@ pub fn run_worker(
         irrelevant_cycles = 0;
         let piece_index = work.index;
 
-        match download_one_piece(&mut stream, &mut state, queue, work.clone(), config.pipeline_depth, &mut throughput, pex_tx, config.down_limit.as_deref()) {
+        match download_one_piece(&mut stream, &mut state, queue, work.clone(), config, &mut throughput, pex_tx) {
             Ok(Some(data)) => {
                 if let Err(e) = write_piece(spans, piece_index, piece_length, &data) {
                     // Disk failure isn't the peer's fault; requeue and bail

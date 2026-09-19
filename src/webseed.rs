@@ -11,8 +11,9 @@ use crate::downloader::queue::{PieceResult, WorkQueue};
 use sha1::{Digest, Sha1};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 /// Give up on a web seed after this many consecutive fetch failures
@@ -136,6 +137,31 @@ fn fetch_piece(agent: &ureq::Agent, targets: &[FileTarget], piece_index: u32, pi
     Ok(out)
 }
 
+/// [`fetch_piece`] on a thread of its own, waited for in short slices so
+/// that `stop` is noticed. An HTTP request cannot be cancelled from
+/// outside, and a mirror that has stopped answering holds it for the whole
+/// read timeout; without this, stopping the client waited that out.
+/// Returns `None` if `stop` was set first, leaving the fetch to finish (or
+/// time out) unwatched.
+fn fetch_piece_or_stop(agent: &ureq::Agent, targets: &Arc<Vec<FileTarget>>, piece_index: u32, piece_length: u64, total_length: u64, stop: &AtomicBool) -> Option<Result<Vec<u8>, String>> {
+    let (tx, rx) = mpsc::channel();
+    let (agent, targets) = (agent.clone(), Arc::clone(targets));
+    thread::spawn(move || {
+        let _ = tx.send(fetch_piece(&agent, &targets, piece_index, piece_length, total_length));
+    });
+    loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => return Some(result),
+            Err(RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::SeqCst) {
+                    return None;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return Some(Err("the fetch thread died".to_string())),
+        }
+    }
+}
+
 /// Runs one web seed against the shared work queue until the queue drains,
 /// the seed fails too many times, or `stop` is set. `log` receives
 /// human-readable progress/errors (routed to the dashboard log).
@@ -154,7 +180,7 @@ pub fn run_web_worker<L: Fn(String)>(
     stop: &AtomicBool,
     log: L,
 ) {
-    let targets = build_targets(base_url, name, files, multi_file);
+    let targets = Arc::new(build_targets(base_url, name, files, multi_file));
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
     let mut consecutive_failures = 0u32;
 
@@ -167,10 +193,18 @@ pub fn run_web_worker<L: Fn(String)>(
             continue; // finished elsewhere (endgame duplicate)
         }
 
-        match fetch_piece(&agent, &targets, idx, piece_length, total_length) {
+        let Some(fetched) = fetch_piece_or_stop(&agent, &targets, idx, piece_length, total_length, stop) else {
+            queue.push_back(work);
+            return; // told to stop while waiting on the mirror
+        };
+        match fetched {
             Ok(data) => {
                 if let Some(limiter) = limiter {
-                    limiter.acquire(data.len());
+                    limiter.acquire_while(data.len(), || !stop.load(Ordering::SeqCst));
+                    if stop.load(Ordering::SeqCst) {
+                        queue.push_back(work);
+                        return; // told to stop while held back by --max-down
+                    }
                 }
                 let mut h = Sha1::new();
                 h.update(&data);
@@ -289,5 +323,300 @@ mod tests {
         assert_eq!(t[0].url, "http://m.test/pub/Album/only.bin");
         let as_single = build_targets("http://m.test/pub/", "only.bin", &files, false);
         assert_eq!(as_single[0].url, "http://m.test/pub/only.bin");
+    }
+
+    // ---- against an HTTP server on loopback ----
+
+    use crate::downloader::file_writer::build_file_spans;
+    use crate::downloader::piece_assembler::PieceWork;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mode {
+        /// Honours Range with a 206.
+        Serve,
+        /// Sends the whole file with a 200 whatever the range.
+        IgnoreRange,
+        /// 404 for everything.
+        NotFound,
+        /// Range honoured, but every byte is wrong.
+        Corrupt,
+        /// Accepts the connection and never answers.
+        Silent,
+    }
+
+    struct Mirror {
+        /// `http://127.0.0.1:port/`
+        base: String,
+        requests: Arc<AtomicUsize>,
+    }
+
+    fn spawn_mirror(files: Vec<(&str, Vec<u8>)>, mode: Mode) -> Mirror {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let files: Vec<(String, Vec<u8>)> = files.into_iter().map(|(path, content)| (format!("/{}", path), content)).collect();
+        thread::spawn(move || {
+            let mut held = Vec::new(); // silent connections stay open
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                counted.fetch_add(1, Ordering::SeqCst);
+                if mode == Mode::Silent {
+                    held.push(stream);
+                    continue;
+                }
+                let files = files.clone();
+                thread::spawn(move || serve(stream, &files, mode));
+            }
+        });
+        Mirror { base, requests }
+    }
+
+    fn serve(stream: TcpStream, files: &[(String, Vec<u8>)], mode: Mode) {
+        let Ok(read_half) = stream.try_clone() else { return };
+        let mut reader = BufReader::new(read_half);
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+            return;
+        }
+        let path = request_line.split_whitespace().nth(1).unwrap_or("").to_string();
+        let mut range = None;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some(spec) = line.to_ascii_lowercase().trim_end().strip_prefix("range: bytes=") {
+                if let Some((from, to)) = spec.split_once('-') {
+                    range = from.parse::<usize>().ok().zip(to.parse::<usize>().ok());
+                }
+            }
+        }
+        let mut stream = stream;
+        let respond = |stream: &mut TcpStream, status: &str, extra: &str, body: &[u8]| {
+            let head = format!("HTTP/1.1 {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n", status, body.len(), extra);
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+        };
+        let Some((_, content)) = files.iter().find(|(p, _)| *p == path) else {
+            respond(&mut stream, "404 Not Found", "", b"");
+            return;
+        };
+        match mode {
+            Mode::NotFound => respond(&mut stream, "404 Not Found", "", b""),
+            Mode::IgnoreRange => respond(&mut stream, "200 OK", "", content),
+            Mode::Serve | Mode::Corrupt => {
+                let (from, to) = range.unwrap_or((0, content.len() - 1));
+                let mut body = content[from..=to.min(content.len() - 1)].to_vec();
+                if mode == Mode::Corrupt {
+                    body.iter_mut().for_each(|b| *b ^= 0xFF);
+                }
+                respond(&mut stream, "206 Partial Content", &format!("Content-Range: bytes {}-{}/{}\r\n", from, to, content.len()), &body);
+            }
+            Mode::Silent => {}
+        }
+    }
+
+    fn sha1_of(data: &[u8]) -> [u8; 20] {
+        Sha1::digest(data).into()
+    }
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bittorrent-rs-webseed-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A web worker's world: the queue of `data`'s pieces, spans on disk, and
+    /// the channel results arrive on.
+    struct Rig {
+        data: Vec<u8>,
+        piece_length: u64,
+        queue: Arc<WorkQueue>,
+        spans: Arc<Vec<FileSpan>>,
+        dir: std::path::PathBuf,
+        tx: Sender<PieceResult>,
+        rx: mpsc::Receiver<PieceResult>,
+        logs: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Rig {
+        /// `files` in torrent order, as (path components, content).
+        fn new(name: &str, files: &[(Vec<&str>, Vec<u8>)], piece_length: u64) -> Rig {
+            let data: Vec<u8> = files.iter().flat_map(|(_, c)| c.iter().copied()).collect();
+            let work = data.chunks(piece_length as usize).enumerate().map(|(i, chunk)| PieceWork { index: i as u32, hash: sha1_of(chunk), length: chunk.len() as u32 }).collect::<Vec<_>>();
+            let piece_count = work.len();
+            let dir = tmp_dir(name);
+            let listed: Vec<(Vec<String>, i64)> = files.iter().map(|(path, c)| (path.iter().map(|p| p.to_string()).collect(), c.len() as i64)).collect();
+            let spans = Arc::new(build_file_spans(&dir, &listed));
+            let (tx, rx) = mpsc::channel();
+            Rig { data, piece_length, queue: Arc::new(WorkQueue::new(work, piece_count)), spans, dir, tx, rx, logs: Arc::new(Mutex::new(Vec::new())) }
+        }
+
+        fn run(&self, base: &str, name: &str, files: &[(Vec<String>, i64)], multi: bool, limiter: Option<&crate::ratelimit::RateLimiter>, stop: &AtomicBool) {
+            let logs = Arc::clone(&self.logs);
+            run_web_worker(base, name, files, multi, limiter, &self.queue, &self.spans, self.piece_length, self.data.len() as u64, &self.tx, stop, move |m| logs.lock().unwrap().push(m));
+        }
+
+        fn logged(&self, needle: &str) -> bool {
+            self.logs.lock().unwrap().iter().any(|l| l.contains(needle))
+        }
+
+        fn completed(&self) -> Vec<u32> {
+            let mut got: Vec<u32> = self.rx.try_iter().map(|r| r.index).collect();
+            got.sort_unstable();
+            got
+        }
+    }
+
+    fn single(name: &str, len: usize) -> (Vec<(Vec<String>, i64)>, Vec<u8>) {
+        let content: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(13).wrapping_add(5)).collect();
+        (vec![(vec![name.to_string()], len as i64)], content)
+    }
+
+    #[test]
+    fn a_web_seed_serves_a_whole_torrent_through_the_normal_pipeline() {
+        let (listed, content) = single("file.bin", 5000);
+        let mirror = spawn_mirror(vec![("file.bin", content.clone())], Mode::Serve);
+        let rig = Rig::new("serves", &[(vec!["file.bin"], content.clone())], 2048);
+
+        rig.run(&mirror.base, "file.bin", &listed, false, None, &AtomicBool::new(false));
+
+        assert_eq!(rig.completed(), vec![0, 1, 2]);
+        assert!(rig.queue.is_empty());
+        assert_eq!(std::fs::read(rig.dir.join("file.bin")).unwrap(), content, "written to disk, every byte");
+        assert_eq!(mirror.requests.load(Ordering::SeqCst), 3, "one ranged request per piece");
+    }
+
+    #[test]
+    fn a_piece_that_spans_two_files_is_fetched_from_both() {
+        let (a, b) = ((0..1500).map(|i| i as u8).collect::<Vec<u8>>(), (0..2500).map(|i| (i as u8).wrapping_add(90)).collect::<Vec<u8>>());
+        let mirror = spawn_mirror(vec![("pack/a.bin", a.clone()), ("pack/sub/b.bin", b.clone())], Mode::Serve);
+        let rig = Rig::new("spans", &[(vec!["a.bin"], a.clone()), (vec!["sub", "b.bin"], b.clone())], 2048);
+        let listed = vec![(vec!["a.bin".to_string()], 1500), (vec!["sub".to_string(), "b.bin".to_string()], 2500)];
+
+        rig.run(&mirror.base, "pack", &listed, true, None, &AtomicBool::new(false));
+
+        assert_eq!(rig.completed(), vec![0, 1]);
+        assert_eq!(std::fs::read(rig.dir.join("a.bin")).unwrap(), a);
+        assert_eq!(std::fs::read(rig.dir.join("sub/b.bin")).unwrap(), b);
+        assert_eq!(mirror.requests.load(Ordering::SeqCst), 3, "piece 0 needed both files, piece 1 only the second");
+    }
+
+    #[test]
+    fn a_server_that_ignores_range_is_fine_only_when_the_range_is_the_whole_file() {
+        let (listed, content) = single("small.bin", 1000);
+        let mirror = spawn_mirror(vec![("small.bin", content.clone())], Mode::IgnoreRange);
+        // One piece, the whole file: a 200 with everything is what was asked for.
+        let whole = Rig::new("ignore-whole", &[(vec!["small.bin"], content.clone())], 1024);
+        whole.run(&mirror.base, "small.bin", &listed, false, None, &AtomicBool::new(false));
+        assert_eq!(whole.completed(), vec![0]);
+
+        // Several pieces: each needs part of the file, which this server cannot give.
+        let (listed, content) = single("big.bin", 4000);
+        let mirror = spawn_mirror(vec![("big.bin", content.clone())], Mode::IgnoreRange);
+        let partial = Rig::new("ignore-partial", &[(vec!["big.bin"], content)], 1024);
+        partial.run(&mirror.base, "big.bin", &listed, false, None, &AtomicBool::new(false));
+        assert!(partial.logged("ignored Range"));
+        assert!(partial.completed().is_empty());
+        assert_eq!(partial.queue.len(), 4, "every piece went back for someone else");
+    }
+
+    #[test]
+    fn a_mirror_that_serves_wrong_bytes_is_caught_by_the_hash_and_given_up_on() {
+        let (listed, content) = single("file.bin", 3000);
+        let mirror = spawn_mirror(vec![("file.bin", content.clone())], Mode::Corrupt);
+        let rig = Rig::new("corrupt", &[(vec!["file.bin"], content)], 1024);
+
+        rig.run(&mirror.base, "file.bin", &listed, false, None, &AtomicBool::new(false));
+
+        assert!(rig.logged("failed hash check"));
+        assert!(rig.logged("disabled after 5 consecutive failures"));
+        assert!(rig.completed().is_empty(), "nothing unverified was accepted");
+        assert_eq!(rig.queue.len(), 3);
+        assert!(!rig.dir.join("file.bin").exists() || std::fs::read(rig.dir.join("file.bin")).unwrap().iter().all(|&b| b == 0), "and nothing unverified was written");
+    }
+
+    #[test]
+    fn a_mirror_that_says_not_found_is_given_up_on_after_five_tries() {
+        let (listed, content) = single("file.bin", 3000);
+        let mirror = spawn_mirror(vec![("file.bin", content.clone())], Mode::NotFound);
+        let rig = Rig::new("not-found", &[(vec!["file.bin"], content)], 1024);
+
+        rig.run(&mirror.base, "file.bin", &listed, false, None, &AtomicBool::new(false));
+
+        assert!(rig.logged("404"));
+        assert!(rig.logged("disabled after 5 consecutive failures"));
+        assert_eq!(mirror.requests.load(Ordering::SeqCst), 5, "it stopped asking after the fifth failure");
+        assert_eq!(rig.queue.len(), 3);
+    }
+
+    #[test]
+    fn a_download_limit_holds_a_web_seed_back_but_not_what_it_delivers() {
+        let (listed, content) = single("file.bin", 8000);
+        let mirror = spawn_mirror(vec![("file.bin", content.clone())], Mode::Serve);
+        let rig = Rig::new("limited", &[(vec!["file.bin"], content.clone())], 4000);
+        // A second's worth in the bucket, so the other 4000 bytes cost a second.
+        let limiter = crate::ratelimit::RateLimiter::new(4000);
+
+        let started = Instant::now();
+        rig.run(&mirror.base, "file.bin", &listed, false, Some(&limiter), &AtomicBool::new(false));
+        let took = started.elapsed();
+
+        assert_eq!(rig.completed(), vec![0, 1]);
+        assert_eq!(std::fs::read(rig.dir.join("file.bin")).unwrap(), content);
+        assert!(took >= Duration::from_millis(900), "8000 bytes at 4000 B/s with a 4000-byte burst: {:?}", took);
+    }
+
+    /// Runs a web worker on a thread and reports how long it took to return
+    /// after `stop` was set 300 ms in, or `None` if it had not by five seconds.
+    fn time_to_stop(rig: Rig, base: String, name: &'static str, files: Vec<(Vec<String>, i64)>, limiter: Option<crate::ratelimit::RateLimiter>) -> (Option<Duration>, Arc<WorkQueue>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let queue = Arc::clone(&rig.queue);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            rig.run(&base, name, &files, false, limiter.as_ref(), &worker_stop);
+            let _ = done_tx.send(());
+        });
+        thread::sleep(Duration::from_millis(300));
+        let stopped_at = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        let returned = done_rx.recv_timeout(Duration::from_secs(5)).ok().map(|_| stopped_at.elapsed());
+        (returned, queue)
+    }
+
+    #[test]
+    fn stopping_does_not_wait_for_a_mirror_that_has_gone_silent() {
+        let (listed, content) = single("file.bin", 3000);
+        let mirror = spawn_mirror(vec![("file.bin", content.clone())], Mode::Silent);
+        let rig = Rig::new("silent", &[(vec!["file.bin"], content)], 1024);
+
+        let (returned, queue) = time_to_stop(rig, mirror.base.clone(), "file.bin", listed, None);
+
+        let took = returned.expect("the worker must stop within seconds, not after the 60 s read timeout");
+        assert!(took < Duration::from_secs(2), "{:?}", took);
+        assert_eq!(queue.len(), 3, "the piece it was fetching went back");
+    }
+
+    #[test]
+    fn stopping_does_not_wait_out_a_long_rate_limit_delay() {
+        let (listed, content) = single("file.bin", 4000);
+        let mirror = spawn_mirror(vec![("file.bin", content.clone())], Mode::Serve);
+        let rig = Rig::new("limit-stop", &[(vec!["file.bin"], content)], 4000);
+        // 10 B/s: the piece just fetched would have to be paid for over ~400 s.
+        let limiter = crate::ratelimit::RateLimiter::new(10);
+
+        let (returned, queue) = time_to_stop(rig, mirror.base.clone(), "file.bin", listed, Some(limiter));
+
+        let took = returned.expect("the worker must stop within seconds, not sleep out its debt");
+        assert!(took < Duration::from_secs(2), "{:?}", took);
+        assert_eq!(queue.len(), 1, "the piece was not counted as done");
     }
 }

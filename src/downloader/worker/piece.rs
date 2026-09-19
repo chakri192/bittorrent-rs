@@ -3,29 +3,26 @@
 
 use super::connect::MAX_UNCHOKE_WAIT_TIMEOUTS;
 use super::pipeline::{depth_for, Throughput};
-use super::{absorb, is_read_timeout, PexSender, WorkerError};
+use super::{absorb, is_read_timeout, PexSender, WorkerConfig, WorkerError};
 use crate::downloader::piece_assembler::PieceAssembler;
 use crate::downloader::queue::WorkQueue;
 use crate::peer::{Message, PeerState};
-use crate::ratelimit::RateLimiter;
 use std::time::Instant;
 
 /// Downloads one piece. Returns `Ok(None)` if the piece was abandoned
 /// because another worker completed it first (endgame duplicate).
 ///
-/// `min_depth` requests are kept in flight at least; how many more depends
+/// `config.pipeline_depth` requests are kept in flight at least; how many more depends
 /// on how fast this peer has been delivering (`throughput`, which carries
 /// over from piece to piece) and on what it says it will queue.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn download_one_piece(
     stream: &mut std::net::TcpStream,
     state: &mut PeerState,
     queue: &WorkQueue,
     work: crate::downloader::piece_assembler::PieceWork,
-    min_depth: usize,
+    config: &WorkerConfig,
     throughput: &mut Throughput,
     pex_tx: Option<&PexSender>,
-    limiter: Option<&RateLimiter>,
 ) -> Result<Option<Vec<u8>>, WorkerError> {
     let piece_index = work.index;
     let mut assembler = PieceAssembler::new(work);
@@ -57,7 +54,7 @@ pub(super) fn download_one_piece(
             assembler.forget_requests();
         } else {
             choked_timeouts = 0;
-            let depth = depth_for(throughput.rate(Instant::now()), min_depth, state.peer_request_limit);
+            let depth = depth_for(throughput.rate(Instant::now()), config.pipeline_depth, state.peer_request_limit);
             while in_flight.len() < depth {
                 let reqs = assembler.next_requests(depth - in_flight.len());
                 if reqs.is_empty() {
@@ -100,8 +97,9 @@ pub(super) fn download_one_piece(
                 blocks_received += 1;
                 throughput.record(Instant::now(), block.len());
                 // Reading slowly is backpressure: the peer's window fills.
-                if let Some(limiter) = limiter {
-                    limiter.acquire(block.len());
+                if let Some(limiter) = config.down_limit.as_deref() {
+                    // Not past the point where the client is stopping.
+                    limiter.acquire_while(block.len(), || !config.interrupt.is_triggered());
                 }
             }
             Message::Piece { .. } => {
