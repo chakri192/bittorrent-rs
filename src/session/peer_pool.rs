@@ -171,6 +171,11 @@ impl PeerPool {
         self.known.len() - self.reserve.len()
     }
 
+    /// Every address accepted so far, banned ones excepted, in no particular order.
+    pub fn known_addresses(&self) -> Vec<SocketAddr> {
+        self.known.iter().filter(|addr| !self.is_banned(addr)).copied().collect()
+    }
+
     /// Distinct addresses accepted so far, dialed or not.
     pub fn known_count(&self) -> usize {
         self.known.len()

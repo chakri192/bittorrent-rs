@@ -160,6 +160,11 @@ impl Services {
         self.seeder = Some(seeder);
     }
 
+    /// The seeder this torrent is served by, if there is one.
+    pub fn seeder(&self) -> Option<&SeederHandle> {
+        self.seeder.as_ref()
+    }
+
     pub fn has_seeder(&self) -> bool {
         self.seeder.is_some()
     }

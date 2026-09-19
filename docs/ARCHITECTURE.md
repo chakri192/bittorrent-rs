@@ -48,7 +48,7 @@ behind locks.
 | orchestration | `session::run`, then seeding | it returns |
 | one per peer | `downloader::worker::run_worker` | queue empty, connection fails, or interrupted |
 | one per web seed | `webseed::run_web_worker` | queue empty or told to stop |
-| seeder accept, one per inbound peer, and one for the choking rounds | `seeder` | `SeederHandle::stop` |
+| seeder accept, one per inbound peer and one per peer dialed while seeding (at most 10), and one for the choking rounds | `seeder` | `SeederHandle::stop` |
 | DHT, one for IPv4 and one for IPv6 (BEP 32) | `dht::service` | `Services::shutdown` |
 | local discovery | `lsd` | `Services::shutdown` |
 | the daemon: one per torrent, one control accept and one per client | `daemon::job`, `daemon::control` | `Manager::remove` / `shutdown`, `Server::stop` |

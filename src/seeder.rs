@@ -49,6 +49,8 @@ const MAX_REQUEST_LEN: u32 = 128 * 1024;
 /// Concurrent inbound peers served at once; connections beyond this are
 /// accepted-and-closed immediately so the backlog doesn't grow unbounded.
 const MAX_INBOUND_PEERS: usize = 40;
+/// How many peers a seeder connects out to at once (see [`SeederHandle::dial`]).
+const MAX_DIALED_PEERS: usize = 10;
 /// The id peers send `ut_metadata` requests to us under.
 const SEEDER_UT_METADATA_ID: u8 = 1;
 /// How many pieces a peer using the Fast Extension may request while choked.
@@ -156,6 +158,8 @@ struct Registry {
     torrents: Mutex<HashMap<[u8; 20], Arc<SeederShared>>>,
     /// Peers being served, over every torrent.
     active_conns: AtomicUsize,
+    /// Peers this side connected out to, and is still connected to or connecting to.
+    dialed: Mutex<std::collections::HashSet<std::net::SocketAddr>>,
     /// Whether encrypted connections (MSE) are accepted, and whether plain ones are.
     encryption: crate::peer::Encryption,
     /// Cleared when the listener stops.
@@ -217,7 +221,7 @@ impl Listener {
         let listener = TcpListener::bind(("0.0.0.0", preferred_port)).or_else(|_| TcpListener::bind(("0.0.0.0", 0)))?;
         let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
-        let registry = Arc::new(Registry { torrents: Mutex::new(HashMap::new()), active_conns: AtomicUsize::new(0), encryption: options.encryption, running: AtomicBool::new(true) });
+        let registry = Arc::new(Registry { torrents: Mutex::new(HashMap::new()), active_conns: AtomicUsize::new(0), dialed: Mutex::new(Default::default()), encryption: options.encryption, running: AtomicBool::new(true) });
 
         let mut threads = Vec::new();
         let accepting = Arc::clone(&registry);
@@ -328,6 +332,31 @@ pub struct SeederHandle {
 }
 
 impl SeederHandle {
+    /// Connects out to `addr`, a peer that may want pieces (from a tracker, the DHT, the local network) and
+    /// serves it as if it had connected here: a client with nothing to download still has something to
+    /// give, and a peer that cannot be reached from outside can only get it this way. A peer that has every
+    /// piece is let go of. Does nothing, and says so, if `addr` is already connected or being dialed, or
+    /// too many are; the connection is made on a thread of its own.
+    pub fn dial(&self, addr: std::net::SocketAddr, transport: crate::peer::Transport, timeout: Duration, encryption: crate::peer::Encryption) -> bool {
+        {
+            let mut dialed = lock(&self.registry.dialed);
+            if dialed.len() >= MAX_DIALED_PEERS || !self.torrent.running.load(Ordering::SeqCst) || !dialed.insert(addr) {
+                return false;
+            }
+        }
+        let (shared, registry) = (Arc::clone(&self.torrent), Arc::clone(&self.registry));
+        thread::spawn(move || {
+            let _ = serve_dialed(addr, &transport, timeout, encryption, &shared);
+            lock(&registry.dialed).remove(&addr);
+        });
+        true
+    }
+
+    /// How many peers this side has dialed and is still connected to (or connecting to).
+    pub fn dialed_count(&self) -> usize {
+        lock(&self.registry.dialed).len()
+    }
+
     /// The limit this torrent's uploads are held to, for tests to see whose it is.
     #[cfg(test)]
     pub(crate) fn up_limit(&self) -> Option<Arc<crate::ratelimit::RateLimiter>> {
@@ -526,6 +555,39 @@ fn serve_peer(stream: Box<dyn PeerStream>, peer_ip: Option<std::net::IpAddr>, re
     // them: the info dictionary, for a peer that has only a magnet link.
     let ours = Handshake::new(shared.info_hash, shared.our_peer_id, shared.metadata.is_some()).with_fast(true);
     stream.write_all(&ours.to_bytes())?;
+    serve_connection(stream, peer_ip, shared, &their_hs, false)
+}
+
+/// The dialing side of a connection to a peer that is to be served: connect, handshake first, then serve.
+fn serve_dialed(addr: std::net::SocketAddr, transport: &crate::peer::Transport, timeout: Duration, encryption: crate::peer::Encryption, shared: &SeederShared) -> std::io::Result<()> {
+    let to_io = |e: &dyn std::fmt::Display| std::io::Error::other(e.to_string());
+    let stream = transport.open(addr, timeout).map_err(|e| to_io(&e))?;
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let ours = Handshake::new(shared.info_hash, shared.our_peer_id, shared.metadata.is_some()).with_fast(true);
+    let mut stream = if encryption == crate::peer::Encryption::Require {
+        crate::peer::mse::initiate(stream, &shared.info_hash, false, &ours.to_bytes()).map_err(|e| to_io(&e))?
+    } else {
+        let mut plain = MseStream::plain(stream);
+        plain.write_all(&ours.to_bytes())?;
+        plain
+    };
+    let mut hs_buf = [0u8; HANDSHAKE_LEN];
+    stream.read_exact(&mut hs_buf)?;
+    let their_hs = Handshake::from_bytes(&hs_buf).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed handshake"))?;
+    if their_hs.info_hash != shared.info_hash {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "the peer answered for another torrent"));
+    }
+    if their_hs.peer_id == shared.our_peer_id {
+        return Ok(()); // ourselves, listed by a tracker
+    }
+    serve_connection(stream, Some(addr.ip()), shared, &their_hs, true)
+}
+
+/// Serves a peer whose handshake has been exchanged, until either side ends it. `dialed` says this
+/// side made the connection, in which case a peer that turns out to have every piece is let go of at
+/// once: two seeds have nothing to give each other.
+fn serve_connection(mut stream: MseStream, peer_ip: Option<std::net::IpAddr>, shared: &SeederShared, their_hs: &Handshake, dialed: bool) -> std::io::Result<()> {
     // The Fast Extension (BEP 6) is in use only if both sides said so.
     let fast = their_hs.supports_fast();
     let speaks_extensions = shared.metadata.is_some() && their_hs.supports_extensions();
@@ -679,6 +741,9 @@ fn serve_peer(stream: Box<dyn PeerStream>, peer_ip: Option<std::net::IpAddr>, re
                 Message::Extended { id: reply_id, payload: reply.encode() }.write_to(&mut stream).map_err(wire_to_io)?;
                 last_sent = Instant::now();
             }
+            // A peer this side dialed that has everything has no use for us: let it go.
+            Message::HaveAll if dialed => return Ok(()),
+            Message::Bitfield(ref bits) if dialed && bitfield_is_full(bits, shared.have.total()) => return Ok(()),
             // Piece-availability chatter from a fellow leecher; a pure
             // serve loop has no use for it. Cancel is inherently
             // best-effort (we serve synchronously, so there's never a
@@ -691,6 +756,11 @@ fn serve_peer(stream: Box<dyn PeerStream>, peer_ip: Option<std::net::IpAddr>, re
             Message::Suggest { .. } | Message::HaveAll | Message::HaveNone | Message::RejectRequest { .. } | Message::AllowedFast { .. } => {}
         }
     }
+}
+
+/// Whether a peer's bitfield says it has every one of `total` pieces.
+fn bitfield_is_full(bits: &[u8], total: usize) -> bool {
+    total > 0 && bits.len() >= total.div_ceil(8) && (0..total).all(|i| bits[i / 8] & (0x80 >> (i % 8)) != 0)
 }
 
 /// Tells a connected peer about pieces verified since it was last told: a
@@ -1908,5 +1978,198 @@ mod tests {
         first.stop();
         second.stop();
         listener.stop();
+    }
+    // ---- dialing out ------------------------------------------------------
+
+    use std::net::TcpListener;
+
+    /// A leecher that listens to be dialed, and what it has to say once it has been.
+    fn leecher_listening() -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, addr)
+    }
+
+    /// Accepts the seeder's connection and shakes hands as a leecher with the peer id `id`; the seeder's handshake.
+    fn accept_and_shake(listener: &TcpListener, info_hash: [u8; 20], id: [u8; 20]) -> (TcpStream, Handshake) {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; HANDSHAKE_LEN];
+        stream.read_exact(&mut buf).unwrap();
+        let theirs = Handshake::from_bytes(&buf).unwrap();
+        stream.write_all(&Handshake::new(info_hash, id, false).to_bytes()).unwrap();
+        (stream, theirs)
+    }
+
+    fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {}", what);
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    const NO_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn a_seeder_dials_a_leecher_and_serves_it_as_if_it_had_connected() {
+        let dir = tmp_dir("dial-serve");
+        let piece = vec![0xCDu8; 16384];
+        let (mut handle, info_hash) = start_test_seeder(&dir, std::slice::from_ref(&piece), 16384, &[0]);
+        let (listener, addr) = leecher_listening();
+
+        assert!(handle.dial(addr, Default::default(), NO_TRANSPORT_TIMEOUT, crate::peer::Encryption::Off));
+        assert_eq!(handle.dialed_count(), 1);
+        let (mut stream, theirs) = accept_and_shake(&listener, info_hash, [0x21; 20]);
+        assert_eq!((theirs.info_hash, theirs.peer_id), (info_hash, [0x20; 20]), "it speaks first, for its torrent, as itself");
+
+        // What it has, then the usual: interested, unchoked, a request, the block.
+        let bitfield = loop {
+            match Message::read_from(&mut stream).unwrap() {
+                Message::Bitfield(bits) => break bits,
+                _ => continue,
+            }
+        };
+        assert_eq!(bitfield, vec![0x80]);
+        Message::Interested.write_to(&mut stream).unwrap();
+        loop {
+            if let Message::Unchoke = Message::read_from(&mut stream).unwrap() {
+                break;
+            }
+        }
+        Message::Request { index: 0, begin: 0, length: 16384 }.write_to(&mut stream).unwrap();
+        let block = loop {
+            if let Message::Piece { index: 0, begin: 0, block } = Message::read_from(&mut stream).unwrap() {
+                break block;
+            }
+        };
+        assert_eq!(block, piece);
+        assert_eq!(handle.uploaded.load(Ordering::Relaxed), 16384);
+        drop(stream);
+        wait_until("the dialed peer to be forgotten once it left", || handle.dialed_count() == 0);
+        handle.stop();
+    }
+
+    #[test]
+    fn a_peer_dialed_that_turns_out_to_have_everything_is_let_go_of() {
+        for announce in [Message::Bitfield(vec![0x80]), Message::HaveAll] {
+            let dir = tmp_dir("dial-seed");
+            let (mut handle, info_hash) = start_test_seeder(&dir, &[vec![1u8; 16384]], 16384, &[0]);
+            let (listener, addr) = leecher_listening();
+            assert!(handle.dial(addr, Default::default(), NO_TRANSPORT_TIMEOUT, crate::peer::Encryption::Off));
+            let (mut stream, _) = accept_and_shake(&listener, info_hash, [0x21; 20]);
+
+            announce.write_to(&mut stream).unwrap();
+
+            // The seeder hangs up: whatever it sent first, a read ends in the end of the stream.
+            let closed = loop {
+                match Message::read_from(&mut stream) {
+                    Ok(_) => continue,
+                    Err(_) => break true,
+                }
+            };
+            assert!(closed);
+            wait_until("the dialed peer to be forgotten", || handle.dialed_count() == 0);
+            handle.stop();
+        }
+    }
+
+    #[test]
+    fn a_peer_that_lacks_a_piece_is_not_let_go_of() {
+        let dir = tmp_dir("dial-partial");
+        let (mut handle, info_hash) = start_test_seeder(&dir, &[vec![1u8; 16384], vec![2u8; 16384]], 16384, &[0, 1]);
+        let (listener, addr) = leecher_listening();
+        assert!(handle.dial(addr, Default::default(), NO_TRANSPORT_TIMEOUT, crate::peer::Encryption::Off));
+        let (mut stream, _) = accept_and_shake(&listener, info_hash, [0x21; 20]);
+        Message::Bitfield(vec![0x80]).write_to(&mut stream).unwrap(); // one of two
+        thread::sleep(Duration::from_millis(700));
+        assert_eq!(handle.dialed_count(), 1, "still connected");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_seeder_that_dials_its_own_address_hangs_up_on_itself() {
+        let dir = tmp_dir("dial-self");
+        let (mut handle, info_hash) = start_test_seeder(&dir, &[vec![1u8; 16384]], 16384, &[0]);
+        let (listener, addr) = leecher_listening();
+        assert!(handle.dial(addr, Default::default(), NO_TRANSPORT_TIMEOUT, crate::peer::Encryption::Off));
+        let (mut stream, _) = accept_and_shake(&listener, info_hash, [0x20; 20]); // the same peer id
+        let closed = Message::read_from(&mut stream).is_err();
+        assert!(closed, "nothing is sent to itself");
+        wait_until("it to be forgotten", || handle.dialed_count() == 0);
+        handle.stop();
+    }
+
+    #[test]
+    fn a_peer_that_answers_for_another_torrent_is_dropped() {
+        let dir = tmp_dir("dial-wrong");
+        let (mut handle, _) = start_test_seeder(&dir, &[vec![1u8; 16384]], 16384, &[0]);
+        let (listener, addr) = leecher_listening();
+        assert!(handle.dial(addr, Default::default(), NO_TRANSPORT_TIMEOUT, crate::peer::Encryption::Off));
+        let (mut stream, _) = accept_and_shake(&listener, [0x99; 20], [0x21; 20]);
+        assert!(Message::read_from(&mut stream).is_err());
+        wait_until("it to be forgotten", || handle.dialed_count() == 0);
+        handle.stop();
+    }
+
+    #[test]
+    fn one_dial_to_an_address_at_a_time_a_limited_number_in_all_and_none_once_stopped() {
+        let dir = tmp_dir("dial-limits");
+        let (mut handle, _) = start_test_seeder(&dir, &[vec![1u8; 16384]], 16384, &[0]);
+        // Listeners that never accept: the dial is under way for as long as the handshake is waited for.
+        let listeners: Vec<_> = (0..MAX_DIALED_PEERS + 1).map(|_| leecher_listening()).collect();
+        let dial = |handle: &SeederHandle, addr| handle.dial(addr, Default::default(), NO_TRANSPORT_TIMEOUT, crate::peer::Encryption::Off);
+
+        assert!(dial(&handle, listeners[0].1));
+        assert!(!dial(&handle, listeners[0].1), "not the same address twice");
+        for (_, addr) in &listeners[1..MAX_DIALED_PEERS] {
+            assert!(dial(&handle, *addr));
+        }
+        assert_eq!(handle.dialed_count(), MAX_DIALED_PEERS);
+        assert!(!dial(&handle, listeners[MAX_DIALED_PEERS].1), "and no more than the limit");
+
+        handle.stop();
+        drop(listeners);
+        let (_, fresh) = leecher_listening();
+        assert!(!dial(&handle, fresh), "a stopped seeder dials nobody");
+    }
+
+    #[test]
+    fn a_dial_that_cannot_connect_is_forgotten() {
+        let dir = tmp_dir("dial-refused");
+        let (mut handle, _) = start_test_seeder(&dir, &[vec![1u8; 16384]], 16384, &[0]);
+        let (listener, addr) = leecher_listening();
+        drop(listener); // nothing listens there now
+        assert!(handle.dial(addr, Default::default(), Duration::from_millis(500), crate::peer::Encryption::Off));
+        wait_until("the failed dial to be forgotten", || handle.dialed_count() == 0);
+        assert!(handle.dial(addr, Default::default(), Duration::from_millis(500), crate::peer::Encryption::Off), "so it can be tried again");
+        handle.stop();
+    }
+
+    #[test]
+    fn where_encryption_is_required_the_dial_is_encrypted() {
+        let dir = tmp_dir("dial-mse");
+        let (mut handle, info_hash) = start_test_seeder(&dir, &[vec![1u8; 16384]], 16384, &[0]);
+        let (listener, addr) = leecher_listening();
+        assert!(handle.dial(addr, Default::default(), NO_TRANSPORT_TIMEOUT, crate::peer::Encryption::Require));
+
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (mut stream, encrypted) = crate::peer::mse::accept(Box::new(stream), &[info_hash], crate::peer::Encryption::Require).unwrap();
+        assert!(encrypted);
+        let mut buf = [0u8; HANDSHAKE_LEN];
+        stream.read_exact(&mut buf).unwrap();
+        assert_eq!(Handshake::from_bytes(&buf).unwrap().info_hash, info_hash, "and the handshake is what came through it");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_bitfield_is_full_only_if_every_piece_is_in_it() {
+        assert!(bitfield_is_full(&[0b1110_0000], 3));
+        assert!(bitfield_is_full(&[0xFF, 0b1000_0000], 9));
+        assert!(!bitfield_is_full(&[0b1010_0000], 3), "a piece missing");
+        assert!(!bitfield_is_full(&[0xFF], 9), "too short to say");
+        assert!(!bitfield_is_full(&[0xFF], 0), "no pieces is not a seed");
+        assert!(!bitfield_is_full(&[], 1));
     }
 }

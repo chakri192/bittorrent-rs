@@ -57,6 +57,11 @@ pub struct Workers {
 }
 
 impl Workers {
+    /// How connections are made and what is said on them: what a peer dialed for any other reason is dialed with.
+    pub fn config(&self) -> &Arc<WorkerConfig> {
+        &self.config
+    }
+
     /// The limit the downloads are held to, for tests to see whose it is.
     #[cfg(test)]
     pub(crate) fn down_limit(&self) -> Option<Arc<crate::ratelimit::RateLimiter>> {

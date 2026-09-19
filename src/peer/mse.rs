@@ -302,6 +302,11 @@ impl fmt::Debug for MseStream {
 }
 
 impl MseStream {
+    /// A plain connection, in the same type as an encrypted one.
+    pub fn plain(inner: Box<dyn PeerStream>) -> MseStream {
+        MseStream { inner, encrypt: None, decrypt: None, replay: VecDeque::new() }
+    }
+
     /// Whether the stream is encrypted (RC4) rather than plain.
     pub fn is_encrypted(&self) -> bool {
         self.encrypt.is_some()
