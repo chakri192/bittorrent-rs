@@ -161,10 +161,11 @@ impl SharedNetwork {
         lock(&self.listener).torrent_count()
     }
 
-    /// Starts serving a torrent on the shared port.
+    /// Starts serving a torrent on the shared port, its uploads held to `up_limit` (which should be
+    /// [`layered`] on this network's).
     #[allow(clippy::too_many_arguments)]
-    pub fn register(&self, info_hash: [u8; 20], our_peer_id: [u8; 20], spans: Arc<Vec<FileSpan>>, piece_length: u64, total_length: u64, have: Arc<HaveMap>, options: SeederOptions) -> SeederHandle {
-        lock(&self.listener).register(info_hash, our_peer_id, spans, piece_length, total_length, have, self.up_limit(), options)
+    pub fn register(&self, info_hash: [u8; 20], our_peer_id: [u8; 20], spans: Arc<Vec<FileSpan>>, piece_length: u64, total_length: u64, have: Arc<HaveMap>, up_limit: Option<Arc<RateLimiter>>, options: SeederOptions) -> SeederHandle {
+        lock(&self.listener).register(info_hash, our_peer_id, spans, piece_length, total_length, have, up_limit, options)
     }
 
     /// Stops everything: the port mapping first (so it is removed while the ports still answer),
@@ -180,6 +181,16 @@ impl SharedNetwork {
         if let Some(utp) = &self.utp {
             utp.shutdown();
         }
+    }
+}
+
+/// The limit for one torrent: the `shared` limit over every torrent, if there is one; and the
+/// torrent's `own` rate, if it has one, which then holds as well, as a part of the shared one.
+pub fn layered(shared: Option<Arc<RateLimiter>>, own: Option<u64>) -> Option<Arc<RateLimiter>> {
+    match (shared, own) {
+        (shared, None) => shared,
+        (Some(shared), Some(rate)) => Some(Arc::new(RateLimiter::under(rate, shared))),
+        (None, Some(rate)) => Some(Arc::new(RateLimiter::new(rate))),
     }
 }
 
@@ -225,7 +236,7 @@ pub(crate) mod tests {
     }
 
     fn idle(network: &SharedNetwork, info_hash: [u8; 20]) -> SeederHandle {
-        network.register(info_hash, [7; 20], Arc::new(Vec::new()), 16384, 0, Arc::new(HaveMap::new(0)), SeederOptions::default())
+        network.register(info_hash, [7; 20], Arc::new(Vec::new()), 16384, 0, Arc::new(HaveMap::new(0)), network.up_limit(), SeederOptions::default())
     }
 
     #[test]
@@ -245,6 +256,22 @@ pub(crate) mod tests {
         assert_eq!(handshake(network.port, b), Some(b), "and the other one is");
         second.stop();
         network.shutdown();
+    }
+
+    #[test]
+    fn a_torrents_own_limit_is_a_part_of_the_shared_one_and_only_where_there_is_one() {
+        let shared = Arc::new(RateLimiter::new(5000));
+        assert!(Arc::ptr_eq(&layered(Some(Arc::clone(&shared)), None).unwrap(), &shared), "no rate of its own: the shared one");
+        let own = layered(Some(Arc::clone(&shared)), Some(100)).unwrap();
+        assert_eq!(own.bytes_per_sec(), 100);
+        assert!(!Arc::ptr_eq(&own, &shared));
+        let t0 = std::time::Instant::now();
+        own.reserve(100, t0);
+        // What it moved was moved through the shared limit too: 5000 - 100 left of a burst of 5000, so 4950 is free and a bit more is not.
+        assert_eq!(shared.reserve(4900, t0), Duration::ZERO);
+        assert!(shared.reserve(200, t0) > Duration::ZERO);
+        assert_eq!(layered(None, Some(7)).unwrap().bytes_per_sec(), 7, "alone, just its own");
+        assert!(layered(None, None).is_none());
     }
 
     #[test]
@@ -269,6 +296,21 @@ pub(crate) mod tests {
         let unlimited = quiet_network(no_dht());
         assert!(idle(&unlimited, [1; 20]).up_limit().is_none());
         unlimited.shutdown();
+    }
+
+    #[test]
+    fn shutdown_takes_the_port_mapping_off_the_router_while_the_ports_still_answer() {
+        let network = quiet_network(no_dht());
+        let port = network.port;
+        let removed_while_listening = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&removed_while_listening);
+        *lock(&network.portmap) = Some(PortMap::fake(move || *lock(&seen) = Some(TcpStream::connect(("127.0.0.1", port)).is_ok())));
+
+        network.shutdown();
+
+        assert_eq!(*lock(&removed_while_listening), Some(true), "the mapping was removed, and the listener was still up when it was");
+        assert!(lock(&network.portmap).is_none(), "and it is let go of");
+        network.shutdown(); // (nothing left to remove the second time)
     }
 
     #[test]

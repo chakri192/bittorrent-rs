@@ -1,7 +1,7 @@
 //! The torrents a daemon is running: adding, removing and listing them, and remembering them.
 
-use super::job::{Job, JobContext, JobDefaults, JobSpec, JobStatus, Source};
-use super::state::{Entry, Store};
+use super::job::{FinishedHook, Job, JobContext, JobDefaults, JobOptions, JobSpec, JobState, JobStatus, Source};
+use super::state::{Dormant, Entry, Store};
 use crate::magnet::parse_magnet_uri;
 use crate::session::SharedNetwork;
 use crate::sync::lock;
@@ -30,25 +30,39 @@ impl Manager {
     /// [`add`](Self::add).
     pub fn new(network: Arc<SharedNetwork>, peer_id: [u8; 20], defaults: JobDefaults, store: Option<Store>) -> Arc<Manager> {
         Arc::new_cyclic(|this: &Weak<Manager>| {
-            let this = Weak::clone(this);
+            let (resolved, finished) = (Weak::clone(this), Weak::clone(this));
             let on_resolved: Box<dyn Fn(&TorrentFile) + Send + Sync> = Box::new(move |torrent| {
-                if let Some(manager) = this.upgrade() {
+                if let Some(manager) = resolved.upgrade() {
                     manager.resolved(torrent);
                 }
             });
-            Manager { context: Arc::new(JobContext { network, peer_id, defaults, on_resolved }), store, jobs: Mutex::new(Vec::new()), entries: Mutex::new(Vec::new()) }
+            let on_finished: FinishedHook = Box::new(move |info_hash, reason| {
+                if let Some(manager) = finished.upgrade() {
+                    manager.finished(info_hash, reason);
+                }
+            });
+            Manager { context: Arc::new(JobContext { network, peer_id, defaults, on_resolved, on_finished }), store, jobs: Mutex::new(Vec::new()), entries: Mutex::new(Vec::new()) }
         })
     }
 
-    /// Starts again the torrents the state directory remembers. What could not be read, or
-    /// could not be started, comes back as warnings.
+    /// The job for what is remembered: running, unless it was set aside or had finished.
+    fn job_for(&self, entry: &Entry) -> Job {
+        let spec = JobSpec { info_hash: entry.info_hash, source: entry.source.clone(), out_dir: entry.out_dir.clone(), options: entry.options.clone() };
+        match &entry.dormant {
+            Some(dormant) => Job::dormant(spec, dormant.state()),
+            None => Job::start(spec, Arc::clone(&self.context)),
+        }
+    }
+
+    /// Starts again the torrents the state directory remembers (those that were not set aside or
+    /// finished). What could not be read comes back as warnings.
     pub fn restore(&self) -> Vec<String> {
         let Some(store) = &self.store else { return Vec::new() };
         let (entries, warnings) = store.load();
         let mut jobs = lock(&self.jobs);
         let mut all = lock(&self.entries);
         for entry in entries {
-            jobs.push(Arc::new(Job::start(JobSpec { info_hash: entry.info_hash, source: entry.source.clone(), out_dir: entry.out_dir.clone() }, Arc::clone(&self.context))));
+            jobs.push(Arc::new(self.job_for(&entry)));
             all.push(entry);
         }
         warnings
@@ -57,8 +71,9 @@ impl Manager {
     /// Adds a torrent, given as a magnet link or as the path of a `.torrent` file, to be
     /// downloaded into `out_dir` (a torrent of several files goes in a directory of its name
     /// under it) and then seeded. Both paths must be absolute: the daemon does not share its
-    /// working directory with whoever is asking.
-    pub fn add(&self, source: &str, out_dir: PathBuf) -> Result<JobStatus, String> {
+    /// working directory with whoever is asking. A pattern in `options` that matches none of a
+    /// `.torrent`'s files is refused here; for a magnet link it is found out when the torrent is.
+    pub fn add(&self, source: &str, out_dir: PathBuf, options: JobOptions) -> Result<JobStatus, String> {
         if !out_dir.is_absolute() {
             return Err(format!("the output directory must be an absolute path: {}", out_dir.display()));
         }
@@ -72,6 +87,10 @@ impl Manager {
             }
             let bytes = fs::read(&path).map_err(|e| format!("reading {}: {}", path.display(), e))?;
             let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| format!("parsing {}: {}", path.display(), e))?;
+            crate::selection::build_mask(&torrent.files, &[], &options.only)?;
+            if !options.prefer.is_empty() {
+                crate::selection::build_prefer_mask(&torrent.files, &options.prefer)?;
+            }
             // Kept, so that the torrent does not depend on the file staying where it was.
             let kept = match &self.store {
                 Some(store) => {
@@ -88,13 +107,13 @@ impl Manager {
         if let Some(existing) = jobs.iter().find(|job| job.info_hash() == info_hash) {
             return Err(format!("already added: {} ({})", info_hash_hex(&info_hash), existing.status().name));
         }
-        let entry = Entry { info_hash, source: source.clone(), out_dir: out_dir.clone() };
+        let entry = Entry { info_hash, source, out_dir, options, dormant: None };
+        let job = Arc::new(self.job_for(&entry));
         {
             let mut entries = lock(&self.entries);
             entries.push(entry);
             self.save(&entries)?;
         }
-        let job = Arc::new(Job::start(JobSpec { info_hash, source, out_dir }, Arc::clone(&self.context)));
         let status = job.status();
         jobs.push(job);
         Ok(status)
@@ -120,6 +139,51 @@ impl Manager {
             let _ = fs::remove_file(store.torrent_path(&hash));
         }
         Ok(job.status())
+    }
+
+    /// Sets a torrent aside: it is stopped, taken off the shared port and the DHT, and told to its
+    /// trackers, and kept, with what it has downloaded, until it is resumed. It stays paused
+    /// through a restart.
+    pub fn pause(&self, id: &str) -> Result<JobStatus, String> {
+        let job = {
+            let jobs = lock(&self.jobs);
+            Arc::clone(&jobs[Self::find(&jobs, id)?])
+        };
+        if job.status().state == JobState::Paused {
+            return Err("it is paused already".to_string());
+        }
+        job.stop(); // (with no lock held: the job may be telling us it has finished)
+        self.replace(&job, Some(Dormant::Paused))
+    }
+
+    /// Starts a torrent that was paused again, or one that had finished (to seed it again) or
+    /// failed (to try again). One that is running is refused.
+    pub fn resume(&self, id: &str) -> Result<JobStatus, String> {
+        let job = {
+            let jobs = lock(&self.jobs);
+            Arc::clone(&jobs[Self::find(&jobs, id)?])
+        };
+        if !job.status().state.is_over() {
+            return Err("it is running".to_string());
+        }
+        job.stop(); // (it is over: this only collects its thread)
+        self.replace(&job, None)
+    }
+
+    /// Puts in the place of `old` a job made from what is remembered of it once its `dormant` is as given.
+    fn replace(&self, old: &Arc<Job>, dormant: Option<Dormant>) -> Result<JobStatus, String> {
+        let mut jobs = lock(&self.jobs);
+        let hash = old.info_hash();
+        let mut entries = lock(&self.entries);
+        let (Some(at), Some(entry)) = (jobs.iter().position(|j| Arc::ptr_eq(j, old)), entries.iter_mut().find(|e| e.info_hash == hash)) else {
+            return Err("it was removed".to_string());
+        };
+        entry.dormant = dormant;
+        let job = Arc::new(self.job_for(entry));
+        self.save(&entries)?;
+        let status = job.status();
+        jobs[at] = job;
+        Ok(status)
     }
 
     pub fn list(&self) -> Vec<JobStatus> {
@@ -175,6 +239,15 @@ impl Manager {
         if let Some(entry) = entries.iter_mut().find(|e| e.info_hash == torrent.info_hash && matches!(e.source, Source::Magnet(_))) {
             entry.source = Source::File(path);
             let _ = store.save(&entries);
+        }
+    }
+
+    /// A torrent has been seeded up to a limit: a restart is not to start it again.
+    fn finished(&self, info_hash: &[u8; 20], reason: &str) {
+        let mut entries = lock(&self.entries);
+        if let Some(entry) = entries.iter_mut().find(|e| &e.info_hash == info_hash) {
+            entry.dormant = Some(Dormant::Finished(reason.to_string()));
+            let _ = self.save(&entries);
         }
     }
 }
@@ -242,6 +315,10 @@ mod tests {
     }
 
     fn seeder(name: &str) -> Seeder {
+        seeder_with(name, None)
+    }
+
+    fn seeder_with(name: &str, store: Option<Store>) -> Seeder {
         let root = dir(name);
         let network = quiet_network(no_dht());
         let (announce, _) = tracker(SocketAddr::from(([127, 0, 0, 1], network.port)));
@@ -258,9 +335,9 @@ mod tests {
                 (path, hash, data, "second.bin")
             },
         ];
-        let manager = manager_on(&network, None);
+        let manager = manager_on(&network, store);
         for (path, _, _, _) in &torrents {
-            manager.add(path.to_str().unwrap(), seed_dir.clone()).unwrap();
+            manager.add(path.to_str().unwrap(), seed_dir.clone(), JobOptions::default()).unwrap();
         }
         for (_, hash, _, _) in &torrents {
             wait_for(&manager, hash, "the seeder to be seeding", |s| s.state == JobState::Seeding);
@@ -279,7 +356,7 @@ mod tests {
         let out = root.join("out");
         fs::create_dir_all(&out).unwrap();
         for (path, _, _, _) in &s.torrents {
-            leech.add(path.to_str().unwrap(), out.clone()).unwrap();
+            leech.add(path.to_str().unwrap(), out.clone(), JobOptions::default()).unwrap();
         }
         assert_eq!(leech.list().len(), 2);
 
@@ -322,16 +399,16 @@ mod tests {
         let network = quiet_network(no_dht());
         let manager = manager_on(&network, None);
         let root = dir("add-errors");
-        assert!(manager.add("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", PathBuf::from("out")).unwrap_err().contains("absolute"));
-        assert!(manager.add("some.torrent", root.clone()).unwrap_err().contains("absolute"));
-        assert!(manager.add(root.join("missing.torrent").to_str().unwrap(), root.clone()).unwrap_err().starts_with("reading"));
+        assert!(manager.add("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", PathBuf::from("out"), JobOptions::default()).unwrap_err().contains("absolute"));
+        assert!(manager.add("some.torrent", root.clone(), JobOptions::default()).unwrap_err().contains("absolute"));
+        assert!(manager.add(root.join("missing.torrent").to_str().unwrap(), root.clone(), JobOptions::default()).unwrap_err().starts_with("reading"));
         fs::write(root.join("bad.torrent"), b"not a torrent").unwrap();
-        assert!(manager.add(root.join("bad.torrent").to_str().unwrap(), root.clone()).unwrap_err().starts_with("parsing"));
-        assert!(manager.add("magnet:?xt=nothing", root.clone()).unwrap_err().starts_with("parsing the magnet link"));
+        assert!(manager.add(root.join("bad.torrent").to_str().unwrap(), root.clone(), JobOptions::default()).unwrap_err().starts_with("parsing"));
+        assert!(manager.add("magnet:?xt=nothing", root.clone(), JobOptions::default()).unwrap_err().starts_with("parsing the magnet link"));
 
         let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce";
-        manager.add(magnet, root.clone()).unwrap();
-        assert!(manager.add(magnet, root.clone()).unwrap_err().starts_with("already added: 0123456789abcdef"));
+        manager.add(magnet, root.clone(), JobOptions::default()).unwrap();
+        assert!(manager.add(magnet, root.clone(), JobOptions::default()).unwrap_err().starts_with("already added: 0123456789abcdef"));
         assert_eq!(manager.list().len(), 1, "and that made no second job");
 
         manager.shutdown();
@@ -344,7 +421,7 @@ mod tests {
         let manager = manager_on(&network, None);
         let root = dir("ids");
         for hash in ["0123456789abcdef0123456789abcdef01234567", "0123ffffffffffffffffffffffffffffffffffff"] {
-            manager.add(&format!("magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce", hash), root.clone()).unwrap();
+            manager.add(&format!("magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce", hash), root.clone(), JobOptions::default()).unwrap();
         }
         assert!(manager.status("0123").unwrap_err().contains("more than one"));
         assert!(manager.status("012").unwrap_err().contains("too short"));
@@ -365,7 +442,7 @@ mod tests {
         let network = quiet_network(no_dht());
         let manager = manager_on(&network, Some(Store::open(&state).unwrap()));
         for (path, _, _, _) in &s.torrents {
-            manager.add(path.to_str().unwrap(), out.clone()).unwrap();
+            manager.add(path.to_str().unwrap(), out.clone(), JobOptions::default()).unwrap();
         }
         for (_, hash, _, _) in &s.torrents {
             wait_for(&manager, hash, "the download", |st| st.state == JobState::Seeding);
@@ -404,7 +481,7 @@ mod tests {
 
         // The seeder is named in the link, as x.pe (BEP 9): the metadata comes from it.
         let magnet = format!("magnet:?xt=urn:btih:{}&x.pe=127.0.0.1:{}", info_hash_hex(hash), s.network.port);
-        manager.add(&magnet, out.clone()).unwrap();
+        manager.add(&magnet, out.clone(), JobOptions::default()).unwrap();
         let status = wait_for(&manager, hash, "the magnet link to become a download", |st| matches!(st.state, JobState::Seeding | JobState::Failed(_)));
         assert_eq!(status.state, JobState::Seeding, "{:?}", status.log);
         assert_eq!(&fs::read(out.join(name)).unwrap(), data);
@@ -424,8 +501,8 @@ mod tests {
         let root = dir("vanished");
         let state = root.join("state");
         let store = Store::open(&state).unwrap();
-        let missing = Entry { info_hash: [0x11; 20], source: Source::File(root.join("gone.torrent")), out_dir: root.clone() };
-        let fine = Entry { info_hash: [0x22; 20], source: Source::Magnet("magnet:?xt=urn:btih:2222222222222222222222222222222222222222&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce".to_string()), out_dir: root.clone() };
+        let missing = Entry::new([0x11; 20], Source::File(root.join("gone.torrent")), root.clone());
+        let fine = Entry::new([0x22; 20], Source::Magnet("magnet:?xt=urn:btih:2222222222222222222222222222222222222222&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce".to_string()), root.clone());
         store.save(&[missing, fine]).unwrap();
         let network = quiet_network(no_dht());
         let manager = manager_on(&network, Some(store));
@@ -438,6 +515,156 @@ mod tests {
         assert!(!manager.status(&"22".repeat(20)).unwrap().state.is_over(), "the other torrent is unaffected");
         manager.remove(&"11".repeat(20)).expect("a failed torrent can be removed");
         manager.shutdown();
+        network.shutdown();
+    }
+
+    use crate::session::network::tests::handshake;
+
+    #[test]
+    fn a_paused_torrent_is_off_the_port_and_stays_so_until_resumed() {
+        let s = seeder("pause");
+        let ((_, first, _, _), (_, second, _, _)) = (&s.torrents[0], &s.torrents[1]);
+
+        let paused = s.manager.pause(&info_hash_hex(first)).unwrap();
+
+        assert_eq!(paused.state, JobState::Paused);
+        assert_eq!(s.manager.status(&info_hash_hex(first)).unwrap().state, JobState::Paused);
+        assert_eq!(s.network.torrent_count(), 1, "it is off the shared port");
+        assert_eq!(handshake(s.network.port, *first), None);
+        assert_eq!(handshake(s.network.port, *second), Some(*second), "the other is served as before");
+        assert!(s.manager.pause(&info_hash_hex(first)).unwrap_err().contains("already"));
+        assert!(s.manager.resume(&info_hash_hex(second)).unwrap_err().contains("running"), "a running torrent is not resumed");
+        assert_eq!(s.manager.list().len(), 2, "still listed");
+
+        s.manager.resume(&info_hash_hex(first)).unwrap();
+        wait_for(&s.manager, first, "the resumed torrent to seed again", |st| st.state == JobState::Seeding);
+        assert_eq!(handshake(s.network.port, *first), Some(*first), "and served");
+        assert_eq!(s.network.torrent_count(), 2);
+
+        s.manager.shutdown();
+        s.network.shutdown();
+    }
+
+    #[test]
+    fn a_torrent_paused_stays_paused_through_a_restart() {
+        let root = dir("pause-restart");
+        let state = root.join("state");
+        let s = seeder_with("pause-restart-seed", Some(Store::open(&state).unwrap()));
+        let hash = s.torrents[0].1;
+        s.manager.pause(&info_hash_hex(&hash)).unwrap();
+        s.manager.shutdown();
+        s.network.shutdown();
+
+        let network = quiet_network(no_dht());
+        let manager = manager_on(&network, Some(Store::open(&state).unwrap()));
+        assert!(manager.restore().is_empty());
+        assert_eq!(manager.status(&info_hash_hex(&hash)).unwrap().state, JobState::Paused, "at once, not started and then stopped");
+        assert_ne!(manager.status(&info_hash_hex(&s.torrents[1].1)).unwrap().state, JobState::Paused, "and only that one");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(handshake(network.port, hash), None, "it is not served");
+
+        manager.resume(&info_hash_hex(&hash)).unwrap();
+        wait_for(&manager, &hash, "the resumed torrent to seed", |st| st.state == JobState::Seeding);
+        assert!(Store::open(&state).unwrap().load().0.iter().all(|e| e.dormant.is_none()), "and it is remembered as running");
+        manager.shutdown();
+        network.shutdown();
+    }
+
+    #[test]
+    fn a_torrent_seeded_up_to_its_limit_is_remembered_as_finished_and_a_restart_does_not_seed_it_again() {
+        let root = dir("finished");
+        let (state, files) = (root.join("state"), root.join("files"));
+        fs::create_dir_all(&files).unwrap();
+        let (path, hash, _) = make_torrent("done.bin", 40_000, 4, &files, &root, "http://127.0.0.1:9/announce");
+        let network = quiet_network(no_dht());
+        let limits = JobDefaults { seed_limits: crate::session::SeedLimits { ratio: None, time: Some(Duration::ZERO) }, ..defaults() };
+        let manager = Manager::new(Arc::clone(&network), [9; 20], limits.clone(), Some(Store::open(&state).unwrap()));
+        manager.add(path.to_str().unwrap(), files.clone(), JobOptions::default()).unwrap();
+
+        let status = wait_for(&manager, &hash, "the seeding to reach its limit", |st| matches!(st.state, JobState::Finished(_) | JobState::Failed(_)));
+        assert!(matches!(&status.state, JobState::Finished(why) if why.contains("seed time")), "{:?} {:?}", status.state, status.log);
+        // (What the job says on its way out is written by the time it is seen to be over.)
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(Store::open(&state).unwrap().load().0[0].dormant, Some(Dormant::Finished(_))) {
+            assert!(Instant::now() < deadline, "the finish was never remembered");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        manager.shutdown();
+        network.shutdown();
+
+        let network = quiet_network(no_dht());
+        let manager = Manager::new(Arc::clone(&network), [9; 20], limits, Some(Store::open(&state).unwrap()));
+        manager.restore();
+        let status = manager.status(&info_hash_hex(&hash)).unwrap();
+        assert!(matches!(&status.state, JobState::Finished(_)), "finished at once, and not run again: {:?}", status.state);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(network.torrent_count(), 0, "so it is not served");
+
+        manager.resume(&info_hash_hex(&hash)).expect("but it can be started to seed again");
+        wait_for(&manager, &hash, "the seeding to start again", |st| matches!(st.state, JobState::Seeding | JobState::Finished(_)));
+        manager.shutdown();
+        network.shutdown();
+    }
+
+    #[test]
+    fn a_failed_torrent_is_tried_again_by_resuming_it() {
+        let root = dir("retry");
+        let state = root.join("state");
+        let files = root.join("files");
+        fs::create_dir_all(&files).unwrap();
+        let (made, hash, _) = make_torrent("late.bin", 30_000, 5, &files, &root, "http://127.0.0.1:9/announce");
+        let store = Store::open(&state).unwrap();
+        let missing = root.join("not-yet.torrent");
+        store.save(&[Entry::new(hash, Source::File(missing.clone()), files.clone())]).unwrap();
+        let network = quiet_network(no_dht());
+        let manager = manager_on(&network, Some(store));
+        manager.restore();
+        wait_for(&manager, &hash, "the missing file to be noticed", |st| matches!(st.state, JobState::Failed(_)));
+
+        fs::copy(&made, &missing).unwrap();
+        manager.resume(&info_hash_hex(&hash)).unwrap();
+
+        wait_for(&manager, &hash, "the retry to work", |st| matches!(st.state, JobState::Seeding | JobState::Failed(_)));
+        assert_eq!(manager.status(&info_hash_hex(&hash)).unwrap().state, JobState::Seeding);
+        manager.shutdown();
+        network.shutdown();
+    }
+
+    #[test]
+    fn only_some_of_a_torrents_files_can_be_asked_for_and_only_those_are_fetched() {
+        let root = dir("only");
+        let network = quiet_network(no_dht());
+        let (announce, _) = tracker(SocketAddr::from(([127, 0, 0, 1], network.port)));
+        // Two files of whole pieces, so that no piece is shared between them.
+        let (seed_dir, out) = (root.join("seed"), root.join("out"));
+        fs::create_dir_all(seed_dir.join("multi")).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        let (a, b) = (content(32_768, 1), content(32_768, 2));
+        fs::write(seed_dir.join("multi/a.bin"), &a).unwrap();
+        fs::write(seed_dir.join("multi/b.bin"), &b).unwrap();
+        let created = create(&seed_dir.join("multi"), &CreateOptions { piece_length: Some(16384), trackers: vec![vec![announce]], ..Default::default() }, |_, _| {}).unwrap();
+        let torrent = root.join("multi.torrent");
+        fs::write(&torrent, &created.bytes).unwrap();
+
+        let seeding = manager_on(&network, None);
+        seeding.add(torrent.to_str().unwrap(), seed_dir.clone(), JobOptions::default()).unwrap();
+        wait_for(&seeding, &created.info_hash, "the seeder to seed", |st| st.state == JobState::Seeding);
+
+        let leech_network = quiet_network(no_dht());
+        let leech = manager_on(&leech_network, None);
+        let wrong = JobOptions { only: vec!["zzz".into()], ..Default::default() };
+        assert!(leech.add(torrent.to_str().unwrap(), out.clone(), wrong).unwrap_err().contains("zzz"), "a pattern that matches nothing is refused at once");
+        assert_eq!(leech.list().len(), 0, "and nothing is added");
+        leech.add(torrent.to_str().unwrap(), out.clone(), JobOptions { only: vec!["A.BIN".into()], ..Default::default() }).unwrap();
+
+        let status = wait_for(&leech, &created.info_hash, "the wanted file to arrive", |st| matches!(st.state, JobState::Seeding | JobState::Failed(_)));
+        assert_eq!(status.state, JobState::Seeding, "{:?}", status.log);
+        assert_eq!(fs::read(out.join("multi/a.bin")).unwrap(), a);
+        assert!(!out.join("multi/b.bin").exists() || fs::read(out.join("multi/b.bin")).unwrap() != b, "the other file was not fetched");
+
+        leech.shutdown();
+        seeding.shutdown();
+        leech_network.shutdown();
         network.shutdown();
     }
 }

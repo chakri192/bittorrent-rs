@@ -12,7 +12,7 @@
 //! {"cmd":"shutdown"}
 //! ```
 
-use super::job::{JobState, JobStatus};
+use super::job::{JobOptions, JobState, JobStatus};
 use super::manager::Manager;
 use crate::json::{self, Object, Value};
 use crate::sync::lock;
@@ -22,7 +22,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -32,30 +32,93 @@ use std::time::Duration;
 const MAX_REQUEST: u64 = 64 * 1024;
 /// How long a connection may sit silent before the daemon lets it go.
 const IDLE: Duration = Duration::from_secs(30);
+/// How many clients may be connected at once. A person and a few scripts need a handful; the rest
+/// is refused, so that a runaway one cannot fill the daemon with threads.
+const MAX_CONNECTIONS: usize = 32;
 /// How many lines of a torrent's log a `status` includes.
 const STATUS_LOG_LINES: usize = 10;
 
 /// What a client can ask for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    Add { source: String, out: PathBuf },
+    Add { source: String, out: PathBuf, options: JobOptions },
     List,
     Status { id: String },
     Remove { id: String },
+    Pause { id: String },
+    Resume { id: String },
     Shutdown,
+}
+
+impl Request {
+    /// The line that says it: what [`parse_request`] reads.
+    pub fn to_line(&self) -> String {
+        match self {
+            Request::Add { source, out, options } => {
+                let mut object = Object::new().string("cmd", "add").string("source", source).string("out", &out.to_string_lossy());
+                if !options.only.is_empty() {
+                    object = object.string("only", &options.only.join("\n"));
+                }
+                if !options.prefer.is_empty() {
+                    object = object.string("prefer", &options.prefer.join("\n"));
+                }
+                if options.sequential {
+                    object = object.boolean("sequential", true);
+                }
+                if let Some(rate) = options.max_up {
+                    object = object.uint("max_up", rate);
+                }
+                if let Some(rate) = options.max_down {
+                    object = object.uint("max_down", rate);
+                }
+                object.finish()
+            }
+            Request::List => Object::new().string("cmd", "list").finish(),
+            Request::Status { id } => Object::new().string("cmd", "status").string("id", id).finish(),
+            Request::Remove { id } => Object::new().string("cmd", "remove").string("id", id).finish(),
+            Request::Pause { id } => Object::new().string("cmd", "pause").string("id", id).finish(),
+            Request::Resume { id } => Object::new().string("cmd", "resume").string("id", id).finish(),
+            Request::Shutdown => Object::new().string("cmd", "shutdown").finish(),
+        }
+    }
 }
 
 /// Reads a request from one line.
 pub fn parse_request(line: &str) -> Result<Request, String> {
     let fields = json::parse_object(line).map_err(|e| format!("not a JSON object: {}", e))?;
     let text = |key: &str| -> Result<String, String> { fields.get(key).and_then(Value::as_str).map(str::to_string).ok_or_else(|| format!("\"{}\" is needed, as a string", key)) };
+    // Optional ones: left out, or null, or of the right kind.
+    let list = |key: &str| -> Result<Vec<String>, String> {
+        match fields.get(key) {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::String(s)) => Ok(s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()),
+            Some(_) => Err(format!("\"{}\" must be a string, one pattern to a line", key)),
+        }
+    };
+    let rate = |key: &str| -> Result<Option<u64>, String> {
+        match fields.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Number(n)) if *n >= 1.0 && n.fract() == 0.0 && *n < 1e15 => Ok(Some(*n as u64)),
+            Some(_) => Err(format!("\"{}\" must be a whole number of bytes per second", key)),
+        }
+    };
     match fields.get("cmd").and_then(Value::as_str) {
-        Some("add") => Ok(Request::Add { source: text("source")?, out: PathBuf::from(text("out")?) }),
+        Some("add") => {
+            let sequential = match fields.get("sequential") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => return Err("\"sequential\" must be true or false".to_string()),
+            };
+            let options = JobOptions { only: list("only")?, prefer: list("prefer")?, sequential, max_up: rate("max_up")?, max_down: rate("max_down")? };
+            Ok(Request::Add { source: text("source")?, out: PathBuf::from(text("out")?), options })
+        }
         Some("list") => Ok(Request::List),
         Some("status") => Ok(Request::Status { id: text("id")? }),
         Some("remove") => Ok(Request::Remove { id: text("id")? }),
+        Some("pause") => Ok(Request::Pause { id: text("id")? }),
+        Some("resume") => Ok(Request::Resume { id: text("id")? }),
         Some("shutdown") => Ok(Request::Shutdown),
-        Some(other) => Err(format!("no command {:?}: they are add, list, status, remove and shutdown", other)),
+        Some(other) => Err(format!("no command {:?}: they are add, list, status, remove, pause, resume and shutdown", other)),
         None => Err("\"cmd\" is needed, as a string".to_string()),
     }
 }
@@ -103,8 +166,10 @@ pub fn handle(manager: &Manager, request: Request, stop: &AtomicBool) -> Vec<Str
         Err(reason) => vec![failure(&reason)],
     };
     match request {
-        Request::Add { source, out } => one(manager.add(&source, out)),
+        Request::Add { source, out, options } => one(manager.add(&source, out, options)),
         Request::Remove { id } => one(manager.remove(&id)),
+        Request::Pause { id } => one(manager.pause(&id)),
+        Request::Resume { id } => one(manager.resume(&id)),
         Request::Status { id } => match manager.status(&id) {
             Ok(status) => vec![torrent_line(&status, true), success()],
             Err(reason) => vec![failure(&reason)],
@@ -164,16 +229,18 @@ impl Server {
     /// Listens on `path`. If a socket file is there already it is replaced, unless somebody
     /// answers on it, which means a daemon is running.
     pub fn start(path: &Path, manager: Arc<Manager>, stop: Arc<AtomicBool>) -> io::Result<Server> {
-        if path.exists() {
-            if UnixStream::connect(path).is_ok() {
-                return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("a daemon is already listening on {}", path.display())));
-            }
-            std::fs::remove_file(path)?;
+        Server::start_with(path, manager, stop, MAX_CONNECTIONS)
+    }
+
+    /// [`start`](Self::start), taking at most `max_connections` clients at once.
+    pub fn start_with(path: &Path, manager: Arc<Manager>, stop: Arc<AtomicBool>, max_connections: usize) -> io::Result<Server> {
+        if path.exists() && UnixStream::connect(path).is_ok() {
+            return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("a daemon is already listening on {}", path.display())));
         }
-        let listener = UnixListener::bind(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let listener = bind_private(path)?;
         listener.set_nonblocking(true)?;
         let running = Arc::new(AtomicBool::new(true));
+        let connected = Arc::new(AtomicUsize::new(0));
         let thread = {
             let running = Arc::clone(&running);
             thread::spawn(move || {
@@ -184,8 +251,17 @@ impl Server {
                             if stream.set_nonblocking(false).is_err() {
                                 continue;
                             }
-                            let (manager, stop) = (Arc::clone(&manager), Arc::clone(&stop));
-                            thread::spawn(move || serve(stream, &manager, &stop));
+                            if connected.fetch_add(1, Ordering::SeqCst) >= max_connections {
+                                connected.fetch_sub(1, Ordering::SeqCst);
+                                let mut stream = stream;
+                                let _ = writeln!(stream, "{}", failure("too many clients are connected"));
+                                continue;
+                            }
+                            let (manager, stop, connected) = (Arc::clone(&manager), Arc::clone(&stop), Arc::clone(&connected));
+                            thread::spawn(move || {
+                                serve(stream, &manager, &stop);
+                                connected.fetch_sub(1, Ordering::SeqCst);
+                            });
                         }
                         Err(_) => thread::sleep(Duration::from_millis(50)),
                     }
@@ -203,6 +279,30 @@ impl Server {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+}
+
+/// Makes the socket at `path` so that nobody but the owner ever has it open to them: bound
+/// inside a directory only the owner can enter, restricted, and only then moved into place. (A
+/// socket bound where it is to be, and restricted afterwards, is there for a moment with the
+/// permissions the process's umask gives it.)
+fn bind_private(path: &Path) -> io::Result<UnixListener> {
+    use std::os::unix::fs::DirBuilderExt;
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let staging = parent.join(format!(".bt-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::SeqCst)));
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    let inside = staging.join("s");
+    let made = UnixListener::bind(&inside).and_then(|listener| {
+        std::fs::set_permissions(&inside, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&inside, path)?;
+        Ok(listener)
+    });
+    let _ = std::fs::remove_file(&inside);
+    let _ = std::fs::remove_dir(&staging);
+    made
 }
 
 /// One line of an answer, read.
@@ -243,12 +343,28 @@ mod tests {
 
     #[test]
     fn every_command_is_read() {
-        assert_eq!(request(r#"{"cmd":"add","source":"magnet:?x","out":"/d"}"#), Request::Add { source: "magnet:?x".into(), out: PathBuf::from("/d") });
+        assert_eq!(request(r#"{"cmd":"add","source":"magnet:?x","out":"/d"}"#), Request::Add { source: "magnet:?x".into(), out: PathBuf::from("/d"), options: JobOptions::default() });
         assert_eq!(request(r#"{"cmd":"list"}"#), Request::List);
         assert_eq!(request(r#"{"cmd":"status","id":"ab12"}"#), Request::Status { id: "ab12".into() });
         assert_eq!(request(r#"{"cmd":"remove","id":"ab12"}"#), Request::Remove { id: "ab12".into() });
         assert_eq!(request(r#"  {"cmd" : "shutdown"}  "#), Request::Shutdown);
-        assert_eq!(request(r#"{"cmd":"add","source":"s","out":"/d","extra":1}"#), Request::Add { source: "s".into(), out: PathBuf::from("/d") }, "what is not asked for is ignored");
+        assert_eq!(request(r#"{"cmd":"add","source":"s","out":"/d","extra":1}"#), Request::Add { source: "s".into(), out: PathBuf::from("/d"), options: JobOptions::default() }, "what is not asked for is ignored");
+    }
+
+    #[test]
+    fn every_request_is_read_back_as_it_was_written() {
+        for r in [
+            Request::Add { source: "magnet:?xt=urn:btih:00&dn=a b".into(), out: PathBuf::from("/d/with \"quotes\" and \\ and é"), options: JobOptions { only: vec![".mkv".into(), "a b".into()], prefer: vec!["nfo".into()], sequential: true, max_up: Some(50_000), max_down: Some(1_000_000) } },
+            Request::Add { source: "/x/y z.torrent".into(), out: PathBuf::from("/d"), options: JobOptions::default() },
+            Request::List,
+            Request::Status { id: "ab12".into() },
+            Request::Remove { id: "ab12".into() },
+            Request::Pause { id: "ab12".into() },
+            Request::Resume { id: "ab12".into() },
+            Request::Shutdown,
+        ] {
+            assert_eq!(parse_request(&r.to_line()), Ok(r.clone()), "{:?}", r);
+        }
     }
 
     #[test]
@@ -325,7 +441,7 @@ mod tests {
         let (manager, network) = manager();
         let stop = AtomicBool::new(false);
 
-        let added = read(&handle(&manager, Request::Add { source: MAGNET.into(), out: PathBuf::from("/tmp") }, &stop));
+        let added = read(&handle(&manager, Request::Add { source: MAGNET.into(), out: PathBuf::from("/tmp"), options: JobOptions::default() }, &stop));
         assert_eq!((added.len(), added[0]["torrent"].as_str(), added[1]["ok"].as_bool()), (2, Some("0123456789abcdef0123456789abcdef01234567"), Some(true)));
 
         let listed = read(&handle(&manager, Request::List, &stop));
@@ -404,6 +520,87 @@ mod tests {
         let path = socket_path("perm");
         let server = Server::start(&path, Arc::clone(&manager), Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        server.stop();
+        manager.shutdown();
+        network.shutdown();
+    }
+
+    #[test]
+    fn the_socket_is_never_there_with_wider_permissions_and_leaves_nothing_behind() {
+        let (manager, network) = manager();
+        let path = socket_path("private");
+        let dir = path.parent().unwrap().to_path_buf();
+        let before: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with(".bt-")).collect();
+        // Watch for the socket from the moment the daemon starts, at the widest umask there is.
+        let watching = Arc::new(AtomicBool::new(true));
+        let seen_wide = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (path, watching, seen_wide) = (path.clone(), Arc::clone(&watching), Arc::clone(&seen_wide));
+            thread::spawn(move || {
+                while watching.load(Ordering::SeqCst) {
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        if meta.permissions().mode() & 0o077 != 0 {
+                            seen_wide.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+            })
+        };
+        // (The moment in question is short, so it is made many times.)
+        for _ in 0..40 {
+            let server = Server::start(&path, Arc::clone(&manager), Arc::new(AtomicBool::new(false))).unwrap();
+            assert!(ask(&path, r#"{"cmd":"list"}"#).is_ok(), "it works where it was moved to");
+            server.stop();
+        }
+        watching.store(false, Ordering::SeqCst);
+        watcher.join().unwrap();
+        assert!(!seen_wide.load(Ordering::SeqCst), "the socket was visible to others");
+        let server = Server::start(&path, Arc::clone(&manager), Arc::new(AtomicBool::new(false))).unwrap();
+        server.stop();
+        let after: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with(".bt-")).collect();
+        assert_eq!(before.len(), after.len(), "no staging directory is left: {:?}", after);
+        manager.shutdown();
+        network.shutdown();
+    }
+
+    #[test]
+    fn clients_beyond_the_limit_are_told_so_and_a_place_is_freed_when_one_leaves() {
+        let (manager, network) = manager();
+        let path = socket_path("limit");
+        let server = Server::start_with(&path, Arc::clone(&manager), Arc::new(AtomicBool::new(false)), 2).unwrap();
+        let connect = || {
+            let stream = UnixStream::connect(&path).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream
+        };
+        // Two that stay: each has made a request, so its thread is known to be running.
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let mut stream = connect();
+            writeln!(stream, r#"{{"cmd":"list"}}"#).unwrap();
+            let mut answer = String::new();
+            BufReader::new(stream.try_clone().unwrap()).read_line(&mut answer).unwrap();
+            held.push(stream);
+        }
+        let mut third = String::new();
+        BufReader::new(connect()).read_line(&mut third).unwrap();
+        assert!(third.contains("too many clients"), "{:?}", third);
+
+        drop(held.pop());
+        // The place is free once the daemon has noticed the hang-up.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut stream = connect();
+            writeln!(stream, r#"{{"cmd":"list"}}"#).unwrap();
+            let mut answer = String::new();
+            let _ = BufReader::new(stream).read_line(&mut answer);
+            if answer.contains("\"ok\":true") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no place was freed: {:?}", answer);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(held);
         server.stop();
         manager.shutdown();
         network.shutdown();

@@ -434,3 +434,75 @@ fn a_utp_connection_survives_hostile_packets_and_time() {
         }
     });
 }
+
+// ---- the daemon ------------------------------------------------------
+
+#[test]
+fn control_requests_survive_hostile_input_and_round_trip_what_they_accept() {
+    use crate::daemon::control::{parse_request, Request};
+    let seeds: Vec<Vec<u8>> = [
+        Request::Add { source: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=a%20b".into(), out: "/downloads/a b".into(), options: Default::default() },
+        Request::Add { source: "/tmp/x \"quoted\".torrent".into(), out: "/o".into(), options: crate::daemon::JobOptions { only: vec!["a".into(), "b c".into()], prefer: vec!["x".into()], sequential: true, max_up: Some(5), max_down: Some(6) } },
+        Request::Pause { id: "ab12".into() },
+        Request::Resume { id: "ab12".into() },
+        Request::List,
+        Request::Status { id: "ab12".into() },
+        Request::Remove { id: "0123456789abcdef".into() },
+        Request::Shutdown,
+    ]
+    .iter()
+    .map(|r| r.to_line().into_bytes())
+    .collect();
+    hammer(&seeds, ITERATIONS, |input| {
+        let Ok(text) = std::str::from_utf8(input) else { return };
+        if let Ok(request) = parse_request(text) {
+            assert_eq!(parse_request(&request.to_line()), Ok(request.clone()), "{:?} did not survive being written and read", request);
+        }
+    });
+}
+
+#[test]
+fn the_daemons_state_file_survives_hostile_input_and_round_trips_what_it_accepts() {
+    use crate::daemon::state::{parse_entries, Entry};
+    use crate::daemon::Source;
+    use crate::daemon::state::Dormant;
+    use crate::daemon::JobOptions;
+    let mut with_options = Entry::new([2; 20], Source::File("/state/torrents/y.torrent".into()), "/o".into());
+    with_options.options = JobOptions { only: vec!["a b".into(), ".mkv".into()], prefer: vec!["\"q\"".into()], sequential: true, max_up: Some(1000), max_down: Some(2_000_000) };
+    with_options.dormant = Some(Dormant::Finished("seed ratio 1.00 reached".into()));
+    let mut paused = Entry::new([3; 20], Source::Magnet("magnet:?xt=urn:btih:0303".into()), "/o".into());
+    paused.dormant = Some(Dormant::Paused);
+    let entries = [Entry::new([0xAB; 20], Source::Magnet("magnet:?xt=urn:btih:abab&dn=\"q\"".into()), "/down loads".into()), Entry::new([1; 20], Source::File("/state/torrents/x.torrent".into()), "/o".into()), with_options, paused];
+    let mut file = String::new();
+    for entry in &entries {
+        file.push_str(&entry.to_line());
+        file.push('\n');
+    }
+    let seeds = vec![file.into_bytes(), entries[0].to_line().into_bytes()];
+    hammer(&seeds, ITERATIONS, |input| {
+        let Ok(text) = std::str::from_utf8(input) else { return };
+        let (read, _) = parse_entries(text);
+        for entry in read {
+            assert_eq!(Entry::from_line(&entry.to_line()), Ok(entry.clone()), "{:?}", entry);
+        }
+    });
+}
+
+#[test]
+fn flat_json_survives_hostile_input() {
+    let seeds: Vec<Vec<u8>> = [
+        r#"{"cmd":"add","source":"a\"b\\c\n","out":"/o"}"#,
+        r#"{"ok":true,"n":-12.5e3,"x":null,"u":"\u00e9\ud83d\ude00"}"#,
+        r#"{"a":1,"b":[1]}"#,
+        r#"{ "spaced" : "out" }"#,
+        "{}",
+    ]
+    .iter()
+    .map(|s| s.as_bytes().to_vec())
+    .collect();
+    hammer(&seeds, ITERATIONS, |input| {
+        if let Ok(text) = std::str::from_utf8(input) {
+            let _ = crate::json::parse_object(text);
+        }
+    });
+}

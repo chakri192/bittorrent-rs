@@ -2,8 +2,8 @@
 //! go, in a state directory. A magnet link is kept as the `.torrent` it turned into once its
 //! metadata arrived, so a restart does not have to find it again.
 
-use super::job::Source;
-use crate::json::{self, Object};
+use super::job::{JobOptions, JobState, Source};
+use crate::json::{self, Object, Value};
 use crate::torrent::info_hash_hex;
 use std::fs;
 use std::io;
@@ -14,36 +14,118 @@ const ENTRIES_FILE: &str = "torrents.jsonl";
 /// Where the `.torrent` files the daemon keeps go, in the state directory.
 const TORRENTS_DIR: &str = "torrents";
 
+/// Why a torrent is not being worked on although it is remembered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dormant {
+    /// It was set aside.
+    Paused,
+    /// It was seeded up to a limit, which is said: it is not started again by a restart.
+    Finished(String),
+}
+
+impl Dormant {
+    pub fn state(&self) -> JobState {
+        match self {
+            Dormant::Paused => JobState::Paused,
+            Dormant::Finished(reason) => JobState::Finished(reason.clone()),
+        }
+    }
+}
+
 /// One torrent the daemon has been given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub info_hash: [u8; 20],
     pub source: Source,
     pub out_dir: PathBuf,
+    pub options: JobOptions,
+    pub dormant: Option<Dormant>,
+}
+
+/// A list of patterns as one string, one to a line.
+fn join_lines(list: &[String]) -> String {
+    list.join("\n")
+}
+
+fn split_lines(text: &str) -> Vec<String> {
+    text.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
 }
 
 impl Entry {
-    fn to_line(&self) -> String {
-        let object = Object::new().string("id", &info_hash_hex(&self.info_hash)).string("out", &self.out_dir.to_string_lossy());
-        match &self.source {
-            Source::Magnet(uri) => object.string("magnet", uri),
-            Source::File(path) => object.string("file", &path.to_string_lossy()),
-        }
-        .finish()
+    /// A torrent to be worked on, with no options.
+    pub fn new(info_hash: [u8; 20], source: Source, out_dir: PathBuf) -> Entry {
+        Entry { info_hash, source, out_dir, options: JobOptions::default(), dormant: None }
     }
 
-    fn from_line(line: &str) -> Result<Entry, String> {
+    pub fn to_line(&self) -> String {
+        let mut object = Object::new().string("id", &info_hash_hex(&self.info_hash)).string("out", &self.out_dir.to_string_lossy());
+        object = match &self.source {
+            Source::Magnet(uri) => object.string("magnet", uri),
+            Source::File(path) => object.string("file", &path.to_string_lossy()),
+        };
+        let options = &self.options;
+        if !options.only.is_empty() {
+            object = object.string("only", &join_lines(&options.only));
+        }
+        if !options.prefer.is_empty() {
+            object = object.string("prefer", &join_lines(&options.prefer));
+        }
+        if options.sequential {
+            object = object.boolean("sequential", true);
+        }
+        if let Some(rate) = options.max_up {
+            object = object.uint("max_up", rate);
+        }
+        if let Some(rate) = options.max_down {
+            object = object.uint("max_down", rate);
+        }
+        match &self.dormant {
+            Some(Dormant::Paused) => object = object.boolean("paused", true),
+            Some(Dormant::Finished(reason)) => object = object.string("finished", reason),
+            None => {}
+        }
+        object.finish()
+    }
+
+    pub fn from_line(line: &str) -> Result<Entry, String> {
         let fields = json::parse_object(line)?;
-        let text = |key: &str| fields.get(key).and_then(|v| v.as_str());
-        let id = text("id").ok_or("no \"id\"")?;
+        let text = |key: &str| -> Result<Option<&str>, String> {
+            match fields.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(s)) => Ok(Some(s)),
+                Some(_) => Err(format!("\"{}\" is not a string", key)),
+            }
+        };
+        let flag = |key: &str| -> Result<bool, String> {
+            match fields.get(key) {
+                None | Some(Value::Null) => Ok(false),
+                Some(Value::Bool(b)) => Ok(*b),
+                Some(_) => Err(format!("\"{}\" is not true or false", key)),
+            }
+        };
+        let rate = |key: &str| -> Result<Option<u64>, String> {
+            match fields.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::Number(n)) if *n >= 1.0 && n.fract() == 0.0 && *n < 1e15 => Ok(Some(*n as u64)),
+                Some(_) => Err(format!("\"{}\" is not a whole number of bytes per second", key)),
+            }
+        };
+        let id = text("id")?.ok_or("no \"id\"")?;
         let info_hash = parse_hex20(id).ok_or_else(|| format!("\"id\" is not an info hash: {:?}", id))?;
-        let out_dir = PathBuf::from(text("out").ok_or("no \"out\"")?);
-        let source = match (text("magnet"), text("file")) {
+        let out_dir = PathBuf::from(text("out")?.ok_or("no \"out\"")?);
+        let source = match (text("magnet")?, text("file")?) {
             (Some(uri), None) => Source::Magnet(uri.to_string()),
             (None, Some(path)) => Source::File(PathBuf::from(path)),
             _ => return Err("it needs exactly one of \"magnet\" and \"file\"".to_string()),
         };
-        Ok(Entry { info_hash, source, out_dir })
+        let options = JobOptions { only: split_lines(text("only")?.unwrap_or("")), prefer: split_lines(text("prefer")?.unwrap_or("")), sequential: flag("sequential")?, max_up: rate("max_up")?, max_down: rate("max_down")? };
+        let dormant = match (flag("paused")?, text("finished")?) {
+            (false, None) => None,
+            (true, None) => Some(Dormant::Paused),
+            (false, Some(reason)) => Some(Dormant::Finished(reason.to_string())),
+            (true, Some(_)) => return Err("it cannot be both \"paused\" and \"finished\"".to_string()),
+        };
+        Ok(Entry { info_hash, source, out_dir, options, dormant })
     }
 }
 
@@ -57,6 +139,20 @@ pub fn parse_hex20(text: &str) -> Option<[u8; 20]> {
         *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
     }
     Some(out)
+}
+
+/// The entries in the text of an entries file, and a warning for each line that could not be
+/// read (which is left out) or that repeats a torrent.
+pub fn parse_entries(text: &str) -> (Vec<Entry>, Vec<String>) {
+    let (mut entries, mut warnings) = (Vec::new(), Vec::new());
+    for (number, line) in text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()) {
+        match Entry::from_line(line) {
+            Ok(entry) if entries.iter().any(|e: &Entry| e.info_hash == entry.info_hash) => warnings.push(format!("{} line {}: {} is there twice; the second is ignored", ENTRIES_FILE, number + 1, info_hash_hex(&entry.info_hash))),
+            Ok(entry) => entries.push(entry),
+            Err(reason) => warnings.push(format!("{} line {}: {}", ENTRIES_FILE, number + 1, reason)),
+        }
+    }
+    (entries, warnings)
 }
 
 /// A state directory.
@@ -88,15 +184,7 @@ impl Store {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return (Vec::new(), Vec::new()),
             Err(e) => return (Vec::new(), vec![format!("reading {}: {}", ENTRIES_FILE, e)]),
         };
-        let (mut entries, mut warnings) = (Vec::new(), Vec::new());
-        for (number, line) in text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()) {
-            match Entry::from_line(line) {
-                Ok(entry) if entries.iter().any(|e: &Entry| e.info_hash == entry.info_hash) => warnings.push(format!("{} line {}: {} is there twice; the second is ignored", ENTRIES_FILE, number + 1, info_hash_hex(&entry.info_hash))),
-                Ok(entry) => entries.push(entry),
-                Err(reason) => warnings.push(format!("{} line {}: {}", ENTRIES_FILE, number + 1, reason)),
-            }
-        }
-        (entries, warnings)
+        parse_entries(&text)
     }
 
     /// Replaces the entries with `entries`, all at once: a crash leaves the old ones or the new.
@@ -124,13 +212,13 @@ mod tests {
     }
 
     fn entry(byte: u8, source: Source) -> Entry {
-        Entry { info_hash: [byte; 20], source, out_dir: PathBuf::from("/downloads/some place") }
+        Entry::new([byte; 20], source, PathBuf::from("/downloads/some place"))
     }
 
     #[test]
     fn what_is_saved_is_loaded_again_in_order() {
         let store = Store::open(&dir("roundtrip")).unwrap();
-        let entries = vec![entry(1, Source::Magnet("magnet:?xt=urn:btih:0101&dn=a \"b\"".to_string())), entry(2, Source::File(PathBuf::from("/state/torrents/x.torrent")))];
+        let entries = vec![entry(1, Source::Magnet("magnet:?xt=urn:btih:0101&dn=a \"b\"".to_string())), entry(2, Source::File(PathBuf::from("/state dir/torrents/x \"y\".torrent")))];
         store.save(&entries).unwrap();
         assert_eq!(store.load(), (entries, Vec::new()));
     }
@@ -190,5 +278,41 @@ mod tests {
         assert_eq!(path.parent().unwrap(), store.dir().join("torrents"));
         assert_eq!(path.file_name().unwrap().to_str().unwrap(), format!("{}.torrent", "ab".repeat(20)));
         assert!(path.parent().unwrap().is_dir(), "in a directory that exists");
+    }
+
+    #[test]
+    fn options_and_a_dormant_state_are_kept_with_the_torrent() {
+        let mut full = entry(7, Source::File(PathBuf::from("/s/x.torrent")));
+        full.options = JobOptions { only: vec!["a b".into(), ".mkv".into()], prefer: vec!["nfo".into()], sequential: true, max_up: Some(1000), max_down: Some(2_000_000) };
+        full.dormant = Some(Dormant::Finished("seed ratio 1.00 reached".into()));
+        let mut paused = entry(8, Source::Magnet("m".into()));
+        paused.dormant = Some(Dormant::Paused);
+        for e in [full, paused] {
+            assert_eq!(Entry::from_line(&e.to_line()), Ok(e.clone()), "{}", e.to_line());
+        }
+        let plain = entry(9, Source::Magnet("m".into())).to_line();
+        assert!(!plain.contains("only") && !plain.contains("paused") && !plain.contains("finished") && !plain.contains("max_"), "nothing is written that is not so: {}", plain);
+        assert_eq!(Dormant::Paused.state(), JobState::Paused);
+        assert_eq!(Dormant::Finished("r".into()).state(), JobState::Finished("r".into()));
+    }
+
+    #[test]
+    fn an_option_of_the_wrong_kind_makes_the_line_unreadable() {
+        let base = |extra: &str| format!("{{\"id\":\"{}\",\"out\":\"/o\",\"magnet\":\"m\"{}}}", "ab".repeat(20), extra);
+        assert!(Entry::from_line(&base("")).is_ok());
+        for (extra, wants) in [
+            (",\"paused\":\"yes\"", "paused"),
+            (",\"sequential\":1", "sequential"),
+            (",\"only\":5", "only"),
+            (",\"max_up\":0", "max_up"),
+            (",\"max_up\":-5", "max_up"),
+            (",\"max_down\":1.5", "max_down"),
+            (",\"max_down\":\"fast\"", "max_down"),
+            (",\"paused\":true,\"finished\":\"r\"", "both"),
+        ] {
+            let error = Entry::from_line(&base(extra)).unwrap_err();
+            assert!(error.contains(wants), "{}: {}", extra, error);
+        }
+        assert!(Entry::from_line(&base(",\"paused\":false,\"max_up\":null")).is_ok(), "false and null are 'not'");
     }
 }

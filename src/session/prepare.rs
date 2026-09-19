@@ -3,7 +3,7 @@
 //! the first tracker announce, and the workers.
 
 use crate::downloader::{any_data_on_disk, create_empty_files, load_and_verify, progress_file_path, rewrite_compact, scan_all, Order, ResumeWriter, WorkQueue, WorkerConfig};
-use crate::ratelimit::RateLimiter;
+use crate::session::network::layered;
 use crate::seeder::{self, HaveMap};
 use crate::session::peer_pool::RetryPolicy;
 use crate::session::{Announcer, DownloadPlan, Log, Outstanding, PeerPool, Progress, ProgressSink, Services, Session, Setup, Workers};
@@ -217,10 +217,11 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     for &idx in &confirmed_resumed {
         have.set(idx);
     }
-    // On a shared network the limits are the network's, over every torrent together; its
-    // listener holds the uploads to its own, so only the download limit is chosen here.
-    let up_limit = options.max_up.map(|rate| Arc::new(RateLimiter::new(rate)));
-    let down_limit = services.network().map_or_else(|| options.max_down.map(|rate| Arc::new(RateLimiter::new(rate))), |network| network.down_limit());
+    // On a shared network its limits hold over every torrent together, and a rate of this torrent's
+    // own holds as well, as a part of them.
+    let shared = services.network();
+    let up_limit = layered(shared.and_then(|network| network.up_limit()), options.max_up);
+    let down_limit = layered(shared.and_then(|network| network.down_limit()), options.max_down);
     // The info dictionary is offered to peers that have only a magnet link
     // (BEP 9), but only if it re-encodes to what the hash was taken over.
     let info_bytes = crate::bencode::encode(&torrent.info);
@@ -235,7 +236,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     let seeder_options = seeder::SeederOptions { metadata, encryption: options.encryption.unwrap_or(crate::peer::Encryption::Prefer), utp: services.utp(), piece_lengths, ipv6: allow_ipv6, ..Default::default() };
     let started = match services.network() {
         // Peers reach this torrent on the port everyone's share.
-        Some(network) => Ok(network.register(torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), seeder_options)),
+        Some(network) => Ok(network.register(torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options)),
         None => seeder::start_with(options.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options),
     };
     match started {
@@ -296,7 +297,9 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // Web seeds serve v1 pieces, which a v2-only torrent has none of.
     let web_seeds: Vec<String> = if options.no_webseed || torrent.is_v2_only() { Vec::new() } else { torrent.url_list.clone() };
 
-    if pool.known_count() == 0 && services.dht().is_none() && services.lsd().is_none() && web_seeds.is_empty() {
+    // (With every wanted piece already on disk there is nothing to look for, and a client that has only
+    // to seed must start whether or not its trackers can be reached.)
+    if !queue.is_empty() && pool.known_count() == 0 && services.dht().is_none() && services.lsd().is_none() && web_seeds.is_empty() {
         return Err("no peers found from any tracker (and DHT, local discovery + web seeds unavailable)".to_string());
     }
     sink.log(format!("{} peer(s) known; dialing up to {} concurrently", pool.known_count(), options.max_peers));
@@ -486,6 +489,26 @@ mod tests {
         let mut services = Services::new();
         let (result, _) = run_prepare(&torrent(), &[true, true], Vec::new(), &options(&dir), &mut services);
         assert_eq!(result.err().as_deref(), Some("no peers found from any tracker (and DHT, local discovery + web seeds unavailable)"));
+    }
+
+    #[test]
+    fn a_torrent_already_whole_on_disk_starts_with_no_peers_to_be_had_since_it_has_only_to_seed() {
+        let dir = tmp_dir("whole-nopeers");
+        write_all_data(&dir);
+        let mut services = Services::new();
+        let (prepared, _) = run_prepare(&torrent(), &[true, true], Vec::new(), &options(&dir), &mut services);
+        assert_eq!(prepared.expect("nothing to fetch, so nobody to fetch it from").queue.len(), 0);
+        assert!(services.has_seeder(), "and it seeds");
+
+        // Missing even one piece, it is as before.
+        let dir = tmp_dir("nearly-whole-nopeers");
+        write_all_data(&dir);
+        let mut b = fs::read(dir.join("t/b")).unwrap();
+        b[250] ^= 0xFF;
+        fs::write(dir.join("t/b"), b).unwrap();
+        let mut services = Services::new();
+        let (result, _) = run_prepare(&torrent(), &[true, true], Vec::new(), &options(&dir), &mut services);
+        assert!(result.err().is_some_and(|e| e.starts_with("no peers found")));
     }
 
     #[test]
@@ -915,17 +938,29 @@ mod tests {
     }
 
     #[test]
-    fn on_a_shared_network_the_limits_are_the_networks_and_not_the_options() {
+    fn on_a_shared_network_the_torrents_own_limits_hold_as_parts_of_the_networks() {
         use crate::session::network::tests::{no_dht, quiet_network};
         let dir = tmp_dir("shared-limits");
         let network = quiet_network(crate::session::NetworkConfig { max_up: Some(5000), max_down: Some(6000), ..no_dht() });
+
+        // With none of its own, the network's.
         let mut services = Services::shared(Arc::clone(&network));
+        let (prepared, _) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        let prepared = prepared.expect("prepared");
+        assert!(Arc::ptr_eq(&services.seeder_up_limit().unwrap(), &network.up_limit().unwrap()));
+        assert!(Arc::ptr_eq(&prepared.workers.down_limit().unwrap(), &network.down_limit().unwrap()), "the same limiter, so that the torrents share the rate");
+        drop(services);
+
+        // With some of its own, those, and under the network's.
         let mut opts = options(&dir);
         (opts.max_up, opts.max_down) = (Some(1), Some(2));
+        let mut services = Services::shared(Arc::clone(&network));
         let (prepared, _) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &opts, &mut services);
         let prepared = prepared.expect("prepared");
-        assert_eq!(services.seeder_up_limit().map(|l| l.bytes_per_sec()), Some(5000));
-        assert!(Arc::ptr_eq(&prepared.workers.down_limit().unwrap(), &network.down_limit().unwrap()), "the same limiter, so that the torrents share the rate");
+        let (up, down) = (services.seeder_up_limit().unwrap(), prepared.workers.down_limit().unwrap());
+        assert_eq!((up.bytes_per_sec(), down.bytes_per_sec()), (1, 2));
+        assert!(!Arc::ptr_eq(&up, &network.up_limit().unwrap()) && !Arc::ptr_eq(&down, &network.down_limit().unwrap()));
+        drop(services);
 
         // Alone, the options' are what there is.
         let mut alone = Services::new();

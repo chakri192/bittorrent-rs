@@ -286,6 +286,20 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_takes_the_port_mapping_off_the_router_while_the_listener_still_answers() {
+        let mut s = Services::new();
+        s.attach_seeder(idle_seeder());
+        let port = s.announce_port(0);
+        let removed_while_listening = Arc::new(std::sync::Mutex::new(None));
+        let seen = Arc::clone(&removed_while_listening);
+        s.portmap = Some(PortMap::fake(move || *seen.lock().unwrap() = Some(TcpStream::connect(("127.0.0.1", port)).is_ok())));
+
+        s.shutdown();
+
+        assert_eq!(*removed_while_listening.lock().unwrap(), Some(true));
+    }
+
+    #[test]
     fn port_mapping_is_not_attempted_without_a_seeder() {
         let mut s = Services::new();
         s.start_portmap(|_| {});
@@ -366,7 +380,7 @@ mod tests {
 
     fn on_network(network: &Arc<SharedNetwork>, info_hash: [u8; 20]) -> Services {
         let mut services = Services::shared(Arc::clone(network));
-        let handle = network.register(info_hash, [7; 20], Arc::new(Vec::new()), 16384, 0, Arc::new(HaveMap::new(0)), Default::default());
+        let handle = network.register(info_hash, [7; 20], Arc::new(Vec::new()), 16384, 0, Arc::new(HaveMap::new(0)), network.up_limit(), Default::default());
         services.attach_seeder(handle);
         services
     }

@@ -155,7 +155,16 @@ place of the terminal; being told to stop is never reported as a failure. The
 has, and remembers them in the state directory (`daemon/state.rs`: one flat JSON
 object to a line, written whole-file-atomically; the daemon keeps its own copy of
 each `.torrent`, and a magnet link becomes one once its metadata arrives).
-The **control socket** (`daemon/control.rs`) is a Unix socket, mode 0600, with
+A torrent that is *dormant* (paused, or seeded up to a limit) is a `Job` with no
+thread, made by `Job::dormant`, that shows what is known of it; the state
+directory says which, so a restart brings it back as it was. `pause` and
+`resume` swap one kind of job for the other under the manager's locks, taking
+care never to join a job's thread while holding the lock its exit wants. A
+torrent's own rate limit is a `RateLimiter::under` the daemon's, so both hold and
+the torrents stay under the whole between them.
+The **control socket** (`daemon/control.rs`) is a Unix socket, mode 0600 (bound
+inside a private directory and moved into place, so it is never there with wider
+permissions), for at most 32 clients at once, with
 one JSON object to a line each way, using the same small JSON reader and writer
 as `--json`; requests are handled by a pure function of the manager, so the
 protocol is tested without a socket and the socket without a network.

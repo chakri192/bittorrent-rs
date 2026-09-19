@@ -163,7 +163,7 @@ enum Kind {
     /// A second signal during that wait exits at once with status 130.
     SecondSignalForcesExit,
     /// The multi-torrent daemon: two torrents downloaded and then seeded on one
-    /// port, told to it over its control socket; one removed while the other
+    /// port, told to it over its control socket; one paused and resumed; one removed while the other
     /// carries on; and, after a restart, what was left remembered.
     Daemon,
 }
@@ -3455,6 +3455,20 @@ fn run_daemon(name: &str) -> Result<String, String> {
         return Err(format!("adding a torrent twice said: {}", again));
     }
 
+    // 3b. One paused: off the port, and listed as paused, while the other is served; resumed, it is served again.
+    daemon_ctl(&socket, &["pause", &id2[..8]])?;
+    wait_for_state(&socket, &id2, "paused")?;
+    if leech_everything(&fx2, daemon.port).is_ok() {
+        return Err("a paused torrent was still served on the port".to_string());
+    }
+    leech_everything(&fx1, daemon.port)?;
+    if !daemon_ctl(&socket, &["pause", &id2]).err().is_some_and(|e| e.contains("already")) {
+        return Err("pausing a paused torrent was accepted".to_string());
+    }
+    daemon_ctl(&socket, &["resume", &id2])?;
+    wait_for_state(&socket, &id2, "seeding")?;
+    leech_everything(&fx2, daemon.port)?;
+
     // 4. One removed: it is told to its tracker, refused on the port, and its files stay; the other carries on.
     daemon_ctl(&socket, &["remove", &id1])?;
     let left = daemon_list(&socket)?;
@@ -3491,5 +3505,5 @@ fn run_daemon(name: &str) -> Result<String, String> {
     let mut child = daemon.child;
     wait_or_kill(&mut child.0, Duration::from_secs(20))?;
 
-    Ok(format!("two torrents downloaded and seeded on the one port {}, both announcing it and both served on it; one removed (told to its tracker, files kept, refused on the port) while the other carried on; and after stop and a restart only the other was there, seeding again", daemon.port))
+    Ok(format!("two torrents downloaded and seeded on the one port {}, both announcing it and both served on it; one paused and resumed (refused on the port while it was paused); one removed (told to its tracker, files kept, refused on the port) while the other carried on; and after stop and a restart only the other was there, seeding again", daemon.port))
 }

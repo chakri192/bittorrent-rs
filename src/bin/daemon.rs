@@ -23,9 +23,9 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(unix)]
 mod unix {
-    use bittorrent_rs::daemon::control::{self, Reply, Server};
+    use bittorrent_rs::daemon::control::{self, Reply, Request, Server};
     use bittorrent_rs::daemon::state::Store;
-    use bittorrent_rs::daemon::{JobDefaults, Manager};
+    use bittorrent_rs::daemon::{JobDefaults, JobOptions, Manager};
     use bittorrent_rs::json::Value;
     use bittorrent_rs::peer::{Encryption, TransportMode};
     use bittorrent_rs::ratelimit::parse_rate;
@@ -45,10 +45,12 @@ mod unix {
     #[derive(Debug, PartialEq)]
     pub enum Command {
         Run(Box<RunArgs>),
-        Add { source: String, out: Option<PathBuf> },
+        Add { source: String, out: Option<PathBuf>, options: JobOptions },
         List,
         Status { id: String },
         Remove { id: String },
+        Pause { id: String },
+        Resume { id: String },
         Stop,
     }
 
@@ -82,7 +84,7 @@ mod unix {
          \x20      daemon add <file.torrent | magnet:?...> [--out DIR] [--socket PATH] [--json]\n\
          \x20      daemon list | status ID | remove ID | stop [--socket PATH] [--json]\n\
          \n\
-         `run` starts the daemon: every torrent it is given is downloaded and then seeded, on one port, with the DHT node, the rate limits and the port mapping shared. The state directory (default ~/.local/state/bittorrent-rs) is where it remembers them; the socket (default daemon.sock in it) is where the other commands reach it. An ID is an info hash, or the start of one."
+         `run` starts the daemon: every torrent it is given is downloaded and then seeded, on one port, with the DHT node, the rate limits and the port mapping shared. The state directory (default ~/.local/state/bittorrent-rs) is where it remembers them; the socket (default daemon.sock in it) is where the other commands reach it. An ID is an info hash, or the start of one. `add` takes the torrent's own limits, which hold as well as the daemon's; `pause` sets a torrent aside until `resume`, which also starts a finished or failed one again."
             .to_string()
     }
 
@@ -96,6 +98,7 @@ mod unix {
         let mut args = Args { command: Command::List, state_dir: None, socket: None, json: false };
         let mut run = RunArgs { port: DEFAULT_PORT, max_up: None, max_down: None, dht: true, lsd: true, portmap: true, ipv6: Ipv6Mode::Auto, transport: TransportMode::Tcp, encryption: None, max_peers: 30, seed_limits: SeedLimits::default(), quiet: false };
         let mut out = None;
+        let mut job = JobOptions::default();
 
         while let Some(flag) = argv.next() {
             let mut value = |what: &str| argv.next().ok_or_else(|| format!("{} requires {}", flag, what));
@@ -104,6 +107,9 @@ mod unix {
                 "--socket" => args.socket = Some(PathBuf::from(value("a path")?)),
                 "--json" => args.json = true,
                 "--out" | "-o" => out = Some(PathBuf::from(value("a directory")?)),
+                "--only" => job.only.push(value("part of a file's path")?),
+                "--prefer" => job.prefer.push(value("part of a file's path")?),
+                "--sequential" => job.sequential = true,
                 "--port" => run.port = value("a port")?.parse().map_err(|_| "--port: not a port number".to_string())?,
                 "--max-up" => run.max_up = Some(parse_rate(&value("a rate such as 500K or 2M")?).map_err(|e| format!("--max-up: {}", e))?),
                 "--max-down" => run.max_down = Some(parse_rate(&value("a rate such as 500K or 2M")?).map_err(|e| format!("--max-down: {}", e))?),
@@ -126,10 +132,18 @@ mod unix {
             }
         }
 
+        // (`--max-up` and `--max-down` are the daemon's for `run` and the torrent's for `add`.)
+        job.max_up = run.max_up;
+        job.max_down = run.max_down;
+        if command != "add" && (!job.only.is_empty() || !job.prefer.is_empty() || job.sequential) {
+            return Err(format!("--only, --prefer and --sequential are for `add`, not {}", command));
+        }
         let need = |what: &str, given: Option<String>| given.ok_or_else(|| format!("{} needs {}", command, what));
         args.command = match command.as_str() {
             "run" => Command::Run(Box::new(run)),
-            "add" => Command::Add { source: need("a .torrent file or a magnet link", positional.take())?, out },
+            "add" => Command::Add { source: need("a .torrent file or a magnet link", positional.take())?, out, options: job },
+            "pause" => Command::Pause { id: need("a torrent's ID", positional.take())? },
+            "resume" => Command::Resume { id: need("a torrent's ID", positional.take())? },
             "list" => Command::List,
             "status" => Command::Status { id: need("a torrent's ID", positional.take())? },
             "remove" => Command::Remove { id: need("a torrent's ID", positional.take())? },
@@ -245,18 +259,21 @@ mod unix {
     fn client(args: &Args) -> Result<(), String> {
         let socket = socket_path(args);
         let request = match &args.command {
-            Command::Add { source, out } => {
+            Command::Add { source, out, options } => {
                 // The daemon has a working directory of its own: it is given paths that mean the same to it.
                 let source = if source.starts_with("magnet:?") { source.clone() } else { std::fs::canonicalize(source).map_err(|e| format!("{}: {}", source, e))?.to_string_lossy().into_owned() };
                 let out = std::path::absolute(out.clone().unwrap_or_else(|| PathBuf::from("."))).map_err(|e| format!("output directory: {}", e))?;
-                bittorrent_rs::json::Object::new().string("cmd", "add").string("source", &source).string("out", &out.to_string_lossy()).finish()
+                Request::Add { source, out, options: options.clone() }
             }
-            Command::List => r#"{"cmd":"list"}"#.to_string(),
-            Command::Status { id } => bittorrent_rs::json::Object::new().string("cmd", "status").string("id", id).finish(),
-            Command::Remove { id } => bittorrent_rs::json::Object::new().string("cmd", "remove").string("id", id).finish(),
-            Command::Stop => r#"{"cmd":"shutdown"}"#.to_string(),
+            Command::List => Request::List,
+            Command::Status { id } => Request::Status { id: id.clone() },
+            Command::Remove { id } => Request::Remove { id: id.clone() },
+            Command::Pause { id } => Request::Pause { id: id.clone() },
+            Command::Resume { id } => Request::Resume { id: id.clone() },
+            Command::Stop => Request::Shutdown,
             Command::Run(_) => return Err("not a client command".to_string()),
-        };
+        }
+        .to_line();
         let replies = control::ask(&socket, &request)?;
         if args.json {
             for reply in &replies {
@@ -342,8 +359,12 @@ mod unix {
 
         #[test]
         fn the_client_commands_take_what_they_need() {
-            assert_eq!(parse(&["add", "a.torrent", "--out", "/d"]).unwrap().command, Command::Add { source: "a.torrent".into(), out: Some(PathBuf::from("/d")) });
-            assert_eq!(parse(&["add", "--out", "/d", "magnet:?xt=urn:btih:00"]).unwrap().command, Command::Add { source: "magnet:?xt=urn:btih:00".into(), out: Some(PathBuf::from("/d")) }, "in either order");
+            assert_eq!(parse(&["add", "a.torrent", "--out", "/d"]).unwrap().command, Command::Add { source: "a.torrent".into(), out: Some(PathBuf::from("/d")), options: JobOptions::default() });
+            assert_eq!(parse(&["add", "--out", "/d", "magnet:?xt=urn:btih:00"]).unwrap().command, Command::Add { source: "magnet:?xt=urn:btih:00".into(), out: Some(PathBuf::from("/d")), options: JobOptions::default() }, "in either order");
+            let Command::Add { options, .. } = parse(&["add", "a.torrent", "--only", ".mkv", "--only", "x y", "--prefer", "nfo", "--sequential", "--max-up", "100K", "--max-down", "1M"]).unwrap().command else { panic!("add") };
+            assert_eq!(options, JobOptions { only: vec![".mkv".into(), "x y".into()], prefer: vec!["nfo".into()], sequential: true, max_up: Some(102_400), max_down: Some(1 << 20) });
+            assert_eq!(parse(&["pause", "ab12"]).unwrap().command, Command::Pause { id: "ab12".into() });
+            assert_eq!(parse(&["resume", "ab12"]).unwrap().command, Command::Resume { id: "ab12".into() });
             assert!(parse(&["list", "--json"]).unwrap().json);
             assert_eq!(parse(&["status", "ab12"]).unwrap().command, Command::Status { id: "ab12".into() });
             assert_eq!(parse(&["remove", "ab12", "--socket", "/x"]).unwrap().socket, Some(PathBuf::from("/x")));
@@ -372,6 +393,11 @@ mod unix {
                 assert!(parse(&["run", flag]).unwrap_err().contains("requires"), "{} with no value", flag);
             }
             assert!(parse(&["add", "x", "--out"]).unwrap_err().contains("requires"));
+            assert!(parse(&["pause"]).unwrap_err().contains("needs a torrent's ID"));
+            assert!(parse(&["resume"]).unwrap_err().contains("needs a torrent's ID"));
+            assert!(parse(&["list", "--only", "x"]).unwrap_err().contains("are for `add`"));
+            assert!(parse(&["run", "--sequential"]).unwrap_err().contains("are for `add`"));
+            assert!(parse(&["add", "x", "--only"]).unwrap_err().contains("requires"));
         }
 
         #[test]

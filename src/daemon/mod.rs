@@ -14,5 +14,5 @@ pub mod state;
 #[cfg(unix)]
 pub mod control;
 
-pub use job::{Job, JobContext, JobDefaults, JobSpec, JobState, JobStatus, Source};
+pub use job::{Job, JobContext, JobDefaults, JobOptions, JobSpec, JobState, JobStatus, Source};
 pub use manager::Manager;
