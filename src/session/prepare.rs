@@ -10,6 +10,7 @@ use crate::session::{Announcer, DownloadPlan, Log, Outstanding, PeerPool, Progre
 use crate::torrent::TorrentFile;
 use crate::tracker_discovery::TransferTotals;
 use crate::ui::format_bytes;
+use sha1::{Digest, Sha1};
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
@@ -202,7 +203,12 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     }
     let up_limit = options.max_up.map(|rate| Arc::new(RateLimiter::new(rate)));
     let down_limit = options.max_down.map(|rate| Arc::new(RateLimiter::new(rate)));
-    match seeder::start(options.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit) {
+    // The info dictionary is offered to peers that have only a magnet link
+    // (BEP 9), but only if it re-encodes to what the hash was taken over.
+    let info_bytes = crate::bencode::encode(&torrent.info);
+    let metadata = (Sha1::digest(&info_bytes).as_slice() == torrent.info_hash).then(|| Arc::new(info_bytes));
+    let seeder_options = seeder::SeederOptions { metadata, ..Default::default() };
+    match seeder::start_with(options.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options) {
         Ok(handle) => {
             sink.log(format!("listening for inbound peers on port {}", handle.port));
             services.attach_seeder(handle);

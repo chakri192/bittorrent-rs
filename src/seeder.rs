@@ -23,6 +23,8 @@
 
 use crate::choker::{Choker, DEFAULT_SLOTS};
 use crate::downloader::file_writer::{read_block, FileSpan};
+use crate::metadata::{MetadataMessage, METADATA_PIECE_SIZE};
+use crate::peer::extension::{ExtendedHandshake, EXTENDED_HANDSHAKE_ID};
 use crate::peer::handshake::{Handshake, HANDSHAKE_LEN};
 use crate::peer::message::Message;
 use crate::peer::state::PeerState;
@@ -42,6 +44,8 @@ const MAX_REQUEST_LEN: u32 = 128 * 1024;
 /// Concurrent inbound peers served at once; connections beyond this are
 /// accepted-and-closed immediately so the backlog doesn't grow unbounded.
 const MAX_INBOUND_PEERS: usize = 40;
+/// The id peers send `ut_metadata` requests to us under.
+const SEEDER_UT_METADATA_ID: u8 = 1;
 /// How often the choice of who to unchoke is made again.
 pub const RECHOKE_INTERVAL: Duration = Duration::from_secs(10);
 /// An inbound peer silent for this long gets dropped.
@@ -49,6 +53,10 @@ const IDLE_DISCONNECT: Duration = Duration::from_secs(300);
 /// Send a keep-alive if we've written nothing for this long (BEP 3
 /// suggests 2 minutes).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(110);
+/// How long a peer has to send its handshake after connecting. Far longer
+/// than [`SERVE_READ_TIMEOUT`]: a peer on a slow or distant link may take
+/// seconds, and that is no reason to drop it.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per-read socket timeout inside the serve loop -- also the granularity
 /// at which shutdown, idle and new-piece checks run, so it is how long a
 /// peer waits to hear that a piece has been verified.
@@ -94,6 +102,11 @@ impl HaveMap {
     pub fn count(&self) -> usize {
         sync::read(&self.bits).iter().filter(|&&x| x).count()
     }
+
+    /// How many pieces the torrent has, verified or not.
+    pub fn total(&self) -> usize {
+        sync::read(&self.bits).len()
+    }
 }
 
 /// Everything the serve loop needs, shared across all inbound-peer threads.
@@ -111,6 +124,8 @@ struct SeederShared {
     active_conns: AtomicUsize,
     /// Who is unchoked.
     choker: Arc<Choker>,
+    /// The info dictionary, for peers that ask for it.
+    metadata: Option<Arc<Vec<u8>>>,
 }
 
 impl SeederShared {
@@ -145,17 +160,21 @@ impl SeederHandle {
 }
 
 /// How the seeder chooses who to serve.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SeederOptions {
     /// Peers served at once (see [`crate::choker`]).
     pub unchoke_slots: usize,
     /// How often that choice is made again.
     pub rechoke_interval: Duration,
+    /// The torrent's info dictionary, exactly as its hash was taken over,
+    /// to offer to peers that ask for it (BEP 9). Without it the seeder
+    /// speaks no extensions.
+    pub metadata: Option<Arc<Vec<u8>>>,
 }
 
 impl Default for SeederOptions {
     fn default() -> Self {
-        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL }
+        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL, metadata: None }
     }
 }
 
@@ -207,18 +226,20 @@ pub fn start_with(
         uploaded: Arc::clone(&uploaded),
         active_conns: AtomicUsize::new(0),
         choker: Arc::new(Choker::new(options.unchoke_slots)),
+        metadata: options.metadata.clone(),
     });
 
     // The rounds: who is served changes here, and each connection notices
     // within a read timeout and tells its peer.
     let rechoke_shared = Arc::clone(&shared);
+    let rechoke_interval = options.rechoke_interval;
     let rechoke_thread = thread::spawn(move || {
         let mut waited = Duration::ZERO;
         while rechoke_shared.running.load(Ordering::SeqCst) {
             let slice = Duration::from_millis(50);
             thread::sleep(slice);
             waited += slice;
-            if waited >= options.rechoke_interval {
+            if waited >= rechoke_interval {
                 waited = Duration::ZERO;
                 rechoke_shared.choker.rechoke();
             }
@@ -230,6 +251,15 @@ pub fn start_with(
         while accept_shared.running.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _addr)) => {
+                    // The listener is non-blocking so that it can notice a stop,
+                    // and where an accepted socket inherits that (macOS, the
+                    // BSDs) each read on it would fail at once when nothing has
+                    // arrived yet: a peer whose handshake came after the accept
+                    // would be dropped. The serving thread wants to block, with
+                    // its own read timeout.
+                    if stream.set_nonblocking(false).is_err() {
+                        continue;
+                    }
                     if accept_shared.active_conns.load(Ordering::SeqCst) >= MAX_INBOUND_PEERS {
                         drop(stream); // over cap: close immediately
                         continue;
@@ -255,7 +285,7 @@ pub fn start_with(
 /// Serves one inbound peer: handshake, bitfield, then Request/Piece until
 /// the peer leaves, goes idle too long, or the seeder shuts down.
 fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(SERVE_READ_TIMEOUT))?;
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
 
     // Inbound side of the BEP 3 handshake: they send first, we validate
@@ -267,11 +297,14 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
     if their_hs.info_hash != shared.info_hash {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "inbound handshake for a different info_hash"));
     }
-    // No extension support advertised on the upload path: this loop
-    // serves piece requests only, so inviting extended messages would
-    // just be traffic to ignore.
-    let ours = Handshake::new(shared.info_hash, shared.our_peer_id, false);
+    // Extensions are offered only when there is something to offer through
+    // them: the info dictionary, for a peer that has only a magnet link.
+    let ours = Handshake::new(shared.info_hash, shared.our_peer_id, shared.metadata.is_some());
     stream.write_all(&ours.to_bytes())?;
+    let speaks_extensions = shared.metadata.is_some() && their_hs.supports_extensions();
+    // From here the loop wakes often to check for a stop, new pieces and a
+    // change of choke.
+    stream.set_read_timeout(Some(SERVE_READ_TIMEOUT))?;
 
     // What we can serve right now, honest at connect time as BEP 3
     // requires. Pieces verified afterwards are announced with `Have` as
@@ -281,6 +314,15 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
     let mut seen_version = shared.have.version();
     let mut advertised = shared.have.snapshot();
     Message::Bitfield(PeerState::encode_bitfield(&advertised)).write_to(&mut stream).map_err(wire_to_io)?;
+    if let (true, Some(metadata)) = (speaks_extensions, &shared.metadata) {
+        // A seed says so (BEP 21): nothing is to be gained by offering it pieces.
+        let seed = shared.have.count() == shared.have.total();
+        Message::Extended { id: EXTENDED_HANDSHAKE_ID, payload: ExtendedHandshake::build_for_seeding(SEEDER_UT_METADATA_ID, metadata.len(), seed) }.write_to(&mut stream).map_err(wire_to_io)?;
+    }
+    // The id the peer wants metadata requests answered under, once it has
+    // said, and how many it has made (bounded: see MAX_METADATA_REQUESTS).
+    let mut peer_metadata_id: Option<u8> = None;
+    let mut metadata_requests = 0usize;
 
     let choker_id = shared.choker.register();
     // Forgets the peer, freeing any slot it held, however this function ends.
@@ -356,6 +398,31 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
                 Message::Piece { index, begin, block }.write_to(&mut stream).map_err(wire_to_io)?;
                 shared.uploaded.fetch_add(length as u64, Ordering::Relaxed);
                 shared.choker.record_upload(choker_id, length as u64);
+                last_sent = Instant::now();
+            }
+            Message::Extended { id: EXTENDED_HANDSHAKE_ID, payload } if speaks_extensions => {
+                peer_metadata_id = ExtendedHandshake::parse(&payload).ok().and_then(|hs| hs.peer_ut_metadata_id());
+            }
+            Message::Extended { id: SEEDER_UT_METADATA_ID, payload } if speaks_extensions => {
+                let (Some(metadata), Some(reply_id)) = (&shared.metadata, peer_metadata_id) else { continue };
+                let Ok(MetadataMessage::Request { piece }) = MetadataMessage::decode(&payload) else { continue };
+                metadata_requests += 1;
+                // The whole dictionary a few times over is plenty; more is a
+                // peer using us to move data for nothing.
+                if metadata_requests > 2 * metadata.len().div_ceil(METADATA_PIECE_SIZE) + 8 {
+                    return Ok(());
+                }
+                let start = piece as usize * METADATA_PIECE_SIZE;
+                let reply = if start < metadata.len() {
+                    let chunk = &metadata[start..(start + METADATA_PIECE_SIZE).min(metadata.len())];
+                    if let Some(limit) = &shared.up_limit {
+                        limit.acquire(chunk.len());
+                    }
+                    MetadataMessage::Data { piece, total_size: metadata.len() as u32, data: chunk.to_vec() }
+                } else {
+                    MetadataMessage::Reject { piece }
+                };
+                Message::Extended { id: reply_id, payload: reply.encode() }.write_to(&mut stream).map_err(wire_to_io)?;
                 last_sent = Instant::now();
             }
             // Piece-availability chatter from a fellow leecher; a pure
@@ -691,7 +758,7 @@ mod tests {
         let have = Arc::new(HaveMap::new(1));
         have.set(0);
         let info_hash = [0x67; 20];
-        let options = SeederOptions { unchoke_slots: slots, rechoke_interval: interval };
+        let options = SeederOptions { unchoke_slots: slots, rechoke_interval: interval, metadata: None };
         let handle = start_with(0, info_hash, [0x20; 20], spans, 16384, 16384, have, None, options).unwrap();
         (handle, info_hash)
     }
@@ -844,6 +911,189 @@ mod tests {
         assert!(blocks > 10, "the busy peer was actually served: {}", blocks);
         assert!(choked_rx.try_recv().is_err(), "and never choked, for it took the most every round");
         assert!(turns, "while the others were told about their turns");
+        handle.stop();
+    }
+
+    // ---- serving the info dictionary (BEP 9) and saying it is a seed (BEP 21) ----
+
+    use crate::peer::extension::{ExtendedHandshake as ExtHs, EXTENDED_HANDSHAKE_ID as EXT_HS_ID};
+    use sha1::{Digest, Sha1};
+
+    /// A seeder that offers `metadata`, with all or none of its one piece.
+    fn start_metadata_seeder(dir: &std::path::Path, metadata: Option<Vec<u8>>, complete: bool) -> (SeederHandle, [u8; 20]) {
+        let files = vec![(vec!["seed.bin".to_string()], 16384i64)];
+        let spans = Arc::new(build_file_spans(dir, &files));
+        write_piece(&spans, 0, 16384, &[0x5Au8; 16384]).unwrap();
+        let have = Arc::new(HaveMap::new(1));
+        if complete {
+            have.set(0);
+        }
+        // The seeder's info hash is the metadata's, as a real torrent's is.
+        let info_hash: [u8; 20] = metadata.as_ref().map_or([0x66; 20], |m| Sha1::digest(m).into());
+        let options = SeederOptions { metadata: metadata.map(Arc::new), ..Default::default() };
+        (start_with(0, info_hash, [0x20; 20], spans, 16384, 16384, have, None, options).unwrap(), info_hash)
+    }
+
+    fn some_metadata(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(7)).collect()
+    }
+
+    /// Connects as a peer that speaks extensions and returns the stream, the
+    /// seeder's handshake and (if it sent one) its extended handshake.
+    fn extension_leecher(port: u16, info_hash: [u8; 20]) -> (TcpStream, Handshake, Option<ExtHs>) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        stream.write_all(&Handshake::new(info_hash, [0x21; 20], true).to_bytes()).unwrap();
+        let mut buf = [0u8; HANDSHAKE_LEN];
+        stream.read_exact(&mut buf).unwrap();
+        let theirs = Handshake::from_bytes(&buf).unwrap();
+        // Say hello in the extension protocol too, asking for replies under id 9.
+        Message::Extended { id: EXT_HS_ID, payload: ExtHs::build(9, None) }.write_to(&mut stream).unwrap();
+        let mut ext = None;
+        stream.set_read_timeout(Some(Duration::from_millis(800))).unwrap();
+        while let Ok(m) = Message::read_from(&mut stream) {
+            if let Message::Extended { id: EXT_HS_ID, payload } = m {
+                ext = Some(ExtHs::parse(&payload).unwrap());
+                break;
+            }
+        }
+        (stream, theirs, ext)
+    }
+
+    #[test]
+    fn the_seeders_own_metadata_client_can_fetch_the_info_dict_from_it_across_several_pieces() {
+        use crate::session::metadata::{fetch_metadata, MetadataConfig};
+        use crate::session::sink::RecordingSink;
+        use std::sync::atomic::AtomicBool;
+        let dir = tmp_dir("serve-metadata");
+        let metadata = some_metadata(40_000); // three pieces of 16 KiB, the last short
+        let (mut handle, info_hash) = start_metadata_seeder(&dir, Some(metadata.clone()), true);
+        let peer: std::net::SocketAddr = format!("127.0.0.1:{}", handle.port).parse().unwrap();
+        let config = MetadataConfig { budget: Duration::from_secs(5), parallelism: 1, connect_timeout: Duration::from_secs(2) };
+
+        let fetched = fetch_metadata(info_hash, [7; 20], vec![peer], None, &config, &RecordingSink::default(), &AtomicBool::new(false)).expect("the seeder serves the metadata");
+
+        assert_eq!(fetched.raw_info, metadata, "every byte, verified against the hash by the fetcher");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_seeder_with_all_its_pieces_says_upload_only_and_one_without_does_not() {
+        let dir = tmp_dir("upload-only");
+        let (mut seed, hash_a) = start_metadata_seeder(&dir, Some(some_metadata(100)), true);
+        let (_, _, ext) = extension_leecher(seed.port, hash_a);
+        let ext = ext.expect("an extended handshake");
+        assert!(ext.upload_only, "a seed says so (BEP 21)");
+        assert_eq!(ext.metadata_size, Some(100));
+        assert!(ext.peer_ut_metadata_id().is_some());
+        assert!(ext.peer_ut_pex_id().is_none(), "and it offers no peer exchange");
+        seed.stop();
+
+        let dir = tmp_dir("not-upload-only");
+        let (mut partial, hash_b) = start_metadata_seeder(&dir, Some(some_metadata(100)), false);
+        let (_, _, ext) = extension_leecher(partial.port, hash_b);
+        assert!(!ext.expect("an extended handshake").upload_only, "a client still downloading does not");
+        partial.stop();
+    }
+
+    #[test]
+    fn a_seeder_with_no_metadata_speaks_no_extensions() {
+        let dir = tmp_dir("no-extensions");
+        let (mut handle, info_hash) = start_metadata_seeder(&dir, None, true);
+
+        let (_, theirs, ext) = extension_leecher(handle.port, info_hash);
+
+        assert!(!theirs.supports_extensions(), "the extension bit is clear");
+        assert!(ext.is_none(), "and no extended handshake is sent");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_request_past_the_end_is_rejected_and_one_before_the_peers_own_handshake_is_ignored() {
+        let dir = tmp_dir("metadata-edge");
+        let (mut handle, info_hash) = start_metadata_seeder(&dir, Some(some_metadata(100)), true);
+        let (mut stream, _, _) = extension_leecher(handle.port, info_hash);
+        let ut_metadata_id = 1; // the id the seeder advertised
+
+        Message::Extended { id: ut_metadata_id, payload: MetadataMessage::Request { piece: 5 }.encode() }.write_to(&mut stream).unwrap();
+
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let reply = loop {
+            match Message::read_from(&mut stream) {
+                Ok(Message::Extended { id: 9, payload }) => break MetadataMessage::decode(&payload).unwrap(),
+                Ok(_) => continue,
+                Err(e) => panic!("no reply: {:?}", e),
+            }
+        };
+        assert_eq!(reply, MetadataMessage::Reject { piece: 5 });
+        handle.stop();
+
+        // A peer that never sent its extended handshake has told us no id to reply under.
+        let dir = tmp_dir("metadata-no-hello");
+        let (mut handle, info_hash) = start_metadata_seeder(&dir, Some(some_metadata(100)), true);
+        let mut silent = TcpStream::connect(("127.0.0.1", handle.port)).unwrap();
+        silent.write_all(&Handshake::new(info_hash, [0x22; 20], true).to_bytes()).unwrap();
+        let mut buf = [0u8; HANDSHAKE_LEN];
+        silent.read_exact(&mut buf).unwrap();
+        Message::Extended { id: 1, payload: MetadataMessage::Request { piece: 0 }.encode() }.write_to(&mut silent).unwrap();
+        silent.set_read_timeout(Some(Duration::from_millis(700))).unwrap();
+        let mut got_data = false;
+        while let Ok(m) = Message::read_from(&mut silent) {
+            got_data |= matches!(m, Message::Extended { id, .. } if id != EXT_HS_ID);
+        }
+        assert!(!got_data, "nothing to answer under");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_peer_that_keeps_asking_for_the_metadata_is_eventually_dropped() {
+        let dir = tmp_dir("metadata-flood");
+        let (mut handle, info_hash) = start_metadata_seeder(&dir, Some(some_metadata(100)), true);
+        let (mut stream, _, _) = extension_leecher(handle.port, info_hash);
+
+        // Set before the seeder hangs up: macOS refuses to set it on a closed socket.
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        // One piece, so 2 * 1 + 8 = 10 requests are allowed.
+        for _ in 0..40 {
+            let request = Message::Extended { id: 1, payload: MetadataMessage::Request { piece: 0 }.encode() };
+            if request.write_to(&mut stream).is_err() {
+                break;
+            }
+        }
+
+        let mut answers = 0;
+        let ended = loop {
+            match Message::read_from(&mut stream) {
+                Ok(Message::Extended { id: 9, .. }) => answers += 1,
+                Ok(_) => {}
+                Err(_) => break true,
+            }
+            if answers > 40 {
+                break false;
+            }
+        };
+        assert!(ended, "the connection was closed");
+        assert!(answers <= 10, "after at most ten answers: {}", answers);
+        handle.stop();
+    }
+
+    #[test]
+    fn a_peer_whose_handshake_arrives_after_the_connection_is_accepted_is_still_served() {
+        // The listener polls without blocking, so a connection is often
+        // accepted before its first byte arrives. Where an accepted socket
+        // inherits the listener's non-blocking mode (macOS, the BSDs) the
+        // handshake read then failed at once and the peer was dropped.
+        let dir = tmp_dir("late-handshake");
+        let (mut handle, info_hash) = start_test_seeder(&dir, &[vec![0x11u8; 16384]], 16384, &[0]);
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+        thread::sleep(Duration::from_millis(1300)); // several accept polls pass, and the serve timeout, with nothing sent
+        stream.write_all(&Handshake::new(info_hash, [0x23; 20], false).to_bytes()).unwrap();
+
+        let mut buf = [0u8; HANDSHAKE_LEN];
+        stream.read_exact(&mut buf).expect("the seeder answered a handshake that came late");
+        assert_eq!(Handshake::from_bytes(&buf).unwrap().info_hash, info_hash);
         handle.stop();
     }
 }

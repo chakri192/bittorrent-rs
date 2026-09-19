@@ -32,6 +32,9 @@ pub struct ExtendedHandshake {
     /// `reqq`: how many outstanding requests the sender will queue without
     /// dropping any. Only a positive number is kept.
     pub reqq: Option<u32>,
+    /// BEP 21 `upload_only`: the sender is a seed (or will only upload), so
+    /// there is no point offering it pieces.
+    pub upload_only: bool,
 }
 
 #[derive(Debug)]
@@ -97,6 +100,23 @@ impl ExtendedHandshake {
         bencode::encode(&Bencode::Dict(top))
     }
 
+    /// The handshake a client that only uploads sends: `ut_metadata` under
+    /// `our_ut_metadata_id` (so peers can fetch the info dict from it, BEP 9)
+    /// with its size, and `upload_only` (BEP 21) when it has every piece.
+    /// It offers no peer exchange.
+    pub fn build_for_seeding(our_ut_metadata_id: u8, metadata_size: usize, upload_only: bool) -> Vec<u8> {
+        let mut m = BTreeMap::new();
+        m.insert(UT_METADATA.as_bytes().to_vec(), Bencode::Int(our_ut_metadata_id as i64));
+        let mut top = BTreeMap::new();
+        top.insert(b"m".to_vec(), Bencode::Dict(m));
+        top.insert(b"metadata_size".to_vec(), Bencode::Int(metadata_size as i64));
+        if upload_only {
+            top.insert(b"upload_only".to_vec(), Bencode::Int(1));
+        }
+        top.insert(b"v".to_vec(), Bencode::Bytes(b"bittorrent-rs/0.1".to_vec()));
+        bencode::encode(&Bencode::Dict(top))
+    }
+
     /// Lenient decode: extended handshakes from real-world clients are
     /// routinely non-canonical (unsorted `m` dicts); rejecting them cost
     /// us usable peers ("dict keys not strictly sorted" in the field).
@@ -120,7 +140,9 @@ impl ExtendedHandshake {
         // A zero, negative or absurd figure says nothing useful.
         let reqq = value.get("reqq").and_then(Bencode::as_int).filter(|&n| n > 0).map(|n| n.min(u32::MAX as i64) as u32);
 
-        Ok(ExtendedHandshake { m, metadata_size, client_version, listen_port, reqq })
+        let upload_only = value.get("upload_only").and_then(Bencode::as_int).is_some_and(|v| v != 0);
+
+        Ok(ExtendedHandshake { m, metadata_size, client_version, listen_port, reqq, upload_only })
     }
 
     /// The peer's chosen id for `ut_metadata`, if they advertised support.
@@ -223,5 +245,27 @@ mod tests {
         let parsed = ExtendedHandshake::parse(raw).unwrap();
         assert_eq!(parsed.peer_ut_metadata_id(), Some(3));
         assert_eq!(parsed.client_version.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn a_seeding_handshake_offers_metadata_and_upload_only_but_no_pex_and_reads_back() {
+        let seed = ExtendedHandshake::parse(&ExtendedHandshake::build_for_seeding(4, 12345, true)).unwrap();
+        assert_eq!(seed.peer_ut_metadata_id(), Some(4));
+        assert_eq!(seed.metadata_size, Some(12345));
+        assert!(seed.upload_only);
+        assert_eq!(seed.peer_ut_pex_id(), None);
+        assert_eq!(seed.client_version.as_deref(), Some("bittorrent-rs/0.1"));
+
+        let partial = ExtendedHandshake::parse(&ExtendedHandshake::build_for_seeding(4, 12345, false)).unwrap();
+        assert!(!partial.upload_only, "a client still downloading does not claim it");
+    }
+
+    #[test]
+    fn upload_only_is_read_as_a_flag_and_absent_means_false() {
+        let with = |v: &str| ExtendedHandshake::parse(format!("d1:mde11:upload_only{}e", v).as_bytes()).unwrap().upload_only;
+        assert!(with("i1e"));
+        assert!(!with("i0e"));
+        assert!(!with("3:yes"), "not a number");
+        assert!(!ExtendedHandshake::parse(b"d1:mdee").unwrap().upload_only);
     }
 }

@@ -90,6 +90,9 @@ enum Kind {
     /// A torrent's empty files exist after the download, though no piece
     /// contains a byte of them; with `--only`, only the selected ones do.
     EmptyFiles,
+    /// A finished client serves its info dictionary to a peer that asks for
+    /// it (BEP 9) and says it is a seed (BEP 21).
+    ServeMetadata,
     /// A magnet link with no tracker, only an `x.pe` peer hint (and a v2
     /// hash beside the v1 one, as a hybrid link has): it still downloads.
     MagnetPeerHint,
@@ -150,6 +153,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
     Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
     Scenario { name: "empty-files", kind: Kind::EmptyFiles },
+    Scenario { name: "serve-metadata", kind: Kind::ServeMetadata },
     Scenario { name: "magnet-peer-hint", kind: Kind::MagnetPeerHint },
     Scenario { name: "tracker-redirect", kind: Kind::TrackerRedirect },
     Scenario { name: "disk-failure", kind: Kind::DiskFailure },
@@ -191,6 +195,7 @@ fn main() {
             Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
             Kind::SigtermMidDownload => run_sigterm_mid_download(scenario.name),
             Kind::EmptyFiles => run_empty_files(scenario.name),
+            Kind::ServeMetadata => run_serve_metadata(scenario.name),
             Kind::MagnetPeerHint => run_magnet_peer_hint(scenario.name),
             Kind::TrackerRedirect => run_tracker_redirect(scenario.name),
             Kind::DiskFailure => run_disk_failure(scenario.name),
@@ -1790,8 +1795,12 @@ fn run_have_broadcast(name: &str) -> Result<String, String> {
     let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
     fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
 
+    // `--seed` keeps the client running once the download is done: a peer
+    // is told of a new piece within half a second, which a client that
+    // exits the moment it finishes might not stay alive for.
     let child = client_command(&torrent, &out_dir, &log_path, 1)
         .arg("--no-dht")
+        .arg("--seed")
         .args(["--port", "0"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1849,10 +1858,7 @@ fn run_have_broadcast(name: &str) -> Result<String, String> {
         return Err(format!("the leecher was told of pieces {:?}; expected each of {:?} exactly once", told, expected));
     }
 
-    let status = wait_or_kill(&mut client.0, Duration::from_secs(20))?;
-    if status.code() != Some(0) {
-        return Err(format!("the client exited with {:?}", status.code()));
-    }
+    wait_for_log(&log_path, "seeding e2e.bin on port", Duration::from_secs(20), &mut client.0)?;
     check_downloaded(&fx, &out_dir)?;
     Ok(format!("a leecher connected before the download began was told of all {} pieces as they were verified, each once", fx.piece_count))
 }
@@ -2264,4 +2270,60 @@ fn run_magnet_peer_hint(name: &str) -> Result<String, String> {
         return Err("a tracker was contacted although the link and the torrent name none".to_string());
     }
     Ok("a hybrid link with a v2 hash and only an x.pe hint fetched its metadata from that peer and downloaded the file, with no tracker involved".to_string())
+}
+
+/// A client that has finished and is seeding is also a source for the info
+/// dictionary: a peer holding only a magnet link connects, asks, and gets it
+/// byte for byte (checked against the harness's own copy), and is told the
+/// client is a seed.
+fn run_serve_metadata(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let child = client_command(&torrent, &out_dir, &log_path, 1).args(["--no-dht", "--seed", "--port", "0"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, "seeding e2e.bin on port", Duration::from_secs(20), &mut client.0)?;
+    let port: u16 = swarm.announces.lock().unwrap().first().and_then(|line| announce_param(line, "port")).and_then(|p| p.parse().ok()).ok_or("no port in the client's first announce")?;
+
+    let wire = |what: &str, e: bittorrent_rs::peer::message::WireError| format!("{}: {:?}", what, e);
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connecting to the listener: {}", e))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    stream.write_all(&Handshake::new(fx.info_hash, [0x55; 20], true).to_bytes()).map_err(|e| e.to_string())?;
+    let mut hs_buf = [0u8; 68];
+    stream.read_exact(&mut hs_buf).map_err(|e| format!("reading the handshake: {}", e))?;
+    let theirs = Handshake::from_bytes(&hs_buf).map_err(|e| format!("the handshake: {:?}", e))?;
+    if !theirs.supports_extensions() {
+        return Err("the client does not advertise the extension protocol".to_string());
+    }
+    // Ask for replies under id 9, and read the client's own handshake.
+    Message::Extended { id: 0, payload: ExtendedHandshake::build(9, None) }.write_to(&mut stream).map_err(|e| wire("sending our extended handshake", e))?;
+    let hello = loop {
+        match Message::read_from(&mut stream).map_err(|e| wire("waiting for the extended handshake", e))? {
+            Message::Extended { id: 0, payload } => break ExtendedHandshake::parse(&payload).map_err(|e| format!("its extended handshake: {}", e))?,
+            _ => continue,
+        }
+    };
+    if !hello.upload_only {
+        return Err("a finished client should say upload_only (BEP 21)".to_string());
+    }
+    if hello.metadata_size != Some(fx.info_bytes.len() as i64) {
+        return Err(format!("it says the metadata is {:?} bytes; it is {}", hello.metadata_size, fx.info_bytes.len()));
+    }
+    let its_id = hello.peer_ut_metadata_id().ok_or("it offers no ut_metadata")?;
+
+    Message::Extended { id: its_id, payload: MetadataMessage::Request { piece: 0 }.encode() }.write_to(&mut stream).map_err(|e| wire("asking for the metadata", e))?;
+    let served = loop {
+        match Message::read_from(&mut stream).map_err(|e| wire("waiting for the metadata", e))? {
+            Message::Extended { id: 9, payload } => break MetadataMessage::decode(&payload).map_err(|e| format!("its reply: {}", e))?,
+            _ => continue,
+        }
+    };
+    match served {
+        MetadataMessage::Data { piece: 0, total_size, data } if data == fx.info_bytes && total_size as usize == fx.info_bytes.len() => {}
+        other => return Err(format!("expected the info dict as piece 0, got {:?}", other)),
+    }
+    Ok(format!("a peer holding only the info hash got the {}-byte info dictionary from the seeding client, byte for byte, and was told it is a seed", fx.info_bytes.len()))
 }
