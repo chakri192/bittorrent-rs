@@ -87,6 +87,9 @@ enum Kind {
     /// SIGTERM mid-download, with the only peer silent: a prompt, clean exit
     /// that keeps the resume file.
     SigtermMidDownload,
+    /// A leecher connected to the client's listener during the download is
+    /// told of each piece as it is verified.
+    HaveBroadcast,
     /// `--seed-ratio`: seeding ends by itself once that much has been
     /// uploaded, and not before.
     SeedRatio,
@@ -122,6 +125,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "limit-upload", kind: Kind::LimitUpload },
     Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
     Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
+    Scenario { name: "have-broadcast", kind: Kind::HaveBroadcast },
     Scenario { name: "seed-ratio-ends-seeding", kind: Kind::SeedRatio },
     Scenario { name: "seed-time-ends-seeding", kind: Kind::SeedTime },
     Scenario { name: "stopped-announce-is-bounded", kind: Kind::StoppedAnnounceIsBounded },
@@ -154,6 +158,7 @@ fn main() {
             Kind::LimitUpload => run_limit_upload(scenario.name),
             Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
             Kind::SigtermMidDownload => run_sigterm_mid_download(scenario.name),
+            Kind::HaveBroadcast => run_have_broadcast(scenario.name),
             Kind::SeedRatio => run_seed_ratio(scenario.name),
             Kind::SeedTime => run_seed_time(scenario.name),
             Kind::StoppedAnnounceIsBounded => run_stopped_announce_is_bounded(scenario.name),
@@ -1688,4 +1693,83 @@ fn run_seed_time(name: &str) -> Result<String, String> {
     check_downloaded(&fx, &out_dir)?;
     check_stopped_last(&swarm, fx.data.len(), 0)?;
     Ok(format!("--seed-time {}s stopped a seeding client by itself after {:.1?}: status 0, tracker told", SEED_FOR.as_secs(), seeded_for))
+}
+
+/// The client serves what it has while it is still downloading. A leecher
+/// that connects to its listener at the start, when it has nothing, must
+/// hear about every piece as the client verifies it -- exactly once each --
+/// or it would have no way to know there was anything to ask for.
+fn run_have_broadcast(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let gate = Gate::new();
+    let swarm = spawn_swarm(&fx, vec![Behavior::ChokedUntil(Arc::clone(&gate))]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let child = client_command(&torrent, &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .args(["--port", "0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+
+    // The client announces the port it listens on; the only peer keeps it
+    // choked, so nothing is downloaded until the gate opens.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let port: u16 = loop {
+        let port = swarm.announces.lock().unwrap().first().and_then(|line| announce_param(line, "port")).and_then(|p| p.parse().ok());
+        if let Some(port) = port {
+            break port;
+        }
+        if Instant::now() >= deadline || client.0.try_wait().map_err(|e| e.to_string())?.is_some() {
+            return Err("the client never announced".to_string());
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+
+    let mut stream = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(e) if Instant::now() >= deadline => return Err(format!("connecting to the client's listener on port {}: {}", port, e)),
+            Err(_) => thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(15))).map_err(|e| e.to_string())?;
+    stream.write_all(&Handshake::new(fx.info_hash, [0x77; 20], false).to_bytes()).map_err(|e| format!("sending the handshake: {}", e))?;
+    let mut hs_buf = [0u8; 68];
+    stream.read_exact(&mut hs_buf).map_err(|e| format!("reading the client's handshake: {}", e))?;
+    let bitfield = loop {
+        match Message::read_from(&mut stream).map_err(|e| format!("waiting for the bitfield: {:?}", e))? {
+            Message::Bitfield(bits) => break bits,
+            _ => continue,
+        }
+    };
+    if bitfield.iter().any(|&byte| byte != 0) {
+        return Err(format!("the client claimed pieces before downloading any: {:?}", bitfield));
+    }
+
+    gate.open();
+    let mut told = Vec::new();
+    while told.len() < fx.piece_count {
+        match Message::read_from(&mut stream).map_err(|e| format!("after {} Have message(s) ({:?}): {:?}", told.len(), told, e))? {
+            Message::Have { piece_index } => told.push(piece_index),
+            _ => continue,
+        }
+    }
+    let mut sorted = told.clone();
+    sorted.sort_unstable();
+    let expected: Vec<u32> = (0..fx.piece_count as u32).collect();
+    if sorted != expected {
+        return Err(format!("the leecher was told of pieces {:?}; expected each of {:?} exactly once", told, expected));
+    }
+
+    let status = wait_or_kill(&mut client.0, Duration::from_secs(20))?;
+    if status.code() != Some(0) {
+        return Err(format!("the client exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+    Ok(format!("a leecher connected before the download began was told of all {} pieces as they were verified, each once", fx.piece_count))
 }

@@ -2,6 +2,8 @@
 //! pieces off disk. Runs concurrently with a download (serving whatever
 //! is verified so far) and standalone after completion (`--seed`).
 //!
+//! A peer is told of every piece verified after it connected, with `Have`.
+//!
 //! Policy is deliberately simple for a from-scratch client: every
 //! interested peer gets unchoked, bounded by a global inbound-connection
 //! cap, with no tit-for-tat rate measurement. Real tit-for-tat exists to
@@ -36,25 +38,37 @@ const IDLE_DISCONNECT: Duration = Duration::from_secs(300);
 /// suggests 2 minutes).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(110);
 /// Per-read socket timeout inside the serve loop -- also the granularity
-/// at which shutdown/idle checks run.
-const SERVE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// at which shutdown, idle and new-piece checks run, so it is how long a
+/// peer waits to hear that a piece has been verified.
+const SERVE_READ_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Thread-safe record of which pieces are verified on disk -- written by
 /// download workers/resume as pieces complete, read by the seeder to
 /// build bitfields and validate requests.
 pub struct HaveMap {
     bits: RwLock<Vec<bool>>,
+    /// Bumped whenever a piece is added, so a connection can tell cheaply
+    /// whether there is anything new to announce.
+    version: AtomicU64,
 }
 
 impl HaveMap {
     pub fn new(total_pieces: usize) -> Self {
-        HaveMap { bits: RwLock::new(vec![false; total_pieces]) }
+        HaveMap { bits: RwLock::new(vec![false; total_pieces]), version: AtomicU64::new(0) }
     }
 
     pub fn set(&self, index: u32) {
         if let Some(b) = sync::write(&self.bits).get_mut(index as usize) {
-            *b = true;
+            if !*b {
+                *b = true;
+                self.version.fetch_add(1, Ordering::SeqCst);
+            }
         }
+    }
+
+    /// Changes each time a piece is added (and never otherwise).
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::SeqCst)
     }
 
     pub fn get(&self, index: u32) -> bool {
@@ -196,13 +210,14 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
     let ours = Handshake::new(shared.info_hash, shared.our_peer_id, false);
     stream.write_all(&ours.to_bytes())?;
 
-    // Snapshot of what we can serve right now. Pieces verified *after*
-    // this moment aren't advertised to this particular peer (no Have
-    // broadcast channel in this simple seeder) -- a peer that wants them
-    // reconnects or hears about them elsewhere; the bitfield is honest at
-    // connect time, which is what BEP 3 requires.
-    let snapshot = shared.have.snapshot();
-    Message::Bitfield(PeerState::encode_bitfield(&snapshot)).write_to(&mut stream).map_err(wire_to_io)?;
+    // What we can serve right now, honest at connect time as BEP 3
+    // requires. Pieces verified afterwards are announced with `Have` as
+    // they appear (see `announce_new_pieces`). The version is read first:
+    // a piece added between the two reads then shows up as a difference
+    // to announce, never as one that is missed.
+    let mut seen_version = shared.have.version();
+    let mut advertised = shared.have.snapshot();
+    Message::Bitfield(PeerState::encode_bitfield(&advertised)).write_to(&mut stream).map_err(wire_to_io)?;
 
     let mut peer_unchoked = false;
     let mut last_heard = Instant::now();
@@ -217,6 +232,10 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
         }
         if last_sent.elapsed() >= KEEPALIVE_INTERVAL {
             Message::KeepAlive.write_to(&mut stream).map_err(wire_to_io)?;
+            last_sent = Instant::now();
+        }
+
+        if announce_new_pieces(&mut stream, &shared.have, &mut seen_version, &mut advertised)? {
             last_sent = Instant::now();
         }
 
@@ -271,6 +290,28 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
     }
 }
 
+/// Tells a connected peer about pieces verified since it was last told: a
+/// `Have` for each. Without this a peer that connected early would never
+/// learn of what this client downloads afterwards, and a client that is
+/// still downloading would be a poor source. Returns whether it sent any.
+fn announce_new_pieces(stream: &mut TcpStream, have: &HaveMap, seen_version: &mut u64, advertised: &mut [bool]) -> std::io::Result<bool> {
+    let version = have.version();
+    if version == *seen_version {
+        return Ok(false);
+    }
+    *seen_version = version;
+    let now = have.snapshot();
+    let mut sent = false;
+    for (index, (&has, told)) in now.iter().zip(advertised.iter_mut()).enumerate() {
+        if has && !*told {
+            Message::Have { piece_index: index as u32 }.write_to(stream).map_err(wire_to_io)?;
+            *told = true;
+            sent = true;
+        }
+    }
+    Ok(sent)
+}
+
 fn wire_to_io(e: crate::peer::message::WireError) -> std::io::Error {
     match e {
         crate::peer::message::WireError::Io(io) => io,
@@ -321,6 +362,13 @@ mod tests {
     }
 
     fn start_limited_seeder(dir: &std::path::Path, pieces: &[Vec<u8>], piece_length: u64, have_indices: &[u32], up_limit: Option<Arc<crate::ratelimit::RateLimiter>>) -> (SeederHandle, [u8; 20]) {
+        let (handle, info_hash, _have) = start_seeder_with_map(dir, pieces, piece_length, have_indices, up_limit);
+        (handle, info_hash)
+    }
+
+    /// A seeder that also gives back its have-map, for tests that verify
+    /// more pieces after peers have connected.
+    fn start_seeder_with_map(dir: &std::path::Path, pieces: &[Vec<u8>], piece_length: u64, have_indices: &[u32], up_limit: Option<Arc<crate::ratelimit::RateLimiter>>) -> (SeederHandle, [u8; 20], Arc<HaveMap>) {
         let total: i64 = pieces.iter().map(|p| p.len() as i64).sum();
         let files = vec![(vec!["seed.bin".to_string()], total)];
         let spans = Arc::new(build_file_spans(dir, &files));
@@ -332,8 +380,85 @@ mod tests {
             have.set(i);
         }
         let info_hash = [0x66; 20];
-        let handle = start(0, info_hash, [0x20; 20], spans, piece_length, total as u64, have, up_limit).unwrap();
-        (handle, info_hash)
+        let handle = start(0, info_hash, [0x20; 20], spans, piece_length, total as u64, Arc::clone(&have), up_limit).unwrap();
+        (handle, info_hash, have)
+    }
+
+    /// The next `Have` the peer sends, skipping anything else; `None` if
+    /// nothing arrives within the stream's read timeout.
+    fn next_have(stream: &mut TcpStream) -> Option<u32> {
+        loop {
+            match Message::read_from(stream) {
+                Ok(Message::Have { piece_index }) => return Some(piece_index),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn three_pieces() -> Vec<Vec<u8>> {
+        (0..3u8).map(|i| vec![i + 1; 16384]).collect()
+    }
+
+    #[test]
+    fn a_piece_verified_after_a_peer_connected_is_announced_to_it() {
+        let dir = tmp_dir("have-broadcast");
+        let (mut handle, info_hash, have) = start_seeder_with_map(&dir, &three_pieces(), 16384, &[0], None);
+        let (mut stream, bitfield) = leech_connect(handle.port, info_hash);
+        assert_eq!(&bitfield[..3], &[true, false, false], "the bitfield was honest at connect time");
+
+        have.set(1);
+
+        assert_eq!(next_have(&mut stream), Some(1), "the peer hears about the new piece without asking");
+        handle.stop();
+    }
+
+    #[test]
+    fn each_new_piece_is_announced_once_and_only_the_new_one() {
+        let dir = tmp_dir("have-once");
+        let (mut handle, info_hash, have) = start_seeder_with_map(&dir, &three_pieces(), 16384, &[0], None);
+        let (mut stream, _) = leech_connect(handle.port, info_hash);
+
+        have.set(1);
+        assert_eq!(next_have(&mut stream), Some(1));
+        have.set(2);
+        assert_eq!(next_have(&mut stream), Some(2), "the second announcement is for piece 2, not piece 1 again");
+
+        // Setting what is already set changes nothing, so nothing is sent.
+        stream.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+        have.set(1);
+        have.set(0);
+        assert_eq!(next_have(&mut stream), None, "nothing new, nothing announced");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_peer_that_connects_later_learns_of_the_piece_from_its_bitfield_not_a_have() {
+        let dir = tmp_dir("have-late");
+        let (mut handle, info_hash, have) = start_seeder_with_map(&dir, &three_pieces(), 16384, &[0], None);
+        have.set(1);
+
+        let (mut stream, bitfield) = leech_connect(handle.port, info_hash);
+
+        assert_eq!(&bitfield[..3], &[true, true, false]);
+        stream.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+        assert_eq!(next_have(&mut stream), None, "already in the bitfield, so not announced again");
+        handle.stop();
+    }
+
+    #[test]
+    fn the_have_map_changes_version_only_when_a_piece_is_added() {
+        let have = HaveMap::new(4);
+        let v0 = have.version();
+        have.set(2);
+        let v1 = have.version();
+        assert_ne!(v0, v1, "a new piece");
+        have.set(2);
+        assert_eq!(have.version(), v1, "the same piece again");
+        have.set(99);
+        assert_eq!(have.version(), v1, "a piece the torrent does not have");
+        have.set(3);
+        assert_ne!(have.version(), v1);
     }
 
     #[test]
