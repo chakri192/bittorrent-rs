@@ -17,6 +17,21 @@ pub trait Transport: Send {
     fn recv(&self, timeout: Duration) -> io::Result<Option<(Vec<u8>, SocketAddr)>>;
 }
 
+/// A transport whose kind is not known where it is used: one node of either family, one shared with uTP or not.
+impl Transport for Box<dyn Transport> {
+    fn ipv6(&self) -> bool {
+        (**self).ipv6()
+    }
+
+    fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<()> {
+        (**self).send_to(data, addr)
+    }
+
+    fn recv(&self, timeout: Duration) -> io::Result<Option<(Vec<u8>, SocketAddr)>> {
+        (**self).recv(timeout)
+    }
+}
+
 pub struct UdpTransport {
     socket: UdpSocket,
 }

@@ -7,7 +7,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,22 +16,180 @@ use std::time::{Duration, Instant};
 /// responses lead us to real nodes, which earn insertion by responding).
 pub const DEFAULT_BOOTSTRAP: &[&str] = &["router.bittorrent.com:6881", "dht.transmissionbt.com:6881", "router.utorrent.com:6881", "dht.libtorrent.org:25401"];
 
-/// Handle to the background DHT service thread `download.rs` runs: it
-/// bootstraps, then alternates `get_peers` lookups (results pushed
-/// through `peers_rx`) with serving inbound queries, re-announcing our
-/// listen port after each lookup.
+/// Interval between repeat lookups of a torrent once its first has run. Long
+/// enough to be polite; short enough that a swarm's churn keeps showing
+/// up in the dial queue.
+const RELOOKUP_INTERVAL: Duration = Duration::from_secs(180);
+
+/// How often the node looks up whether there is something to do: a torrent added, a lookup
+/// due, or (before the listener is up) a port to announce that it did not have.
+const ANNOUNCE_POLL: Duration = Duration::from_millis(500);
+
+/// What a node is told to do.
+enum Command {
+    Add { info_hash: [u8; 20], announce_port: Arc<AtomicU16>, tx: mpsc::Sender<Vec<SocketAddr>> },
+    Remove { info_hash: [u8; 20] },
+}
+
+/// A DHT node -- one on IPv4 and, if wanted, one on IPv6 (BEP 32), each with a
+/// routing table of its own -- that looks up and announces any number of
+/// torrents, added and removed while it runs. Dropping it does not stop it.
+pub struct DhtNode {
+    /// The UDP port of the IPv4 node.
+    pub port: u16,
+    /// The UDP port of the IPv6 node, if one runs.
+    pub port6: Option<u16>,
+    /// Live routing-table size of the IPv4 node, updated by its thread each
+    /// round -- a cheap "is the DHT healthy?" signal for the UI.
+    pub nodes: Arc<AtomicUsize>,
+    /// The same for the IPv6 node, if one runs.
+    pub nodes6: Arc<AtomicUsize>,
+    commands: Vec<mpsc::Sender<Command>>,
+    stop: Arc<AtomicBool>,
+    handles: Mutex<Vec<thread::JoinHandle<()>>>,
+}
+
+impl DhtNode {
+    /// Starts a node on UDP `bind_port` (an ephemeral one if it is taken), and with `ipv6` a
+    /// second on an IPv6 socket, on the same port number if it can. If the machine has no
+    /// IPv6 the second node is simply not there. `bootstrap_nodes` are `host:port` routers.
+    pub fn start(bind_port: u16, bootstrap_nodes: Vec<String>, ipv6: bool) -> io::Result<DhtNode> {
+        let transport = UdpTransport::bind(bind_port)?;
+        let port = transport.local_port();
+        DhtNode::start_on(transport, port, bootstrap_nodes, ipv6)
+    }
+
+    /// [`start`](Self::start) on a transport already made -- one shared with uTP, say --
+    /// which listens on UDP `port`.
+    pub fn start_on<T: super::Transport + 'static>(transport: T, port: u16, bootstrap_nodes: Vec<String>, ipv6: bool) -> io::Result<DhtNode> {
+        DhtNode::start_every(transport, port, bootstrap_nodes, ipv6, RELOOKUP_INTERVAL)
+    }
+
+    /// [`start_on`](Self::start_on), looking each torrent up again every `relookup`.
+    fn start_every<T: super::Transport + 'static>(transport: T, port: u16, bootstrap_nodes: Vec<String>, ipv6: bool, relookup: Duration) -> io::Result<DhtNode> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (nodes, nodes6) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let mut commands = Vec::new();
+        let mut handles = Vec::new();
+        let mut spawn = |transport: Box<dyn super::Transport>, table_size: Arc<AtomicUsize>, bootstrap: Vec<String>| {
+            let (tx, rx) = mpsc::channel();
+            commands.push(tx);
+            let stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || run_node(Dht::new(transport), bootstrap, rx, table_size, stop, relookup)));
+        };
+        spawn(Box::new(transport), Arc::clone(&nodes), bootstrap_nodes.clone());
+        let mut port6 = None;
+        if ipv6 {
+            // The IPv6 node prefers the same port number, as peers expect one number to do for both.
+            if let Ok(transport6) = UdpTransport::bind_v6(port) {
+                port6 = Some(transport6.local_port());
+                spawn(Box::new(transport6), Arc::clone(&nodes6), bootstrap_nodes);
+            }
+        }
+        Ok(DhtNode { port, port6, nodes, nodes6, commands, stop, handles: Mutex::new(handles) })
+    }
+
+    /// Nodes known, over both families.
+    pub fn node_count(&self) -> usize {
+        self.nodes.load(Ordering::SeqCst) + self.nodes6.load(Ordering::SeqCst)
+    }
+
+    /// Starts looking up `info_hash` and announcing `announce_port` for it. `announce_port` is
+    /// read afresh each round: `0` means "not yet", which lets a torrent be added before its
+    /// listener is up. What is found arrives on the returned handle.
+    pub fn add_torrent(self: &Arc<Self>, info_hash: [u8; 20], announce_port: Arc<AtomicU16>) -> DhtService {
+        let (tx, peers_rx) = mpsc::channel();
+        for commands in &self.commands {
+            let _ = commands.send(Command::Add { info_hash, announce_port: Arc::clone(&announce_port), tx: tx.clone() });
+        }
+        DhtService { peers_rx, port: self.port, nodes: Arc::clone(&self.nodes), nodes6: Arc::clone(&self.nodes6), port6: self.port6, info_hash, node: Arc::clone(self), owned: false }
+    }
+
+    /// Stops the node and its threads, and with them every torrent's lookups. Safe to call twice.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let handles: Vec<_> = crate::sync::lock(&self.handles).drain(..).collect();
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+}
+
+/// One torrent being looked up on a node.
+struct Tracked {
+    info_hash: [u8; 20],
+    announce_port: Arc<AtomicU16>,
+    tx: mpsc::Sender<Vec<SocketAddr>>,
+    next_lookup: Instant,
+    /// What the last lookup found, for the announce that follows it.
+    found: Option<super::LookupResult>,
+    announced: bool,
+}
+
+/// One DHT node, of whichever family its transport is, on a thread of its own: it serves the
+/// network, and between times looks up and announces each torrent it has been given.
+fn run_node<T: super::Transport>(mut dht: Dht<T>, bootstrap: Vec<String>, commands: mpsc::Receiver<Command>, table_size: Arc<AtomicUsize>, stop: Arc<AtomicBool>, relookup: Duration) {
+    dht.bootstrap(&bootstrap, &stop);
+    table_size.store(dht.table_len(), Ordering::SeqCst);
+    let mut torrents: Vec<Tracked> = Vec::new();
+
+    while !stop.load(Ordering::SeqCst) {
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                Command::Add { info_hash, announce_port, tx } => {
+                    torrents.retain(|t| t.info_hash != info_hash);
+                    torrents.push(Tracked { info_hash, announce_port, tx, next_lookup: Instant::now(), found: None, announced: false });
+                }
+                Command::Remove { info_hash } => torrents.retain(|t| t.info_hash != info_hash),
+            }
+        }
+
+        let now = Instant::now();
+        // The one most overdue, so that none goes without for want of the ones before it in the list.
+        if let Some(index) = (0..torrents.len()).filter(|&i| torrents[i].next_lookup <= now).min_by_key(|&i| torrents[i].next_lookup) {
+            let found = dht.get_peers(&torrents[index].info_hash, Duration::from_secs(10), &stop);
+            let torrent = &mut torrents[index];
+            if !found.peers.is_empty() && torrent.tx.send(found.peers.clone()).is_err() {
+                torrents.remove(index); // nobody wants it any more
+                continue;
+            }
+            torrent.found = Some(found);
+            torrent.announced = false;
+            torrent.next_lookup = Instant::now() + relookup;
+        }
+
+        // The announce needs our port, which may not be known yet (the DHT starts before the
+        // listener); rather than leave it to the next round, it is looked for every so often, and
+        // made with the tokens the lookup won.
+        for torrent in torrents.iter_mut().filter(|t| !t.announced) {
+            let port = torrent.announce_port.load(Ordering::SeqCst);
+            if let (true, Some(found)) = (port != 0, &torrent.found) {
+                dht.announce(&torrent.info_hash, port, found);
+                torrent.announced = true;
+            }
+        }
+
+        table_size.store(dht.table_len(), Ordering::SeqCst);
+        // Serving, until there is something else to do.
+        let wait = torrents.iter().map(|t| t.next_lookup.saturating_duration_since(Instant::now())).min().map_or(ANNOUNCE_POLL, |due| due.min(ANNOUNCE_POLL));
+        dht.serve_for(wait.max(Duration::from_millis(10)), &stop);
+    }
+}
+
+/// The handle a torrent holds on a DHT node: what is found for it, and the way to stop looking.
 pub struct DhtService {
     pub peers_rx: Receiver<Vec<SocketAddr>>,
     pub port: u16,
-    /// Live routing-table size of the IPv4 node, updated by its thread each
-    /// round -- a cheap "is the DHT healthy?" signal for the UI.
+    /// Live routing-table size of the IPv4 node -- a cheap "is the DHT healthy?" signal for the UI.
     pub nodes: Arc<AtomicUsize>,
     /// The same for the IPv6 node (BEP 32), if one runs.
     pub nodes6: Arc<AtomicUsize>,
     /// The UDP port of the IPv6 node, if one runs.
     pub port6: Option<u16>,
-    stop: Arc<AtomicBool>,
-    handles: Vec<thread::JoinHandle<()>>,
+    info_hash: [u8; 20],
+    node: Arc<DhtNode>,
+    /// Whether the node is this handle's alone, and ends with it.
+    owned: bool,
 }
 
 impl DhtService {
@@ -40,21 +198,17 @@ impl DhtService {
         self.nodes.load(Ordering::SeqCst) + self.nodes6.load(Ordering::SeqCst)
     }
 
+    /// Stops looking up this torrent; and, if the node was made for it alone, ends the node.
     pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        for h in self.handles.drain(..) {
-            let _ = h.join();
+        if self.owned {
+            self.node.stop();
+        } else {
+            for commands in &self.node.commands {
+                let _ = commands.send(Command::Remove { info_hash: self.info_hash });
+            }
         }
     }
 }
-
-/// Interval between repeat lookups once the first one has run. Long
-/// enough to be polite; short enough that a swarm's churn keeps showing
-/// up in the dial queue.
-const RELOOKUP_INTERVAL: Duration = Duration::from_secs(180);
-
-/// How often, before our port is known, to check whether it is.
-const ANNOUNCE_POLL: Duration = Duration::from_millis(500);
 
 /// `announce_port` is read fresh before each announce round: `0` means
 /// "don't announce yet". This lets the downloader spawn the DHT early
@@ -64,61 +218,24 @@ const ANNOUNCE_POLL: Duration = Duration::from_millis(500);
 /// With `ipv6`, a second node runs on an IPv6 socket of its own (BEP 32), with
 /// a routing table of its own, and what it finds arrives on the same channel.
 /// If the machine has no IPv6 the second node is simply not there.
+///
+/// A node for one torrent; [`DhtNode`] serves many.
 pub fn spawn_service(bind_port: u16, bootstrap_nodes: Vec<String>, info_hash: [u8; 20], announce_port: Arc<AtomicU16>, ipv6: bool) -> io::Result<DhtService> {
-    let transport = UdpTransport::bind(bind_port)?;
-    let port = transport.local_port();
-    spawn_service_on(transport, port, bootstrap_nodes, info_hash, announce_port, ipv6)
+    let node = Arc::new(DhtNode::start(bind_port, bootstrap_nodes, ipv6)?);
+    Ok(owned(node, info_hash, announce_port))
 }
 
 /// [`spawn_service`] on a transport already made -- one shared with uTP, say --
 /// which listens on UDP `port`.
 pub fn spawn_service_on<T: super::Transport + 'static>(transport: T, port: u16, bootstrap_nodes: Vec<String>, info_hash: [u8; 20], announce_port: Arc<AtomicU16>, ipv6: bool) -> io::Result<DhtService> {
-    let stop = Arc::new(AtomicBool::new(false));
-    let (nodes, nodes6) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-    let (tx, peers_rx) = mpsc::channel();
-
-    let mut handles = vec![spawn_node(transport, bootstrap_nodes.clone(), info_hash, Arc::clone(&announce_port), tx.clone(), Arc::clone(&nodes), Arc::clone(&stop))];
-    let mut port6 = None;
-    if ipv6 {
-        // The IPv6 node prefers the same port number, as peers expect one number to do for both.
-        if let Ok(transport6) = UdpTransport::bind_v6(port) {
-            port6 = Some(transport6.local_port());
-            handles.push(spawn_node(transport6, bootstrap_nodes, info_hash, announce_port, tx, Arc::clone(&nodes6), Arc::clone(&stop)));
-        }
-    }
-    Ok(DhtService { peers_rx, port, nodes, nodes6, port6, stop, handles })
+    let node = Arc::new(DhtNode::start_on(transport, port, bootstrap_nodes, ipv6)?);
+    Ok(owned(node, info_hash, announce_port))
 }
 
-/// One DHT node, of whichever family its transport is, on a thread of its own.
-fn spawn_node<T: super::Transport + 'static>(transport: T, bootstrap_nodes: Vec<String>, info_hash: [u8; 20], announce_port: Arc<AtomicU16>, tx: mpsc::Sender<Vec<SocketAddr>>, nodes: Arc<AtomicUsize>, stop: Arc<AtomicBool>) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut dht = Dht::new(transport);
-        dht.bootstrap(&bootstrap_nodes, &stop);
-        nodes.store(dht.table_len(), Ordering::SeqCst);
-
-        while !stop.load(Ordering::SeqCst) {
-            let found = dht.get_peers(&info_hash, Duration::from_secs(10), &stop);
-            if !found.peers.is_empty() && tx.send(found.peers.clone()).is_err() {
-                return; // downloader gone; nothing left to do
-            }
-            // The announce needs our port, which may not be known yet (the DHT starts
-            // before the listener); rather than leave it to the next round, look again
-            // every so often until it is, and announce with the tokens this lookup won.
-            let round_ends = Instant::now() + RELOOKUP_INTERVAL;
-            let mut announced = false;
-            while Instant::now() < round_ends && !stop.load(Ordering::SeqCst) {
-                let port = announce_port.load(Ordering::SeqCst);
-                if port != 0 && !announced {
-                    dht.announce(&info_hash, port, &found);
-                    announced = true;
-                }
-                nodes.store(dht.table_len(), Ordering::SeqCst);
-                let step = if announced { RELOOKUP_INTERVAL } else { ANNOUNCE_POLL };
-                dht.serve_for(step.min(round_ends.saturating_duration_since(Instant::now())), &stop);
-            }
-            nodes.store(dht.table_len(), Ordering::SeqCst);
-        }
-    })
+fn owned(node: Arc<DhtNode>, info_hash: [u8; 20], announce_port: Arc<AtomicU16>) -> DhtService {
+    let mut service = node.add_torrent(info_hash, announce_port);
+    service.owned = true;
+    service
 }
 
 #[cfg(test)]
@@ -140,6 +257,9 @@ mod tests {
     struct FakeNode {
         port: u16,
         announces: Announces,
+        /// The info hash of every `get_peers` and of every `announce_peer`, in order.
+        asked: Arc<Mutex<Vec<[u8; 20]>>>,
+        announced: Arc<Mutex<Vec<[u8; 20]>>>,
         stop: Arc<AtomicBool>,
         thread: Option<thread::JoinHandle<()>>,
     }
@@ -150,20 +270,35 @@ mod tests {
         }
 
         fn start_on(bind: &str, peer: SocketAddr) -> Self {
+            FakeNode::start_with(bind, Some(peer))
+        }
+
+        /// One that answers each info hash with a peer of its own, `peer_for` it.
+        fn start_by_hash() -> Self {
+            FakeNode::start_with("127.0.0.1:0", None)
+        }
+
+        fn start_with(bind: &str, peer: Option<SocketAddr>) -> Self {
             let socket = UdpSocket::bind(bind).unwrap();
             socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
             let port = socket.local_addr().unwrap().port();
             let announces = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
             let (log, halt) = (Arc::clone(&announces), Arc::clone(&stop));
+            let (asked, announced) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+            let (asked_log, announced_log) = (Arc::clone(&asked), Arc::clone(&announced));
             let thread = thread::spawn(move || {
                 let mut buf = [0u8; 2048];
                 while !halt.load(Ordering::SeqCst) {
                     let Ok((n, from)) = socket.recv_from(&mut buf) else { continue };
                     let Ok(KrpcMessage::Query { t, query }) = KrpcMessage::decode(&buf[..n]) else { continue };
                     let response = match query {
-                        Query::GetPeers { .. } => Response { id: NODE_ID, values: vec![peer], token: Some(b"tk".to_vec()), ..Default::default() },
-                        Query::AnnouncePeer { port, token, .. } => {
+                        Query::GetPeers { info_hash, .. } => {
+                            asked_log.lock().unwrap().push(info_hash);
+                            Response { id: NODE_ID, values: vec![peer.unwrap_or_else(|| peer_for(&info_hash))], token: Some(b"tk".to_vec()), ..Default::default() }
+                        }
+                        Query::AnnouncePeer { port, token, info_hash, .. } => {
+                            announced_log.lock().unwrap().push(info_hash);
                             log.lock().unwrap().push((port, token));
                             Response { id: NODE_ID, ..Default::default() }
                         }
@@ -172,7 +307,7 @@ mod tests {
                     let _ = socket.send_to(&KrpcMessage::Response { t, response }.encode(), from);
                 }
             });
-            FakeNode { port, announces, stop, thread: Some(thread) }
+            FakeNode { port, announces, asked, announced, stop, thread: Some(thread) }
         }
 
         fn router(&self) -> String {
@@ -203,6 +338,15 @@ mod tests {
 
     fn peer() -> SocketAddr {
         "203.0.113.9:51413".parse().unwrap()
+    }
+
+    /// The peer a by-hash node hands out for a torrent: the first byte of the hash says which.
+    fn peer_for(info_hash: &[u8; 20]) -> SocketAddr {
+        SocketAddr::from(([203, 0, 113, info_hash[0]], 51413))
+    }
+
+    fn started(bootstrap: String, ipv6: bool) -> Arc<DhtNode> {
+        Arc::new(DhtNode::start(0, vec![bootstrap], ipv6).unwrap())
     }
 
     #[test]
@@ -356,5 +500,117 @@ mod tests {
         wait_until("the announce_peer, well inside the three minutes to the next round", || !node.announces.lock().unwrap().is_empty());
         assert_eq!(node.announces.lock().unwrap()[0], (6889, b"tk".to_vec()), "with the token the first lookup won");
         service.stop();
+    }
+
+    #[test]
+    fn one_node_looks_up_and_announces_each_torrent_it_is_given() {
+        let router = FakeNode::start_by_hash();
+        let node = started(router.router(), false);
+        let (first, second) = ([1u8; 20], [2u8; 20]);
+        let mut a = node.add_torrent(first, Arc::new(AtomicU16::new(6881)));
+        let mut b = node.add_torrent(second, Arc::new(AtomicU16::new(6882)));
+
+        // Each hears of the peer for its own torrent and of no other.
+        assert_eq!(a.peers_rx.recv_timeout(Duration::from_secs(10)).unwrap(), vec![peer_for(&first)]);
+        assert_eq!(b.peers_rx.recv_timeout(Duration::from_secs(10)).unwrap(), vec![peer_for(&second)]);
+        wait_until("both announces", || router.announced.lock().unwrap().len() >= 2);
+        let ports: Vec<u16> = router.announces.lock().unwrap().iter().map(|(port, _)| *port).collect();
+        let hashes = router.announced.lock().unwrap().clone();
+        for (hash, port) in hashes.iter().zip(&ports) {
+            assert_eq!(*port, if *hash == first { 6881 } else { 6882 }, "each torrent announces its own port");
+        }
+        assert!(hashes.contains(&first) && hashes.contains(&second));
+        assert_eq!(a.port, b.port, "over one socket");
+
+        a.stop();
+        b.stop();
+        node.stop();
+    }
+
+    #[test]
+    fn a_torrent_added_while_the_node_runs_is_looked_up_at_once() {
+        let router = FakeNode::start_by_hash();
+        let node = started(router.router(), false);
+        let mut early = node.add_torrent([1; 20], Arc::new(AtomicU16::new(0)));
+        early.peers_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        // Long before the early torrent's next lookup, which is minutes off.
+        let mut late = node.add_torrent([7; 20], Arc::new(AtomicU16::new(6881)));
+        assert_eq!(late.peers_rx.recv_timeout(Duration::from_secs(10)).expect("looked up without waiting for a round"), vec![peer_for(&[7; 20])]);
+        early.stop();
+        late.stop();
+        node.stop();
+    }
+
+    #[test]
+    fn stopping_one_torrent_leaves_the_node_and_the_others_running() {
+        let router = FakeNode::start_by_hash();
+        let node = started(router.router(), false);
+        let mut gone = node.add_torrent([1; 20], Arc::new(AtomicU16::new(0)));
+        gone.peers_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        gone.stop();
+
+        let mut kept = node.add_torrent([2; 20], Arc::new(AtomicU16::new(6881)));
+        assert_eq!(kept.peers_rx.recv_timeout(Duration::from_secs(10)).expect("the node still works"), vec![peer_for(&[2; 20])]);
+        wait_until("the announce", || router.announced.lock().unwrap().contains(&[2; 20]));
+        assert!(!node.stop.load(Ordering::SeqCst), "stopping a torrent is not stopping the node");
+        kept.stop();
+        node.stop();
+    }
+
+    #[test]
+    fn a_torrent_removed_is_not_looked_up_or_announced_again() {
+        let router = FakeNode::start_by_hash();
+        let node = started(router.router(), false);
+        // Its port unknown, it would be announced as soon as the port is; but it is removed first.
+        let port = Arc::new(AtomicU16::new(0));
+        let mut removed = node.add_torrent([1; 20], Arc::clone(&port));
+        removed.peers_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        removed.stop();
+        let mut other = node.add_torrent([2; 20], Arc::new(AtomicU16::new(0)));
+        other.peers_rx.recv_timeout(Duration::from_secs(10)).unwrap(); // the removal has been read by now
+
+        port.store(6881, Ordering::SeqCst);
+        thread::sleep(Duration::from_secs(1));
+        assert!(!router.announced.lock().unwrap().contains(&[1; 20]), "nothing is announced for a torrent that is gone");
+        other.stop();
+        node.stop();
+    }
+
+    #[test]
+    fn the_handle_of_a_service_made_for_one_torrent_ends_the_node_with_it() {
+        let router = FakeNode::start_by_hash();
+        let mut service = spawn_service(0, vec![router.router()], [3; 20], Arc::new(AtomicU16::new(0)), false).unwrap();
+        service.peers_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        service.stop();
+        assert!(service.node.stop.load(Ordering::SeqCst), "the node it made goes with it");
+    }
+
+    #[test]
+    fn each_torrent_is_looked_up_and_announced_again_every_round() {
+        let router = FakeNode::start_by_hash();
+        let transport = UdpTransport::bind(0).unwrap();
+        let port = transport.local_port();
+        let node = Arc::new(DhtNode::start_every(transport, port, vec![router.router()], false, Duration::from_millis(300)).unwrap());
+        let mut service = node.add_torrent([1; 20], Arc::new(AtomicU16::new(6881)));
+        let mut other = node.add_torrent([2; 20], Arc::new(AtomicU16::new(6882)));
+
+        let count = |hash: [u8; 20]| router.announced.lock().unwrap().iter().filter(|h| **h == hash).count();
+        wait_until("both to be announced a second time", || count([1; 20]) >= 2 && count([2; 20]) >= 2);
+        service.stop();
+        other.stop();
+        node.stop();
+    }
+
+    #[test]
+    fn a_torrent_nobody_is_listening_for_is_dropped_by_the_node() {
+        let router = FakeNode::start_by_hash();
+        let node = started(router.router(), false);
+        let service = node.add_torrent([1; 20], Arc::new(AtomicU16::new(6881)));
+        drop(service.peers_rx); // the receiving end goes away, as when a session ends
+        wait_until("the first lookup", || !router.asked.lock().unwrap().is_empty());
+        thread::sleep(Duration::from_millis(500));
+        assert!(router.announced.lock().unwrap().is_empty(), "having found nobody to tell, the node lets the torrent go, and does not announce it");
+        node.stop();
     }
 }
