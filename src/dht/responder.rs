@@ -12,6 +12,11 @@ use std::time::{Duration, Instant};
 /// storage node second.
 const MAX_STORED_PEERS_PER_HASH: usize = 100;
 
+/// Info-hashes remembered in total. A token is bound only to the sender's
+/// address, so without a limit here one `get_peers` buys the right to make
+/// this node remember an unbounded number of info-hashes.
+const MAX_STORED_INFOHASHES: usize = 1000;
+
 impl<T: Transport> Dht<T> {
     /// Handles one inbound datagram. Queries get answered on the spot;
     /// responses are returned to the caller for transaction correlation.
@@ -44,10 +49,14 @@ impl<T: Transport> Dht<T> {
                             return None;
                         }
                         let peer_port = if *implied_port { from_v4.port() } else { *port };
-                        let peers = self.peer_store.entry(*info_hash).or_default();
-                        let peer = SocketAddrV4::new(*from_v4.ip(), peer_port);
-                        if !peers.contains(&peer) && peers.len() < MAX_STORED_PEERS_PER_HASH {
-                            peers.push(peer);
+                        // At capacity we still answer "ok" but only add peers to
+                        // info-hashes we already hold.
+                        if self.peer_store.contains_key(info_hash) || self.peer_store.len() < MAX_STORED_INFOHASHES {
+                            let peers = self.peer_store.entry(*info_hash).or_default();
+                            let peer = SocketAddrV4::new(*from_v4.ip(), peer_port);
+                            if !peers.contains(&peer) && peers.len() < MAX_STORED_PEERS_PER_HASH {
+                                peers.push(peer);
+                            }
                         }
                         Response { id: self.node_id, ..Default::default() }
                     }
@@ -262,5 +271,73 @@ mod tests {
         let token = harvest_token(&mut dht, &transport, v4("10.5.5.5:7000"), [0x77; 20]);
 
         assert!(!announce_accepted(&mut dht, &transport, v4("10.6.6.6:7000"), [0x77; 20], token), "a token must not work from a different address");
+    }
+
+    /// Sends `bytes` to the node as if from `from`, and lets it answer.
+    fn deliver(dht: &mut Dht<&MockTransport>, from: SocketAddrV4, bytes: Vec<u8>) {
+        let _ = dht.handle_inbound(&bytes, std::net::SocketAddr::V4(from));
+    }
+
+    #[test]
+    fn hostile_datagrams_never_panic_the_node_or_grow_its_store_past_its_limits() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let from = v4("10.9.9.9:6881");
+        let id = [0x02; 20];
+        let ih = [0x77; 20];
+        let token = harvest_token(&mut dht, &transport, from, ih);
+        let seeds = vec![
+            KrpcMessage::Query { t: b"p".to_vec(), query: Query::Ping { id } }.encode(),
+            KrpcMessage::Query { t: b"f".to_vec(), query: Query::FindNode { id, target: ih } }.encode(),
+            KrpcMessage::Query { t: b"g".to_vec(), query: Query::GetPeers { id, info_hash: ih } }.encode(),
+            KrpcMessage::Query { t: b"a".to_vec(), query: Query::AnnouncePeer { id, info_hash: ih, port: 6881, token, implied_port: false } }.encode(),
+            KrpcMessage::Response { t: b"r".to_vec(), response: Response { id, ..Default::default() } }.encode(),
+        ];
+        crate::fuzz::hammer(&seeds, 2000, |input| {
+            deliver(&mut dht, from, input.to_vec());
+            assert!(dht.peer_store.values().all(|peers| peers.len() <= MAX_STORED_PEERS_PER_HASH));
+            assert!(dht.peer_store.len() <= MAX_STORED_INFOHASHES, "store holds {} info-hashes", dht.peer_store.len());
+        });
+    }
+
+    #[test]
+    fn announcing_endless_distinct_info_hashes_cannot_grow_the_store_without_limit() {
+        // A token is bound only to the sender's address, so one get_peers
+        // buys the right to announce any info-hash at all.
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let from = v4("10.9.9.9:6881");
+        let token = harvest_token(&mut dht, &transport, from, [0x77; 20]);
+
+        for n in 0..(MAX_STORED_INFOHASHES as u32 * 3) {
+            let mut info_hash = [0u8; 20];
+            info_hash[..4].copy_from_slice(&n.to_be_bytes());
+            let q = KrpcMessage::Query { t: b"a".to_vec(), query: Query::AnnouncePeer { id: [0x02; 20], info_hash, port: 6881, token: token.clone(), implied_port: false } };
+            deliver(&mut dht, from, q.encode());
+        }
+
+        assert_eq!(dht.peer_store.len(), MAX_STORED_INFOHASHES, "full, and no fuller");
+    }
+
+    #[test]
+    fn an_info_hash_already_stored_can_still_gain_peers_when_the_store_is_full() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let token_holder = v4("10.9.9.9:6881");
+        let token = harvest_token(&mut dht, &transport, token_holder, [0; 20]);
+        let announce = |dht: &mut Dht<&MockTransport>, n: u32, port: u16| {
+            let mut info_hash = [0u8; 20];
+            info_hash[..4].copy_from_slice(&n.to_be_bytes());
+            let q = KrpcMessage::Query { t: b"a".to_vec(), query: Query::AnnouncePeer { id: [0x02; 20], info_hash, port, token: token.clone(), implied_port: false } };
+            deliver(dht, token_holder, q.encode());
+        };
+        for n in 0..MAX_STORED_INFOHASHES as u32 {
+            announce(&mut dht, n, 1000);
+        }
+        announce(&mut dht, 0, 2000); // an existing hash, a second port
+
+        let mut first = [0u8; 20];
+        first[..4].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(dht.peer_store[&first].len(), 2, "an entry we already hold keeps accepting peers");
     }
 }
