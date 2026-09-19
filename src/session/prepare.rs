@@ -69,6 +69,9 @@ pub struct Options {
     /// on disk but no resume file, such as after a completed download or
     /// files copied in from elsewhere.
     pub recheck: bool,
+    /// Message stream encryption (`--encryption`). `None` is the default:
+    /// outgoing connections are plain, incoming ones may be either.
+    pub encryption: Option<crate::peer::Encryption>,
     /// Fetch pieces in order instead of rarest first (`--sequential`).
     pub sequential: bool,
     /// Files whose pieces are fetched before the others (`--prefer`), as a
@@ -207,7 +210,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // (BEP 9), but only if it re-encodes to what the hash was taken over.
     let info_bytes = crate::bencode::encode(&torrent.info);
     let metadata = (Sha1::digest(&info_bytes).as_slice() == torrent.info_hash).then(|| Arc::new(info_bytes));
-    let seeder_options = seeder::SeederOptions { metadata, ..Default::default() };
+    let seeder_options = seeder::SeederOptions { metadata, encryption: options.encryption.unwrap_or(crate::peer::Encryption::Prefer), ..Default::default() };
     match seeder::start_with(options.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options) {
         Ok(handle) => {
             sink.log(format!("listening for inbound peers on port {}", handle.port));
@@ -264,7 +267,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
         sink.log(format!("skipped {} IPv6 peer(s) with no local route (pass --ipv6 to force)", pool.skipped_ipv6()));
     }
 
-    let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: options.pipeline_depth, connect_timeout: options.connect_timeout, down_limit, interrupt: Default::default(), peers: Default::default() });
+    let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: options.pipeline_depth, connect_timeout: options.connect_timeout, down_limit, interrupt: Default::default(), peers: Default::default(), encryption: options.encryption.unwrap_or_default() });
     let mut workers = Workers::new(Arc::clone(&queue), Arc::clone(&spans), config, piece_length, options.max_peers, torrent.private, shared_log(sink));
 
     // Web-seed workers: one thread per url-list entry, draining the same
@@ -341,6 +344,7 @@ mod tests {
             max_up: None,
             recheck: false,
             sequential: false,
+            encryption: None,
             prefer: Vec::new(),
             retry_delay: Duration::from_secs(15),
             pipeline_depth: 5,

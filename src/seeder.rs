@@ -28,6 +28,7 @@ use crate::peer::extension::{ExtendedHandshake, EXTENDED_HANDSHAKE_ID};
 use crate::peer::handshake::{Handshake, HANDSHAKE_LEN};
 use crate::peer::message::Message;
 use crate::peer::state::PeerState;
+use crate::peer::PeerStream;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -126,6 +127,7 @@ struct SeederShared {
     choker: Arc<Choker>,
     /// The info dictionary, for peers that ask for it.
     metadata: Option<Arc<Vec<u8>>>,
+    encryption: crate::peer::Encryption,
 }
 
 impl SeederShared {
@@ -166,6 +168,9 @@ pub struct SeederOptions {
     pub unchoke_slots: usize,
     /// How often that choice is made again.
     pub rechoke_interval: Duration,
+    /// Whether encrypted connections (MSE) are accepted, and whether plain
+    /// ones are.
+    pub encryption: crate::peer::Encryption,
     /// The torrent's info dictionary, exactly as its hash was taken over,
     /// to offer to peers that ask for it (BEP 9). Without it the seeder
     /// speaks no extensions.
@@ -174,7 +179,9 @@ pub struct SeederOptions {
 
 impl Default for SeederOptions {
     fn default() -> Self {
-        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL, metadata: None }
+        // Both are accepted by default: a peer that offers encryption is
+        // taken up on it, and one that does not is served all the same.
+        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL, encryption: crate::peer::Encryption::Prefer, metadata: None }
     }
 }
 
@@ -227,6 +234,7 @@ pub fn start_with(
         active_conns: AtomicUsize::new(0),
         choker: Arc::new(Choker::new(options.unchoke_slots)),
         metadata: options.metadata.clone(),
+        encryption: options.encryption,
     });
 
     // The rounds: who is served changes here, and each connection notices
@@ -284,9 +292,13 @@ pub fn start_with(
 
 /// Serves one inbound peer: handshake, bitfield, then Request/Piece until
 /// the peer leaves, goes idle too long, or the seeder shuts down.
-fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<()> {
+fn serve_peer(stream: TcpStream, shared: &SeederShared) -> std::io::Result<()> {
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+
+    // Plain or encrypted (MSE), whichever the peer began with; from here on
+    // it makes no difference to what follows.
+    let (mut stream, _encrypted) = crate::peer::mse::accept(Box::new(stream), &[shared.info_hash], shared.encryption).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
     // Inbound side of the BEP 3 handshake: they send first, we validate
     // the info_hash and answer. A mismatch (peer wants a torrent this
@@ -439,7 +451,7 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
 /// `Have` for each. Without this a peer that connected early would never
 /// learn of what this client downloads afterwards, and a client that is
 /// still downloading would be a poor source. Returns whether it sent any.
-fn announce_new_pieces(stream: &mut TcpStream, have: &HaveMap, seen_version: &mut u64, advertised: &mut [bool]) -> std::io::Result<bool> {
+fn announce_new_pieces(stream: &mut dyn PeerStream, have: &HaveMap, seen_version: &mut u64, advertised: &mut [bool]) -> std::io::Result<bool> {
     let version = have.version();
     if version == *seen_version {
         return Ok(false);
@@ -758,7 +770,7 @@ mod tests {
         let have = Arc::new(HaveMap::new(1));
         have.set(0);
         let info_hash = [0x67; 20];
-        let options = SeederOptions { unchoke_slots: slots, rechoke_interval: interval, metadata: None };
+        let options = SeederOptions { unchoke_slots: slots, rechoke_interval: interval, metadata: None, ..Default::default() };
         let handle = start_with(0, info_hash, [0x20; 20], spans, 16384, 16384, have, None, options).unwrap();
         (handle, info_hash)
     }
@@ -969,7 +981,7 @@ mod tests {
         let metadata = some_metadata(40_000); // three pieces of 16 KiB, the last short
         let (mut handle, info_hash) = start_metadata_seeder(&dir, Some(metadata.clone()), true);
         let peer: std::net::SocketAddr = format!("127.0.0.1:{}", handle.port).parse().unwrap();
-        let config = MetadataConfig { budget: Duration::from_secs(5), parallelism: 1, connect_timeout: Duration::from_secs(2) };
+        let config = MetadataConfig { budget: Duration::from_secs(5), parallelism: 1, connect_timeout: Duration::from_secs(2), encryption: Default::default() };
 
         let fetched = fetch_metadata(info_hash, [7; 20], vec![peer], None, &config, &RecordingSink::default(), &AtomicBool::new(false)).expect("the seeder serves the metadata");
 
@@ -1094,6 +1106,75 @@ mod tests {
         let mut buf = [0u8; HANDSHAKE_LEN];
         stream.read_exact(&mut buf).expect("the seeder answered a handshake that came late");
         assert_eq!(Handshake::from_bytes(&buf).unwrap().info_hash, info_hash);
+        handle.stop();
+    }
+
+    // ---- encrypted connections (MSE) ----
+
+    fn start_encryption_seeder(dir: &std::path::Path, mode: crate::peer::Encryption) -> (SeederHandle, [u8; 20]) {
+        let files = vec![(vec!["seed.bin".to_string()], 16384i64)];
+        let spans = Arc::new(build_file_spans(dir, &files));
+        write_piece(&spans, 0, 16384, &[0x5Au8; 16384]).unwrap();
+        let have = Arc::new(HaveMap::new(1));
+        have.set(0);
+        let info_hash = [0x68; 20];
+        let options = SeederOptions { encryption: mode, ..Default::default() };
+        (start_with(0, info_hash, [0x20; 20], spans, 16384, 16384, have, None, options).unwrap(), info_hash)
+    }
+
+    #[test]
+    fn an_encrypted_leecher_is_served_a_block_like_any_other() {
+        use crate::peer::mse;
+        let dir = tmp_dir("mse-serve");
+        let (mut handle, info_hash) = start_encryption_seeder(&dir, crate::peer::Encryption::Prefer);
+        let tcp = TcpStream::connect(("127.0.0.1", handle.port)).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut stream = mse::initiate(Box::new(tcp), &info_hash, false, &Handshake::new(info_hash, [0x24; 20], false).to_bytes()).expect("the seeder takes an encrypted connection");
+        assert!(stream.is_encrypted());
+
+        let mut buf = [0u8; HANDSHAKE_LEN];
+        stream.read_exact(&mut buf).unwrap();
+        assert_eq!(Handshake::from_bytes(&buf).unwrap().info_hash, info_hash, "its handshake comes back through the cipher");
+        Message::Interested.write_to(&mut stream).unwrap();
+        let mut unchoked = false;
+        while !unchoked {
+            unchoked = matches!(Message::read_from(&mut stream).unwrap(), Message::Unchoke);
+        }
+        Message::Request { index: 0, begin: 0, length: 16384 }.write_to(&mut stream).unwrap();
+        let block = loop {
+            if let Message::Piece { block, .. } = Message::read_from(&mut stream).unwrap() {
+                break block;
+            }
+        };
+        assert_eq!(block, vec![0x5Au8; 16384], "the block, decrypted, is the data");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_seeder_that_requires_encryption_turns_away_a_plain_handshake() {
+        let dir = tmp_dir("mse-require");
+        let (mut handle, info_hash) = start_encryption_seeder(&dir, crate::peer::Encryption::Require);
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+        stream.write_all(&Handshake::new(info_hash, [0x24; 20], false).to_bytes()).unwrap();
+
+        let mut buf = [0u8; HANDSHAKE_LEN];
+        assert!(stream.read_exact(&mut buf).is_err(), "no handshake comes back: the connection is closed");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_seeder_with_encryption_off_does_not_understand_an_encrypted_attempt_but_serves_plain_ones() {
+        use crate::peer::mse;
+        let dir = tmp_dir("mse-off");
+        let (mut handle, info_hash) = start_encryption_seeder(&dir, crate::peer::Encryption::Off);
+        let tcp = TcpStream::connect(("127.0.0.1", handle.port)).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        assert!(mse::initiate(Box::new(tcp), &info_hash, false, b"").is_err());
+
+        let (_, bitfield) = leech_connect(handle.port, info_hash);
+        assert_eq!(bitfield.first(), Some(&true), "a plain peer is served as usual");
         handle.stop();
     }
 }

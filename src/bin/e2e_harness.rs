@@ -102,6 +102,10 @@ enum Kind {
     /// A tracker that redirects every announce: the client follows it, and
     /// the download is unaffected.
     TrackerRedirect,
+    /// `--encryption`: an encrypted connection is made and used where the
+    /// peer will, a plain one where it will not (unless required), and
+    /// incoming connections are taken either way (unless required).
+    Encryption,
     /// A disk that cannot be written to ends the run at once with a message
     /// saying so, instead of dialing the same peers over and over.
     DiskFailure,
@@ -160,6 +164,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "serve-metadata", kind: Kind::ServeMetadata },
     Scenario { name: "magnet-peer-hint", kind: Kind::MagnetPeerHint },
     Scenario { name: "tracker-redirect", kind: Kind::TrackerRedirect },
+    Scenario { name: "encryption", kind: Kind::Encryption },
     Scenario { name: "disk-failure", kind: Kind::DiskFailure },
     Scenario { name: "prefer-files", kind: Kind::PreferFiles },
     Scenario { name: "json-events", kind: Kind::JsonEvents },
@@ -203,6 +208,7 @@ fn main() {
             Kind::ServeMetadata => run_serve_metadata(scenario.name),
             Kind::MagnetPeerHint => run_magnet_peer_hint(scenario.name),
             Kind::TrackerRedirect => run_tracker_redirect(scenario.name),
+            Kind::Encryption => run_encryption(scenario.name),
             Kind::DiskFailure => run_disk_failure(scenario.name),
             Kind::PreferFiles => run_prefer_files(scenario.name),
             Kind::JsonEvents => run_json_events(scenario.name),
@@ -334,6 +340,9 @@ impl Fixture {
 /// What one fake peer observed of the client.
 #[derive(Default)]
 struct PeerLog {
+    /// Connections that turned out to be encrypted (MSE) and plain.
+    encrypted_connections: usize,
+    plain_connections: usize,
     /// Whether the client's extended handshake offered `ut_pex`.
     pex_offered: Option<bool>,
     /// Every piece index the client asked for, in order (repeats included).
@@ -436,6 +445,8 @@ fn announce_param(request_line: &str, key: &str) -> Option<String> {
 
 /// What a fake peer needs to know about the torrent it serves.
 struct PeerContext {
+    /// Whether this peer takes encrypted (MSE) connections, and plain ones.
+    encryption: bittorrent_rs::peer::Encryption,
     data: Vec<u8>,
     /// The bencoded info dict, served to clients that ask for it (BEP 9).
     info_bytes: Vec<u8>,
@@ -453,6 +464,12 @@ fn spawn_swarm(fx: &Fixture, behaviors: Vec<Behavior>) -> Swarm {
 
 /// [`spawn_swarm`] with a chosen way for the tracker to behave.
 fn spawn_swarm_with_tracker(fx: &Fixture, behaviors: Vec<Behavior>, mode: TrackerMode) -> Swarm {
+    spawn_swarm_full(fx, behaviors, mode, bittorrent_rs::peer::Encryption::Off)
+}
+
+/// [`spawn_swarm_with_tracker`] with the peers taking encrypted connections
+/// too, if `encryption` says so.
+fn spawn_swarm_full(fx: &Fixture, behaviors: Vec<Behavior>, mode: TrackerMode, encryption: bittorrent_rs::peer::Encryption) -> Swarm {
     let tracker_listener = TcpListener::bind("127.0.0.1:0").expect("bind fake tracker");
     let tracker_addr = tracker_listener.local_addr().unwrap();
 
@@ -463,7 +480,7 @@ fn spawn_swarm_with_tracker(fx: &Fixture, behaviors: Vec<Behavior>, mode: Tracke
         peer_addrs.push(listener.local_addr().unwrap());
         let log = Arc::new(Mutex::new(PeerLog::default()));
         logs.push(Arc::clone(&log));
-        let cx = PeerContext { data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count };
+        let cx = PeerContext { encryption, data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count };
         thread::spawn(move || run_fake_peer(listener, cx, behavior, log));
     }
 
@@ -529,7 +546,10 @@ fn run_fake_peer(listener: TcpListener, cx: PeerContext, behavior: Behavior, log
     }
 }
 
-fn serve_connection(mut stream: TcpStream, cx: &PeerContext, behavior: &Behavior, log: &Mutex<PeerLog>) {
+fn serve_connection(tcp: TcpStream, cx: &PeerContext, behavior: &Behavior, log: &Mutex<PeerLog>) {
+    // Plain or encrypted, whichever the client begins with (as far as this
+    // peer is set to take).
+    let Ok((mut stream, encrypted)) = bittorrent_rs::peer::mse::accept(Box::new(tcp), &[cx.info_hash], cx.encryption) else { return };
     let mut hs_buf = [0u8; 68];
     if stream.read_exact(&mut hs_buf).is_err() {
         return;
@@ -541,6 +561,14 @@ fn serve_connection(mut stream: TcpStream, cx: &PeerContext, behavior: &Behavior
     let our_hs = Handshake::new(cx.info_hash, [0x99; 20], true);
     if stream.write_all(&our_hs.to_bytes()).is_err() {
         return;
+    }
+    {
+        let mut log = log.lock().unwrap();
+        if encrypted {
+            log.encrypted_connections += 1;
+        } else {
+            log.plain_connections += 1;
+        }
     }
 
     let mut bits = vec![0u8; cx.piece_count.div_ceil(8)];
@@ -2401,4 +2429,113 @@ fn run_verify(name: &str) -> Result<String, String> {
         return Err("--verify touched the network".to_string());
     }
     Ok("intact files pass with status 0; a wrong byte, a truncated file and a missing one each fail with status 1 and are named; --only ignores the rest; no tracker or peer was contacted".to_string())
+}
+
+/// Message stream encryption through the real binary, both directions.
+fn run_encryption(name: &str) -> Result<String, String> {
+    use bittorrent_rs::peer::mse;
+    use bittorrent_rs::peer::Encryption;
+    let fx = Fixture::new(false);
+    let dir = scratch_dir(name);
+    let run_download = |label: &str, peer_takes: Encryption, flag: &str| -> Result<(std::process::ExitStatus, Arc<Mutex<PeerLog>>), String> {
+        let swarm = spawn_swarm_full(&fx, vec![Behavior::Serve], TrackerMode::Answer, peer_takes);
+        let torrent = dir.join(format!("{}.torrent", label));
+        fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+        let mut child = client_command(&torrent, &dir.join(format!("{}-out", label)), &dir.join(format!("{}.log", label)), 1)
+            .args(["--no-dht", "--retry-delay", "1", "--encryption", flag, "--timeout", "12"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to spawn the client: {}", e))?;
+        let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+        Ok((status, Arc::clone(&swarm.logs[0])))
+    };
+
+    // 1. --encryption require, against a peer that does MSE: encrypted, and the file arrives.
+    let (status, log) = run_download("require", Encryption::Prefer, "require")?;
+    check_downloaded(&fx, &dir.join("require-out"))?;
+    let seen = log.lock().unwrap();
+    if !status.success() || seen.encrypted_connections == 0 || seen.plain_connections != 0 {
+        return Err(format!("--encryption require: exit {:?}, {} encrypted and {} plain connections", status.code(), seen.encrypted_connections, seen.plain_connections));
+    }
+    drop(seen);
+
+    // 2. --encryption prefer, against a peer that only speaks plain: falls back and finishes.
+    let (status, log) = run_download("prefer", Encryption::Off, "prefer")?;
+    check_downloaded(&fx, &dir.join("prefer-out"))?;
+    let seen = log.lock().unwrap();
+    if !status.success() || seen.plain_connections == 0 || seen.encrypted_connections != 0 {
+        return Err(format!("--encryption prefer against a plain peer: exit {:?}, {} encrypted and {} plain", status.code(), seen.encrypted_connections, seen.plain_connections));
+    }
+    drop(seen);
+
+    // 3. --encryption require, against a peer that only speaks plain: never falls back.
+    let (status, log) = run_download("refused", Encryption::Off, "require")?;
+    let seen = log.lock().unwrap();
+    if status.success() || seen.plain_connections != 0 {
+        return Err(format!("--encryption require must not use a plain peer: exit {:?}, {} plain connections", status.code(), seen.plain_connections));
+    }
+    drop(seen);
+
+    // 4. Incoming: a client that requires encryption serves an encrypted leecher and turns a plain one away.
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let torrent = dir.join("inbound.torrent");
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let log_path = dir.join("inbound.log");
+    let child = client_command(&torrent, &dir.join("inbound-out"), &log_path, 1)
+        .args(["--no-dht", "--seed", "--port", "0", "--encryption", "prefer"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, "seeding e2e.bin on port", Duration::from_secs(20), &mut client.0)?;
+    let port: u16 = swarm.announces.lock().unwrap().first().and_then(|line| announce_param(line, "port")).and_then(|p| p.parse().ok()).ok_or("no port in the client's first announce")?;
+
+    let tcp = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    let mut stream = mse::initiate(Box::new(tcp), &fx.info_hash, false, &Handshake::new(fx.info_hash, [0x66; 20], false).to_bytes()).map_err(|e| format!("the client would not take an encrypted connection: {}", e))?;
+    let mut hs = [0u8; 68];
+    stream.read_exact(&mut hs).map_err(|e| format!("reading its handshake: {}", e))?;
+    Message::Interested.write_to(&mut stream).map_err(|e| format!("{:?}", e))?;
+    loop {
+        if matches!(Message::read_from(&mut stream).map_err(|e| format!("waiting for the unchoke: {:?}", e))?, Message::Unchoke) {
+            break;
+        }
+    }
+    let piece_len = fx.piece_len.min(fx.data.len());
+    Message::Request { index: 0, begin: 0, length: piece_len as u32 }.write_to(&mut stream).map_err(|e| format!("{:?}", e))?;
+    let block = loop {
+        if let Message::Piece { block, .. } = Message::read_from(&mut stream).map_err(|e| format!("waiting for the block: {:?}", e))? {
+            break block;
+        }
+    };
+    if block != fx.data[..piece_len] {
+        return Err("the block served over the encrypted connection is wrong".to_string());
+    }
+
+    // A client set to `require` refuses plain, which the default `prefer` above did not.
+    let strict_log = dir.join("strict.log");
+    // Its own peer must do MSE, or the client could not download to have anything to serve.
+    let strict_swarm = spawn_swarm_full(&fx, vec![Behavior::Serve], TrackerMode::Answer, Encryption::Prefer);
+    let strict_torrent = dir.join("strict.torrent");
+    fs::write(&strict_torrent, fx.torrent_bytes(strict_swarm.tracker_addr)).expect("write torrent file");
+    let child = client_command(&strict_torrent, &dir.join("strict-out"), &strict_log, 1)
+        .args(["--no-dht", "--seed", "--port", "0", "--encryption", "require"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut strict = KillOnDrop(child);
+    wait_for_log(&strict_log, "seeding e2e.bin on port", Duration::from_secs(20), &mut strict.0)?;
+    let strict_port: u16 = strict_swarm.announces.lock().unwrap().first().and_then(|line| announce_param(line, "port")).and_then(|p| p.parse().ok()).ok_or("no port in the strict client's announce")?;
+    let mut plain = TcpStream::connect(("127.0.0.1", strict_port)).map_err(|e| e.to_string())?;
+    plain.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+    plain.write_all(&Handshake::new(fx.info_hash, [0x66; 20], false).to_bytes()).map_err(|e| e.to_string())?;
+    let mut reply = [0u8; 68];
+    if plain.read_exact(&mut reply).is_ok() {
+        return Err("a client set to require encryption answered a plain handshake".to_string());
+    }
+
+    Ok("require encrypted a download from an MSE peer; prefer fell back to plain for a plain-only peer; require refused it; an encrypted leecher was served by the client, and a require-client turned a plain one away".to_string())
 }

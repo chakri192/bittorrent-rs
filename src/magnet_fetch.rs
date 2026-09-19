@@ -5,7 +5,7 @@
 //! calls was already unit-tested there; what's new here is the orchestration.
 
 use crate::metadata::{MetadataAssembler, MetadataError, MetadataMessage};
-use crate::peer::connection::{connect_and_handshake, read_message, send_message, ConnectionError};
+use crate::peer::connection::{read_message, send_message, ConnectionError};
 use crate::peer::extension::{ExtendedHandshake, ExtensionError};
 use crate::peer::message::Message;
 use std::net::SocketAddr;
@@ -65,8 +65,8 @@ impl std::error::Error for MetadataFetchError {}
 /// piece in sequence and assembles+verifies the result against
 /// `info_hash` (the hash from the magnet URI). Returns the raw info dict
 /// bytes on success -- ready for `torrent::from_info_dict_bytes`.
-pub fn fetch_metadata_from_peer(addr: SocketAddr, info_hash: [u8; 20], our_peer_id: [u8; 20], timeout: Duration) -> Result<Vec<u8>, MetadataFetchError> {
-    let (mut stream, peer_handshake) = connect_and_handshake(addr, info_hash, our_peer_id, true, timeout)?;
+pub fn fetch_metadata_from_peer(addr: SocketAddr, info_hash: [u8; 20], our_peer_id: [u8; 20], timeout: Duration, encryption: crate::peer::Encryption) -> Result<Vec<u8>, MetadataFetchError> {
+    let (mut stream, peer_handshake) = crate::peer::connect_and_handshake_with(addr, info_hash, our_peer_id, true, timeout, encryption)?;
     if !peer_handshake.supports_extensions() {
         return Err(MetadataFetchError::PeerLacksExtensionProtocol);
     }
@@ -178,7 +178,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let mock = spawn_mock_metadata_peer(listener, info_hash, info_bytes.clone());
 
-        let fetched = fetch_metadata_from_peer(addr, info_hash, [0x33; 20], Duration::from_secs(5)).unwrap();
+        let fetched = fetch_metadata_from_peer(addr, info_hash, [0x33; 20], Duration::from_secs(5), Default::default()).unwrap();
         assert_eq!(fetched, info_bytes);
         mock.join().unwrap();
     }
@@ -194,7 +194,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let mock = spawn_mock_metadata_peer(listener, info_hash, info_bytes.clone());
 
-        let fetched = fetch_metadata_from_peer(addr, info_hash, [0x44; 20], Duration::from_secs(5)).unwrap();
+        let fetched = fetch_metadata_from_peer(addr, info_hash, [0x44; 20], Duration::from_secs(5), Default::default()).unwrap();
         let torrent = crate::torrent::from_info_dict_bytes(&fetched, info_hash, None, vec![]).unwrap();
         assert_eq!(torrent.name, "a");
         assert_eq!(torrent.total_length(), 5);
@@ -227,7 +227,7 @@ mod tests {
         // becomes one when cast to usize.
         for size in [-1, 0, i64::MIN, crate::metadata::MAX_METADATA_SIZE + 1, i64::MAX] {
             let addr = peer_claiming_metadata_size(size);
-            let result = fetch_metadata_from_peer(addr, [0x11; 20], [0x22; 20], Duration::from_secs(2));
+            let result = fetch_metadata_from_peer(addr, [0x11; 20], [0x22; 20], Duration::from_secs(2), Default::default());
             assert!(matches!(result, Err(MetadataFetchError::Metadata(crate::metadata::MetadataError::SizeNotAcceptable(n))) if n == size), "size {}: {:?}", size, result.err());
         }
     }

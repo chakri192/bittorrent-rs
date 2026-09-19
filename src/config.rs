@@ -46,6 +46,9 @@ pub struct Config {
     pub log: Option<PathBuf>,
     /// Live dashboard on/off (default on). `false` is equivalent to `--no-tui`.
     pub tui: Option<bool>,
+    /// `"off"` | `"prefer"` | `"require"`: message stream encryption
+    /// (`--encryption`).
+    pub encryption: Option<String>,
 }
 
 impl Config {

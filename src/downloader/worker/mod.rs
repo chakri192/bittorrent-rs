@@ -53,6 +53,8 @@ pub struct WorkerConfig {
     pub interrupt: Interrupt,
     /// What each connected peer is doing, for the dashboard.
     pub peers: PeerRegistry,
+    /// Whether outgoing connections use message stream encryption.
+    pub encryption: crate::peer::Encryption,
 }
 
 /// A way to end workers that are blocked reading from a peer.

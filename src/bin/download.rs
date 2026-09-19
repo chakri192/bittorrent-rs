@@ -62,6 +62,8 @@ struct Args {
     retry_delay: Duration,
     /// Verify every piece on disk instead of trusting the resume file.
     recheck: bool,
+    /// Message stream encryption, if chosen.
+    encryption: Option<bittorrent_rs::peer::Encryption>,
     /// Fetch pieces in order rather than rarest first.
     sequential: bool,
     /// Case-insensitive path substrings of files to fetch first.
@@ -140,6 +142,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
     let mut retry_delay = Duration::from_secs(15);
     let mut recheck = false;
     let mut sequential = false;
+    let mut encryption = cfg.encryption.as_deref().map(bittorrent_rs::peer::Encryption::parse).transpose().map_err(|e| format!("config encryption: {}", e))?;
     let mut prefer: Vec<String> = Vec::new();
     let mut save_torrent = None;
     let mut json = false;
@@ -186,6 +189,10 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
             }
             "--recheck" => recheck = true,
             "--sequential" => sequential = true,
+            "--encryption" => {
+                let v = argv.next().ok_or("--encryption requires off, prefer or require")?;
+                encryption = Some(bittorrent_rs::peer::Encryption::parse(&v).map_err(|e| format!("--encryption: {}", e))?);
+            }
             "--prefer" => prefer.push(argv.next().ok_or("--prefer requires a path substring")?),
             "--json" => json = true,
             "--verify" => verify = true,
@@ -288,11 +295,11 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
         seed = true;
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, sequential, prefer, save_torrent, json, verify, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
+    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, encryption, sequential, prefer, save_torrent, json, verify, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--verify] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--encryption off|prefer|require] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--verify] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -409,7 +416,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         if let Some(name) = &magnet.display_name {
             ui.set_title(name.clone());
         }
-        let metadata = MetadataConfig { budget: METADATA_RESOLVE_BUDGET, parallelism: METADATA_PARALLELISM, connect_timeout: CONNECT_TIMEOUT };
+        let metadata = MetadataConfig { budget: METADATA_RESOLVE_BUDGET, parallelism: METADATA_PARALLELISM, connect_timeout: CONNECT_TIMEOUT, encryption: args.encryption.unwrap_or_default() };
         let (torrent, peers) = resolve_magnet(&magnet, our_peer_id, args.port, services.dht(), &metadata, ui, stop).map_err(|e| finish_err(ui, e))?;
         // The DHT had to run to fetch the metadata, since a magnet link
         // doesn't say whether the torrent is private until the info dict
@@ -468,6 +475,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         reannounce_override: args.reannounce_override.map(Duration::from_secs),
         retry_delay: args.retry_delay,
         recheck: args.recheck,
+        encryption: args.encryption,
         sequential: args.sequential,
         prefer: bittorrent_rs::selection::build_prefer_mask(&torrent.files, &args.prefer).map_err(|e| finish_err(ui, e))?,
         max_down: args.max_down,
@@ -596,6 +604,19 @@ mod tests {
         assert!(parse(&Config::default(), &["x"]).unwrap().prefer.is_empty());
         assert_eq!(parse(&Config::default(), &["x", "--prefer", ".nfo", "--prefer", "ep1"]).unwrap().prefer, vec![".nfo".to_string(), "ep1".to_string()]);
         assert!(parse(&Config::default(), &["x", "--prefer"]).err().unwrap().contains("requires"));
+    }
+
+    #[test]
+    fn encryption_is_chosen_by_flag_or_config_and_the_flag_wins() {
+        use bittorrent_rs::peer::Encryption;
+        assert_eq!(parse(&Config::default(), &["x"]).unwrap().encryption, None, "unset: plain out, either in");
+        assert_eq!(parse(&Config::default(), &["x", "--encryption", "require"]).unwrap().encryption, Some(Encryption::Require));
+        let cfg = cfg_from("encryption = \"prefer\"");
+        assert_eq!(parse(&cfg, &["x"]).unwrap().encryption, Some(Encryption::Prefer));
+        assert_eq!(parse(&cfg, &["x", "--encryption", "off"]).unwrap().encryption, Some(Encryption::Off));
+        assert!(parse(&Config::default(), &["x", "--encryption", "maybe"]).err().unwrap().starts_with("--encryption:"));
+        assert!(parse(&Config::default(), &["x", "--encryption"]).err().unwrap().contains("requires"));
+        assert!(parse(&cfg_from("encryption = \"maybe\""), &["x"]).err().unwrap().starts_with("config encryption:"));
     }
 
     #[test]
