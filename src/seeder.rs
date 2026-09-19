@@ -4,6 +4,15 @@
 //!
 //! A peer is told of every piece verified after it connected, with `Have`.
 //!
+//! Who is served is decided by [`crate::choker`]: a few unchoke slots,
+//! most to the peers taking the most from us and one rotating optimistic
+//! slot, re-decided every [`RECHOKE_INTERVAL`]. Everyone else is choked and
+//! their requests ignored. (Only the seeding half of tit-for-tat: inbound
+//! peers are never downloaded from, so there is no reciprocation to reward.)
+//!
+//! What follows is the older description of the policy, kept for its
+//! reasoning about the connection cap.
+//!
 //! Policy is deliberately simple for a from-scratch client: every
 //! interested peer gets unchoked, bounded by a global inbound-connection
 //! cap, with no tit-for-tat rate measurement. Real tit-for-tat exists to
@@ -12,6 +21,7 @@
 //! choke-round machinery (README documents this as a known
 //! simplification).
 
+use crate::choker::{Choker, DEFAULT_SLOTS};
 use crate::downloader::file_writer::{read_block, FileSpan};
 use crate::peer::handshake::{Handshake, HANDSHAKE_LEN};
 use crate::peer::message::Message;
@@ -32,6 +42,8 @@ const MAX_REQUEST_LEN: u32 = 128 * 1024;
 /// Concurrent inbound peers served at once; connections beyond this are
 /// accepted-and-closed immediately so the backlog doesn't grow unbounded.
 const MAX_INBOUND_PEERS: usize = 40;
+/// How often the choice of who to unchoke is made again.
+pub const RECHOKE_INTERVAL: Duration = Duration::from_secs(10);
 /// An inbound peer silent for this long gets dropped.
 const IDLE_DISCONNECT: Duration = Duration::from_secs(300);
 /// Send a keep-alive if we've written nothing for this long (BEP 3
@@ -97,6 +109,8 @@ struct SeederShared {
     running: Arc<AtomicBool>,
     uploaded: Arc<AtomicU64>,
     active_conns: AtomicUsize,
+    /// Who is unchoked.
+    choker: Arc<Choker>,
 }
 
 impl SeederShared {
@@ -118,14 +132,30 @@ pub struct SeederHandle {
     pub uploaded: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
     accept_thread: Option<thread::JoinHandle<()>>,
+    rechoke_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl SeederHandle {
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        if let Some(h) = self.accept_thread.take() {
-            let _ = h.join();
+        for thread in [self.accept_thread.take(), self.rechoke_thread.take()].into_iter().flatten() {
+            let _ = thread.join();
         }
+    }
+}
+
+/// How the seeder chooses who to serve.
+#[derive(Debug, Clone, Copy)]
+pub struct SeederOptions {
+    /// Peers served at once (see [`crate::choker`]).
+    pub unchoke_slots: usize,
+    /// How often that choice is made again.
+    pub rechoke_interval: Duration,
+}
+
+impl Default for SeederOptions {
+    fn default() -> Self {
+        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL }
     }
 }
 
@@ -139,6 +169,22 @@ pub fn start(
     total_length: u64,
     have: Arc<HaveMap>,
     up_limit: Option<Arc<crate::ratelimit::RateLimiter>>,
+) -> std::io::Result<SeederHandle> {
+    start_with(preferred_port, info_hash, our_peer_id, spans, piece_length, total_length, have, up_limit, SeederOptions::default())
+}
+
+/// [`start`] with the choking policy chosen.
+#[allow(clippy::too_many_arguments)]
+pub fn start_with(
+    preferred_port: u16,
+    info_hash: [u8; 20],
+    our_peer_id: [u8; 20],
+    spans: Arc<Vec<FileSpan>>,
+    piece_length: u64,
+    total_length: u64,
+    have: Arc<HaveMap>,
+    up_limit: Option<Arc<crate::ratelimit::RateLimiter>>,
+    options: SeederOptions,
 ) -> std::io::Result<SeederHandle> {
     // Preferred port first (conventionally 6881), ephemeral fallback --
     // another client on the same machine owning 6881 shouldn't stop this
@@ -160,6 +206,23 @@ pub fn start(
         running: Arc::clone(&running),
         uploaded: Arc::clone(&uploaded),
         active_conns: AtomicUsize::new(0),
+        choker: Arc::new(Choker::new(options.unchoke_slots)),
+    });
+
+    // The rounds: who is served changes here, and each connection notices
+    // within a read timeout and tells its peer.
+    let rechoke_shared = Arc::clone(&shared);
+    let rechoke_thread = thread::spawn(move || {
+        let mut waited = Duration::ZERO;
+        while rechoke_shared.running.load(Ordering::SeqCst) {
+            let slice = Duration::from_millis(50);
+            thread::sleep(slice);
+            waited += slice;
+            if waited >= options.rechoke_interval {
+                waited = Duration::ZERO;
+                rechoke_shared.choker.rechoke();
+            }
+        }
     });
 
     let accept_shared = Arc::clone(&shared);
@@ -186,7 +249,7 @@ pub fn start(
         }
     });
 
-    Ok(SeederHandle { port, uploaded, running, accept_thread: Some(accept_thread) })
+    Ok(SeederHandle { port, uploaded, running, accept_thread: Some(accept_thread), rechoke_thread: Some(rechoke_thread) })
 }
 
 /// Serves one inbound peer: handshake, bitfield, then Request/Piece until
@@ -219,7 +282,17 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
     let mut advertised = shared.have.snapshot();
     Message::Bitfield(PeerState::encode_bitfield(&advertised)).write_to(&mut stream).map_err(wire_to_io)?;
 
-    let mut peer_unchoked = false;
+    let choker_id = shared.choker.register();
+    // Forgets the peer, freeing any slot it held, however this function ends.
+    struct Leaving<'a>(&'a Choker, crate::choker::PeerId);
+    impl Drop for Leaving<'_> {
+        fn drop(&mut self) {
+            self.0.unregister(self.1);
+        }
+    }
+    let _leaving = Leaving(&shared.choker, choker_id);
+    // Whether the peer has been told it is unchoked.
+    let mut told_unchoked = false;
     let mut last_heard = Instant::now();
     let mut last_sent = Instant::now();
 
@@ -239,6 +312,14 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
             last_sent = Instant::now();
         }
 
+        // Tell the peer when the choker has changed its mind.
+        let allowed = shared.choker.is_unchoked(choker_id);
+        if allowed != told_unchoked {
+            (if allowed { Message::Unchoke } else { Message::Choke }).write_to(&mut stream).map_err(wire_to_io)?;
+            told_unchoked = allowed;
+            last_sent = Instant::now();
+        }
+
         let msg = match Message::read_from(&mut stream) {
             Ok(m) => m,
             Err(crate::peer::message::WireError::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
@@ -251,17 +332,13 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
 
         match msg {
             Message::Interested => {
-                if !peer_unchoked {
-                    Message::Unchoke.write_to(&mut stream).map_err(wire_to_io)?;
-                    peer_unchoked = true;
-                    last_sent = Instant::now();
-                }
+                shared.choker.set_interested(choker_id, true);
+                // A free slot is theirs at once; the loop tells them next time round.
+                shared.choker.grant_if_free(choker_id);
             }
-            Message::NotInterested => {
-                // Leave them unchoked; they'll either re-request or idle out.
-            }
+            Message::NotInterested => shared.choker.set_interested(choker_id, false),
             Message::Request { index, begin, length } => {
-                if !peer_unchoked {
+                if !shared.choker.is_unchoked(choker_id) {
                     continue; // BEP 3: requests while choked are ignored
                 }
                 if length > MAX_REQUEST_LEN {
@@ -278,6 +355,7 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
                 }
                 Message::Piece { index, begin, block }.write_to(&mut stream).map_err(wire_to_io)?;
                 shared.uploaded.fetch_add(length as u64, Ordering::Relaxed);
+                shared.choker.record_upload(choker_id, length as u64);
                 last_sent = Instant::now();
             }
             // Piece-availability chatter from a fellow leecher; a pure
@@ -600,6 +678,172 @@ mod tests {
         }
 
         assert!(started.elapsed() >= Duration::from_millis(500), "32 KiB at 20,000 B/s cannot take {:?}", started.elapsed());
+        handle.stop();
+    }
+
+    // ---- choking ----
+
+    fn start_choking_seeder(dir: &std::path::Path, slots: usize, interval: Duration) -> (SeederHandle, [u8; 20]) {
+        let pieces = [vec![0x5Au8; 16384]];
+        let files = vec![(vec!["seed.bin".to_string()], 16384i64)];
+        let spans = Arc::new(build_file_spans(dir, &files));
+        write_piece(&spans, 0, 16384, &pieces[0]).unwrap();
+        let have = Arc::new(HaveMap::new(1));
+        have.set(0);
+        let info_hash = [0x67; 20];
+        let options = SeederOptions { unchoke_slots: slots, rechoke_interval: interval };
+        let handle = start_with(0, info_hash, [0x20; 20], spans, 16384, 16384, have, None, options).unwrap();
+        (handle, info_hash)
+    }
+
+    /// A leecher that has connected and said it is interested.
+    fn interested_leecher(port: u16, info_hash: [u8; 20]) -> TcpStream {
+        let (mut stream, _) = leech_connect(port, info_hash);
+        Message::Interested.write_to(&mut stream).unwrap();
+        stream
+    }
+
+    /// The next Choke or Unchoke the peer sends within `wait`, skipping the rest.
+    fn next_choke_message(stream: &mut TcpStream, wait: Duration) -> Option<Message> {
+        stream.set_read_timeout(Some(wait)).unwrap();
+        loop {
+            match Message::read_from(stream) {
+                Ok(m @ (Message::Choke | Message::Unchoke)) => return Some(m),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    #[test]
+    fn only_as_many_peers_are_unchoked_as_there_are_slots() {
+        let dir = tmp_dir("slots");
+        let (mut handle, info_hash) = start_choking_seeder(&dir, 2, Duration::from_secs(3600));
+        let mut leechers: Vec<TcpStream> = (0..4).map(|_| interested_leecher(handle.port, info_hash)).collect();
+
+        let told: Vec<Option<Message>> = leechers.iter_mut().map(|l| next_choke_message(l, Duration::from_millis(700))).collect();
+
+        assert_eq!(told[0], Some(Message::Unchoke));
+        assert_eq!(told[1], Some(Message::Unchoke));
+        assert_eq!(told[2], None, "no slot left, so no Unchoke");
+        assert_eq!(told[3], None);
+        handle.stop();
+    }
+
+    #[test]
+    fn a_choked_peers_requests_are_ignored_and_an_unchoked_peers_are_served() {
+        let dir = tmp_dir("choked-requests");
+        let (mut handle, info_hash) = start_choking_seeder(&dir, 1, Duration::from_secs(3600));
+        let mut first = interested_leecher(handle.port, info_hash);
+        let mut second = interested_leecher(handle.port, info_hash);
+        assert_eq!(next_choke_message(&mut first, Duration::from_secs(2)), Some(Message::Unchoke));
+
+        Message::Request { index: 0, begin: 0, length: 16384 }.write_to(&mut second).unwrap();
+        Message::Request { index: 0, begin: 0, length: 16384 }.write_to(&mut first).unwrap();
+
+        first.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let served = loop {
+            match Message::read_from(&mut first) {
+                Ok(Message::Piece { block, .. }) => break Some(block.len()),
+                Ok(_) => continue,
+                Err(_) => break None,
+            }
+        };
+        assert_eq!(served, Some(16384), "the unchoked peer got its block");
+        second.set_read_timeout(Some(Duration::from_millis(700))).unwrap();
+        let mut got_piece = false;
+        while let Ok(m) = Message::read_from(&mut second) {
+            got_piece |= matches!(m, Message::Piece { .. });
+        }
+        assert!(!got_piece, "the choked peer got nothing");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_round_hands_a_slot_on_to_a_peer_that_was_waiting_and_tells_the_one_that_lost_it() {
+        let dir = tmp_dir("rotation");
+        // One regular slot and one optimistic; rounds every 150 ms.
+        let (mut handle, info_hash) = start_choking_seeder(&dir, 2, Duration::from_millis(150));
+        let mut a = interested_leecher(handle.port, info_hash);
+        let mut b = interested_leecher(handle.port, info_hash);
+        let mut c = interested_leecher(handle.port, info_hash);
+        assert_eq!(next_choke_message(&mut a, Duration::from_secs(2)), Some(Message::Unchoke));
+        assert_eq!(next_choke_message(&mut b, Duration::from_secs(2)), Some(Message::Unchoke));
+
+        // The optimistic slot goes round the interested peers, so c, which
+        // had no slot, gets one, and whoever it displaces is choked.
+        assert_eq!(next_choke_message(&mut c, Duration::from_secs(6)), Some(Message::Unchoke), "the peer that waited got its turn");
+        let choked = next_choke_message(&mut b, Duration::from_secs(3));
+        assert_eq!(choked, Some(Message::Choke), "and b, which had the optimistic slot, was told it lost it");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_slot_freed_by_a_peer_leaving_goes_to_the_next_at_the_following_round() {
+        let dir = tmp_dir("slot-freed");
+        let (mut handle, info_hash) = start_choking_seeder(&dir, 1, Duration::from_millis(150));
+        let mut first = interested_leecher(handle.port, info_hash);
+        let mut second = interested_leecher(handle.port, info_hash);
+        assert_eq!(next_choke_message(&mut first, Duration::from_secs(2)), Some(Message::Unchoke));
+        assert_eq!(next_choke_message(&mut second, Duration::from_millis(400)), None, "one slot, taken");
+
+        drop(first);
+
+        assert_eq!(next_choke_message(&mut second, Duration::from_secs(4)), Some(Message::Unchoke), "the waiting peer is served once the slot is free");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_peer_that_says_it_is_no_longer_interested_is_choked() {
+        let dir = tmp_dir("not-interested");
+        let (mut handle, info_hash) = start_choking_seeder(&dir, 2, Duration::from_secs(3600));
+        let mut a = interested_leecher(handle.port, info_hash);
+        assert_eq!(next_choke_message(&mut a, Duration::from_secs(2)), Some(Message::Unchoke));
+
+        Message::NotInterested.write_to(&mut a).unwrap();
+
+        assert_eq!(next_choke_message(&mut a, Duration::from_secs(2)), Some(Message::Choke));
+        handle.stop();
+    }
+
+    #[test]
+    fn the_peer_taking_the_most_keeps_its_slot_while_the_others_take_turns() {
+        let dir = tmp_dir("keeps-slot");
+        // One slot by speed, one optimistic, rounds every 100 ms.
+        let (mut handle, info_hash) = start_choking_seeder(&dir, 2, Duration::from_millis(100));
+        let mut idle = interested_leecher(handle.port, info_hash); // connects first, so wins any tie
+        let mut busy = interested_leecher(handle.port, info_hash);
+        let mut waiting = interested_leecher(handle.port, info_hash);
+        assert_eq!(next_choke_message(&mut idle, Duration::from_secs(2)), Some(Message::Unchoke));
+        assert_eq!(next_choke_message(&mut busy, Duration::from_secs(2)), Some(Message::Unchoke));
+
+        // `busy` downloads as fast as it can for a couple of seconds.
+        let (choked_tx, choked_rx) = std::sync::mpsc::channel();
+        let downloader = thread::spawn(move || {
+            busy.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            let until = Instant::now() + Duration::from_millis(2500);
+            let mut blocks = 0;
+            while Instant::now() < until {
+                let _ = Message::Request { index: 0, begin: 0, length: 16384 }.write_to(&mut busy);
+                while let Ok(m) = Message::read_from(&mut busy) {
+                    match m {
+                        Message::Choke => {
+                            let _ = choked_tx.send(());
+                        }
+                        Message::Piece { .. } => blocks += 1,
+                        _ => {}
+                    }
+                }
+            }
+            blocks
+        });
+        // Meanwhile the others are told in turn, as the optimistic slot moves.
+        let turns = next_choke_message(&mut waiting, Duration::from_secs(3)).is_some() | next_choke_message(&mut idle, Duration::from_millis(50)).is_some();
+        let blocks = downloader.join().unwrap();
+
+        assert!(blocks > 10, "the busy peer was actually served: {}", blocks);
+        assert!(choked_rx.try_recv().is_err(), "and never choked, for it took the most every round");
+        assert!(turns, "while the others were told about their turns");
         handle.stop();
     }
 }

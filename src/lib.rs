@@ -7,6 +7,7 @@
 
 pub mod bencode;
 pub mod bytes;
+pub mod choker;
 pub mod config;
 pub mod create;
 pub mod dht;
