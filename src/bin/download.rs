@@ -393,8 +393,8 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         if !args.no_dht {
             services.start_dht(args.port, magnet.info_hash, |m| ui.log(m));
         }
-        if magnet.trackers.is_empty() && services.dht().is_none() {
-            return Err(finish_err(ui, "magnet link has no trackers and DHT is disabled (--no-dht) -- no way to find any peer".to_string()));
+        if magnet.trackers.is_empty() && magnet.peers.is_empty() && services.dht().is_none() {
+            return Err(finish_err(ui, "magnet link has no trackers or peers and DHT is disabled (--no-dht) -- no way to find any peer".to_string()));
         }
         if let Some(name) = &magnet.display_name {
             ui.set_title(name.clone());

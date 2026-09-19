@@ -90,6 +90,9 @@ enum Kind {
     /// A torrent's empty files exist after the download, though no piece
     /// contains a byte of them; with `--only`, only the selected ones do.
     EmptyFiles,
+    /// A magnet link with no tracker, only an `x.pe` peer hint (and a v2
+    /// hash beside the v1 one, as a hybrid link has): it still downloads.
+    MagnetPeerHint,
     /// A tracker that redirects every announce: the client follows it, and
     /// the download is unaffected.
     TrackerRedirect,
@@ -147,6 +150,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
     Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
     Scenario { name: "empty-files", kind: Kind::EmptyFiles },
+    Scenario { name: "magnet-peer-hint", kind: Kind::MagnetPeerHint },
     Scenario { name: "tracker-redirect", kind: Kind::TrackerRedirect },
     Scenario { name: "disk-failure", kind: Kind::DiskFailure },
     Scenario { name: "prefer-files", kind: Kind::PreferFiles },
@@ -187,6 +191,7 @@ fn main() {
             Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
             Kind::SigtermMidDownload => run_sigterm_mid_download(scenario.name),
             Kind::EmptyFiles => run_empty_files(scenario.name),
+            Kind::MagnetPeerHint => run_magnet_peer_hint(scenario.name),
             Kind::TrackerRedirect => run_tracker_redirect(scenario.name),
             Kind::DiskFailure => run_disk_failure(scenario.name),
             Kind::PreferFiles => run_prefer_files(scenario.name),
@@ -404,6 +409,8 @@ enum TrackerMode {
 
 struct Swarm {
     tracker_addr: SocketAddr,
+    /// Where each fake peer listens, in the order of `logs`.
+    peer_addrs: Vec<SocketAddr>,
     /// One log per peer, in the order the tracker lists them.
     logs: Vec<Arc<Mutex<PeerLog>>>,
     /// The request line of every announce the tracker received, in order:
@@ -450,6 +457,7 @@ fn spawn_swarm_with_tracker(fx: &Fixture, behaviors: Vec<Behavior>, mode: Tracke
         thread::spawn(move || run_fake_peer(listener, cx, behavior, log));
     }
 
+    let peer_addrs_for_swarm = peer_addrs.clone();
     let announces = Arc::new(Mutex::new(Vec::new()));
     let tracker_announces = Arc::clone(&announces);
     thread::spawn(move || {
@@ -492,7 +500,7 @@ fn spawn_swarm_with_tracker(fx: &Fixture, behaviors: Vec<Behavior>, mode: Tracke
         }
     });
 
-    Swarm { tracker_addr, logs, announces }
+    Swarm { tracker_addr, peer_addrs: peer_addrs_for_swarm, logs, announces }
 }
 
 /// The extended-message id the fake peer uses for ut_metadata. Deliberately
@@ -2226,4 +2234,34 @@ fn run_tracker_redirect(name: &str) -> Result<String, String> {
         }
     }
     Ok(format!("{} announces, each redirected from /announce to /announce2 and followed, and the file matches", announces.len() / 2))
+}
+
+/// A hybrid magnet link (a v2 hash beside the v1 one) with no tracker, only
+/// an `x.pe` hint naming the peer, and DHT off: the hint is the only way to
+/// find anyone, and the v2 hash must not make the link unreadable.
+fn run_magnet_peer_hint(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (out_dir, log_path) = (dir.join("out"), dir.join("client.log"));
+    let hash = bittorrent_rs::torrent::info_hash_hex(&fx.info_hash);
+    let link = format!("magnet:?xt=urn:btih:{}&xt=urn:btmh:1220{}&x.pe={}&dn=e2e.bin", hash, "ab".repeat(32), swarm.peer_addrs[0]);
+
+    let mut child = client_command(&link, &out_dir, &log_path, 1).arg("--no-dht").stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("download binary exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+    let log = fs::read_to_string(&log_path).map_err(|e| e.to_string())?;
+    if !log.contains("names 1 peer(s) to try directly") {
+        return Err("the log does not say the link's peer hint was used".to_string());
+    }
+    if swarm.logs[0].lock().unwrap().metadata_pieces_served == 0 {
+        return Err("the peer was never asked for the metadata".to_string());
+    }
+    if !swarm.announces.lock().unwrap().is_empty() {
+        return Err("a tracker was contacted although the link and the torrent name none".to_string());
+    }
+    Ok("a hybrid link with a v2 hash and only an x.pe hint fetched its metadata from that peer and downloaded the file, with no tracker involved".to_string())
 }

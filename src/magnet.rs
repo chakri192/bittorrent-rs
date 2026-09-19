@@ -1,12 +1,21 @@
-//! Magnet URI parsing (BEP 9). Only the fields needed to bootstrap a
-//! metadata exchange: `xt` (InfoHash, hex or base32), `dn` (display name),
-//! `tr` (tracker URLs, repeatable).
+//! Magnet URI parsing (BEP 9). The fields needed to bootstrap a metadata
+//! exchange: `xt` (the v1 InfoHash, hex or base32; a `urn:btmh:` beside it,
+//! as in a hybrid v1/v2 link, is ignored), `dn` (display name), `tr`
+//! (tracker URLs), `x.pe` (peers to try directly) and `ws` (BEP 19 web
+//! seeds), each repeatable and each also accepted numbered (`tr.1`).
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MagnetLink {
     pub info_hash: [u8; 20],
     pub display_name: Option<String>,
+    /// `tr` (or `tr.N`), each once, in the order given.
     pub trackers: Vec<String>,
+    /// `x.pe` (or `x.pe.N`): addresses of peers to try directly (BEP 9),
+    /// so a link with no tracker and no DHT still has somewhere to start.
+    /// Only `ip:port` and `[ipv6]:port` forms; a hostname is not resolved.
+    pub peers: Vec<std::net::SocketAddr>,
+    /// `ws` (or `ws.N`): BEP 19 web seed URLs.
+    pub web_seeds: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -42,8 +51,13 @@ pub fn parse_magnet_uri(uri: &str) -> Result<MagnetLink, MagnetError> {
     let query = uri.strip_prefix("magnet:?").ok_or(MagnetError::NotAMagnetUri)?;
 
     let mut info_hash: Option<[u8; 20]> = None;
+    // An `xt` in some namespace other than BitTorrent v1's, seen while
+    // looking for one (a hybrid link carries `urn:btmh:` beside `urn:btih:`).
+    let mut other_xt: Option<String> = None;
     let mut display_name = None;
-    let mut trackers = Vec::new();
+    let mut trackers: Vec<String> = Vec::new();
+    let mut peers: Vec<std::net::SocketAddr> = Vec::new();
+    let mut web_seeds: Vec<String> = Vec::new();
 
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -52,22 +66,44 @@ pub fn parse_magnet_uri(uri: &str) -> Result<MagnetLink, MagnetError> {
         let (key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
         let value = percent_decode(raw_value)?;
 
-        match key {
+        // Some links number repeated parameters: `tr.1=`, `x.pe.2=`.
+        let base_key = key.rsplit_once('.').filter(|(_, n)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).map_or(key, |(k, _)| k);
+
+        match base_key {
             "xt" => {
-                let hash_str = value.strip_prefix("urn:btih:").ok_or_else(|| MagnetError::BadInfoHashEncoding(value.clone()))?;
-                info_hash = Some(decode_info_hash(hash_str)?);
+                let lower = value.to_ascii_lowercase();
+                match lower.strip_prefix("urn:btih:") {
+                    // The first BitTorrent v1 hash is the one used.
+                    Some(hash_str) if info_hash.is_none() => info_hash = Some(decode_info_hash(hash_str)?),
+                    Some(_) => {}
+                    None => other_xt = Some(value),
+                }
             }
             "dn" => display_name = Some(value),
-            "tr" => trackers.push(value),
-            _ => {} // ignore unrecognized params (x.pe, kt, ws, as, xs, ...)
+            "tr" => {
+                if !trackers.contains(&value) {
+                    trackers.push(value);
+                }
+            }
+            "x.pe" => {
+                if let Ok(addr) = value.parse::<std::net::SocketAddr>() {
+                    if !peers.contains(&addr) {
+                        peers.push(addr);
+                    }
+                }
+            }
+            "ws" if (value.starts_with("http://") || value.starts_with("https://")) && !web_seeds.contains(&value) => web_seeds.push(value),
+            _ => {} // ignore unrecognized params (kt, as, xs, ...)
         }
     }
 
-    Ok(MagnetLink {
-        info_hash: info_hash.ok_or(MagnetError::MissingInfoHash)?,
-        display_name,
-        trackers,
-    })
+    let info_hash = match (info_hash, other_xt) {
+        (Some(hash), _) => hash,
+        // Only a hash this client cannot use (BitTorrent v2 alone).
+        (None, Some(other)) => return Err(MagnetError::BadInfoHashEncoding(other)),
+        (None, None) => return Err(MagnetError::MissingInfoHash),
+    };
+    Ok(MagnetLink { info_hash, display_name, trackers, peers, web_seeds })
 }
 
 fn decode_info_hash(s: &str) -> Result<[u8; 20], MagnetError> {
@@ -224,5 +260,64 @@ mod tests {
         let m = parse_magnet_uri("magnet:?xt=urn:btih:AABBCCDDEEFF00112233445566778899AABBCCDD").unwrap();
         assert!(m.trackers.is_empty());
         assert!(m.display_name.is_none());
+    }
+
+    // ---- links as they turn up in the wild ----
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn a_hybrid_link_with_a_v2_hash_beside_the_v1_one_is_accepted() {
+        let v2 = "1220aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        for uri in [format!("magnet:?xt=urn:btih:{}&xt=urn:btmh:{}&dn=x", HASH, v2), format!("magnet:?xt=urn:btmh:{}&xt=urn:btih:{}", v2, HASH)] {
+            let link = parse_magnet_uri(&uri).expect(&uri);
+            assert_eq!(link.info_hash[0], 0x01, "the v1 hash, whichever order they come in");
+            assert_eq!(link.info_hash[19], 0x67);
+        }
+    }
+
+    #[test]
+    fn a_link_with_only_a_v2_hash_says_it_cannot_be_used_rather_than_that_it_has_no_hash() {
+        let err = parse_magnet_uri("magnet:?xt=urn:btmh:1220aabb").unwrap_err();
+        assert!(matches!(err, MagnetError::BadInfoHashEncoding(ref v) if v.contains("btmh")), "{:?}", err);
+        assert_eq!(parse_magnet_uri("magnet:?dn=only-a-name").unwrap_err(), MagnetError::MissingInfoHash);
+    }
+
+    #[test]
+    fn the_first_v1_hash_wins_and_the_scheme_is_case_insensitive() {
+        let other = "f".repeat(40);
+        let link = parse_magnet_uri(&format!("magnet:?xt=URN:BTIH:{}&xt=urn:btih:{}", HASH.to_uppercase(), other)).unwrap();
+        assert_eq!(link.info_hash[0], 0x01);
+    }
+
+    #[test]
+    fn trackers_are_kept_once_each_in_order_and_numbered_ones_count() {
+        let link = parse_magnet_uri(&format!("magnet:?xt=urn:btih:{}&tr=udp%3A%2F%2Fa%3A1&tr.1=http%3A%2F%2Fb%2Fannounce&tr=udp%3A%2F%2Fa%3A1&tr.2=udp%3A%2F%2Fc%3A2", HASH)).unwrap();
+        assert_eq!(link.trackers, vec!["udp://a:1", "http://b/announce", "udp://c:2"]);
+    }
+
+    #[test]
+    fn peer_hints_are_read_as_socket_addresses_and_anything_else_is_skipped() {
+        let link = parse_magnet_uri(&format!("magnet:?xt=urn:btih:{}&x.pe=10.0.0.1%3A6881&x.pe.1=%5B2001%3Adb8%3A%3A1%5D%3A51413&x.pe=10.0.0.1%3A6881&x.pe=some.host%3A6881&x.pe=not-an-address&x.pe=10.0.0.2", HASH)).unwrap();
+        assert_eq!(link.peers, vec!["10.0.0.1:6881".parse().unwrap(), "[2001:db8::1]:51413".parse().unwrap()], "once each; a hostname, a non-address and a missing port are left out");
+    }
+
+    #[test]
+    fn web_seeds_are_kept_when_they_are_http_urls() {
+        let link = parse_magnet_uri(&format!("magnet:?xt=urn:btih:{}&ws=http%3A%2F%2Fm%2Ff.bin&ws.1=https%3A%2F%2Fn%2Ff.bin&ws=ftp%3A%2F%2Fx%2Ff&ws=http%3A%2F%2Fm%2Ff.bin", HASH)).unwrap();
+        assert_eq!(link.web_seeds, vec!["http://m/f.bin", "https://n/f.bin"]);
+    }
+
+    #[test]
+    fn a_link_with_none_of_the_extras_has_none() {
+        let link = parse_magnet_uri(&format!("magnet:?xt=urn:btih:{}", HASH)).unwrap();
+        assert!(link.trackers.is_empty() && link.peers.is_empty() && link.web_seeds.is_empty());
+    }
+
+    #[test]
+    fn a_dotted_key_that_is_not_a_number_is_not_mistaken_for_a_repeat() {
+        let link = parse_magnet_uri(&format!("magnet:?xt=urn:btih:{}&tr.extra=http%3A%2F%2Fx&x.pe.a=10.0.0.1%3A1&trx=http%3A%2F%2Fy", HASH)).unwrap();
+        assert!(link.trackers.is_empty(), "tr.extra and trx are other parameters");
+        assert!(link.peers.is_empty(), "x.pe.a is not a numbered x.pe");
     }
 }

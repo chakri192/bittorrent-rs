@@ -55,15 +55,22 @@ pub fn resolve_magnet(magnet: &MagnetLink, our_peer_id: [u8; 20], announce_port:
             sink.log(format!("tracker {} failed: {}", f.url, f.error));
         }
         initial_peers = peers;
-    } else {
+    } else if magnet.peers.is_empty() {
         sink.log("magnet link has no trackers; waiting on the DHT for peers".to_string());
+    }
+    if !magnet.peers.is_empty() {
+        sink.log(format!("the magnet link names {} peer(s) to try directly", magnet.peers.len()));
+        initial_peers.extend(magnet.peers.iter().copied());
     }
 
     let fetched = fetch_metadata(magnet.info_hash, our_peer_id, initial_peers, dht, config, sink, stop)?;
 
     let announce = magnet.trackers.first().cloned();
-    let announce_list = vec![magnet.trackers.clone()];
-    let torrent = torrent::from_info_dict_bytes(&fetched.raw_info, magnet.info_hash, announce, announce_list).map_err(|e| format!("building torrent from metadata: {}", e))?;
+    // One tier of every tracker in the link; none if it had none.
+    let announce_list = if magnet.trackers.is_empty() { Vec::new() } else { vec![magnet.trackers.clone()] };
+    let mut torrent = torrent::from_info_dict_bytes(&fetched.raw_info, magnet.info_hash, announce, announce_list).map_err(|e| format!("building torrent from metadata: {}", e))?;
+    // The info dict carries no web seeds; the link may.
+    torrent.url_list = magnet.web_seeds.clone();
     Ok((torrent, fetched.known_peers))
 }
 
@@ -378,5 +385,32 @@ mod tests {
         let dead_tracker = format!("http://{}/announce", dead_addr());
         let _ = resolve_magnet(&magnet(std::slice::from_ref(&dead_tracker)), [2; 20], 6881, None, &config(), &sink, &AtomicBool::new(false));
         assert!(sink.logged(&format!("tracker {} failed:", dead_tracker)));
+    }
+
+    #[test]
+    fn a_peer_named_in_the_link_is_used_with_no_tracker_at_all() {
+        let sink = RecordingSink::default();
+        let peer = good_peer();
+        let link = parse_magnet_uri(&format!("magnet:?xt=urn:btih:{}&x.pe={}", info_hash().iter().map(|b| format!("{:02x}", b)).collect::<String>(), peer)).unwrap();
+
+        let (torrent, known) = resolve_magnet(&link, [2; 20], 6881, None, &config(), &sink, &AtomicBool::new(false)).expect("the hinted peer serves the metadata");
+
+        assert_eq!(torrent.info_hash, info_hash());
+        assert_eq!(known, vec![peer]);
+        assert!(sink.logged("names 1 peer(s) to try directly"));
+        assert!(!sink.logged("waiting on the DHT"), "there was somewhere to start");
+        assert!(torrent.announce.is_none() && torrent.announce_list.is_empty(), "no tracker, no empty tier either");
+    }
+
+    #[test]
+    fn web_seeds_in_the_link_become_the_torrents() {
+        let sink = RecordingSink::default();
+        let peer = good_peer();
+        let hex: String = info_hash().iter().map(|b| format!("{:02x}", b)).collect();
+        let link = parse_magnet_uri(&format!("magnet:?xt=urn:btih:{}&x.pe={}&ws=http%3A%2F%2Fmirror%2Ffile.bin", hex, peer)).unwrap();
+
+        let (torrent, _) = resolve_magnet(&link, [2; 20], 6881, None, &config(), &sink, &AtomicBool::new(false)).unwrap();
+
+        assert_eq!(torrent.url_list, vec!["http://mirror/file.bin".to_string()]);
     }
 }
