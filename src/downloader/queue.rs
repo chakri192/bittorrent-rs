@@ -79,6 +79,8 @@ pub struct WorkQueue {
     /// downloader that doesn't track per-peer liveness at this layer.
     availability: Mutex<Vec<u32>>,
     order: Order,
+    /// Pieces to hand out before any other (`--prefer`).
+    preferred: HashSet<u32>,
 }
 
 impl WorkQueue {
@@ -90,7 +92,15 @@ impl WorkQueue {
             inner: Mutex::new(Inner { pending: pieces, claimed: HashMap::new(), done: HashSet::new(), partial: HashMap::new() }),
             availability: Mutex::new(vec![0u32; total_pieces]),
             order: Order::default(),
+            preferred: HashSet::new(),
         }
+    }
+
+    /// Makes the pieces in `preferred` come out before all others, in
+    /// whichever order is in force among themselves.
+    pub fn with_preferred(mut self, preferred: HashSet<u32>) -> Self {
+        self.preferred = preferred;
+        self
     }
 
     /// Chooses which pending piece comes out first (rarest by default).
@@ -132,9 +142,13 @@ impl WorkQueue {
         // Lower comes first. The index breaks ties, so the choice is
         // deterministic rather than an accident of the list's order.
         let order = self.order;
-        let rank = |w: &PieceWork| match order {
-            Order::RarestFirst => (availability.get(w.index as usize).copied().unwrap_or(0), w.index),
-            Order::Sequential => (0, w.index),
+        let preferred = &self.preferred;
+        let rank = |w: &PieceWork| {
+            let later = u8::from(!preferred.contains(&w.index));
+            match order {
+                Order::RarestFirst => (later, availability.get(w.index as usize).copied().unwrap_or(0), w.index),
+                Order::Sequential => (later, 0, w.index),
+            }
         };
 
         let first_offered = inner.pending.iter().enumerate().filter(|(_, w)| has(w.index)).min_by_key(|(_, w)| rank(w)).map(|(i, _)| i);
@@ -693,5 +707,58 @@ mod tests {
         // Space freed by taking one makes room again.
         q.stash_partial(1, partial_of(1, 1, big));
         assert!(q.take_partial(1).is_some());
+    }
+
+    // ---- preferred pieces ----
+
+    fn preferred(pieces: &[u32]) -> HashSet<u32> {
+        pieces.iter().copied().collect()
+    }
+
+    #[test]
+    fn preferred_pieces_come_out_first_however_common_they_are() {
+        let q = WorkQueue::new(vec![work(0), work(1), work(2), work(3)], 4).with_preferred(preferred(&[2, 3]));
+        // Pieces 2 and 3 are the commonest, so plain rarest-first would leave them for last.
+        for _ in 0..3 {
+            q.note_have(2);
+            q.note_have(3);
+        }
+
+        let order: Vec<u32> = std::iter::from_fn(|| piece_index(q.take_for(|_| true))).take(4).collect();
+
+        assert_eq!(order, vec![2, 3, 0, 1], "the preferred first, then the rest");
+    }
+
+    #[test]
+    fn among_the_preferred_the_usual_order_still_holds() {
+        let q = WorkQueue::new(vec![work(0), work(1), work(2), work(3)], 4).with_preferred(preferred(&[1, 2, 3]));
+        q.note_have(1);
+        q.note_have(1);
+        q.note_have(2);
+        // Rarest first among 1, 2 and 3: 3 (unseen), 2, 1; then 0.
+        let order: Vec<u32> = std::iter::from_fn(|| piece_index(q.take_for(|_| true))).take(4).collect();
+        assert_eq!(order, vec![3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn sequential_takes_the_preferred_pieces_in_order_before_the_rest() {
+        let q = WorkQueue::new(vec![work(0), work(1), work(2), work(3)], 4).with_order(Order::Sequential).with_preferred(preferred(&[2, 3]));
+        let order: Vec<u32> = std::iter::from_fn(|| piece_index(q.take_for(|_| true))).take(4).collect();
+        assert_eq!(order, vec![2, 3, 0, 1]);
+    }
+
+    #[test]
+    fn a_preferred_piece_the_peer_lacks_does_not_hold_back_the_others() {
+        let q = WorkQueue::new(vec![work(0), work(1)], 2).with_preferred(preferred(&[1]));
+        assert_eq!(piece_index(q.take_for(has(&[0]))), Some(0), "the peer has only piece 0, so it gets that");
+        assert_eq!(piece_index(q.take_for(has(&[0, 1]))), Some(1));
+    }
+
+    #[test]
+    fn with_nothing_preferred_the_order_is_unchanged() {
+        let q = WorkQueue::new(vec![work(2), work(0), work(1)], 3).with_preferred(HashSet::new());
+        q.note_have(0);
+        let order: Vec<u32> = std::iter::from_fn(|| piece_index(q.take_for(|_| true))).take(3).collect();
+        assert_eq!(order, vec![1, 2, 0]);
     }
 }

@@ -70,6 +70,9 @@ pub struct Options {
     pub recheck: bool,
     /// Fetch pieces in order instead of rarest first (`--sequential`).
     pub sequential: bool,
+    /// Files whose pieces are fetched before the others (`--prefer`), as a
+    /// per-file mask; empty for none.
+    pub prefer: Vec<bool>,
     /// The first delay before retrying a peer that failed; later retries
     /// wait longer (see [`RetryPolicy`]).
     pub retry_delay: Duration,
@@ -219,7 +222,8 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // *unwanted* pieces from a prior full run stay advertised for seeding
     // via `have` above, but don't count toward this run's goal.)
     let Outstanding { work, pieces_done, bytes_done: bytes_already_done } = plan.outstanding(torrent, &confirmed_resumed);
-    let queue = Arc::new(WorkQueue::new(work, total_pieces).with_order(if options.sequential { Order::Sequential } else { Order::RarestFirst }));
+    let preferred = if options.prefer.iter().any(|&p| p) { crate::selection::selected_pieces(&torrent.files, torrent.piece_length as u64, &options.prefer).0 } else { Default::default() };
+    let queue = Arc::new(WorkQueue::new(work, total_pieces).with_order(if options.sequential { Order::Sequential } else { Order::RarestFirst }).with_preferred(preferred));
 
     let allow_ipv6 = match options.ipv6 {
         Ipv6Mode::Always => true,
@@ -329,6 +333,7 @@ mod tests {
             max_up: None,
             recheck: false,
             sequential: false,
+            prefer: Vec::new(),
             retry_delay: Duration::from_secs(15),
             pipeline_depth: 5,
             connect_timeout: Duration::from_secs(1),
@@ -662,5 +667,24 @@ mod tests {
 
         assert_eq!(first_taken(false), 2, "rarest first: the piece nobody has been seen with");
         assert_eq!(first_taken(true), 0, "--sequential: the lowest index");
+    }
+
+    #[test]
+    fn preferred_files_make_their_pieces_come_out_of_the_queue_first() {
+        let dir = tmp_dir("prefer");
+        let first_taken = |prefer: Vec<bool>| {
+            let mut opts = options(&dir);
+            opts.prefer = prefer;
+            let mut services = Services::new();
+            let (prepared, _) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &opts, &mut services);
+            match prepared.unwrap().queue.take_for(|_| true) {
+                crate::downloader::Take::Piece(work) => work.index,
+                other => panic!("expected a piece, got {:?}", other),
+            }
+        };
+
+        assert_eq!(first_taken(Vec::new()), 0, "no preference: the lowest index among equals");
+        // The torrent's second file (bytes 256..600) is pieces 1 and 2.
+        assert_eq!(first_taken(vec![false, true]), 1, "preferring it brings its first piece out ahead of piece 0");
     }
 }

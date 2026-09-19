@@ -64,6 +64,8 @@ struct Args {
     recheck: bool,
     /// Fetch pieces in order rather than rarest first.
     sequential: bool,
+    /// Case-insensitive path substrings of files to fetch first.
+    prefer: Vec<String>,
     /// Where to write the torrent's `.torrent` file, if asked.
     save_torrent: Option<PathBuf>,
     /// Write status as JSON lines on stdout instead of a dashboard.
@@ -136,6 +138,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
     let mut retry_delay = Duration::from_secs(15);
     let mut recheck = false;
     let mut sequential = false;
+    let mut prefer: Vec<String> = Vec::new();
     let mut save_torrent = None;
     let mut json = false;
     let mut max_down = None;
@@ -180,6 +183,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
             }
             "--recheck" => recheck = true,
             "--sequential" => sequential = true,
+            "--prefer" => prefer.push(argv.next().ok_or("--prefer requires a path substring")?),
             "--json" => json = true,
             "--save-torrent" => save_torrent = Some(PathBuf::from(argv.next().ok_or("--save-torrent requires a file name")?)),
             "--max-down" => {
@@ -274,11 +278,11 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
         seed = true;
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, sequential, save_torrent, json, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
+    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, sequential, prefer, save_torrent, json, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--sequential] [--save-torrent FILE] [--json] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -451,6 +455,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         retry_delay: args.retry_delay,
         recheck: args.recheck,
         sequential: args.sequential,
+        prefer: bittorrent_rs::selection::build_prefer_mask(&torrent.files, &args.prefer).map_err(|e| finish_err(ui, e))?,
         max_down: args.max_down,
         max_up: args.max_up,
         ipv6: args.ipv6,
@@ -537,6 +542,13 @@ mod tests {
 
     fn cfg_from(toml: &str) -> Config {
         toml::from_str(toml).unwrap()
+    }
+
+    #[test]
+    fn prefer_can_be_given_more_than_once() {
+        assert!(parse(&Config::default(), &["x"]).unwrap().prefer.is_empty());
+        assert_eq!(parse(&Config::default(), &["x", "--prefer", ".nfo", "--prefer", "ep1"]).unwrap().prefer, vec![".nfo".to_string(), "ep1".to_string()]);
+        assert!(parse(&Config::default(), &["x", "--prefer"]).err().unwrap().contains("requires"));
     }
 
     #[test]

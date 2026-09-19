@@ -87,6 +87,9 @@ enum Kind {
     /// SIGTERM mid-download, with the only peer silent: a prompt, clean exit
     /// that keeps the resume file.
     SigtermMidDownload,
+    /// `--prefer`: the pieces of the preferred file are requested first;
+    /// a pattern that matches nothing is refused before any download.
+    PreferFiles,
     /// `--json`: stdout is nothing but JSON events, in a sensible order,
     /// for a download, a failure, a `--list` and an interruption.
     JsonEvents,
@@ -134,6 +137,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "limit-upload", kind: Kind::LimitUpload },
     Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
     Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
+    Scenario { name: "prefer-files", kind: Kind::PreferFiles },
     Scenario { name: "json-events", kind: Kind::JsonEvents },
     Scenario { name: "create-torrent", kind: Kind::CreateTorrent },
     Scenario { name: "partial-peers", kind: Kind::PartialPeers },
@@ -170,6 +174,7 @@ fn main() {
             Kind::LimitUpload => run_limit_upload(scenario.name),
             Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
             Kind::SigtermMidDownload => run_sigterm_mid_download(scenario.name),
+            Kind::PreferFiles => run_prefer_files(scenario.name),
             Kind::JsonEvents => run_json_events(scenario.name),
             Kind::CreateTorrent => run_create_torrent(scenario.name),
             Kind::PartialPeers => run_partial_peers(scenario.name),
@@ -2030,4 +2035,50 @@ fn run_json_events(name: &str) -> Result<String, String> {
     }
 
     Ok(format!("--json: {} events for a download (torrent, progress, done), a lone error for a missing torrent, file events for --list, and a final stopped after SIGINT; stdout was JSON throughout", events.len()))
+}
+
+/// A torrent of two files, the second of which is preferred: its pieces are
+/// requested before the first file's, and the whole download still
+/// completes. A `--prefer` that matches no file fails before any download.
+fn run_prefer_files(name: &str) -> Result<String, String> {
+    // 1500 + 1500 bytes in 256-byte pieces: 12 pieces, and the second file
+    // starts inside piece 5, so it covers pieces 5 through 11.
+    let fx = Fixture::build("pack", &[("a.bin", pattern(1500, 1)), ("b.bin", pattern(1500, 2))], 256, false);
+    assert_eq!(fx.piece_count, 12);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1)
+        .args(["--no-dht", "--prefer", "B.BIN"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("download binary exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+    let asked = swarm.logs[0].lock().unwrap().requested.clone();
+    let expected: Vec<u32> = (5..12).chain(0..5).collect();
+    if asked != expected {
+        return Err(format!("pieces were requested in the order {:?}; expected the preferred file's pieces first: {:?}", asked, expected));
+    }
+
+    // A pattern that matches nothing is a typo, and is refused up front.
+    let typo_swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let typo_torrent = dir.join("typo.torrent");
+    fs::write(&typo_torrent, fx.torrent_bytes(typo_swarm.tracker_addr)).expect("write torrent file");
+    let refused = client_command(&typo_torrent, &dir.join("typo-out"), &dir.join("typo.log"), 1).args(["--no-dht", "--prefer", "nosuchfile"]).output().map_err(|e| format!("running the client: {}", e))?;
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    if refused.status.success() || !stderr.contains("matched no file") {
+        return Err(format!("a --prefer that matches nothing should fail saying so; exit {:?}, stderr {:?}", refused.status.code(), stderr.trim()));
+    }
+    if !typo_swarm.logs[0].lock().unwrap().requested.is_empty() {
+        return Err("the client asked for pieces despite refusing the flag".to_string());
+    }
+
+    Ok("--prefer b.bin requested its 7 pieces (5..11) before the other 5, and the whole torrent downloaded; a pattern matching nothing was refused before any request".to_string())
 }

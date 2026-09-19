@@ -55,6 +55,27 @@ pub fn build_mask(files: &Files, indices: &[usize], patterns: &[String]) -> Resu
     Ok(mask)
 }
 
+/// The per-file mask for `--prefer`: files whose joined path contains any
+/// of `patterns` (case-insensitively). Errors on a pattern that matches
+/// nothing, like `--only`, so a typo does not silently prefer nothing.
+pub fn build_prefer_mask(files: &Files, patterns: &[String]) -> Result<Vec<bool>, String> {
+    let mut mask = vec![false; files.len()];
+    for pat in patterns {
+        let needle = pat.to_lowercase();
+        let mut matched = false;
+        for (idx, (parts, _)) in files.iter().enumerate() {
+            if file_path(parts).to_lowercase().contains(&needle) {
+                mask[idx] = true;
+                matched = true;
+            }
+        }
+        if !matched {
+            return Err(format!("--prefer {:?}: matched no file in this torrent", pat));
+        }
+    }
+    Ok(mask)
+}
+
 /// True when every file is selected (the common, non-selective case --
 /// lets callers skip all the filtering work).
 pub fn selects_everything(mask: &[bool]) -> bool {
@@ -251,5 +272,28 @@ mod tests {
         let read = crate::json::parse_object(&events[0]).unwrap();
         assert_eq!(read["selected"].as_bool(), Some(false));
         assert_eq!(read["path"].as_str(), Some("we\"ird/name\n.bin"));
+    }
+
+    #[test]
+    fn the_prefer_mask_marks_matching_files_case_insensitively() {
+        let mask = build_prefer_mask(&files(), &["EP2".to_string(), ".nfo".to_string()]).unwrap();
+        assert_eq!(mask, vec![false, true, true]);
+        assert_eq!(build_prefer_mask(&files(), &[]).unwrap(), vec![false, false, false], "nothing asked, nothing preferred");
+    }
+
+    #[test]
+    fn a_prefer_pattern_matching_nothing_is_an_error_naming_it() {
+        let err = build_prefer_mask(&files(), &["ep2".to_string(), "typo".to_string()]).unwrap_err();
+        assert!(err.contains("--prefer") && err.contains("typo"), "{}", err);
+    }
+
+    #[test]
+    fn preferred_files_map_to_the_pieces_they_touch() {
+        // Files of 1000, 1000 and 50 bytes in 256-byte pieces: the second file
+        // covers bytes 1000..2000, pieces 3 through 7.
+        let (pieces, _) = selected_pieces(&files(), 256, &build_prefer_mask(&files(), &["ep2".to_string()]).unwrap());
+        let mut got: Vec<u32> = pieces.into_iter().collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![3, 4, 5, 6, 7]);
     }
 }
