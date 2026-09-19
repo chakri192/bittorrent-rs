@@ -15,26 +15,22 @@
 //!   download <file.torrent | magnet:?xt=urn:btih:...> [options]
 
 use bittorrent_rs::config::Config;
-use bittorrent_rs::dht;
 use bittorrent_rs::downloader::{build_file_spans, load_and_verify, progress_file_path, rewrite_compact, ResumeWriter, WorkQueue, WorkerConfig};
-use bittorrent_rs::magnet::{parse_magnet_uri, MagnetLink};
-use bittorrent_rs::magnet_fetch::fetch_metadata_from_peer;
+use bittorrent_rs::magnet::parse_magnet_uri;
 use bittorrent_rs::seeder::{self, HaveMap};
-use bittorrent_rs::session::{Announcer, DownloadPlan, Log, Outstanding, PeerPool, Progress, Services, Session, Setup, Workers};
+use bittorrent_rs::session::{resolve_magnet, Announcer, DownloadPlan, Log, MetadataConfig, Outstanding, PeerPool, Progress, Services, Session, Setup, Workers};
 use bittorrent_rs::torrent::{self, TorrentFile};
-use bittorrent_rs::tracker::{generate_peer_id, Event};
-use bittorrent_rs::tracker_discovery::{announce_to_all, build_request, TransferTotals};
+use bittorrent_rs::tracker::generate_peer_id;
+use bittorrent_rs::tracker_discovery::TransferTotals;
 use bittorrent_rs::tui::{self, Ui};
-use bittorrent_rs::ui::{self, Logger, Snapshot};
-use std::collections::{HashSet, VecDeque};
+use bittorrent_rs::ui::{self, Logger};
 use std::fs;
 use std::io::IsTerminal;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -348,7 +344,11 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         if magnet.trackers.is_empty() && services.dht().is_none() {
             return Err(finish_err(ui, "magnet link has no trackers and DHT is disabled (--no-dht) -- no way to find any peer".to_string()));
         }
-        let (torrent, peers) = resolve_magnet(&magnet, our_peer_id, args.port, services.dht(), ui, stop)?;
+        if let Some(name) = &magnet.display_name {
+            ui.set_title(name.clone());
+        }
+        let metadata = MetadataConfig { budget: METADATA_RESOLVE_BUDGET, parallelism: METADATA_PARALLELISM, connect_timeout: CONNECT_TIMEOUT };
+        let (torrent, peers) = resolve_magnet(&magnet, our_peer_id, args.port, services.dht(), &metadata, ui, stop).map_err(|e| finish_err(ui, e))?;
         // The DHT had to run to fetch the metadata, since a magnet link
         // doesn't say whether the torrent is private until the info dict
         // arrives. Now that it has, shut the DHT down: no lookups, no
@@ -538,138 +538,6 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
 fn finish_err(ui: &Ui, reason: String) -> String {
     ui.finish(Err(reason.clone()));
     reason
-}
-
-/// Bootstraps a magnet link into a full `TorrentFile`: gathers peers from
-/// the magnet's trackers and the DHT, then probes them concurrently for
-/// the info dict (BEP 9) until one delivers a copy that SHA-1-verifies
-/// against the magnet's InfoHash. Returns the torrent plus every peer
-/// address gathered (they seed the download phase's dial queue).
-fn resolve_magnet(magnet: &MagnetLink, our_peer_id: [u8; 20], announce_port: u16, dht: Option<&dht::DhtService>, ui: &Ui, stop: &AtomicBool) -> Result<(TorrentFile, Vec<SocketAddr>), String> {
-    if let Some(name) = &magnet.display_name {
-        ui.set_title(name.clone());
-    }
-
-    let mut known: HashSet<SocketAddr> = HashSet::new();
-    let untried: Arc<Mutex<VecDeque<SocketAddr>>> = Arc::new(Mutex::new(VecDeque::new()));
-
-    if !magnet.trackers.is_empty() {
-        ui.log(format!("querying {} tracker(s) to bootstrap peer list", magnet.trackers.len()));
-        let bootstrap_req = build_request(magnet.info_hash, our_peer_id, announce_port, TransferTotals { uploaded: 0, downloaded: 0, left: 1 }, Some(Event::Started));
-        let (peers, failures, _interval) = announce_to_all(&magnet.trackers, &bootstrap_req);
-        for f in &failures {
-            ui.log(format!("tracker {} failed: {}", f.url, f.error));
-        }
-        let mut q = untried.lock().unwrap();
-        for p in peers {
-            if known.insert(p) {
-                q.push_back(p);
-            }
-        }
-    } else {
-        ui.log("magnet link has no trackers; waiting on the DHT for peers");
-    }
-
-    // Concurrent BEP 9 probe pool. First worker to verify metadata wins.
-    let pool_stop = Arc::new(AtomicBool::new(false));
-    let attempts = Arc::new(AtomicU64::new(0));
-    let last_err = Arc::new(Mutex::new(String::from("no peer source produced any address")));
-    let (found_tx, found_rx) = mpsc::channel::<Vec<u8>>();
-
-    let mut workers = Vec::with_capacity(METADATA_PARALLELISM);
-    for _ in 0..METADATA_PARALLELISM {
-        let untried = Arc::clone(&untried);
-        let pool_stop = Arc::clone(&pool_stop);
-        let attempts = Arc::clone(&attempts);
-        let last_err = Arc::clone(&last_err);
-        let found_tx = found_tx.clone();
-        let info_hash = magnet.info_hash;
-        workers.push(thread::spawn(move || {
-            while !pool_stop.load(Ordering::SeqCst) {
-                let Some(peer) = untried.lock().unwrap().pop_front() else {
-                    thread::sleep(Duration::from_millis(200));
-                    continue;
-                };
-                attempts.fetch_add(1, Ordering::Relaxed);
-                match fetch_metadata_from_peer(peer, info_hash, our_peer_id, CONNECT_TIMEOUT) {
-                    Ok(raw_info) => {
-                        if !pool_stop.swap(true, Ordering::SeqCst) {
-                            let _ = found_tx.send(raw_info);
-                        }
-                        return;
-                    }
-                    Err(e) => *last_err.lock().unwrap() = e.to_string(),
-                }
-            }
-        }));
-    }
-    drop(found_tx);
-
-    let deadline = Instant::now() + METADATA_RESOLVE_BUDGET;
-    let mut last_log = Instant::now();
-    let raw_info = loop {
-        if stop.load(Ordering::SeqCst) {
-            break None; // user quit
-        }
-        if let Some(dht) = dht {
-            let mut q = untried.lock().unwrap();
-            for batch in dht.peers_rx.try_iter() {
-                for p in batch {
-                    if known.insert(p) {
-                        q.push_back(p);
-                    }
-                }
-            }
-        }
-
-        // Keep the dashboard alive during resolution.
-        ui.set_snapshot(Snapshot {
-            known_peers: known.len(),
-            dht_nodes: dht.map(|d| d.nodes.load(Ordering::SeqCst)).unwrap_or(0),
-            status: "resolving",
-            ..Default::default()
-        });
-        if last_log.elapsed() >= Duration::from_secs(3) {
-            ui.log(format!("resolving metadata: {} peer(s) probed, {} known, {}s left", attempts.load(Ordering::Relaxed), known.len(), deadline.saturating_duration_since(Instant::now()).as_secs()));
-            last_log = Instant::now();
-        }
-
-        match found_rx.recv_timeout(Duration::from_millis(300)) {
-            Ok(raw) => break Some(raw),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if Instant::now() >= deadline {
-                    break None;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break None,
-        }
-    };
-    pool_stop.store(true, Ordering::SeqCst);
-    for w in workers {
-        let _ = w.join();
-    }
-
-    match raw_info {
-        Some(raw) => {
-            ui.log("metadata received and verified against magnet InfoHash");
-            let announce = magnet.trackers.first().cloned();
-            let announce_list = vec![magnet.trackers.clone()];
-            let torrent = torrent::from_info_dict_bytes(&raw, magnet.info_hash, announce, announce_list).map_err(|e| finish_err(ui, format!("building torrent from metadata: {}", e)))?;
-            Ok((torrent, known.into_iter().collect()))
-        }
-        None => {
-            let n = attempts.load(Ordering::Relaxed);
-            let last = last_err.lock().unwrap().clone();
-            let reason = if stop.load(Ordering::SeqCst) {
-                "stopped before metadata could be resolved".to_string()
-            } else if Instant::now() >= deadline {
-                format!("metadata resolution budget ({}s) exhausted after {} concurrent probe(s) across {} known peer(s) (last error: {})", METADATA_RESOLVE_BUDGET.as_secs(), n, known.len(), last)
-            } else {
-                format!("no peer among {} would provide metadata after {} probe(s) (last error: {})", known.len(), n, last)
-            };
-            Err(finish_err(ui, reason))
-        }
-    }
 }
 
 fn collect_tracker_urls(torrent: &TorrentFile) -> Vec<String> {
