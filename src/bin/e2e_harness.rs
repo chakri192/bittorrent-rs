@@ -83,10 +83,9 @@ enum Kind {
     LimitUpload,
     /// SIGINT while seeding, with no terminal: a clean exit, status 0.
     SigintWhileSeeding,
-    /// SIGTERM mid-download: a clean exit that keeps the resume file.
+    /// SIGTERM mid-download, with the only peer silent: a prompt, clean exit
+    /// that keeps the resume file.
     SigtermMidDownload,
-    /// A second signal while shutting down: exit at once with status 130.
-    SecondSignalForcesExit,
 }
 
 struct Scenario {
@@ -112,7 +111,6 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "limit-upload", kind: Kind::LimitUpload },
     Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
     Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
-    Scenario { name: "second-signal-forces-exit", kind: Kind::SecondSignalForcesExit },
 ];
 
 fn main() {
@@ -134,8 +132,7 @@ fn main() {
             Kind::LimitDownload => run_limit_download(scenario.name),
             Kind::LimitUpload => run_limit_upload(scenario.name),
             Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
-            Kind::SigtermMidDownload => run_signal_mid_download(scenario.name, false),
-            Kind::SecondSignalForcesExit => run_signal_mid_download(scenario.name, true),
+            Kind::SigtermMidDownload => run_sigterm_mid_download(scenario.name),
         };
         match outcome {
             Ok(summary) => println!("PASS [{}]: {}", scenario.name, summary),
@@ -1387,10 +1384,14 @@ fn run_sigint_while_seeding(name: &str) -> Result<String, String> {
     Ok(format!("SIGINT stopped a seeding client cleanly in {:.1?}: status 0 and a \"stopped\" message", took))
 }
 
-/// A signal while downloading from a peer that has gone silent. With
-/// `second_signal`, a second one follows half a second later.
-fn run_signal_mid_download(name: &str, second_signal: bool) -> Result<String, String> {
+/// SIGTERM while downloading from a peer that has gone silent. The client
+/// used to wait out that peer's read timeout (10 s) before it could stop;
+/// it must now stop promptly, with the pieces already downloaded kept.
+fn run_sigterm_mid_download(name: &str) -> Result<String, String> {
     const STALL_AFTER: usize = 3;
+    // Comfortably under the 10 s read timeout it used to wait for, and
+    // generous for a loaded machine: the stop itself takes a few hundred ms.
+    const PROMPT: Duration = Duration::from_secs(4);
     let fx = Fixture::new(false);
     let swarm = spawn_swarm(&fx, vec![Behavior::StallAfter(STALL_AFTER)]);
     let dir = scratch_dir(name);
@@ -1413,24 +1414,13 @@ fn run_signal_mid_download(name: &str, second_signal: bool) -> Result<String, St
         thread::sleep(Duration::from_millis(20));
     }
 
-    send_signal(&client.0, if second_signal { "INT" } else { "TERM" })?;
-    if second_signal {
-        // The first signal starts a graceful stop that waits on the silent
-        // peer; the second must not wait.
-        thread::sleep(Duration::from_millis(500));
-        let again = Instant::now();
-        send_signal(&client.0, "INT")?;
-        let status = wait_or_kill(&mut client.0, Duration::from_secs(5))?;
-        if status.code() != Some(130) {
-            return Err(format!("a second signal should exit with status 130; got {:?}", status.code()));
-        }
-        return Ok(format!("a second signal ended the client at once (status 130, {:.1?} later) instead of waiting on the silent peer", again.elapsed()));
-    }
-
+    send_signal(&client.0, "TERM")?;
     let signalled = Instant::now();
-    // Shutdown waits for the worker blocked on the silent peer, up to its
-    // 10s read timeout, so allow for that.
     let status = wait_or_kill(&mut client.0, Duration::from_secs(25))?;
+    let took = signalled.elapsed();
+    if took > PROMPT {
+        return Err(format!("the client took {:?} to stop after SIGTERM; it should not wait on a silent peer", took));
+    }
     if status.code() != Some(0) {
         return Err(format!("the client exited with {:?} after SIGTERM; a clean stop is status 0", status.code()));
     }
@@ -1442,5 +1432,5 @@ fn run_signal_mid_download(name: &str, second_signal: bool) -> Result<String, St
     if recorded.len() != STALL_AFTER {
         return Err(format!("the resume file should keep the {} pieces downloaded; it lists {:?}", STALL_AFTER, recorded));
     }
-    Ok(format!("SIGTERM mid-download stopped the client cleanly after {:.1?}: status 0, a \"stopped\" message, {} pieces kept for a resume", signalled.elapsed(), STALL_AFTER))
+    Ok(format!("SIGTERM mid-download stopped the client cleanly after {:.1?}: status 0, a \"stopped\" message, {} pieces kept for a resume", took, STALL_AFTER))
 }

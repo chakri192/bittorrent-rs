@@ -149,6 +149,9 @@ impl Workers {
     /// the pieces they completed that nobody had collected yet.
     pub fn shutdown(&mut self) -> Vec<PieceResult> {
         self.web_stop.store(true, Ordering::SeqCst);
+        // Workers blocked on a silent peer would otherwise be waited for
+        // until their read timeout.
+        self.config.interrupt.trigger();
         self.pex_tx = None;
         for h in self.peers.drain(..).chain(self.web_seeds.drain(..)) {
             let _ = h.join();
@@ -177,7 +180,7 @@ mod tests {
     }
 
     fn workers(queue: Arc<WorkQueue>, max_peers: usize, private: bool, log: Log) -> Workers {
-        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None });
+        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default() });
         Workers::new(queue, Arc::new(Vec::new()), config, 16, max_peers, private, log)
     }
 

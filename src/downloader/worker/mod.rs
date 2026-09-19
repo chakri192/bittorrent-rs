@@ -23,9 +23,11 @@ use crate::peer::{ConnectionError, WireError};
 use connect::establish;
 use messages::{absorb, is_read_timeout};
 use piece::download_one_piece;
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use crate::sync::lock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub struct WorkerConfig {
@@ -41,6 +43,72 @@ pub struct WorkerConfig {
     /// Shared limit on the bytes downloaded across every connection
     /// (`--max-down`), if any.
     pub down_limit: Option<Arc<RateLimiter>>,
+    /// Lets the coordinator cut short workers blocked on the network.
+    pub interrupt: Interrupt,
+}
+
+/// A way to end workers that are blocked reading from a peer.
+///
+/// A blocked read cannot be interrupted from outside, but its socket can be
+/// shut down, which makes the read return at once. Each worker registers
+/// its connection here; [`trigger`](Self::trigger) shuts them all. Without
+/// it, stopping the client waited out the read timeout of any peer that had
+/// gone silent, up to ten seconds.
+///
+/// Registering keeps a second handle on the socket, and a connection only
+/// closes when *every* handle is gone. So a registration lasts exactly as
+/// long as its worker: dropping the [`Registration`] removes and closes the
+/// handle, and the worker's own drop then really closes the connection.
+#[derive(Debug, Default)]
+pub struct Interrupt {
+    triggered: AtomicBool,
+    next_id: AtomicU64,
+    streams: Mutex<Vec<(u64, TcpStream)>>,
+}
+
+/// A connection tracked by an [`Interrupt`], untracked when dropped.
+#[derive(Debug)]
+pub struct Registration<'a> {
+    interrupt: &'a Interrupt,
+    id: Option<u64>,
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            lock(&self.interrupt.streams).retain(|(other, _)| *other != id);
+        }
+    }
+}
+
+impl Interrupt {
+    /// Tracks `stream` until the returned registration is dropped, so a
+    /// trigger in the meantime can shut it down. If the interrupt has
+    /// already been triggered, the stream is shut down now.
+    pub fn register(&self, stream: &TcpStream) -> Registration<'_> {
+        let Ok(clone) = stream.try_clone() else { return Registration { interrupt: self, id: None } };
+        let mut streams = lock(&self.streams);
+        if self.triggered.load(Ordering::SeqCst) {
+            let _ = clone.shutdown(Shutdown::Both);
+            return Registration { interrupt: self, id: None };
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        streams.push((id, clone));
+        Registration { interrupt: self, id: Some(id) }
+    }
+
+    /// Shuts down every registered connection. Safe to call repeatedly.
+    pub fn trigger(&self) {
+        let mut streams = lock(&self.streams);
+        self.triggered.store(true, Ordering::SeqCst);
+        for (_, stream) in streams.drain(..) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    pub fn is_triggered(&self) -> bool {
+        self.triggered.load(Ordering::SeqCst)
+    }
 }
 
 /// Addresses learned from a peer via ut_pex (BEP 11), reported back to
@@ -82,7 +150,8 @@ pub fn run_worker(
     results_tx: &Sender<PieceResult>,
     pex_tx: Option<&PexSender>,
 ) -> Result<(), WorkerError> {
-    let (mut stream, mut state) = establish(peer_addr, config, queue, pex_tx)?;
+    // The registration is held to the end of the run: dropping it is what lets the connection close.
+    let (mut stream, mut state, _registration) = establish(peer_addr, config, queue, pex_tx)?;
 
     /// After this many consecutive "peer doesn't have anything we still
     /// need" cycles with no new relevant Have/Bitfield arriving, give up

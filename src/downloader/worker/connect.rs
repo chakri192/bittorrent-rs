@@ -1,6 +1,6 @@
 //! Getting a connection ready to download from.
 
-use super::{absorb, is_read_timeout, PexSender, WorkerConfig, WorkerError};
+use super::{absorb, is_read_timeout, PexSender, Registration, WorkerConfig, WorkerError};
 use crate::downloader::queue::WorkQueue;
 use crate::peer::{connect_and_handshake, ConnectionError, ExtendedHandshake, Message, PeerState, WireError};
 use std::net::{SocketAddr, TcpStream};
@@ -16,9 +16,17 @@ const MAX_UNCHOKE_WAIT_TIMEOUTS: u32 = 6;
 ///
 /// Bitfield, Have and PEX messages that arrive while waiting update the
 /// shared rarity tracker and the PEX feed as a side effect.
-pub(super) fn establish(peer_addr: SocketAddr, config: &WorkerConfig, queue: &WorkQueue, pex_tx: Option<&PexSender>) -> Result<(TcpStream, PeerState), WorkerError> {
+///
+/// The connection is registered with the config's interrupt, so stopping
+/// the client can end the wait; the returned [`Registration`] must be kept
+/// as long as the connection is used.
+pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, queue: &WorkQueue, pex_tx: Option<&PexSender>) -> Result<(TcpStream, PeerState, Registration<'a>), WorkerError> {
     let (mut stream, peer_handshake) =
         connect_and_handshake(peer_addr, config.info_hash, config.our_peer_id, true, config.connect_timeout).map_err(|e| WorkerError::Connection { stage: "connect_and_handshake", error: e })?;
+
+    // Registered before anything else is read, so that stopping the client
+    // ends a worker that is waiting on this peer instead of waiting it out.
+    let registration = config.interrupt.register(&stream);
 
     let mut state = PeerState::for_torrent(queue.total_pieces());
     state.supports_extensions = peer_handshake.supports_extensions();
@@ -69,7 +77,7 @@ pub(super) fn establish(peer_addr: SocketAddr, config: &WorkerConfig, queue: &Wo
         }
     }
 
-    Ok((stream, state))
+    Ok((stream, state, registration))
 }
 
 #[cfg(test)]
@@ -86,7 +94,7 @@ mod tests {
     const INFO_HASH: [u8; 20] = [0x42; 20];
 
     fn config() -> WorkerConfig {
-        WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None }
+        WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default() }
     }
 
     fn queue(pieces: usize) -> WorkQueue {
@@ -129,7 +137,8 @@ mod tests {
             thread::sleep(Duration::from_millis(200));
         });
 
-        let (_stream, state) = establish(addr, &config(), &queue(1), None).expect("connected and unchoked");
+        let config = config();
+        let (_stream, state, _registration) = establish(addr, &config, &queue(1), None).expect("connected and unchoked");
 
         seen_rx.try_recv().expect("the peer received Interested before it unchoked us");
         assert!(!state.peer_choking);
@@ -148,7 +157,8 @@ mod tests {
             Message::Unchoke.write_to(stream).unwrap();
             thread::sleep(Duration::from_millis(200));
         });
-        establish(addr, &config(), &queue(1), channel.as_ref()).expect("connected and unchoked");
+        let config = config();
+        establish(addr, &config, &queue(1), channel.as_ref()).expect("connected and unchoked");
         rx.recv_timeout(Duration::from_secs(2)).expect("the peer saw an extended handshake")
     }
 
@@ -167,7 +177,8 @@ mod tests {
             thread::sleep(Duration::from_millis(200));
         });
 
-        let (_stream, state) = establish(addr, &config(), &queue(4), None).unwrap();
+        let config = config();
+        let (_stream, state, _registration) = establish(addr, &config, &queue(4), None).unwrap();
 
         assert_eq!(&state.peer_has_pieces[..4], &[false, true, true, false], "the bitfield sent before the unchoke was kept");
     }
@@ -176,7 +187,8 @@ mod tests {
     fn a_peer_that_hangs_up_before_unchoking_is_a_named_failure() {
         let addr = fake_peer(false, |_stream| {}); // handshake, then close
 
-        let err = establish(addr, &config(), &queue(1), None).expect_err("no unchoke ever comes");
+        let config = config();
+        let err = establish(addr, &config, &queue(1), None).expect_err("no unchoke ever comes");
 
         // Depending on timing the client notices on its write or on its read.
         assert!(matches!(err, WorkerError::Connection { stage, .. } if stage == "wait_for_unchoke" || stage == "send_interested"), "got {:?}", err);
@@ -185,7 +197,8 @@ mod tests {
     #[test]
     fn an_unreachable_peer_fails_at_the_connect_stage() {
         let dead = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        let err = establish(dead, &config(), &queue(1), None).expect_err("nothing is listening");
+        let config = config();
+        let err = establish(dead, &config, &queue(1), None).expect_err("nothing is listening");
         assert!(matches!(err, WorkerError::Connection { stage: "connect_and_handshake", .. }), "got {:?}", err);
     }
 
@@ -198,7 +211,8 @@ mod tests {
             thread::sleep(Duration::from_millis(200));
         });
 
-        let (_stream, state) = establish(addr, &config(), &queue(4), None).unwrap();
+        let config = config();
+        let (_stream, state, _registration) = establish(addr, &config, &queue(4), None).unwrap();
 
         assert_eq!(state.peer_has_pieces.len(), 4, "the torrent has 4 pieces, whatever the peer claims");
     }

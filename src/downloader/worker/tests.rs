@@ -12,6 +12,7 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 
 fn tmp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("bittorrent-rs-worker-test-{}-{}", name, std::process::id()));
@@ -89,7 +90,7 @@ fn run_worker_downloads_all_pieces_from_mock_peer_and_writes_to_disk() {
     let spans = Arc::new(build_file_spans(&dir, &files));
 
     let (tx, rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default() };
 
     run_worker(addr, &config, &queue, &spans, 16384, &tx, None).unwrap();
     mock.join().unwrap();
@@ -128,7 +129,7 @@ fn run_worker_survives_a_peer_that_unchokes_slower_than_the_read_timeout() {
     let files = vec![(vec!["out.bin".to_string()], 16384i64)];
     let spans = Arc::new(build_file_spans(&dir, &files));
     let (tx, rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_millis(100), down_limit: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default() };
 
     run_worker(addr, &config, &queue, &spans, 16384, &tx, None).unwrap();
     mock.join().unwrap();
@@ -162,7 +163,7 @@ fn run_worker_gives_up_on_a_peer_that_never_unchokes() {
     let files = vec![(vec!["out.bin".to_string()], 100i64)];
     let spans = Arc::new(build_file_spans(&dir, &files));
     let (tx, _rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_millis(100), down_limit: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default() };
 
     let result = run_worker(addr, &config, &queue, &spans, 100, &tx, None);
     assert!(matches!(result, Err(WorkerError::Connection { stage: "peer_never_unchoked", .. })), "expected bounded give-up, got: {:?}", result);
@@ -201,7 +202,7 @@ fn run_worker_gives_up_on_peer_with_no_needed_pieces_instead_of_hanging() {
     // Short connect_timeout also governs the per-read timeout on the
     // stream, so this test doesn't take anywhere near 8 real seconds
     // despite the mock peer sleeping that long.
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_millis(100), down_limit: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default() };
 
     let result = run_worker(addr, &config, &queue, &spans, 100, &tx, None);
     assert!(matches!(result, Err(WorkerError::Connection { stage: "peer_has_no_needed_pieces", .. })), "expected bounded give-up, got: {:?}", result);
@@ -229,7 +230,7 @@ fn run_worker_requeues_piece_on_hash_mismatch_and_stops() {
     let spans = Arc::new(build_file_spans(&dir, &files));
 
     let (tx, _rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x22; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x22; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default() };
 
     let result = run_worker(addr, &config, &queue, &spans, 16384, &tx, None);
     assert!(matches!(result, Err(WorkerError::PieceHashMismatch)));
@@ -302,7 +303,7 @@ fn worker_reports_pex_peers_from_a_pex_sending_peer() {
     let spans = Arc::new(build_file_spans(&dir, &files));
     let (tx, _rx) = mpsc::channel();
     let (pex_tx, pex_rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default() };
 
     run_worker(addr, &config, &queue, &spans, 16384, &tx, Some(&pex_tx)).unwrap();
     let _ = mock.join();
@@ -327,7 +328,7 @@ fn a_download_limit_slows_the_worker_but_not_what_it_downloads() {
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 32768i64)]));
     let (tx, rx) = mpsc::channel();
     let limiter = Arc::new(crate::ratelimit::RateLimiter::new(20_000));
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: Some(limiter) };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: Some(limiter), interrupt: Default::default() };
 
     let started = std::time::Instant::now();
     run_worker(addr, &config, &queue, &spans, 16384, &tx, None).unwrap();
@@ -338,4 +339,123 @@ fn a_download_limit_slows_the_worker_but_not_what_it_downloads() {
     let mut results: Vec<_> = rx.try_iter().collect();
     results.sort_by_key(|r| r.index);
     assert_eq!((results[0].data.as_slice(), results[1].data.as_slice()), (piece0.as_slice(), piece1.as_slice()), "and every byte is still right");
+}
+
+// ---- Interrupt: ending workers that are blocked on a silent peer ----
+
+/// A connected pair on loopback: (client end, server end).
+fn socket_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    (client, server)
+}
+
+#[test]
+fn triggering_ends_a_read_that_is_blocked_on_a_registered_connection() {
+    let (client, _server) = socket_pair(); // the server end never sends a byte
+    let interrupt = Arc::new(Interrupt::default());
+    let _registration = interrupt.register(&client);
+
+    let reader = thread::spawn(move || {
+        let mut client = client;
+        client.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let started = Instant::now();
+        let mut buf = [0u8; 1];
+        let n = client.read(&mut buf);
+        (matches!(n, Ok(0)), started.elapsed())
+    });
+    thread::sleep(Duration::from_millis(150)); // let the read block
+    interrupt.trigger();
+
+    let (ended, waited) = reader.join().unwrap();
+    assert!(ended, "the read returned end-of-stream");
+    assert!(waited < Duration::from_secs(5), "the read was cut short, not left to its 30 s timeout: {:?}", waited);
+    assert!(interrupt.is_triggered());
+}
+
+#[test]
+fn a_connection_registered_after_the_trigger_is_shut_down_at_once() {
+    let (mut client, _server) = socket_pair();
+    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap(); // macOS refuses to set it once shut down
+    let interrupt = Interrupt::default();
+    interrupt.trigger();
+
+    let _registration = interrupt.register(&client);
+
+    let started = Instant::now();
+    let mut buf = [0u8; 1];
+    let outcome = client.read(&mut buf);
+    assert!(outcome.is_ok_and(|n| n == 0), "a shut-down socket reads end-of-stream");
+    assert!(started.elapsed() < Duration::from_secs(2), "it did not wait for the read timeout");
+}
+
+#[test]
+fn triggering_twice_is_harmless() {
+    let (client, _server) = socket_pair();
+    let interrupt = Interrupt::default();
+    let _registration = interrupt.register(&client);
+    interrupt.trigger();
+    interrupt.trigger();
+    assert!(interrupt.is_triggered());
+}
+
+#[test]
+fn a_dropped_registration_lets_the_connection_really_close() {
+    // Registering keeps a second handle on the socket, and a connection
+    // only closes once every handle is gone. If the registration outlived
+    // its worker the peer would never see the hang-up, and every
+    // download that finished would leave its peers waiting.
+    let (client, mut server) = socket_pair();
+    let interrupt = Interrupt::default();
+    let registration = interrupt.register(&client);
+
+    drop(registration);
+    drop(client);
+
+    server.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut buf = [0u8; 1];
+    let outcome = server.read(&mut buf);
+    assert!(outcome.is_ok_and(|n| n == 0), "the peer saw end-of-stream rather than a timeout");
+}
+
+#[test]
+fn a_worker_waiting_on_a_silent_peer_stops_when_interrupted() {
+    let info_hash = [0x61; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Handshakes, then says nothing at all: the worker sits in wait_for_unchoke.
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut hs = [0u8; 68];
+        std::io::Read::read_exact(&mut stream, &mut hs).unwrap();
+        std::io::Write::write_all(&mut stream, &Handshake::new(info_hash, [0x99; 20], false).to_bytes()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(20));
+    });
+
+    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: [0; 20], length: 16384 }], 1));
+    let dir = tmp_dir("interrupted");
+    let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 16384i64)]));
+    let (tx, _rx) = mpsc::channel();
+    // A 30 s read timeout: only the interrupt can end this in time.
+    let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(30), down_limit: None, interrupt: Default::default() });
+
+    let worker = {
+        let (config, queue, spans) = (config.clone(), queue.clone(), spans.clone());
+        thread::spawn(move || {
+            let started = Instant::now();
+            let result = run_worker(addr, &config, &queue, &spans, 16384, &tx, None);
+            (result, started.elapsed())
+        })
+    };
+    thread::sleep(Duration::from_millis(300)); // connected, handshaken, waiting
+    config.interrupt.trigger();
+
+    let (result, took) = worker.join().unwrap();
+    assert!(result.is_err(), "an interrupted worker reports a failure, not success");
+    assert!(took < Duration::from_secs(5), "the interrupt cut the wait short, not the 30 s read timeout: {:?}", took);
+    assert_eq!(queue.len(), 1, "the piece it never got goes back for someone else");
+    let _ = release_tx.send(());
+    peer.join().unwrap();
 }

@@ -250,7 +250,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
         sink.log(format!("skipped {} IPv6 peer(s) with no local route (pass --ipv6 to force)", pool.skipped_ipv6()));
     }
 
-    let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: options.pipeline_depth, connect_timeout: options.connect_timeout, down_limit });
+    let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: options.pipeline_depth, connect_timeout: options.connect_timeout, down_limit, interrupt: Default::default() });
     let mut workers = Workers::new(Arc::clone(&queue), Arc::clone(&spans), config, piece_length, options.max_peers, torrent.private, shared_log(sink));
 
     // Web-seed workers: one thread per url-list entry, draining the same
