@@ -12,6 +12,7 @@
 //! port = 51413
 //! seed = true
 //! dht = true
+//! lsd = true         # find peers on the local network (BEP 14)
 //! ipv6 = "auto"      # "auto" | "always" | "never"
 //! reannounce = 900
 //! seed_ratio = 2.0   # stop seeding at this ratio ...
@@ -31,6 +32,8 @@ pub struct Config {
     pub seed: Option<bool>,
     /// DHT on/off (default on). `false` is equivalent to `--no-dht`.
     pub dht: Option<bool>,
+    /// Local service discovery (BEP 14) on/off (default on). `false` == `--no-lsd`.
+    pub lsd: Option<bool>,
     /// UPnP/NAT-PMP port mapping on/off (default on). `false` == `--no-portmap`.
     pub portmap: Option<bool>,
     /// BEP 19 web seeds on/off (default on). `false` == `--no-webseed`.

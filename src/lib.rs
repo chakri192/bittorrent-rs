@@ -13,6 +13,7 @@ pub mod create;
 pub mod dht;
 pub mod downloader;
 pub mod json;
+pub mod lsd;
 #[cfg(test)]
 mod fuzz;
 #[cfg(test)]

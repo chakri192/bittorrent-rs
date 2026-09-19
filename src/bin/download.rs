@@ -84,6 +84,7 @@ struct Args {
     /// When to stop seeding on its own; unset means only when told to.
     seed_limits: SeedLimits,
     no_dht: bool,
+    no_lsd: bool,
     no_portmap: bool,
     no_webseed: bool,
     ipv6: Ipv6Mode,
@@ -159,6 +160,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
     };
     let mut no_seed_flag = false;
     let mut no_dht = !cfg.dht.unwrap_or(true);
+    let mut no_lsd = !cfg.lsd.unwrap_or(true);
     let mut no_portmap = !cfg.portmap.unwrap_or(true);
     let mut no_webseed = !cfg.webseed.unwrap_or(true);
     let mut ipv6 = match cfg.ipv6.as_deref() {
@@ -236,6 +238,8 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
             }
             "--no-dht" => no_dht = true,
             "--dht" => no_dht = false,
+            "--no-lsd" => no_lsd = true,
+            "--lsd" => no_lsd = false,
             "--no-portmap" => no_portmap = true,
             "--portmap" => no_portmap = false,
             "--no-webseed" => no_webseed = true,
@@ -295,11 +299,11 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
         seed = true;
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, encryption, sequential, prefer, save_torrent, json, verify, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
+    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, encryption, sequential, prefer, save_torrent, json, verify, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_lsd, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--encryption off|prefer|require] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--verify] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--lsd | --no-lsd] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--encryption off|prefer|require] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--verify] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -393,6 +397,18 @@ fn main() -> ExitCode {
     }
 }
 
+/// Where local service discovery listens and announces: BEP 14's multicast
+/// group, unless both `BITTORRENT_RS_LSD_LISTEN` and `BITTORRENT_RS_LSD_SEND_TO`
+/// name unicast addresses, which is how the end-to-end tests keep it on
+/// loopback.
+fn lsd_config() -> bittorrent_rs::lsd::LsdConfig {
+    let address = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<std::net::SocketAddr>().ok());
+    match (address("BITTORRENT_RS_LSD_LISTEN"), address("BITTORRENT_RS_LSD_SEND_TO")) {
+        (Some(listen), Some(send_to)) => bittorrent_rs::lsd::LsdConfig { listen, send_to, join: None, share_port: false, ..bittorrent_rs::lsd::LsdConfig::multicast() },
+        _ => bittorrent_rs::lsd::LsdConfig::multicast(),
+    }
+}
+
 /// The whole download, start to finish, publishing to `ui`. Returns a
 /// human-readable completion summary (`Ok`) or a failure reason (`Err`);
 /// either way it also calls `ui.finish` so the dashboard can wind down
@@ -483,6 +499,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         ipv6: args.ipv6,
         no_portmap: args.no_portmap,
         no_webseed: args.no_webseed,
+        lsd: (!args.no_lsd).then(lsd_config),
         timeout: args.timeout,
         pipeline_depth: PIPELINE_DEPTH,
         connect_timeout: CONNECT_TIMEOUT,
@@ -604,6 +621,34 @@ mod tests {
         assert!(parse(&Config::default(), &["x"]).unwrap().prefer.is_empty());
         assert_eq!(parse(&Config::default(), &["x", "--prefer", ".nfo", "--prefer", "ep1"]).unwrap().prefer, vec![".nfo".to_string(), "ep1".to_string()]);
         assert!(parse(&Config::default(), &["x", "--prefer"]).err().unwrap().contains("requires"));
+    }
+
+    #[test]
+    fn local_discovery_is_on_unless_the_flag_or_config_says_otherwise_and_the_flag_wins() {
+        assert!(!parse(&Config::default(), &["x"]).unwrap().no_lsd, "on by default");
+        assert!(parse(&Config::default(), &["x", "--no-lsd"]).unwrap().no_lsd);
+        let off = cfg_from("lsd = false");
+        assert!(parse(&off, &["x"]).unwrap().no_lsd);
+        assert!(!parse(&off, &["x", "--lsd"]).unwrap().no_lsd, "the flag wins over the config");
+        assert!(!parse(&cfg_from("lsd = true"), &["x"]).unwrap().no_lsd);
+        assert!(!parse(&Config::default(), &["x", "--no-dht"]).unwrap().no_lsd, "and it is not the same switch as the DHT's");
+    }
+
+    #[test]
+    fn local_discovery_uses_the_multicast_group_unless_the_test_hooks_name_both_addresses() {
+        let group = bittorrent_rs::lsd::LsdConfig::multicast();
+        std::env::remove_var("BITTORRENT_RS_LSD_LISTEN");
+        std::env::remove_var("BITTORRENT_RS_LSD_SEND_TO");
+        assert_eq!(lsd_config().send_to, group.send_to);
+        std::env::set_var("BITTORRENT_RS_LSD_LISTEN", "127.0.0.1:4001");
+        assert_eq!(lsd_config().send_to, group.send_to, "one of the two is not enough");
+        std::env::set_var("BITTORRENT_RS_LSD_SEND_TO", "127.0.0.1:4002");
+        let hooked = lsd_config();
+        assert_eq!((hooked.listen.port(), hooked.send_to.port(), hooked.join, hooked.share_port), (4001, 4002, None, false));
+        std::env::set_var("BITTORRENT_RS_LSD_SEND_TO", "not an address");
+        assert_eq!(lsd_config().send_to, group.send_to, "an unusable one is ignored, not obeyed");
+        std::env::remove_var("BITTORRENT_RS_LSD_LISTEN");
+        std::env::remove_var("BITTORRENT_RS_LSD_SEND_TO");
     }
 
     #[test]

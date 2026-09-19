@@ -49,6 +49,7 @@ behind locks.
 | one per web seed | `webseed::run_web_worker` | queue empty or told to stop |
 | seeder accept, one per inbound peer, and one for the choking rounds | `seeder` | `SeederHandle::stop` |
 | DHT | `dht::service` | `Services::shutdown` |
+| local discovery | `lsd` | `Services::shutdown` |
 
 **Shared state**, all small: the `WorkQueue` (pieces still to fetch, how
 common each is, and blocks left over from peers that failed part-way), the
@@ -77,7 +78,7 @@ return at once. A second signal skips all of this and exits with status 130.
    seeder, the DHT and the port mapping (`Services`). Make the first announce.
 3. **Run** (`Session::run`), on a 250 ms tick: collect verified pieces from
    the workers, retire ended workers into the `PeerPool` (which decides on
-   retries and bans), gather new addresses from PEX and the DHT, dial more
+   retries and bans), gather new addresses from PEX, the DHT and the local network, dial more
    peers, re-announce when due, publish a snapshot to the dashboard.
 4. **In a worker** (`downloader::worker`): connect, handshake, exchange
    extended handshakes, express interest, wait to be unchoked. Then loop:
@@ -159,5 +160,5 @@ seeding half of tit-for-tat, since inbound peers are never downloaded from;
 trackers are asked concurrently rather than by BEP 12 tier; a piece
 interrupted part-way is handed to the next peer within a run but not saved
 across runs; one piece is downloaded at a time per connection, so a request
-pipeline drains at each piece boundary; no uTP, BEP 14 or BEP 32, and no BEP 52
-(v2) torrents.
+pipeline drains at each piece boundary; no uTP or BEP 32, local discovery is IPv4
+only, and there are no BEP 52 (v2) torrents.

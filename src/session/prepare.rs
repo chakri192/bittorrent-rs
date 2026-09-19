@@ -56,6 +56,9 @@ pub struct Options {
     pub ipv6: Ipv6Mode,
     pub no_portmap: bool,
     pub no_webseed: bool,
+    /// Announce on the local network and listen for others (BEP 14): where
+    /// to, or `None` for not at all. Never done for a private torrent.
+    pub lsd: Option<crate::lsd::LsdConfig>,
     /// Give up after this long (`--timeout`).
     pub timeout: Option<Duration>,
     /// Limit on the bytes downloaded per second across every connection
@@ -220,6 +223,14 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     }
     let announce_port = services.announce_port(options.port);
 
+    // Local service discovery announces the info hash to the whole network,
+    // which a private torrent must not do; and it announces the listener's
+    // port, so it needs a listener.
+    if let (Some(config), false, true) = (&options.lsd, torrent.private, services.has_seeder()) {
+        let log = shared_log(sink);
+        services.start_lsd(config.clone(), torrent.info_hash, announce_port, move |m| log(m));
+    }
+
     // Best-effort port forwarding (UPnP/NAT-PMP) so inbound peers and DHT
     // queries reach us behind a home router. Runs on its own thread and
     // never blocks; silently no-ops if the router doesn't cooperate.
@@ -259,8 +270,8 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // alive.
     let web_seeds: Vec<String> = if options.no_webseed { Vec::new() } else { torrent.url_list.clone() };
 
-    if pool.known_count() == 0 && services.dht().is_none() && web_seeds.is_empty() {
-        return Err("no peers found from any tracker (and DHT + web seeds unavailable)".to_string());
+    if pool.known_count() == 0 && services.dht().is_none() && services.lsd().is_none() && web_seeds.is_empty() {
+        return Err("no peers found from any tracker (and DHT, local discovery + web seeds unavailable)".to_string());
     }
     sink.log(format!("{} peer(s) known; dialing up to {} concurrently", pool.known_count(), options.max_peers));
     if pool.skipped_ipv6() > 0 {
@@ -339,6 +350,7 @@ mod tests {
             ipv6: Ipv6Mode::Never,
             no_portmap: true, // nothing here may touch the LAN gateway
             no_webseed: false,
+            lsd: None,
             timeout: None,
             max_down: None,
             max_up: None,
@@ -438,7 +450,7 @@ mod tests {
         let dir = tmp_dir("nopeers");
         let mut services = Services::new();
         let (result, _) = run_prepare(&torrent(), &[true, true], Vec::new(), &options(&dir), &mut services);
-        assert_eq!(result.err().as_deref(), Some("no peers found from any tracker (and DHT + web seeds unavailable)"));
+        assert_eq!(result.err().as_deref(), Some("no peers found from any tracker (and DHT, local discovery + web seeds unavailable)"));
     }
 
     #[test]
@@ -522,6 +534,45 @@ mod tests {
         let mut services = Services::new();
         let (prepared, _) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
         assert!(prepared.unwrap().workers.pex_enabled());
+    }
+
+    /// Local discovery on loopback, as a test can have it.
+    fn lsd_options(dir: &std::path::Path) -> Options {
+        let mut with = options(dir);
+        with.lsd = Some(crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen: SocketAddr::from(([127, 0, 0, 1], 0)), join: None, share_port: false, interval: Duration::from_secs(3600) });
+        with
+    }
+
+    #[test]
+    fn local_discovery_announces_the_port_the_listener_really_has() {
+        let dir = tmp_dir("lsd");
+        let mut services = Services::new();
+        let (prepared, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &lsd_options(&dir), &mut services);
+        assert!(prepared.is_ok());
+        let port = services.announce_port(0);
+        assert!(services.lsd().is_some());
+        assert!(log.logged(&format!("local service discovery running (announcing port {})", port)), "{:?}", log.lines.lock().unwrap());
+    }
+
+    #[test]
+    fn local_discovery_is_left_off_when_not_asked_for_and_for_a_private_torrent() {
+        let dir = tmp_dir("lsd-off");
+        let mut services = Services::new();
+        run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services).0.unwrap();
+        assert!(services.lsd().is_none(), "not asked for");
+
+        let private = parse_torrent_file(&torrent_bytes(None, None, true)).unwrap();
+        let mut services = Services::new();
+        run_prepare(&private, &[true, true], vec![dead_addr()], &lsd_options(&dir), &mut services).0.unwrap();
+        assert!(services.lsd().is_none(), "a private torrent's info hash is not shouted at the local network (BEP 27)");
+    }
+
+    #[test]
+    fn local_discovery_alone_is_reason_enough_to_wait_for_peers() {
+        let dir = tmp_dir("lsd-alone");
+        let mut services = Services::new();
+        let (prepared, _) = run_prepare(&torrent(), &[true, true], Vec::new(), &lsd_options(&dir), &mut services);
+        assert!(prepared.is_ok(), "no tracker, no DHT, no address -- but the local network may yet turn one up");
     }
 
     #[test]

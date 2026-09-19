@@ -1,15 +1,16 @@
 //! The background services a session runs alongside the download proper:
-//! the DHT node, the inbound-peer listener (seeder) and the router port
-//! mapping. One owner, so they start in a sensible order and always stop
+//! the DHT node, local service discovery, the inbound-peer listener (seeder)
+//! and the router port mapping. One owner, so they start in a sensible order and always stop
 //! together.
 
 use crate::dht::{self, DhtService};
+use crate::lsd::{LsdConfig, LsdService};
 use crate::portmap::{self, PortMap};
 use crate::seeder::SeederHandle;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Owns the DHT service, the seeder and the port mapping.
+/// Owns the DHT service, local discovery, the seeder and the port mapping.
 ///
 /// Dropping it stops all three, so a session that bails out early (no
 /// peers, a bad torrent) cannot leave a port mapping on the user's router
@@ -18,6 +19,7 @@ use std::sync::Arc;
 #[derive(Default)]
 pub struct Services {
     dht: Option<DhtService>,
+    lsd: Option<LsdService>,
     seeder: Option<SeederHandle>,
     portmap: Option<PortMap>,
     /// The TCP port the DHT service announces for us. Shared with its
@@ -42,6 +44,25 @@ impl Services {
             }
             Err(e) => log(format!("DHT disabled (couldn't bind UDP socket): {}", e)),
         }
+    }
+
+    /// Starts announcing the torrent on the local network (BEP 14) and
+    /// listening for others doing the same. Failure to set up the socket
+    /// (no multicast route, say) is not fatal: `log` says so and the session
+    /// goes on without it.
+    pub fn start_lsd(&mut self, config: LsdConfig, info_hash: [u8; 20], tcp_port: u16, log: impl Fn(String)) {
+        match LsdService::start(config, info_hash, tcp_port) {
+            Ok(service) => {
+                log(format!("local service discovery running (announcing port {})", tcp_port));
+                self.lsd = Some(service);
+            }
+            Err(e) => log(format!("local service discovery disabled: {}", e)),
+        }
+    }
+
+    /// The running local-discovery service, if there is one.
+    pub fn lsd(&self) -> Option<&LsdService> {
+        self.lsd.as_ref()
     }
 
     /// The running DHT node, if there is one.
@@ -98,6 +119,9 @@ impl Services {
         }
         if let Some(mut s) = self.seeder.take() {
             s.stop();
+        }
+        if let Some(mut l) = self.lsd.take() {
+            l.stop();
         }
         if let Some(mut d) = self.dht.take() {
             d.stop();
@@ -179,5 +203,36 @@ mod tests {
         let mut s = Services::new();
         s.start_portmap(|_| {});
         assert!(s.portmap.is_none());
+    }
+
+    fn loopback_lsd(listen_port: u16) -> LsdConfig {
+        LsdConfig { send_to: std::net::SocketAddr::from(([127, 0, 0, 1], 9)), listen: std::net::SocketAddr::from(([127, 0, 0, 1], listen_port)), join: None, share_port: false, interval: std::time::Duration::from_secs(3600) }
+    }
+
+    #[test]
+    fn local_discovery_is_running_once_started_and_gone_after_shutdown() {
+        let mut s = Services::new();
+        assert!(s.lsd().is_none());
+        let logged = std::sync::Mutex::new(Vec::new());
+        s.start_lsd(loopback_lsd(0), [0x11; 20], 6881, |m| logged.lock().unwrap().push(m));
+        let addr = s.lsd().expect("started").listen_addr;
+        assert!(logged.lock().unwrap()[0].contains("6881"), "it says which port it announces: {:?}", logged.lock().unwrap());
+        assert!(std::net::UdpSocket::bind(addr).is_err(), "and holds its socket");
+
+        s.shutdown();
+
+        assert!(s.lsd().is_none());
+        assert!(std::net::UdpSocket::bind(addr).is_ok(), "shutdown released the socket");
+    }
+
+    #[test]
+    fn local_discovery_that_cannot_start_is_reported_and_the_session_goes_on_without_it() {
+        // The address is taken, and this config does not share.
+        let taken = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut s = Services::new();
+        let logged = std::sync::Mutex::new(Vec::new());
+        s.start_lsd(loopback_lsd(taken.local_addr().unwrap().port()), [0x11; 20], 6881, |m| logged.lock().unwrap().push(m));
+        assert!(s.lsd().is_none());
+        assert!(logged.lock().unwrap()[0].contains("disabled"), "{:?}", logged.lock().unwrap());
     }
 }

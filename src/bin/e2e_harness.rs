@@ -106,6 +106,11 @@ enum Kind {
     /// peer will, a plain one where it will not (unless required), and
     /// incoming connections are taken either way (unless required).
     Encryption,
+    /// Local service discovery (BEP 14): a torrent with no tracker and no
+    /// DHT finds its only peer from a datagram on the local network, and
+    /// announces itself the way the BEP describes. Kept on loopback with
+    /// unicast addresses in place of the multicast group.
+    LocalDiscovery,
     /// The Fast Extension (BEP 6): the client downloads what a peer allows
     /// while still choked, and as a seeder tells a fast peer what it has
     /// with `have all`, allows it pieces and serves them before any unchoke.
@@ -169,6 +174,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "magnet-peer-hint", kind: Kind::MagnetPeerHint },
     Scenario { name: "tracker-redirect", kind: Kind::TrackerRedirect },
     Scenario { name: "encryption", kind: Kind::Encryption },
+    Scenario { name: "local-discovery", kind: Kind::LocalDiscovery },
     Scenario { name: "fast-extension", kind: Kind::FastExtension },
     Scenario { name: "disk-failure", kind: Kind::DiskFailure },
     Scenario { name: "prefer-files", kind: Kind::PreferFiles },
@@ -214,6 +220,7 @@ fn main() {
             Kind::MagnetPeerHint => run_magnet_peer_hint(scenario.name),
             Kind::TrackerRedirect => run_tracker_redirect(scenario.name),
             Kind::Encryption => run_encryption(scenario.name),
+            Kind::LocalDiscovery => run_local_discovery(scenario.name),
             Kind::FastExtension => run_fast_extension(scenario.name),
             Kind::DiskFailure => run_disk_failure(scenario.name),
             Kind::PreferFiles => run_prefer_files(scenario.name),
@@ -739,6 +746,8 @@ fn client_command(source: impl AsRef<std::ffi::OsStr>, out_dir: &Path, log: &Pat
     // gateway, and a client killed mid-run can't remove the mapping it
     // made, which would leave it on a real router.
     cmd.arg("--no-portmap");
+    // And local discovery would announce on the real network's multicast group.
+    cmd.arg("--no-lsd");
     // Plain output, but a logfile: assertions read what the client says
     // about its own decisions (DHT started or not, pieces resumed).
     cmd.arg("--no-tui").arg("--log").arg(log);
@@ -2401,6 +2410,91 @@ fn run_serve_metadata(name: &str) -> Result<String, String> {
         other => return Err(format!("expected the info dict as piece 0, got {:?}", other)),
     }
     Ok(format!("a peer holding only the info hash got the {}-byte info dictionary from the seeding client, byte for byte, and was told it is a seed", fx.info_bytes.len()))
+}
+
+/// Local service discovery (BEP 14). The torrent names no tracker and the DHT
+/// is off, so the fake peer can be found only through a datagram from the
+/// "local network" -- here the harness, writing the announcement by hand.
+/// The client's own announcement, which the harness receives, must be what
+/// the BEP shows: the request line, the info hash in hex, and the port the
+/// client is really listening on. A neighbour announcing a different torrent
+/// must not be dialed.
+fn run_local_discovery(name: &str) -> Result<String, String> {
+    use std::net::UdpSocket;
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    // No `announce` at all.
+    let mut bytes = b"d4:info".to_vec();
+    bytes.extend_from_slice(&fx.info_bytes);
+    bytes.push(b'e');
+    fs::write(&torrent, bytes).expect("write torrent file");
+
+    // Where the client will hear from its neighbours, and where it will announce to.
+    let listens_on = {
+        let probe = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        probe.local_addr().map_err(|e| e.to_string())?
+    };
+    let network = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    network.set_read_timeout(Some(Duration::from_secs(20))).map_err(|e| e.to_string())?;
+    let network_addr = network.local_addr().map_err(|e| e.to_string())?;
+
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1)
+        .args(["--no-dht", "--lsd", "--timeout", "40"])
+        .env("BITTORRENT_RS_LSD_LISTEN", listens_on.to_string())
+        .env("BITTORRENT_RS_LSD_SEND_TO", network_addr.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+
+    // Its announcement, as the network sees it.
+    let mut buf = [0u8; 2048];
+    let (len, _) = network.recv_from(&mut buf).map_err(|e| format!("the client announced nothing on the local network: {}", e))?;
+    let heard = String::from_utf8_lossy(&buf[..len]).to_string();
+    let lines: Vec<&str> = heard.split("\r\n").collect();
+    let hash_hex = bittorrent_rs::torrent::info_hash_hex(&fx.info_hash);
+    if lines.first() != Some(&"BT-SEARCH * HTTP/1.1") {
+        let _ = child.kill();
+        return Err(format!("the announcement does not begin with BEP 14's request line: {:?}", heard));
+    }
+    if !lines.iter().any(|l| l.eq_ignore_ascii_case(&format!("Infohash: {}", hash_hex))) {
+        let _ = child.kill();
+        return Err(format!("the announcement does not carry the info hash {}: {:?}", hash_hex, heard));
+    }
+    let announced_port: u16 = lines.iter().find_map(|l| l.strip_prefix("Port: ")).and_then(|p| p.parse().ok()).ok_or("the announcement has no Port header")?;
+    if !heard.ends_with("\r\n\r\n") || !lines.iter().any(|l| l.starts_with("cookie: ")) {
+        let _ = child.kill();
+        return Err(format!("the announcement lacks its cookie or its blank-line ending: {:?}", heard));
+    }
+
+    // Neighbours. One has a different torrent (and nothing listening where it says).
+    let decoy = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    decoy.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let neighbour = |port: u16, hash: &str| format!("BT-SEARCH * HTTP/1.1\r\nHost: 239.192.152.143:6771\r\nPort: {}\r\nInfohash: {}\r\ncookie: the-harness\r\n\r\n\r\n", port, hash);
+    network.send_to(neighbour(decoy.local_addr().map_err(|e| e.to_string())?.port(), &"cd".repeat(20)).as_bytes(), listens_on).map_err(|e| e.to_string())?;
+    network.send_to(neighbour(swarm.peer_addrs[0].port(), &hash_hex).as_bytes(), listens_on).map_err(|e| e.to_string())?;
+
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("the client exited with {:?}; its log: {}", status.code(), fs::read_to_string(&log_path).unwrap_or_default().lines().rev().take(8).collect::<Vec<_>>().join(" | ")));
+    }
+    check_downloaded(&fx, &out_dir)?;
+    let log = fs::read_to_string(&log_path).map_err(|e| e.to_string())?;
+    if !log.contains("LSD: 1 new peer address(es)") {
+        return Err("the log does not say the peer came from local discovery".to_string());
+    }
+    if !log.contains(&format!("listening for inbound peers on port {}", announced_port)) {
+        return Err(format!("it announced port {}, which is not the one it says it listens on", announced_port));
+    }
+    if !swarm.announces.lock().unwrap().is_empty() {
+        return Err("a tracker was contacted although the torrent names none".to_string());
+    }
+    if decoy.accept().is_ok() {
+        return Err("the client dialed a neighbour that announced a different torrent".to_string());
+    }
+    Ok(format!("a trackerless torrent with no DHT found its peer from a local announcement, announced itself with the right hash and port ({}), and ignored a neighbour with another torrent", announced_port))
 }
 
 /// The Fast Extension (BEP 6), both ways round.

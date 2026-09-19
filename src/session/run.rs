@@ -201,7 +201,7 @@ impl<'a> Session<'a> {
     }
 
     /// Feeds the dial queue from the passive discovery sources: peer
-    /// exchange and the DHT.
+    /// exchange, the DHT and the local network.
     fn poll_discovery(&mut self) {
         let sink = self.sink;
         let pex_fresh: usize = self.workers.pex_batches().map(|batch| self.pool.add(batch)).sum();
@@ -216,6 +216,13 @@ impl<'a> Session<'a> {
                 sink.log(format!("DHT: {} new peer address(es)", dht_fresh));
             }
             self.fresh_since_announce += dht_fresh;
+        }
+        if let Some(lsd) = self.services.lsd() {
+            let lsd_fresh: usize = lsd.peers_rx.try_iter().map(|batch| self.pool.add(batch)).sum();
+            if lsd_fresh > 0 {
+                sink.log(format!("LSD: {} new peer address(es) on the local network", lsd_fresh));
+            }
+            self.fresh_since_announce += lsd_fresh;
         }
     }
 
@@ -912,6 +919,49 @@ mod tests {
     }
 
     const SAFETY: Duration = Duration::from_secs(20); // only a net: a regression fails instead of hanging
+
+    #[test]
+    fn a_peer_heard_of_on_the_local_network_is_news_to_the_round_it_arrives_in() {
+        // A round that found nobody is fruitless, and enough of them end the run; one that heard of a peer is not.
+        let dir = tmp_dir("lsd-fresh");
+        let sink = Arc::new(RecordingSink::default());
+        let mut services = Services::new();
+        let listen = SocketAddr::from(([127, 0, 0, 1], 0));
+        services.start_lsd(crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen, join: None, share_port: false, interval: Duration::from_secs(3600) }, INFO_HASH, 6881, |_| {});
+        let heard_at = services.lsd().expect("the service started").listen_addr;
+        let neighbour = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        neighbour.send_to(&crate::lsd::announcement(heard_at, 5555, &INFO_HASH, "the-neighbour"), heard_at).unwrap();
+        let mut s = session(&sink, &services, &dir, &[], None);
+        let until = Instant::now() + Duration::from_secs(5);
+        while s.fresh_since_announce == 0 && Instant::now() < until {
+            s.poll_discovery();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(s.fresh_since_announce, 1);
+    }
+
+    #[test]
+    fn a_peer_found_on_the_local_network_is_dialed_and_the_download_finishes() {
+        // No tracker, no DHT and no address to begin with: the only way to the
+        // peer is a datagram from the local network, as LSD would deliver it.
+        let dir = tmp_dir("lsd");
+        let sink = Arc::new(RecordingSink::default());
+        let mut services = Services::new();
+        let listen = SocketAddr::from(([127, 0, 0, 1], 0));
+        let config = crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen, join: None, share_port: false, interval: Duration::from_secs(3600) };
+        services.start_lsd(config, INFO_HASH, 6881, |_| {});
+        let heard_at = services.lsd().expect("the service started").listen_addr;
+        let peer = fake_peer(true);
+        let neighbour = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        neighbour.send_to(&crate::lsd::announcement(heard_at, peer.port(), &INFO_HASH, "the-neighbour"), heard_at).unwrap();
+        let mut s = session(&sink, &services, &dir, &[], Some(SAFETY));
+
+        let report = s.run(&AtomicBool::new(false));
+
+        assert!(report.complete, "{:?}", sink.lines.lock().unwrap());
+        assert!(sink.logged("LSD: 1 new peer address(es) on the local network"));
+        assert_eq!(std::fs::read(dir.join("f.bin")).unwrap(), data());
+    }
 
     #[test]
     fn a_peer_that_drops_us_once_is_dialed_again_and_the_download_finishes() {

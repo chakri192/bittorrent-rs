@@ -422,7 +422,7 @@ mod tests {
         asm.next_requests(2);
         asm.refuse_request(3 * BLOCK_SIZE); // not asked for yet
         asm.refuse_request(50 * BLOCK_SIZE); // not even in the piece
-        asm.refuse_request(7); // not on a block boundary
+        asm.refuse_request(BLOCK_SIZE + 7); // in a block that is out, but not where a request begins
         asm.record_block(0, &vec![0; BLOCK_SIZE as usize]).unwrap();
         asm.refuse_request(0); // already here
         assert_eq!(asm.next_requests(5), vec![(6, 2 * BLOCK_SIZE, BLOCK_SIZE), (6, 3 * BLOCK_SIZE, BLOCK_SIZE)], "the cursor alone decides, as if no refusal had come");
