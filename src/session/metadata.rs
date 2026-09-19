@@ -68,6 +68,13 @@ pub fn resolve_magnet(magnet: &MagnetLink, our_peer_id: [u8; 20], announce_port:
     }
 
     let fetched = fetch_metadata(magnet.info_hash, our_peer_id, initial_peers, dht, config, sink, stop)?;
+    // A link with only the SHA-256 hash of a v2 torrent holds what came to it to all 256 bits of it, not only the 160
+    // that peers know the torrent by. (One that also has a v1 hash is a hybrid, checked by that.)
+    if let Some(full) = magnet.info_hash_v2.as_ref().filter(|full| full[..20] == magnet.info_hash[..]) {
+        if crate::sha256::sha256(&fetched.raw_info) != *full {
+            return Err("the metadata a peer sent does not match the link's SHA-256 info hash".to_string());
+        }
+    }
 
     let announce = magnet.trackers.first().cloned();
     // One tier of every tracker in the link; none if it had none.

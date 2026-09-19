@@ -136,6 +136,8 @@ struct SeederShared {
     /// The info dictionary, for peers that ask for it.
     metadata: Option<Arc<Vec<u8>>>,
     piece_lengths: Option<Arc<Vec<u32>>>,
+    /// What hash requests (BEP 52) are answered from, for a v2 torrent.
+    hash_source: Option<Arc<crate::v2::HashSource>>,
 }
 
 impl SeederShared {
@@ -270,6 +272,7 @@ impl Listener {
             choker: Arc::new(Choker::new(options.unchoke_slots)),
             metadata: options.metadata.clone(),
             piece_lengths: options.piece_lengths.clone(),
+            hash_source: options.hash_source.clone(),
         });
 
         // The rounds: who is served changes here, and each connection notices
@@ -402,6 +405,8 @@ pub struct SeederOptions {
     /// The length of every piece, where they are not all `piece_length` but for
     /// the last (a v2 torrent, whose pieces never span files).
     pub piece_lengths: Option<Arc<Vec<u32>>>,
+    /// The piece layers of a v2 torrent, to answer hash requests (BEP 52) from.
+    pub hash_source: Option<Arc<crate::v2::HashSource>>,
     /// Take IPv6 connections too, on the same port number (BEP 32 announces IPv6
     /// addresses, which are of no use if nothing listens on them).
     pub ipv6: bool,
@@ -411,7 +416,7 @@ impl Default for SeederOptions {
     fn default() -> Self {
         // Both are accepted by default: a peer that offers encryption is
         // taken up on it, and one that does not is served all the same.
-        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL, encryption: crate::peer::Encryption::Prefer, metadata: None, utp: None, piece_lengths: None, ipv6: false }
+        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL, encryption: crate::peer::Encryption::Prefer, metadata: None, utp: None, piece_lengths: None, hash_source: None, ipv6: false }
     }
 }
 
@@ -746,6 +751,17 @@ fn serve_connection(mut stream: MseStream, peer_ip: Option<std::net::IpAddr>, sh
                 Message::Extended { id: reply_id, payload: reply.encode() }.write_to(&mut stream).map_err(wire_to_io)?;
                 last_sent = Instant::now();
             }
+            Message::HashRequest(request) => {
+                // Answered with the hashes, and the uncles after them, or refused: a request must always be answered.
+                let answer = shared.hash_source.as_ref().and_then(|source| source.answer(&request.root, request.base_layer, request.index, request.length, request.proof_layers));
+                let reply = match answer {
+                    Some(range) => Message::Hashes { request, hashes: range.hashes.into_iter().chain(range.uncles).collect() },
+                    None => Message::HashReject(request),
+                };
+                reply.write_to(&mut stream).map_err(wire_to_io)?;
+                last_sent = Instant::now();
+            }
+            Message::Hashes { .. } | Message::HashReject(_) => {}
             // A peer this side dialed that has everything has no use for us: let it go.
             Message::HaveAll if dialed => return Ok(()),
             Message::Bitfield(ref bits) if dialed && bitfield_is_full(bits, shared.have.total()) => return Ok(()),
@@ -2199,5 +2215,63 @@ mod tests {
         assert!(!bitfield_is_full(&[0xFF], 9), "too short to say");
         assert!(!bitfield_is_full(&[0xFF], 0), "no pieces is not a seed");
         assert!(!bitfield_is_full(&[], 1));
+    }
+
+    // ---- hash requests (BEP 52) --------------------------------------------
+
+    #[test]
+    fn a_v2_seeder_answers_hash_requests_from_its_layers_and_refuses_what_it_cannot() {
+        use crate::peer::message::HashRequest;
+        use crate::v2::{file_height, hash_file, verify_range, HashSource, V2File};
+        // A file of eight pieces of 32 KiB (two blocks: the pieces are layer 1, the blocks layer 0), its layer and root.
+        let piece_length = 32768usize;
+        let mut state = 3u64;
+        let bytes: Vec<u8> = (0..8 * piece_length - 7)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 56) as u8
+            })
+            .collect();
+        let hashes = hash_file(&mut &bytes[..], bytes.len() as u64, piece_length).unwrap();
+        let root = hashes.root.unwrap();
+        let file = V2File { path: vec!["f".into()], length: bytes.len() as u64, root: Some(root) };
+        let source = HashSource::new(std::slice::from_ref(&file), &std::collections::BTreeMap::from([(root, hashes.layer.clone())]), piece_length as u64).unwrap();
+        let height = file_height(file.length, piece_length as u64);
+
+        let dir = tmp_dir("hash-requests");
+        let spans = Arc::new(build_file_spans(&dir, &[(vec!["seed.bin".to_string()], 16384i64)]));
+        let info_hash = [0x77; 20];
+        let mut handle = start_with(0, info_hash, [0x20; 20], spans, 16384, 16384, Arc::new(HaveMap::new(1)), None, SeederOptions { hash_source: Some(Arc::new(source)), ..Default::default() }).unwrap();
+        let (mut stream, _) = leech_connect(handle.port, info_hash);
+        let ask = |stream: &mut TcpStream, request: HashRequest| -> Message {
+            Message::HashRequest(request).write_to(stream).unwrap();
+            loop {
+                match Message::read_from(stream).unwrap() {
+                    m @ (Message::Hashes { .. } | Message::HashReject(_)) => break m,
+                    _ => continue,
+                }
+            }
+        };
+
+        // Asked for the whole piece layer with the proof that reaches the root: answered, and the answer proves itself.
+        let request = HashRequest { root, base_layer: 0, index: 0, length: 8, proof_layers: 0 };
+        assert_eq!(ask(&mut stream, request), Message::HashReject(request), "the 16 KiB leaves are not kept, so they are refused");
+        let request = HashRequest { root, base_layer: crate::v2::piece_layer(piece_length as u64), index: 4, length: 4, proof_layers: height - 2 };
+        let Message::Hashes { request: echoed, hashes: answer } = ask(&mut stream, request) else { panic!("refused") };
+        assert_eq!(echoed, request, "the answer repeats the request");
+        assert_eq!(&answer[..4], &hashes.layer[4..8]);
+        assert!(verify_range(&root, request.base_layer, height, 4, &answer[..4], &answer[4..], request.proof_layers));
+        // Refused: another file, a length that is not allowed, and nothing said is left unanswered.
+        for bad in [HashRequest { root: [9; 32], ..request }, HashRequest { length: 3, ..request }, HashRequest { index: 1, ..request }, HashRequest { length: 1024, index: 0, ..request }] {
+            assert_eq!(ask(&mut stream, bad), Message::HashReject(bad), "{:?}", bad);
+        }
+        handle.stop();
+
+        // A seeder with nothing to answer from refuses them all.
+        let plain_dir = tmp_dir("hash-requests-v1");
+        let (mut plain, plain_hash) = start_test_seeder(&plain_dir, &[vec![1u8; 16384]], 16384, &[0]);
+        let (mut stream, _) = leech_connect(plain.port, plain_hash);
+        assert_eq!(ask(&mut stream, request), Message::HashReject(request));
+        plain.stop();
     }
 }

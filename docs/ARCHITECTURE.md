@@ -221,5 +221,4 @@ seeding half of tit-for-tat, since inbound peers are never downloaded from;
 a magnet link's trackers are asked concurrently, having no tiers, and `--tracker-mode concurrent` does the same for a torrent's; a piece
 interrupted part-way is handed to the next peer within a run but not saved
 across runs; one piece is downloaded at a time per connection, so a request
-pipeline drains at each piece boundary; uTP and local discovery are IPv4 only (and uTP is
-unproven against other clients), and BEP 52 (v2) needs the piece layers in the .torrent (no hash-request messages), so a v2 torrent without them, or a v2-only magnet link, cannot be downloaded.
+pipeline drains at each piece boundary; local discovery is IPv4 only, and BEP 52 (v2) has no web seeds and refuses requests for the 16 KiB leaf hashes.

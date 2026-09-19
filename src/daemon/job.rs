@@ -328,8 +328,16 @@ fn run(shared: &Arc<JobShared>, spec: &JobSpec, context: &JobContext) -> Result<
     if stop.load(Ordering::SeqCst) {
         return Ok(JobState::Stopped);
     }
+    let mut torrent = torrent;
     if torrent.info_hash != spec.info_hash {
         return Err(format!("the torrent's info hash is {}, not the {} it was added as", info_hash_hex(&torrent.info_hash), info_hash_hex(&spec.info_hash)));
+    }
+    // A v2 torrent that lacks its piece layers (a magnet link's does) gets them from peers before it is kept or run.
+    if torrent.is_v2_only() && !torrent.v2_ready() {
+        let transport = Transport { mode: if services.utp().is_some() { defaults.transport } else { TransportMode::Tcp }, utp: services.utp() };
+        let config = crate::session::layers::LayerConfig { our_peer_id: context.peer_id, timeout: defaults.connect_timeout, encryption: defaults.encryption.unwrap_or_default(), transport };
+        let discovery = crate::session::layers::Discovery { bootstrap: bootstrap_peers.clone(), dht: services.dht(), trackers: torrent.tracker_tiers(), announce_port: context.network.port };
+        crate::session::layers::complete_torrent(&mut torrent, discovery, &config, crate::session::layers::LAYER_BUDGET, stop, &|m| sink.log(m))?;
     }
     (context.on_resolved)(&torrent);
     *lock(&shared.name) = torrent.name.clone();

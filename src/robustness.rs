@@ -104,6 +104,9 @@ fn message_seeds() -> Vec<Vec<u8>> {
         Message::Cancel { index: 1, begin: 0, length: 16384 },
         Message::Port(6881),
         Message::Extended { id: 1, payload: b"d1:md6:ut_pexi2eee".to_vec() },
+        Message::HashRequest(crate::peer::message::HashRequest { root: [3; 32], base_layer: 2, index: 0, length: 512, proof_layers: 9 }),
+        Message::HashReject(crate::peer::message::HashRequest { root: [4; 32], base_layer: 0, index: 2, length: 2, proof_layers: 0 }),
+        Message::Hashes { request: crate::peer::message::HashRequest { root: [5; 32], base_layer: 2, index: 4, length: 2, proof_layers: 2 }, hashes: vec![[1; 32], [2; 32], [3; 32], [4; 32]] },
     ]
     .iter()
     .map(Message::to_bytes)

@@ -6,6 +6,7 @@
 
 pub mod announce;
 pub mod env;
+pub mod layers;
 pub mod metadata;
 pub mod network;
 pub mod peer_pool;

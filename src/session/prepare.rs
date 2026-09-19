@@ -10,7 +10,6 @@ use crate::session::{Announcer, DownloadPlan, Log, Outstanding, PeerPool, Progre
 use crate::torrent::TorrentFile;
 use crate::tracker_discovery::TransferTotals;
 use crate::ui::format_bytes;
-use sha1::{Digest, Sha1};
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
@@ -227,7 +226,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // The info dictionary is offered to peers that have only a magnet link
     // (BEP 9), but only if it re-encodes to what the hash was taken over.
     let info_bytes = crate::bencode::encode(&torrent.info);
-    let metadata = (Sha1::digest(&info_bytes).as_slice() == torrent.info_hash).then(|| Arc::new(info_bytes));
+    let metadata = crate::torrent::info_hash_matches(&info_bytes, &torrent.info_hash).then(|| Arc::new(info_bytes));
     // Whether IPv6 is in use at all: peers are dialed over it, and the listener takes it.
     let allow_ipv6 = match options.ipv6 {
         Ipv6Mode::Always => true,
@@ -235,7 +234,8 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
         Ipv6Mode::Auto => has_ipv6_egress(),
     };
     let piece_lengths = (!torrent.v2_pieces.is_empty()).then(|| Arc::new(torrent.v2_pieces.iter().map(|p| p.length).collect::<Vec<u32>>()));
-    let seeder_options = seeder::SeederOptions { metadata, encryption: options.encryption.unwrap_or(crate::peer::Encryption::Prefer), utp: services.utp(), piece_lengths, ipv6: allow_ipv6, ..Default::default() };
+    let hash_source = torrent.v2.as_ref().and_then(|meta| crate::v2::HashSource::new(&meta.files, &meta.layers, piece_length)).map(Arc::new);
+    let seeder_options = seeder::SeederOptions { metadata, encryption: options.encryption.unwrap_or(crate::peer::Encryption::Prefer), utp: services.utp(), piece_lengths, hash_source, ipv6: allow_ipv6, ..Default::default() };
     let started = match services.network() {
         // Peers reach this torrent on the port everyone's share.
         Some(network) => Ok(network.register(torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options)),

@@ -196,10 +196,7 @@ pub fn parse_torrent_file(data: &[u8]) -> Result<TorrentFile, TorrentError> {
 /// `assemble_and_verify` -- cheap, and this function has no other way to
 /// know the hash wasn't tampered with between that check and this call.
 pub fn from_info_dict_bytes(raw_info: &[u8], expected_info_hash: [u8; 20], announce: Option<String>, announce_list: Vec<Vec<String>>) -> Result<TorrentFile, TorrentError> {
-    let mut hasher = Sha1::new();
-    hasher.update(raw_info);
-    let actual: [u8; 20] = hasher.finalize().into();
-    if actual != expected_info_hash {
+    if !info_hash_matches(raw_info, &expected_info_hash) {
         return Err(TorrentError::InfoHashMismatch);
     }
 
@@ -208,6 +205,14 @@ pub fn from_info_dict_bytes(raw_info: &[u8], expected_info_hash: [u8; 20], annou
     // contains `url-list`; web seeds, if any, would arrive via the magnet
     // `ws=` param (not currently parsed).
     build_torrent_from_info(info, raw_info, announce, announce_list, Vec::new(), None)
+}
+
+/// Whether `raw_info` is the info dictionary that `expected` names: its SHA-1 (BitTorrent v1), or the first 20 bytes of
+/// its SHA-256, which is how peers and trackers know a v2 torrent (BEP 52).
+pub fn info_hash_matches(raw_info: &[u8], expected: &[u8; 20]) -> bool {
+    let sha1: [u8; 20] = Sha1::digest(raw_info).into();
+    let sha256 = crate::sha256::sha256(raw_info);
+    &sha1 == expected || sha256[..20] == expected[..]
 }
 
 /// Shared construction logic: given a parsed info dict value and the raw
@@ -387,6 +392,27 @@ impl TorrentFile {
         urls.sort();
         urls.dedup();
         urls
+    }
+
+    /// Gives a v2-only torrent the piece layers it lacked (fetched from peers with hash requests, BEP 52), which
+    /// makes every piece something to check against, so that it can be downloaded. Layers are checked against the
+    /// files' roots first; on `Err` the torrent is as it was.
+    pub fn install_layers(&mut self, layers: std::collections::BTreeMap<crate::v2::Hash, Vec<crate::v2::Hash>>) -> Result<(), crate::v2::V2Error> {
+        let Some(meta) = &mut self.v2 else { return Err(crate::v2::V2Error::BadLayer) };
+        crate::v2::validate_layers(&meta.files, &layers, self.piece_length)?;
+        let mut combined = meta.layers.clone();
+        combined.extend(layers);
+        let v2_pieces = crate::v2::plan_pieces(&meta.files, &combined, self.piece_length as u64).ok_or(crate::v2::V2Error::BadLayer)?;
+        meta.layers = combined;
+        self.pieces = v2_pieces.iter().map(|p| <[u8; 20]>::try_from(&p.root[..20]).unwrap_or([0; 20])).collect();
+        self.v2_pieces = v2_pieces;
+        Ok(())
+    }
+
+    /// The `pieces root` of each file longer than a piece for which this v2 torrent has no piece layer yet.
+    pub fn missing_layers(&self) -> Vec<(crate::v2::Hash, u64)> {
+        let Some(meta) = &self.v2 else { return Vec::new() };
+        meta.files.iter().filter(|f| f.length > self.piece_length as u64).filter_map(|f| f.root.filter(|root| !meta.layers.contains_key(root)).map(|root| (root, f.length))).collect()
     }
 
     /// The trackers as BEP 12 has them: the tiers of `announce-list`, most preferred first (empty tiers left out),
@@ -925,5 +951,31 @@ mod tests {
     fn an_announce_the_list_leaves_out_is_a_tier_before_the_rest_and_empty_tiers_are_dropped() {
         let torrent = with_trackers(Some("http://main/"), &[&[], &["http://b/"], &[]]);
         assert_eq!(torrent.tracker_tiers(), vec![vec!["http://main/".to_string()], vec!["http://b/".to_string()]]);
+    }
+
+    #[test]
+    fn an_info_dictionary_is_named_by_its_sha1_or_by_the_first_twenty_bytes_of_its_sha256() {
+        let info = b"d6:lengthi5e4:name1:f12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
+        let sha1: [u8; 20] = Sha1::digest(info).into();
+        let mut sha256_short = [0u8; 20];
+        sha256_short.copy_from_slice(&crate::sha256::sha256(info)[..20]);
+        assert!(info_hash_matches(info, &sha1));
+        assert!(info_hash_matches(info, &sha256_short), "how a v2 torrent is known to peers");
+        assert!(!info_hash_matches(info, &[0; 20]));
+        assert!(!info_hash_matches(b"something else", &sha1) && !info_hash_matches(b"something else", &sha256_short));
+    }
+
+    #[test]
+    fn the_info_dictionary_of_a_v2_torrent_builds_a_torrent_when_given_its_short_sha256_hash() {
+        let dir = std::env::temp_dir().join(format!("bt-torrent-v2meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.bin"), vec![7u8; 40000]).unwrap();
+        let created = crate::create::create(&dir.join("f.bin"), &crate::create::CreateOptions { v2: true, piece_length: Some(16384), ..Default::default() }, |_, _| {}).unwrap();
+        let raw_info = bencode::encode(&bencode::decode(&created.bytes).unwrap().get("info").unwrap().clone());
+        let torrent = from_info_dict_bytes(&raw_info, created.info_hash, None, Vec::new()).expect("what a magnet link's metadata exchange gives");
+        assert!(torrent.is_v2_only() && !torrent.v2_ready(), "with no layers: they were not in the info dictionary");
+        assert_eq!(torrent.missing_layers().len(), 1);
+        assert!(matches!(from_info_dict_bytes(&raw_info, [0x11; 20], None, Vec::new()), Err(TorrentError::InfoHashMismatch)));
     }
 }

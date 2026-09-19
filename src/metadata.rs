@@ -6,6 +6,7 @@
 //! header-then-raw-bytes shape.
 
 use crate::bencode::{self, Bencode, Decoder};
+#[cfg(test)]
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 
@@ -238,10 +239,8 @@ impl MetadataAssembler {
     /// before this check passes.
     pub fn assemble_and_verify(&self, expected_info_hash: &[u8; 20]) -> Result<Vec<u8>, MetadataError> {
         let raw = self.assemble()?;
-        let mut hasher = Sha1::new();
-        hasher.update(&raw);
-        let actual: [u8; 20] = hasher.finalize().into();
-        if &actual != expected_info_hash {
+        // The v1 hash of a v1 torrent, or a v2 torrent's, which is the first 20 bytes of a SHA-256.
+        if !crate::torrent::info_hash_matches(&raw, expected_info_hash) {
             return Err(MetadataError::InfoHashMismatch);
         }
         Ok(raw)

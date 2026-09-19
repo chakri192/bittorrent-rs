@@ -329,6 +329,120 @@ pub fn validate_layers(files: &[V2File], layers: &BTreeMap<Hash, Vec<Hash>>, pie
     Ok(())
 }
 
+// ---- proofs (hash requests) -------------------------------------------
+
+/// The layer of a file's tree, counted up from the leaves (layer 0 is the 16 KiB blocks), whose nodes are the pieces.
+pub fn piece_layer(piece_length: u64) -> u32 {
+    (piece_length / BLOCK as u64).trailing_zeros()
+}
+
+/// How many layers above the leaves the root of a file longer than a piece is: the piece layer, and the pieces
+/// (rounded up to a power of two) above it.
+pub fn file_height(length: u64, piece_length: u64) -> u32 {
+    piece_layer(piece_length) + length.div_ceil(piece_length).next_power_of_two().trailing_zeros()
+}
+
+/// The nodes of a layer of `layer_number`, padded out to the whole width of a tree `height` layers high, and every layer
+/// above it up to the root. `layers[k]` is the layer `layer_number + k`.
+fn upper_layers(layer: &[Hash], layer_number: u32, height: u32) -> Vec<Vec<Hash>> {
+    let mut level: Vec<Hash> = layer.to_vec();
+    level.resize(1usize << (height - layer_number), zero_subtree(layer_number));
+    let mut layers = vec![level];
+    while layers[layers.len() - 1].len() > 1 {
+        let next = layers[layers.len() - 1].chunks(2).map(|pair| parent(&pair[0], &pair[1])).collect();
+        layers.push(next);
+    }
+    layers
+}
+
+/// What answers a hash request (BEP 52): `length` hashes of one layer, then the uncles that carry them to the root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HashRange {
+    pub hashes: Vec<Hash>,
+    /// The sibling hash in each layer from the one above the range's own subtree to just below the root,
+    /// lowest first, as many as `proof_layers` reaches.
+    pub uncles: Vec<Hash>,
+}
+
+/// Answers a request for `length` hashes from `index` of layer `layer_number` of a file whose tree is `height` layers
+/// high, `layer` being that layer's hashes as the file has them (the padding beyond them is worked out), with
+/// `proof_layers` layers of uncles. `None` where the request is malformed or asks for what the tree does not have:
+/// `length` must be a power of two of at least two, `index` a multiple of it, the range within the layer.
+///
+/// Of the proof layers, counted from the one above the base layer, the first `log2(length) - 1` are not sent (the
+/// hashes themselves make them), and there is none for the root, which has no sibling.
+pub fn hash_range(layer: &[Hash], layer_number: u32, height: u32, index: u32, length: u32, proof_layers: u32) -> Option<HashRange> {
+    if layer_number >= height || length < 2 || !length.is_power_of_two() || index & (length - 1) != 0 {
+        return None;
+    }
+    let width = 1u64 << (height - layer_number);
+    if u64::from(index) + u64::from(length) > width || layer.len() as u64 > width {
+        return None;
+    }
+    let layers = upper_layers(layer, layer_number, height);
+    let hashes = layers[0][index as usize..(index + length) as usize].to_vec();
+    let below = length.trailing_zeros();
+    let uncles = (below..=proof_layers).take_while(|j| layer_number + j < height).map(|j| layers[j as usize][((index >> j) ^ 1) as usize]).collect();
+    Some(HashRange { hashes, uncles })
+}
+
+/// The most hashes one hash request may ask for (BEP 52 says a requester should not ask for more).
+pub const MAX_HASHES_PER_REQUEST: u32 = 512;
+
+/// What a seeder answers hash requests from: the piece layer of each file longer than a piece.
+#[derive(Debug, Clone, Default)]
+pub struct HashSource {
+    piece_length: u64,
+    /// By `pieces root`: the file's length, and its piece layer.
+    files: BTreeMap<Hash, (u64, Vec<Hash>)>,
+}
+
+impl HashSource {
+    /// A source from a torrent's files and the piece layers it has; none for a torrent with no layer to answer from.
+    pub fn new(files: &[V2File], layers: &BTreeMap<Hash, Vec<Hash>>, piece_length: u64) -> Option<HashSource> {
+        let files: BTreeMap<Hash, (u64, Vec<Hash>)> = files.iter().filter(|f| f.length > piece_length).filter_map(|f| Some((f.root?, (f.length, layers.get(&f.root?)?.clone())))).collect();
+        (!files.is_empty()).then_some(HashSource { piece_length, files })
+    }
+
+    /// The answer to a request for `length` hashes from `index` of layer `base_layer` of the file with `root`, with
+    /// `proof_layers` of uncles; `None` (to be rejected) for a file it does not know, a layer below the pieces (the
+    /// 16 KiB leaves are not kept), or a request not allowed.
+    pub fn answer(&self, root: &Hash, base_layer: u32, index: u32, length: u32, proof_layers: u32) -> Option<HashRange> {
+        let (file_length, layer) = self.files.get(root)?;
+        let (height, pieces_at) = (file_height(*file_length, self.piece_length), piece_layer(self.piece_length));
+        if base_layer < pieces_at || length > MAX_HASHES_PER_REQUEST || base_layer >= height {
+            return None;
+        }
+        if base_layer == pieces_at {
+            return hash_range(layer, base_layer, height, index, length, proof_layers);
+        }
+        let above = upper_layers(layer, pieces_at, height).swap_remove((base_layer - pieces_at) as usize);
+        hash_range(&above, base_layer, height, index, length, proof_layers)
+    }
+}
+
+/// Whether `hashes` (from `index` of layer `layer_number`) and the `uncles` after them lead, as far as the top of a tree
+/// `height` layers high, to `root`: the check on what a peer answers a hash request with.
+pub fn verify_range(root: &Hash, layer_number: u32, height: u32, index: u32, hashes: &[Hash], uncles: &[Hash], proof_layers: u32) -> bool {
+    let length = hashes.len() as u32;
+    if layer_number >= height || length < 2 || !length.is_power_of_two() || index & (length - 1) != 0 || u64::from(index) + u64::from(length) > 1u64 << (height - layer_number) {
+        return false;
+    }
+    let below = length.trailing_zeros();
+    let expected = (below..=proof_layers).take_while(|j| layer_number + j < height).count();
+    if uncles.len() != expected {
+        return false;
+    }
+    let mut node = merkle_root(hashes, length as usize, [0u8; 32]);
+    let mut position = index >> below;
+    for uncle in uncles {
+        node = if position & 1 == 0 { parent(&node, uncle) } else { parent(uncle, &node) };
+        position >>= 1;
+    }
+    // The proof has to reach the root: nothing short of it says anything about the file.
+    layer_number + below + uncles.len() as u32 == height && node == *root
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,5 +752,121 @@ mod tests {
         let file = V2File { path: vec!["f".to_string()], length: 20_000, root: Some([7u8; 32]) };
         let pieces = plan_pieces(&[file], &BTreeMap::new(), 16 * BLOCK as u64).unwrap();
         assert_eq!(pieces, vec![V2Piece { file: 0, offset: 0, length: 20_000, root: [7u8; 32], width: 2 }]);
+    }
+
+    // ---- proofs ---------------------------------------------------------
+
+    /// A file of `pieces` pieces of 64 KiB (the last short), its root and its piece layer.
+    fn file_of(pieces: usize) -> (Hash, Vec<Hash>, u32) {
+        let piece_length = 65536;
+        // (Not `data`, whose pieces repeat with a period of two, which makes a tree that cannot tell left from right.)
+        let mut state = 9u64;
+        let bytes: Vec<u8> = (0..pieces * piece_length - 1000)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 56) as u8
+            })
+            .collect();
+        let hashes = hash_file(&mut &bytes[..], bytes.len() as u64, piece_length).unwrap();
+        (hashes.root.unwrap(), hashes.layer, file_height(bytes.len() as u64, piece_length as u64))
+    }
+
+    #[test]
+    fn the_layer_of_pieces_and_the_height_of_a_file() {
+        assert_eq!(piece_layer(16384), 0);
+        assert_eq!(piece_layer(65536), 2);
+        assert_eq!(file_height(65537, 65536), 3, "two pieces: one layer above the piece layer");
+        assert_eq!(file_height(3 * 65536, 65536), 4, "three pieces are four wide");
+        assert_eq!(file_height(4 * 65536, 65536), 4);
+        assert_eq!(file_height(5 * 65536, 65536), 5);
+    }
+
+    #[test]
+    fn every_range_of_every_size_proves_itself_to_the_root() {
+        for pieces in [2usize, 3, 5, 8, 13] {
+            let (root, layer, height) = file_of(pieces);
+            let layer_number = 2;
+            let width = 1u32 << (height - layer_number);
+            for length in (1..=width.trailing_zeros()).map(|k| 1u32 << k) {
+                for index in (0..width).step_by(length as usize) {
+                    // As many proof layers as reach the root, which is what a requester asks for.
+                    let proof_layers = height - layer_number - 1;
+                    let range = hash_range(&layer, layer_number, height, index, length, proof_layers).unwrap_or_else(|| panic!("{} pieces, {} from {}", pieces, length, index));
+                    assert_eq!(range.hashes.len(), length as usize);
+                    assert_eq!(range.uncles.len(), (height - layer_number - length.trailing_zeros()) as usize, "one uncle for each layer the range does not fill");
+                    assert!(verify_range(&root, layer_number, height, index, &range.hashes, &range.uncles, proof_layers), "{} pieces, {} from {}", pieces, length, index);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_hashes_of_a_range_are_the_layers_own_and_past_its_end_the_padding() {
+        let (_, layer, height) = file_of(5); // 8 wide
+        let range = hash_range(&layer, 2, height, 4, 4, 0).unwrap();
+        assert_eq!(&range.hashes[..1], &layer[4..5], "the last real piece");
+        assert!(range.hashes[1..].iter().all(|h| *h == zero_subtree(2)), "then padding as wide as a piece is");
+    }
+
+    #[test]
+    fn a_proof_is_only_as_long_as_the_layers_asked_for_reach() {
+        let (root, layer, height) = file_of(8); // 8 wide: height 5, piece layer 2
+        let full = hash_range(&layer, 2, height, 0, 2, height - 3).unwrap();
+        assert_eq!(full.uncles.len(), 2);
+        let short = hash_range(&layer, 2, height, 0, 2, 1).unwrap();
+        assert_eq!(short.uncles.len(), 1, "one proof layer, one uncle");
+        assert!(!verify_range(&root, 2, height, 0, &short.hashes, &short.uncles, 1), "which does not reach the root, and so proves nothing");
+        assert!(hash_range(&layer, 2, height, 0, 2, 0).unwrap().uncles.is_empty(), "none asked for, none sent");
+        assert_eq!(hash_range(&layer, 2, height, 0, 2, 99).unwrap().uncles.len(), 2, "more than there are layers is as many as there are: the root has no sibling");
+        // With the whole layer in the range there is nothing to add.
+        let all = hash_range(&layer, 2, height, 0, 8, 5).unwrap();
+        assert!(all.uncles.is_empty());
+        assert!(verify_range(&root, 2, height, 0, &all.hashes, &all.uncles, 5));
+    }
+
+    #[test]
+    fn a_request_that_is_not_allowed_or_not_there_is_none() {
+        let (_, layer, height) = file_of(8);
+        for (layer_number, index, length) in [(2, 0, 1), (2, 0, 3), (2, 2, 4), (2, 4, 8), (2, 8, 2), (5, 0, 2), (6, 0, 2), (2, 0, 0)] {
+            assert!(hash_range(&layer, layer_number, height, index, length, 2).is_none(), "{} {} {}", layer_number, index, length);
+        }
+    }
+
+    #[test]
+    fn a_proof_that_is_wrong_in_any_part_does_not_verify() {
+        let (root, layer, height) = file_of(8);
+        let range = hash_range(&layer, 2, height, 2, 2, 2).unwrap();
+        assert!(verify_range(&root, 2, height, 2, &range.hashes, &range.uncles, 2));
+        let mut bad = range.clone();
+        bad.hashes[0][0] ^= 1;
+        assert!(!verify_range(&root, 2, height, 2, &bad.hashes, &bad.uncles, 2), "a hash altered");
+        let mut bad = range.clone();
+        bad.uncles[0][5] ^= 1;
+        assert!(!verify_range(&root, 2, height, 2, &range.hashes, &bad.uncles, 2), "an uncle altered");
+        assert!(!verify_range(&root, 2, height, 0, &range.hashes, &range.uncles, 2), "claimed from the wrong place");
+        assert!(!verify_range(&root, 2, height, 2, &range.hashes, &range.uncles[..1], 2), "an uncle missing");
+        let mut wrong_root = root;
+        wrong_root[0] ^= 1;
+        assert!(!verify_range(&wrong_root, 2, height, 2, &range.hashes, &range.uncles, 2), "for another file");
+        assert!(!verify_range(&root, 2, height, 2, &range.hashes[..1], &range.uncles, 2), "one hash is not a range");
+    }
+
+    #[test]
+    fn a_hash_source_answers_for_the_piece_layer_and_those_above_it_and_for_nothing_else() {
+        let (root, layer, height) = file_of(8);
+        let file = V2File { path: vec!["f".into()], length: 8 * 65536 - 1000, root: Some(root) };
+        let source = HashSource::new(std::slice::from_ref(&file), &BTreeMap::from([(root, layer.clone())]), 65536).unwrap();
+
+        let range = source.answer(&root, 2, 0, 4, height - 3).unwrap();
+        assert_eq!(range.hashes, layer[..4]);
+        assert!(verify_range(&root, 2, height, 0, &range.hashes, &range.uncles, height - 3));
+        // A layer above the pieces: its hashes are the pieces' parents.
+        let upper = source.answer(&root, 3, 2, 2, height - 4).unwrap();
+        assert!(verify_range(&root, 3, height, 2, &upper.hashes, &upper.uncles, height - 4));
+        assert!(source.answer(&root, 0, 0, 2, 0).is_none(), "the leaves are not kept");
+        assert!(source.answer(&root, height, 0, 2, 0).is_none(), "nor is there a layer at or above the root's");
+        assert!(source.answer(&[0xEE; 32], 2, 0, 2, 0).is_none(), "another file's");
+        assert!(source.answer(&root, 2, 0, 1024, 0).is_none(), "and no more than 512 hashes at once");
+        assert!(HashSource::new(&[V2File { length: 1000, ..file }], &BTreeMap::new(), 65536).is_none(), "a torrent of files a piece long or less has no layers to answer from");
     }
 }

@@ -92,6 +92,8 @@ struct Args {
     no_lsd: bool,
     no_portmap: bool,
     no_webseed: bool,
+    /// Peers to try, given as `HOST:PORT` (`--peer`), before any tracker or the DHT has named one.
+    peers_hint: Vec<std::net::SocketAddr>,
     ipv6: Ipv6Mode,
     /// Case-insensitive path substrings selecting which files to download.
     only: Vec<String>,
@@ -148,6 +150,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
     let mut retry_delay = Duration::from_secs(15);
     let mut recheck = false;
     let mut sequential = false;
+    let mut peers_hint: Vec<std::net::SocketAddr> = Vec::new();
     let mut tracker_mode = cfg.tracker_mode.as_deref().map(|t| bittorrent_rs::tracker_discovery::TrackerMode::parse(t).ok_or_else(|| format!("config tracker_mode: {:?} is not tiered or concurrent", t))).transpose()?.unwrap_or_default();
     let mut transport = cfg.transport.as_deref().map(|t| bittorrent_rs::peer::TransportMode::parse(t).ok_or_else(|| format!("config transport: {:?} is not tcp, utp or both", t))).transpose()?.unwrap_or_default();
     let mut encryption = cfg.encryption.as_deref().map(bittorrent_rs::peer::Encryption::parse).transpose().map_err(|e| format!("config encryption: {}", e))?;
@@ -258,6 +261,10 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
             "--no-portmap" => no_portmap = true,
             "--portmap" => no_portmap = false,
             "--no-webseed" => no_webseed = true,
+            "--peer" => {
+                let v = argv.next().ok_or("--peer requires an address such as 192.0.2.5:6881 or [2001:db8::1]:6881")?;
+                peers_hint.push(v.parse().map_err(|_| format!("--peer: {:?} is not ADDRESS:PORT", v))?);
+            }
             "--webseed" => no_webseed = false,
             "--tui" => no_tui = false,
             // Consumed in the pre-scan (`load_config_from_args`); accepted
@@ -314,11 +321,11 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
         seed = true;
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, encryption, transport, tracker_mode, sequential, prefer, save_torrent, json, verify, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_lsd, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
+    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, encryption, transport, tracker_mode, sequential, prefer, save_torrent, json, verify, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_lsd, no_portmap, no_webseed, peers_hint, ipv6, only, files_sel, list, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--lsd | --no-lsd] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--encryption off|prefer|require] [--transport tcp|utp|both] [--tracker-mode tiered|concurrent] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--verify] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--lsd | --no-lsd] [--portmap | --no-portmap] [--webseed | --no-webseed] [--peer ADDRESS:PORT]... [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--encryption off|prefer|require] [--transport tcp|utp|both] [--tracker-mode tiered|concurrent] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--verify] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -422,6 +429,15 @@ fn dht_ipv6(args: &Args) -> bool {
     }
 }
 
+/// Asks peers for the piece layers a v2 torrent lacks (BEP 52), until it has them or gives up.
+fn fetch_layers_if_missing(torrent: &mut torrent::TorrentFile, bootstrap_peers: &[std::net::SocketAddr], services: &Services, args: &Args, our_peer_id: [u8; 20], ui: &Ui, stop: &AtomicBool) -> Result<(), String> {
+    use bittorrent_rs::session::layers::{complete_torrent, Discovery, LayerConfig, LAYER_BUDGET};
+    let transport = bittorrent_rs::peer::Transport { mode: if services.utp().is_some() { args.transport } else { Default::default() }, utp: services.utp() };
+    let config = LayerConfig { our_peer_id, timeout: CONNECT_TIMEOUT, encryption: args.encryption.unwrap_or_default(), transport };
+    let discovery = Discovery { bootstrap: bootstrap_peers.to_vec(), dht: services.dht(), trackers: torrent.tracker_tiers(), announce_port: args.port };
+    complete_torrent(torrent, discovery, &config, LAYER_BUDGET, stop, &|m| ui.log(m))
+}
+
 /// The whole download, start to finish, publishing to `ui`. Returns a
 /// human-readable completion summary (`Ok`) or a failure reason (`Err`);
 /// either way it also calls `ui.finish` so the dashboard can wind down
@@ -434,8 +450,9 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     // DHT, the listener and the port mapping.
     let mut services = Services::new();
 
-    let (torrent, bootstrap_peers) = if args.source.starts_with("magnet:?") {
-        let magnet = parse_magnet_uri(&args.source).map_err(|e| finish_err(ui, format!("parsing magnet uri: {}", e)))?;
+    let (mut torrent, bootstrap_peers) = if args.source.starts_with("magnet:?") {
+        let mut magnet = parse_magnet_uri(&args.source).map_err(|e| finish_err(ui, format!("parsing magnet uri: {}", e)))?;
+        magnet.peers.extend(args.peers_hint.iter().copied());
         if args.transport.wants_utp() {
             services.start_utp(args.port, |m| ui.log(m));
         }
@@ -461,9 +478,6 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     } else {
         let bytes = fs::read(&args.source).map_err(|e| finish_err(ui, format!("reading {}: {}", args.source, e)))?;
         let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| finish_err(ui, format!("parsing {}: {}", args.source, e)))?;
-        if torrent.is_v2_only() && !torrent.v2_ready() && !args.list && !args.verify {
-            return Err(finish_err(ui, bittorrent_rs::session::prepare::NO_PIECE_LAYERS.to_string()));
-        }
         // A `.torrent` already carries the file list, so `--list` needs no
         // network at all.
         if args.transport.wants_utp() && !args.list && !args.verify {
@@ -472,8 +486,12 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         if !args.no_dht && !args.list && !args.verify && !torrent.private {
             services.start_dht(args.port, torrent.info_hash, dht_ipv6(&args), dht_bootstrap(), |m| ui.log(m));
         }
-        (torrent, Vec::new())
+        (torrent, args.peers_hint.clone())
     };
+    // A v2 torrent that does not carry its piece layers (a magnet link's never does) gets them from peers.
+    if torrent.is_v2_only() && !torrent.v2_ready() && !args.list && !args.verify {
+        fetch_layers_if_missing(&mut torrent, &bootstrap_peers, &services, &args, our_peer_id, ui, stop).map_err(|e| finish_err(ui, e))?;
+    }
     if let Some(path) = &args.save_torrent {
         bittorrent_rs::create::save_torrent(&torrent, path).map_err(|e| finish_err(ui, format!("--save-torrent: {}", e)))?;
         ui.log(format!("saved the torrent to {}", path.display()));
@@ -682,6 +700,16 @@ mod tests {
         assert!(parse(&Config::default(), &["x", "--tracker-mode", "all"]).err().unwrap().starts_with("--tracker-mode:"));
         assert!(parse(&Config::default(), &["x", "--tracker-mode"]).err().unwrap().contains("requires"));
         assert!(parse(&cfg_from("tracker_mode = \"all\""), &["x"]).err().unwrap().starts_with("config tracker_mode:"));
+    }
+
+    #[test]
+    fn peers_can_be_named_on_the_command_line() {
+        assert!(parse(&Config::default(), &["x"]).unwrap().peers_hint.is_empty());
+        let args = parse(&Config::default(), &["x", "--peer", "192.0.2.5:6881", "--peer", "[2001:db8::1]:7000"]).unwrap();
+        assert_eq!(args.peers_hint, vec!["192.0.2.5:6881".parse().unwrap(), "[2001:db8::1]:7000".parse().unwrap()]);
+        assert!(parse(&Config::default(), &["x", "--peer", "example.com:6881"]).err().unwrap().starts_with("--peer:"), "an address, not a name");
+        assert!(parse(&Config::default(), &["x", "--peer", "1.2.3.4"]).err().unwrap().starts_with("--peer:"), "with its port");
+        assert!(parse(&Config::default(), &["x", "--peer"]).err().unwrap().contains("requires"));
     }
 
     #[test]
