@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Lets a branch be checked on Linux by hand (Actions > CI > Run workflow), without a pull request.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
