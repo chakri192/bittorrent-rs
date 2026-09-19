@@ -83,7 +83,8 @@ impl Shared {
     fn handle(self: &Arc<Self>, datagram: &[u8], from: SocketAddr, now: Instant) {
         let packet = match Packet::decode(datagram) {
             Ok(packet) => packet,
-            Err(PacketError::NotUtp) => {
+            // Too short to be uTP is as much not uTP as the wrong version is.
+            Err(PacketError::NotUtp | PacketError::TooShort) => {
                 if let Some(tx) = lock(&self.others).as_ref() {
                     let _ = tx.send((datagram.to_vec(), from));
                 }
@@ -178,7 +179,13 @@ fn random_u16() -> u16 {
 /// A UDP port speaking uTP.
 pub struct UtpSocket {
     shared: Arc<Shared>,
-    handle: Option<JoinHandle<()>>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for UtpSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UtpSocket({:?})", self.shared.socket.local_addr())
+    }
 }
 
 impl UtpSocket {
@@ -193,7 +200,7 @@ impl UtpSocket {
         let shared = Arc::new(Shared { socket, links: Mutex::new(HashMap::new()), pending: Mutex::new(VecDeque::new()), pending_changed: Condvar::new(), accepting: AtomicBool::new(false), stop: AtomicBool::new(false), others: Mutex::new(others) });
         let serving = Arc::clone(&shared);
         let handle = thread::Builder::new().name("utp".to_string()).spawn(move || serve(&serving))?;
-        Ok(UtpSocket { shared, handle: Some(handle) })
+        Ok(UtpSocket { shared, handle: Mutex::new(Some(handle)) })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -274,16 +281,26 @@ impl UtpSocket {
     }
 }
 
-impl Drop for UtpSocket {
-    fn drop(&mut self) {
+impl UtpSocket {
+    /// Ends every connection and stops the thread. A socket shared between
+    /// owners is stopped by whichever of them is last to act; the socket
+    /// itself is closed when the last of them lets go. Safe to call twice.
+    pub fn shutdown(&self) {
         self.shared.stop.store(true, Ordering::SeqCst);
         self.shared.pending_changed.notify_all();
-        if let Some(handle) = self.handle.take() {
+        let handle = lock(&self.handle).take();
+        if let Some(handle) = handle {
             let _ = handle.join();
         }
         // Connections never accepted hold the shared state, which holds them; break the loop
         // so the socket is closed and the port is free.
         lock(&self.shared.pending).clear();
+    }
+}
+
+impl Drop for UtpSocket {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -303,6 +320,8 @@ fn serve(shared: &Arc<Shared>) {
         }
     }
     shared.abort_all();
+    // Whoever waits for the datagrams that are not ours should learn there will be none.
+    *lock(&shared.others) = None;
 }
 
 /// A uTP connection, used like a TCP stream.
@@ -860,5 +879,19 @@ else:
         assert!(echoed == expect, "what Python echoed");
         let out = python.wait_with_output().unwrap();
         assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"));
+    }
+
+    #[test]
+    fn a_datagram_too_short_to_be_utp_is_handed_over_too_and_a_broken_utp_one_is_dropped() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let socket = UtpSocket::with_socket(UdpSocket::bind("127.0.0.1:0").unwrap(), Some(tx)).unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // A uTP header whose extension runs off the end: uTP, but broken.
+        let mut broken = Packet { kind: PacketType::State, connection_id: 1, timestamp: 0, timestamp_diff: 0, wnd_size: 0, seq_nr: 0, ack_nr: 0, sack: Vec::new(), payload: Vec::new() }.encode();
+        broken[1] = 1;
+        sender.send_to(&broken, socket.local_addr().unwrap()).unwrap();
+        sender.send_to(b"d1:y1:qe", socket.local_addr().unwrap()).unwrap();
+        let (bytes, _) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(bytes, b"d1:y1:qe", "the short one arrived, and the broken uTP packet did not go to the DHT");
     }
 }

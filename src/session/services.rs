@@ -3,10 +3,13 @@
 //! and the router port mapping. One owner, so they start in a sensible order and always stop
 //! together.
 
-use crate::dht::{self, DhtService};
+use crate::dht::{self, DhtService, SharedTransport};
 use crate::lsd::{LsdConfig, LsdService};
 use crate::portmap::{self, PortMap};
 use crate::seeder::SeederHandle;
+use crate::utp::socket::Foreign;
+use crate::utp::UtpSocket;
+use std::net::UdpSocket;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -20,6 +23,10 @@ use std::sync::Arc;
 pub struct Services {
     dht: Option<DhtService>,
     lsd: Option<LsdService>,
+    /// The uTP socket (BEP 29), which the DHT shares if there is one.
+    utp: Option<Arc<UtpSocket>>,
+    /// The datagrams on that socket that are not uTP, until the DHT takes them.
+    utp_foreign: Option<std::sync::mpsc::Receiver<Foreign>>,
     seeder: Option<SeederHandle>,
     portmap: Option<PortMap>,
     /// The TCP port the DHT service announces for us. Shared with its
@@ -37,13 +44,47 @@ impl Services {
     /// is not fatal: `log` says so and the session goes on without one.
     pub fn start_dht(&mut self, port: u16, info_hash: [u8; 20], log: impl Fn(String)) {
         let bootstrap = dht::DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect();
-        match dht::spawn_service(port, bootstrap, info_hash, Arc::clone(&self.dht_announce_port)) {
+        // With a uTP socket, the DHT uses its port, as peers expect one port to do both.
+        let started = match self.shared_dht_transport() {
+            Some((transport, udp_port)) => dht::spawn_service_on(transport, udp_port, bootstrap, info_hash, Arc::clone(&self.dht_announce_port)),
+            None => dht::spawn_service(port, bootstrap, info_hash, Arc::clone(&self.dht_announce_port)),
+        };
+        match started {
             Ok(service) => {
                 log(format!("DHT node running on UDP port {}", service.port));
                 self.dht = Some(service);
             }
             Err(e) => log(format!("DHT disabled (couldn't bind UDP socket): {}", e)),
         }
+    }
+
+    /// Opens the UDP port for uTP connections (BEP 29), `port` if it is free.
+    /// Failure is not fatal: `log` says so and connections are made over TCP.
+    pub fn start_utp(&mut self, port: u16, log: impl Fn(String)) {
+        let bound = UdpSocket::bind(("0.0.0.0", port)).or_else(|_| UdpSocket::bind(("0.0.0.0", 0)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        match bound.and_then(|socket| UtpSocket::with_socket(socket, Some(tx))) {
+            Ok(socket) => {
+                log(format!("uTP running on UDP port {}", socket.local_addr().map(|a| a.port()).unwrap_or(0)));
+                self.utp = Some(Arc::new(socket));
+                self.utp_foreign = Some(rx);
+            }
+            Err(e) => log(format!("uTP disabled (couldn't bind UDP socket): {}", e)),
+        }
+    }
+
+    /// The DHT's way of using the uTP socket's port, and that port, if there
+    /// is a socket and the DHT has not already taken it.
+    fn shared_dht_transport(&mut self) -> Option<(SharedTransport, u16)> {
+        let (utp, foreign) = (self.utp.as_ref()?, self.utp_foreign.take()?);
+        let transport = SharedTransport::new(Arc::clone(utp), foreign);
+        let port = transport.local_port();
+        Some((transport, port))
+    }
+
+    /// The uTP socket, if one is running.
+    pub fn utp(&self) -> Option<Arc<UtpSocket>> {
+        self.utp.clone()
     }
 
     /// Starts announcing the torrent on the local network (BEP 14) and
@@ -106,7 +147,7 @@ impl Services {
     pub fn start_portmap(&mut self, log: impl Fn(String) + Send + 'static) {
         let Some(seeder) = &self.seeder else { return };
         let tcp = seeder.port;
-        let udp = self.dht.as_ref().map(|d| d.port).unwrap_or(tcp);
+        let udp = self.dht.as_ref().map(|d| d.port).or_else(|| self.utp.as_ref().and_then(|u| u.local_addr().ok()).map(|a| a.port())).unwrap_or(tcp);
         self.portmap = portmap::map_ports(tcp, udp, log);
     }
 
@@ -125,6 +166,9 @@ impl Services {
         }
         if let Some(mut d) = self.dht.take() {
             d.stop();
+        }
+        if let Some(utp) = self.utp.take() {
+            utp.shutdown();
         }
     }
 }
@@ -234,5 +278,43 @@ mod tests {
         s.start_lsd(loopback_lsd(taken.local_addr().unwrap().port()), [0x11; 20], 6881, |m| logged.lock().unwrap().push(m));
         assert!(s.lsd().is_none());
         assert!(logged.lock().unwrap()[0].contains("disabled"), "{:?}", logged.lock().unwrap());
+    }
+
+    #[test]
+    fn a_utp_socket_is_running_once_started_and_gone_after_shutdown() {
+        let mut s = Services::new();
+        assert!(s.utp().is_none());
+        let logged = std::sync::Mutex::new(Vec::new());
+        s.start_utp(0, |m| logged.lock().unwrap().push(m));
+        let utp = s.utp().expect("started");
+        let port = utp.local_addr().unwrap().port();
+        assert!(logged.lock().unwrap()[0].contains(&port.to_string()), "it says which port: {:?}", logged.lock().unwrap());
+
+        s.shutdown();
+        drop(utp);
+
+        assert!(s.utp().is_none());
+        assert!(std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok(), "the port is free again");
+    }
+
+    #[test]
+    fn a_utp_socket_that_cannot_take_the_preferred_port_takes_another() {
+        let taken = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let taken_port = taken.local_addr().unwrap().port();
+        let mut s = Services::new();
+        s.start_utp(taken_port, |_| {});
+        let port = s.utp().expect("still started").local_addr().unwrap().port();
+        assert_ne!(port, taken_port);
+    }
+
+    #[test]
+    fn the_dht_takes_the_utp_sockets_port_once_and_only_when_there_is_a_socket() {
+        let mut s = Services::new();
+        assert!(s.shared_dht_transport().is_none(), "no socket, nothing to share");
+        s.start_utp(0, |_| {});
+        let port = s.utp().unwrap().local_addr().unwrap().port();
+        let (_, shared_port) = s.shared_dht_transport().expect("the DHT can have it");
+        assert_eq!(shared_port, port, "the same port, so one number serves TCP peers' uTP and the DHT");
+        assert!(s.shared_dht_transport().is_none(), "but only one DHT can");
     }
 }

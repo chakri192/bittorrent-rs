@@ -55,6 +55,8 @@ pub struct WorkerConfig {
     pub peers: PeerRegistry,
     /// Whether outgoing connections use message stream encryption.
     pub encryption: crate::peer::Encryption,
+    /// How outgoing connections are opened: TCP, uTP, or both.
+    pub transport: crate::peer::Transport,
 }
 
 /// A way to end workers that are blocked reading from a peer.

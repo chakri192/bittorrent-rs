@@ -22,7 +22,7 @@ pub(super) const MAX_UNCHOKE_WAIT_TIMEOUTS: u32 = 6;
 /// the client can end the wait; the returned [`Registration`] must be kept
 /// as long as the connection is used.
 pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, queue: &WorkQueue, pex_tx: Option<&PexSender>) -> Result<(Box<dyn PeerStream>, PeerState, Registration<'a>), WorkerError> {
-    let (mut stream, peer_handshake) = connect_and_handshake_with(peer_addr, config.info_hash, config.our_peer_id, true, true, config.connect_timeout, config.encryption)
+    let (mut stream, peer_handshake) = connect_and_handshake_with(peer_addr, config.info_hash, config.our_peer_id, true, true, config.connect_timeout, config.encryption, &config.transport)
         .map_err(|e| WorkerError::Connection { stage: "connect_and_handshake", error: e })?;
 
     // Registered before anything else is read, so that stopping the client
@@ -101,7 +101,7 @@ mod tests {
     const INFO_HASH: [u8; 20] = [0x42; 20];
 
     fn config() -> WorkerConfig {
-        WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default() }
+        WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default() }
     }
 
     fn queue(pieces: usize) -> WorkQueue {

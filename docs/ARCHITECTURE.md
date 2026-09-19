@@ -27,6 +27,7 @@ someone about to change the code.
        ▼
   peer/  handshake · wire messages · extensions (BEP 10) · PEX (BEP 11)
          Fast Extension (BEP 6) · message stream encryption · PeerStream
+  utp/   packets · connection (a state machine on an injected clock) · socket
   bencode.rs · torrent.rs   the formats everything above reads
 ```
 
@@ -50,6 +51,7 @@ behind locks.
 | seeder accept, one per inbound peer, and one for the choking rounds | `seeder` | `SeederHandle::stop` |
 | DHT | `dht::service` | `Services::shutdown` |
 | local discovery | `lsd` | `Services::shutdown` |
+| uTP | `utp::socket` (one thread for every connection) | `Services::shutdown` |
 
 **Shared state**, all small: the `WorkQueue` (pieces still to fetch, how
 common each is, and blocks left over from peers that failed part-way), the
@@ -107,6 +109,15 @@ a transport is one more implementation of the trait. **The Fast Extension**
 changes what "choked" means: a worker may still ask for the pieces a peer has
 allowed, and a peer that refuses a request says so instead of staying silent.
 
+**uTP** (`utp/`) is a transport like TCP, chosen by `--transport`. The
+protocol lives in `utp::conn::Connection`, which is given packets and the
+time and says what to send; it has no socket and no clock, which is why loss,
+reordering and timeouts are tested by simulation on a virtual clock. `socket`
+runs the UDP port: one thread feeds datagrams to connections and gives them
+the time, and each connection is a `PeerStream`, so the workers and the seeder
+neither know nor care. Datagrams that are not uTP go to the DHT, which is how
+the two share a port.
+
 Piece data reaches disk only after its hash has matched. Everything before
 that is untrusted bytes in a buffer.
 
@@ -160,5 +171,5 @@ seeding half of tit-for-tat, since inbound peers are never downloaded from;
 trackers are asked concurrently rather than by BEP 12 tier; a piece
 interrupted part-way is handed to the next peer within a run but not saved
 across runs; one piece is downloaded at a time per connection, so a request
-pipeline drains at each piece boundary; no uTP or BEP 32, local discovery is IPv4
-only, and there are no BEP 52 (v2) torrents.
+pipeline drains at each piece boundary; no BEP 32, uTP and local discovery are IPv4 only (and uTP is
+unproven against other clients), and there are no BEP 52 (v2) torrents.

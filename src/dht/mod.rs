@@ -35,8 +35,8 @@ mod token;
 mod transport;
 
 pub use lookup::LookupResult;
-pub use service::{spawn_service, DhtService, DEFAULT_BOOTSTRAP};
-pub use transport::{Transport, UdpTransport};
+pub use service::{spawn_service, spawn_service_on, DhtService, DEFAULT_BOOTSTRAP};
+pub use transport::{SharedTransport, Transport, UdpTransport};
 
 use krpc::{KrpcMessage, NodeId, Query};
 use routing::RoutingTable;

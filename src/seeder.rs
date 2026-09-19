@@ -32,7 +32,7 @@ use crate::peer::fast::allowed_fast_set;
 use crate::peer::mse::MseStream;
 use crate::peer::PeerStream;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync;
 use std::sync::{Arc, RwLock};
@@ -154,12 +154,13 @@ pub struct SeederHandle {
     running: Arc<AtomicBool>,
     accept_thread: Option<thread::JoinHandle<()>>,
     rechoke_thread: Option<thread::JoinHandle<()>>,
+    utp_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl SeederHandle {
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        for thread in [self.accept_thread.take(), self.rechoke_thread.take()].into_iter().flatten() {
+        for thread in [self.accept_thread.take(), self.rechoke_thread.take(), self.utp_thread.take()].into_iter().flatten() {
             let _ = thread.join();
         }
     }
@@ -179,13 +180,15 @@ pub struct SeederOptions {
     /// to offer to peers that ask for it (BEP 9). Without it the seeder
     /// speaks no extensions.
     pub metadata: Option<Arc<Vec<u8>>>,
+    /// A uTP socket to take connections on as well as TCP ones (BEP 29).
+    pub utp: Option<Arc<crate::utp::UtpSocket>>,
 }
 
 impl Default for SeederOptions {
     fn default() -> Self {
         // Both are accepted by default: a peer that offers encryption is
         // taken up on it, and one that does not is served all the same.
-        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL, encryption: crate::peer::Encryption::Prefer, metadata: None }
+        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL, encryption: crate::peer::Encryption::Prefer, metadata: None, utp: None }
     }
 }
 
@@ -279,7 +282,8 @@ pub fn start_with(
                     accept_shared.active_conns.fetch_add(1, Ordering::SeqCst);
                     let conn_shared = Arc::clone(&accept_shared);
                     thread::spawn(move || {
-                        let _ = serve_peer(stream, &conn_shared);
+                        let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
+                        let _ = serve_peer(Box::new(stream), peer_ip, &conn_shared);
                         conn_shared.active_conns.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
@@ -291,19 +295,39 @@ pub fn start_with(
         }
     });
 
-    Ok(SeederHandle { port, uploaded, running, accept_thread: Some(accept_thread), rechoke_thread: Some(rechoke_thread) })
+    // uTP connections, if there is a socket for them: served just as TCP ones are.
+    let utp_thread = options.utp.clone().map(|utp| {
+        utp.listen();
+        let utp_shared = Arc::clone(&shared);
+        thread::spawn(move || {
+            while utp_shared.running.load(Ordering::SeqCst) {
+                let Some(stream) = utp.accept(Duration::from_millis(200)) else { continue };
+                if utp_shared.active_conns.load(Ordering::SeqCst) >= MAX_INBOUND_PEERS {
+                    continue; // over cap: dropped, which closes it
+                }
+                utp_shared.active_conns.fetch_add(1, Ordering::SeqCst);
+                let conn_shared = Arc::clone(&utp_shared);
+                thread::spawn(move || {
+                    let peer_ip = Some(stream.peer_addr().ip());
+                    let _ = serve_peer(Box::new(stream), peer_ip, &conn_shared);
+                    conn_shared.active_conns.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        })
+    });
+
+    Ok(SeederHandle { port, uploaded, running, accept_thread: Some(accept_thread), rechoke_thread: Some(rechoke_thread), utp_thread })
 }
 
 /// Serves one inbound peer: handshake, bitfield, then Request/Piece until
 /// the peer leaves, goes idle too long, or the seeder shuts down.
-fn serve_peer(stream: TcpStream, shared: &SeederShared) -> std::io::Result<()> {
-    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
+fn serve_peer(stream: Box<dyn PeerStream>, peer_ip: Option<std::net::IpAddr>, shared: &SeederShared) -> std::io::Result<()> {
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
 
     // Plain or encrypted (MSE), whichever the peer began with; from here on
     // it makes no difference to what follows.
-    let (mut stream, _encrypted) = crate::peer::mse::accept(Box::new(stream), &[shared.info_hash], shared.encryption).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let (mut stream, _encrypted) = crate::peer::mse::accept(stream, &[shared.info_hash], shared.encryption).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
     // Inbound side of the BEP 3 handshake: they send first, we validate
     // the info_hash and answer. A mismatch (peer wants a torrent this
@@ -519,7 +543,7 @@ mod tests {
     use super::*;
     use crate::downloader::file_writer::{build_file_spans, write_piece};
     use std::fs;
-    use std::net::SocketAddr;
+    use std::net::{SocketAddr, TcpStream};
 
     fn tmp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("bittorrent-rs-seeder-test-{}-{}", name, std::process::id()));
@@ -577,6 +601,55 @@ mod tests {
         let info_hash = [0x66; 20];
         let handle = start(0, info_hash, [0x20; 20], spans, piece_length, total as u64, Arc::clone(&have), up_limit).unwrap();
         (handle, info_hash, have)
+    }
+
+    #[test]
+    fn a_peer_can_leech_from_the_seeder_over_utp() {
+        use crate::utp::UtpSocket;
+        let dir = tmp_dir("utp");
+        let pieces = [vec![0x11u8; 256], vec![0x22u8; 256], vec![0x33u8; 100]];
+        let total: i64 = pieces.iter().map(|p| p.len() as i64).sum();
+        let spans = Arc::new(build_file_spans(&dir, &[(vec!["seed.bin".to_string()], total)]));
+        for (i, p) in pieces.iter().enumerate() {
+            write_piece(&spans, i as u32, 256, p).unwrap();
+        }
+        let have = Arc::new(HaveMap::new(3));
+        (0..3).for_each(|i| have.set(i));
+        let info_hash = [0x67; 20];
+        let socket = Arc::new(UtpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap());
+        let options = SeederOptions { utp: Some(Arc::clone(&socket)), ..Default::default() };
+        let mut seeder = start_with(0, info_hash, [0x20; 20], spans, 256, total as u64, have, None, options).unwrap();
+
+        let leech = Arc::new(UtpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap());
+        let mut stream = leech.connect(SocketAddr::from(([127, 0, 0, 1], socket.local_addr().unwrap().port())), Duration::from_secs(5)).expect("the seeder takes uTP connections");
+        crate::peer::PeerStream::set_read_timeout(&stream, Some(Duration::from_secs(5))).unwrap();
+        stream.write_all(&Handshake::new(info_hash, [0x21; 20], false).to_bytes()).unwrap();
+        let mut hs = [0u8; HANDSHAKE_LEN];
+        stream.read_exact(&mut hs).unwrap();
+        assert_eq!(Handshake::from_bytes(&hs).unwrap().info_hash, info_hash);
+        Message::Interested.write_to(&mut stream).unwrap();
+        let mut unchoked = false;
+        while !unchoked {
+            unchoked = matches!(Message::read_from(&mut stream).unwrap(), Message::Unchoke);
+        }
+        Message::Request { index: 1, begin: 0, length: 256 }.write_to(&mut stream).unwrap();
+        let block = loop {
+            if let Message::Piece { index: 1, block, .. } = Message::read_from(&mut stream).unwrap() {
+                break block;
+            }
+        };
+        assert_eq!(block, pieces[1]);
+        assert!(seeder.uploaded.load(Ordering::SeqCst) >= 256, "and it counts what it served");
+        drop(stream);
+        seeder.stop();
+    }
+
+    #[test]
+    fn a_seeder_without_a_utp_socket_does_not_listen_for_utp() {
+        let dir = tmp_dir("no-utp");
+        let (mut seeder, _) = start_test_seeder(&dir, &[vec![1u8; 256]], 256, &[0]);
+        assert!(seeder.utp_thread.is_none());
+        seeder.stop();
     }
 
     /// The next `Have` the peer sends, skipping anything else; `None` if
@@ -1019,7 +1092,7 @@ mod tests {
         let metadata = some_metadata(40_000); // three pieces of 16 KiB, the last short
         let (mut handle, info_hash) = start_metadata_seeder(&dir, Some(metadata.clone()), true);
         let peer: std::net::SocketAddr = format!("127.0.0.1:{}", handle.port).parse().unwrap();
-        let config = MetadataConfig { budget: Duration::from_secs(5), parallelism: 1, connect_timeout: Duration::from_secs(2), encryption: Default::default() };
+        let config = MetadataConfig { budget: Duration::from_secs(5), parallelism: 1, connect_timeout: Duration::from_secs(2), transport: Default::default(), encryption: Default::default() };
 
         let fetched = fetch_metadata(info_hash, [7; 20], vec![peer], None, &config, &RecordingSink::default(), &AtomicBool::new(false)).expect("the seeder serves the metadata");
 

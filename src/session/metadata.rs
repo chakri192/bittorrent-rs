@@ -31,6 +31,8 @@ pub struct MetadataConfig {
     pub connect_timeout: Duration,
     /// Whether to use message stream encryption with the peers.
     pub encryption: crate::peer::Encryption,
+    /// How the peers are dialed.
+    pub transport: crate::peer::Transport,
 }
 
 /// What a successful search found.
@@ -106,6 +108,7 @@ pub fn fetch_metadata(info_hash: [u8; 20], our_peer_id: [u8; 20], initial_peers:
         let found_tx = found_tx.clone();
         let connect_timeout = config.connect_timeout;
         let encryption = config.encryption;
+        let transport = config.transport.clone();
         workers.push(thread::spawn(move || {
             while !pool_stop.load(Ordering::SeqCst) {
                 let Some(peer) = lock(&untried).pop_front() else {
@@ -113,7 +116,7 @@ pub fn fetch_metadata(info_hash: [u8; 20], our_peer_id: [u8; 20], initial_peers:
                     continue;
                 };
                 attempts.fetch_add(1, Ordering::Relaxed);
-                match fetch_metadata_from_peer(peer, info_hash, our_peer_id, connect_timeout, encryption) {
+                match fetch_metadata_from_peer(peer, info_hash, our_peer_id, connect_timeout, encryption, &transport) {
                     Ok(raw_info) => {
                         if !pool_stop.swap(true, Ordering::SeqCst) {
                             let _ = found_tx.send(raw_info);
@@ -275,7 +278,7 @@ mod tests {
     }
 
     fn config() -> MetadataConfig {
-        MetadataConfig { budget: Duration::from_secs(1), parallelism: 4, connect_timeout: Duration::from_secs(1), encryption: Default::default() }
+        MetadataConfig { budget: Duration::from_secs(1), parallelism: 4, connect_timeout: Duration::from_secs(1), encryption: Default::default(), transport: Default::default() }
     }
 
     fn fetch(peers: Vec<SocketAddr>, stop: &AtomicBool, sink: &RecordingSink) -> Result<Fetched, String> {

@@ -116,6 +116,11 @@ impl Workers {
     }
 
     /// Peer connections currently held (as of the last [`reap`](Self::reap)).
+    /// How connections to peers are opened.
+    pub fn transport_mode(&self) -> crate::peer::TransportMode {
+        self.config.transport.mode
+    }
+
     pub fn active_peers(&self) -> usize {
         self.peers.len()
     }
@@ -203,7 +208,7 @@ mod tests {
     }
 
     fn workers(queue: Arc<WorkQueue>, max_peers: usize, private: bool, log: Log) -> Workers {
-        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default() });
+        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default() });
         Workers::new(queue, Arc::new(Vec::new()), config, 16, max_peers, private, log)
     }
 
@@ -365,7 +370,7 @@ mod tests {
         let queue = Arc::new(WorkQueue::new(work, 3));
         let files = vec![(vec!["file.bin".to_string()], 3000i64)];
         let spans = Arc::new(build_file_spans(&dir, &files));
-        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default() });
+        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default() });
         let (log, _) = recording_log();
         let mut w = Workers::new(queue, spans, config, 1024, 1, false, log);
         assert_eq!(w.disk_failure(), None, "nothing has failed yet");

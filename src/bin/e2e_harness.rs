@@ -106,6 +106,11 @@ enum Kind {
     /// peer will, a plain one where it will not (unless required), and
     /// incoming connections are taken either way (unless required).
     Encryption,
+    /// uTP (BEP 29): a peer reachable only over uTP is downloaded from with
+    /// `--transport both` and `--transport utp` and is out of reach for
+    /// `tcp`; and as a seeder the client serves a leecher that comes in over
+    /// uTP.
+    Utp,
     /// Local service discovery (BEP 14): a torrent with no tracker and no
     /// DHT finds its only peer from a datagram on the local network, and
     /// announces itself the way the BEP describes. Kept on loopback with
@@ -174,6 +179,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "magnet-peer-hint", kind: Kind::MagnetPeerHint },
     Scenario { name: "tracker-redirect", kind: Kind::TrackerRedirect },
     Scenario { name: "encryption", kind: Kind::Encryption },
+    Scenario { name: "utp", kind: Kind::Utp },
     Scenario { name: "local-discovery", kind: Kind::LocalDiscovery },
     Scenario { name: "fast-extension", kind: Kind::FastExtension },
     Scenario { name: "disk-failure", kind: Kind::DiskFailure },
@@ -220,6 +226,7 @@ fn main() {
             Kind::MagnetPeerHint => run_magnet_peer_hint(scenario.name),
             Kind::TrackerRedirect => run_tracker_redirect(scenario.name),
             Kind::Encryption => run_encryption(scenario.name),
+            Kind::Utp => run_utp(scenario.name),
             Kind::LocalDiscovery => run_local_discovery(scenario.name),
             Kind::FastExtension => run_fast_extension(scenario.name),
             Kind::DiskFailure => run_disk_failure(scenario.name),
@@ -353,6 +360,8 @@ impl Fixture {
 /// What one fake peer observed of the client.
 #[derive(Default)]
 struct PeerLog {
+    /// Connections that came in over uTP.
+    utp_connections: usize,
     /// Connections that turned out to be encrypted (MSE) and plain.
     encrypted_connections: usize,
     plain_connections: usize,
@@ -491,9 +500,6 @@ fn spawn_swarm_with_tracker(fx: &Fixture, behaviors: Vec<Behavior>, mode: Tracke
 /// [`spawn_swarm_with_tracker`] with the peers taking encrypted connections
 /// too, if `encryption` says so.
 fn spawn_swarm_full(fx: &Fixture, behaviors: Vec<Behavior>, mode: TrackerMode, encryption: bittorrent_rs::peer::Encryption) -> Swarm {
-    let tracker_listener = TcpListener::bind("127.0.0.1:0").expect("bind fake tracker");
-    let tracker_addr = tracker_listener.local_addr().unwrap();
-
     let mut peer_addrs = Vec::new();
     let mut logs = Vec::new();
     for behavior in behaviors {
@@ -505,7 +511,16 @@ fn spawn_swarm_full(fx: &Fixture, behaviors: Vec<Behavior>, mode: TrackerMode, e
         thread::spawn(move || run_fake_peer(listener, cx, behavior, log));
     }
 
-    let peer_addrs_for_swarm = peer_addrs.clone();
+    let (tracker_addr, announces) = spawn_tracker(peer_addrs.clone(), mode);
+    Swarm { tracker_addr, peer_addrs, logs, announces }
+}
+
+/// A fake tracker that lists `peer_addrs` in answer to every announce (and
+/// misbehaves as `mode` says). Returns where it listens and the request line
+/// of every announce it receives.
+fn spawn_tracker(peer_addrs: Vec<SocketAddr>, mode: TrackerMode) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let tracker_listener = TcpListener::bind("127.0.0.1:0").expect("bind fake tracker");
+    let tracker_addr = tracker_listener.local_addr().unwrap();
     let announces = Arc::new(Mutex::new(Vec::new()));
     let tracker_announces = Arc::clone(&announces);
     thread::spawn(move || {
@@ -547,8 +562,37 @@ fn spawn_swarm_full(fx: &Fixture, behaviors: Vec<Behavior>, mode: TrackerMode, e
             let _ = stream.write_all(&body);
         }
     });
+    (tracker_addr, announces)
+}
 
-    Swarm { tracker_addr, peer_addrs: peer_addrs_for_swarm, logs, announces }
+/// [`spawn_swarm`] with peers that can be reached only over uTP: each has a
+/// UDP port and, on that number, nothing listening on TCP (the port is taken
+/// from a TCP listener that is then let go, so a connection there is
+/// refused).
+fn spawn_utp_swarm(fx: &Fixture, behaviors: Vec<Behavior>) -> (Swarm, Vec<Arc<bittorrent_rs::utp::UtpSocket>>) {
+    let mut peer_addrs = Vec::new();
+    let mut logs = Vec::new();
+    let mut sockets = Vec::new();
+    for behavior in behaviors {
+        let port = TcpListener::bind("127.0.0.1:0").expect("pick a port").local_addr().unwrap().port();
+        let socket = Arc::new(bittorrent_rs::utp::UtpSocket::bind(SocketAddr::from(([127, 0, 0, 1], port))).expect("bind uTP"));
+        socket.listen();
+        peer_addrs.push(SocketAddr::from(([127, 0, 0, 1], port)));
+        let log = Arc::new(Mutex::new(PeerLog::default()));
+        logs.push(Arc::clone(&log));
+        let cx = Arc::new(PeerContext { encryption: bittorrent_rs::peer::Encryption::Off, data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count });
+        let behavior = Arc::new(behavior);
+        let accepting = Arc::clone(&socket);
+        thread::spawn(move || {
+            while let Some(stream) = accepting.accept(Duration::from_secs(3600)) {
+                let (cx, behavior, log) = (Arc::clone(&cx), Arc::clone(&behavior), Arc::clone(&log));
+                thread::spawn(move || serve_stream(Box::new(stream), true, &cx, &behavior, &log));
+            }
+        });
+        sockets.push(socket);
+    }
+    let (tracker_addr, announces) = spawn_tracker(peer_addrs.clone(), TrackerMode::Answer);
+    (Swarm { tracker_addr, peer_addrs, logs, announces }, sockets)
 }
 
 /// The extended-message id the fake peer uses for ut_metadata. Deliberately
@@ -568,9 +612,14 @@ fn run_fake_peer(listener: TcpListener, cx: PeerContext, behavior: Behavior, log
 }
 
 fn serve_connection(tcp: TcpStream, cx: &PeerContext, behavior: &Behavior, log: &Mutex<PeerLog>) {
+    serve_stream(Box::new(tcp), false, cx, behavior, log);
+}
+
+/// One connection, over TCP or uTP.
+fn serve_stream(stream: Box<dyn bittorrent_rs::peer::PeerStream>, over_utp: bool, cx: &PeerContext, behavior: &Behavior, log: &Mutex<PeerLog>) {
     // Plain or encrypted, whichever the client begins with (as far as this
     // peer is set to take).
-    let Ok((mut stream, encrypted)) = bittorrent_rs::peer::mse::accept(Box::new(tcp), &[cx.info_hash], cx.encryption) else { return };
+    let Ok((mut stream, encrypted)) = bittorrent_rs::peer::mse::accept(stream, &[cx.info_hash], cx.encryption) else { return };
     let mut hs_buf = [0u8; 68];
     if stream.read_exact(&mut hs_buf).is_err() {
         return;
@@ -587,6 +636,9 @@ fn serve_connection(tcp: TcpStream, cx: &PeerContext, behavior: &Behavior, log: 
     {
         let mut log = log.lock().unwrap();
         log.fast_offered = Some(their_hs.supports_fast());
+        if over_utp {
+            log.utp_connections += 1;
+        }
         if encrypted {
             log.encrypted_connections += 1;
         } else {
@@ -1162,9 +1214,14 @@ fn leech_everything(fx: &Fixture, port: u16) -> Result<(), String> {
 
 /// [`leech_everything`], but downloading only the pieces in `wanted`.
 fn leech_pieces(fx: &Fixture, port: u16, wanted: std::ops::Range<usize>) -> Result<(), String> {
-    let wire = |what: &str, e: bittorrent_rs::peer::message::WireError| format!("{}: {:?}", what, e);
     let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connecting to the client's listener on port {}: {}", port, e))?;
     stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    leech_over(fx, &mut stream, wanted)
+}
+
+/// [`leech_pieces`] over a connection already made, TCP or uTP.
+fn leech_over<S: Read + Write>(fx: &Fixture, stream: &mut S, wanted: std::ops::Range<usize>) -> Result<(), String> {
+    let wire = |what: &str, e: bittorrent_rs::peer::message::WireError| format!("{}: {:?}", what, e);
 
     let ours = Handshake::new(fx.info_hash, [0x77; 20], false);
     stream.write_all(&ours.to_bytes()).map_err(|e| format!("sending the handshake: {}", e))?;
@@ -1176,7 +1233,7 @@ fn leech_pieces(fx: &Fixture, port: u16, wanted: std::ops::Range<usize>) -> Resu
     }
 
     let bitfield = loop {
-        match Message::read_from(&mut stream).map_err(|e| wire("waiting for the bitfield", e))? {
+        match Message::read_from(&mut *stream).map_err(|e| wire("waiting for the bitfield", e))? {
             Message::Bitfield(bits) => break bits,
             _ => continue,
         }
@@ -1186,9 +1243,9 @@ fn leech_pieces(fx: &Fixture, port: u16, wanted: std::ops::Range<usize>) -> Resu
         return Err(format!("the client advertised {} of {} pieces after finishing", advertised, fx.piece_count));
     }
 
-    Message::Interested.write_to(&mut stream).map_err(|e| wire("sending interested", e))?;
+    Message::Interested.write_to(&mut *stream).map_err(|e| wire("sending interested", e))?;
     loop {
-        match Message::read_from(&mut stream).map_err(|e| wire("waiting for the unchoke", e))? {
+        match Message::read_from(&mut *stream).map_err(|e| wire("waiting for the unchoke", e))? {
             Message::Unchoke => break,
             _ => continue,
         }
@@ -1197,9 +1254,9 @@ fn leech_pieces(fx: &Fixture, port: u16, wanted: std::ops::Range<usize>) -> Resu
     for index in wanted {
         let start = index * fx.piece_len;
         let end = (start + fx.piece_len).min(fx.data.len());
-        Message::Request { index: index as u32, begin: 0, length: (end - start) as u32 }.write_to(&mut stream).map_err(|e| wire("requesting a piece", e))?;
+        Message::Request { index: index as u32, begin: 0, length: (end - start) as u32 }.write_to(&mut *stream).map_err(|e| wire("requesting a piece", e))?;
         let block = loop {
-            match Message::read_from(&mut stream).map_err(|e| wire(&format!("waiting for piece {}", index), e))? {
+            match Message::read_from(&mut *stream).map_err(|e| wire(&format!("waiting for piece {}", index), e))? {
                 Message::Piece { index: got, begin: 0, block } if got as usize == index => break block,
                 _ => continue,
             }
@@ -2410,6 +2467,74 @@ fn run_serve_metadata(name: &str) -> Result<String, String> {
         other => return Err(format!("expected the info dict as piece 0, got {:?}", other)),
     }
     Ok(format!("a peer holding only the info hash got the {}-byte info dictionary from the seeding client, byte for byte, and was told it is a seed", fx.info_bytes.len()))
+}
+
+/// uTP (BEP 29). The fake peers can be reached only over uTP: their TCP port
+/// is refused. `--transport both` must try TCP, be refused, and go by uTP;
+/// `--transport utp` must go by uTP at once; `--transport tcp` must not reach
+/// them at all. And with a port that is free for both TCP and UDP, the
+/// client as a seeder serves a leecher that comes in over uTP.
+fn run_utp(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let dir = scratch_dir(name);
+
+    for mode in ["both", "utp"] {
+        let (swarm, _sockets) = spawn_utp_swarm(&fx, vec![Behavior::Serve]);
+        let torrent = dir.join(format!("{}.torrent", mode));
+        fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+        let out_dir = dir.join(format!("{}-out", mode));
+        let log_path = dir.join(format!("{}.log", mode));
+        let mut child = client_command(&torrent, &out_dir, &log_path, 1).args(["--no-dht", "--transport", mode, "--timeout", "40"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+        let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+        if !status.success() {
+            return Err(format!("--transport {}: the client exited with {:?}; its log: {}", mode, status.code(), fs::read_to_string(&log_path).unwrap_or_default().lines().rev().take(6).collect::<Vec<_>>().join(" | ")));
+        }
+        check_downloaded(&fx, &out_dir)?;
+        let seen = swarm.logs[0].lock().unwrap();
+        if seen.utp_connections == 0 || seen.plain_connections != seen.utp_connections {
+            return Err(format!("--transport {}: {} uTP and {} plain connections; every one should have been uTP", mode, seen.utp_connections, seen.plain_connections));
+        }
+    }
+
+    // TCP alone cannot reach a uTP-only peer.
+    let (swarm, _sockets) = spawn_utp_swarm(&fx, vec![Behavior::Serve]);
+    let torrent = dir.join("tcp.torrent");
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let mut child = client_command(&torrent, &dir.join("tcp-out"), &dir.join("tcp.log"), 1).args(["--no-dht", "--transport", "tcp", "--timeout", "5", "--retry-delay", "1"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if status.success() || swarm.logs[0].lock().unwrap().connections != 0 {
+        return Err(format!("--transport tcp reached a peer that only speaks uTP (exit {:?})", status.code()));
+    }
+
+    // The client as a seeder, on a port that is free for TCP and for UDP.
+    let port = (0..50)
+        .find_map(|_| {
+            let tcp = TcpListener::bind("127.0.0.1:0").ok()?;
+            let port = tcp.local_addr().ok()?.port();
+            let udp = std::net::UdpSocket::bind(("0.0.0.0", port)).ok()?;
+            drop((tcp, udp));
+            Some(port)
+        })
+        .ok_or("no port free for both TCP and UDP")?;
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let torrent = dir.join("seed.torrent");
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let log_path = dir.join("seed.log");
+    let child = client_command(&torrent, &dir.join("seed-out"), &log_path, 1)
+        .args(["--no-dht", "--seed", "--transport", "both", "--port", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, &format!("seeding e2e.bin on port {}", port), Duration::from_secs(20), &mut client.0)?;
+
+    let leech = bittorrent_rs::utp::UtpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).map_err(|e| e.to_string())?;
+    let mut stream = leech.connect(SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_secs(10)).map_err(|e| format!("the seeding client did not take a uTP connection on UDP port {}: {}", port, e))?;
+    bittorrent_rs::peer::PeerStream::set_read_timeout(&stream, Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    leech_over(&fx, &mut stream, 0..fx.piece_count)?;
+
+    Ok(format!("--transport both and utp downloaded from a peer whose TCP port refuses (every connection was uTP), --transport tcp did not reach it, and the seeding client served all {} pieces to a leecher on UDP port {}", fx.piece_count, port))
 }
 
 /// Local service discovery (BEP 14). The torrent names no tracker and the DHT

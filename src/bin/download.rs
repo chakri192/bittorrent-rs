@@ -64,6 +64,8 @@ struct Args {
     recheck: bool,
     /// Message stream encryption, if chosen.
     encryption: Option<bittorrent_rs::peer::Encryption>,
+    /// TCP, uTP, or TCP with uTP as the second try.
+    transport: bittorrent_rs::peer::TransportMode,
     /// Fetch pieces in order rather than rarest first.
     sequential: bool,
     /// Case-insensitive path substrings of files to fetch first.
@@ -143,6 +145,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
     let mut retry_delay = Duration::from_secs(15);
     let mut recheck = false;
     let mut sequential = false;
+    let mut transport = cfg.transport.as_deref().map(|t| bittorrent_rs::peer::TransportMode::parse(t).ok_or_else(|| format!("config transport: {:?} is not tcp, utp or both", t))).transpose()?.unwrap_or_default();
     let mut encryption = cfg.encryption.as_deref().map(bittorrent_rs::peer::Encryption::parse).transpose().map_err(|e| format!("config encryption: {}", e))?;
     let mut prefer: Vec<String> = Vec::new();
     let mut save_torrent = None;
@@ -194,6 +197,10 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
             "--encryption" => {
                 let v = argv.next().ok_or("--encryption requires off, prefer or require")?;
                 encryption = Some(bittorrent_rs::peer::Encryption::parse(&v).map_err(|e| format!("--encryption: {}", e))?);
+            }
+            "--transport" => {
+                let v = argv.next().ok_or("--transport requires tcp, utp or both")?;
+                transport = bittorrent_rs::peer::TransportMode::parse(&v).ok_or_else(|| format!("--transport: {:?} is not tcp, utp or both", v))?;
             }
             "--prefer" => prefer.push(argv.next().ok_or("--prefer requires a path substring")?),
             "--json" => json = true,
@@ -299,11 +306,11 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
         seed = true;
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, encryption, sequential, prefer, save_torrent, json, verify, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_lsd, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
+    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, encryption, transport, sequential, prefer, save_torrent, json, verify, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_lsd, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--lsd | --no-lsd] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--encryption off|prefer|require] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--verify] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--lsd | --no-lsd] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--encryption off|prefer|require] [--transport tcp|utp|both] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--verify] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -423,6 +430,9 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
 
     let (torrent, bootstrap_peers) = if args.source.starts_with("magnet:?") {
         let magnet = parse_magnet_uri(&args.source).map_err(|e| finish_err(ui, format!("parsing magnet uri: {}", e)))?;
+        if args.transport.wants_utp() {
+            services.start_utp(args.port, |m| ui.log(m));
+        }
         if !args.no_dht {
             services.start_dht(args.port, magnet.info_hash, |m| ui.log(m));
         }
@@ -432,7 +442,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         if let Some(name) = &magnet.display_name {
             ui.set_title(name.clone());
         }
-        let metadata = MetadataConfig { budget: METADATA_RESOLVE_BUDGET, parallelism: METADATA_PARALLELISM, connect_timeout: CONNECT_TIMEOUT, encryption: args.encryption.unwrap_or_default() };
+        let metadata = MetadataConfig { budget: METADATA_RESOLVE_BUDGET, parallelism: METADATA_PARALLELISM, connect_timeout: CONNECT_TIMEOUT, encryption: args.encryption.unwrap_or_default(), transport: bittorrent_rs::peer::Transport { mode: if services.utp().is_some() { args.transport } else { Default::default() }, utp: services.utp() } };
         let (torrent, peers) = resolve_magnet(&magnet, our_peer_id, args.port, services.dht(), &metadata, ui, stop).map_err(|e| finish_err(ui, e))?;
         // The DHT had to run to fetch the metadata, since a magnet link
         // doesn't say whether the torrent is private until the info dict
@@ -447,6 +457,9 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| finish_err(ui, format!("parsing {}: {}", args.source, e)))?;
         // A `.torrent` already carries the file list, so `--list` needs no
         // network at all.
+        if args.transport.wants_utp() && !args.list && !args.verify {
+            services.start_utp(args.port, |m| ui.log(m));
+        }
         if !args.no_dht && !args.list && !args.verify && !torrent.private {
             services.start_dht(args.port, torrent.info_hash, |m| ui.log(m));
         }
@@ -492,6 +505,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         retry_delay: args.retry_delay,
         recheck: args.recheck,
         encryption: args.encryption,
+        transport: args.transport,
         sequential: args.sequential,
         prefer: bittorrent_rs::selection::build_prefer_mask(&torrent.files, &args.prefer).map_err(|e| finish_err(ui, e))?,
         max_down: args.max_down,
@@ -649,6 +663,19 @@ mod tests {
         assert_eq!(lsd_config().send_to, group.send_to, "an unusable one is ignored, not obeyed");
         std::env::remove_var("BITTORRENT_RS_LSD_LISTEN");
         std::env::remove_var("BITTORRENT_RS_LSD_SEND_TO");
+    }
+
+    #[test]
+    fn transport_is_chosen_by_flag_or_config_and_the_flag_wins() {
+        use bittorrent_rs::peer::TransportMode;
+        assert_eq!(parse(&Config::default(), &["x"]).unwrap().transport, TransportMode::Tcp, "TCP unless asked");
+        assert_eq!(parse(&Config::default(), &["x", "--transport", "utp"]).unwrap().transport, TransportMode::Utp);
+        let cfg = cfg_from("transport = \"both\"");
+        assert_eq!(parse(&cfg, &["x"]).unwrap().transport, TransportMode::Both);
+        assert_eq!(parse(&cfg, &["x", "--transport", "tcp"]).unwrap().transport, TransportMode::Tcp);
+        assert!(parse(&Config::default(), &["x", "--transport", "udp"]).err().unwrap().starts_with("--transport:"));
+        assert!(parse(&Config::default(), &["x", "--transport"]).err().unwrap().contains("requires"));
+        assert!(parse(&cfg_from("transport = \"udp\""), &["x"]).err().unwrap().starts_with("config transport:"));
     }
 
     #[test]

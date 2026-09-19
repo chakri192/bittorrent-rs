@@ -8,8 +8,9 @@ use super::handshake::{Handshake, HandshakeError, HANDSHAKE_LEN};
 use super::message::{Message, WireError};
 use super::mse::{self, Encryption, MseError};
 use super::stream::PeerStream;
+use super::transport::Transport;
 use std::io::Write;
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -69,14 +70,7 @@ pub fn connect_and_handshake(
     support_extensions: bool,
     timeout: Duration,
 ) -> Result<(Box<dyn PeerStream>, Handshake), ConnectionError> {
-    connect_and_handshake_with(addr, info_hash, our_peer_id, support_extensions, false, timeout, Encryption::Off)
-}
-
-fn open(addr: SocketAddr, timeout: Duration) -> Result<TcpStream, ConnectionError> {
-    let stream = TcpStream::connect_timeout(&addr, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    Ok(stream)
+    connect_and_handshake_with(addr, info_hash, our_peer_id, support_extensions, false, timeout, Encryption::Off, &Transport::default())
 }
 
 /// Reads the peer's handshake off `stream` and checks it is for `info_hash`.
@@ -95,7 +89,9 @@ fn read_handshake(stream: &mut dyn PeerStream, info_hash: [u8; 20]) -> Result<Ha
 /// [`Prefer`](Encryption::Prefer) an encrypted connection is tried first and,
 /// if the peer will not do it, a plain one is made; with
 /// [`Require`](Encryption::Require) there is no second try. A peer that
-/// cannot be reached at all is not tried twice.
+/// cannot be reached at all is not tried twice. `transport` says whether to
+/// dial over TCP, uTP or both.
+#[allow(clippy::too_many_arguments)]
 pub fn connect_and_handshake_with(
     addr: SocketAddr,
     info_hash: [u8; 20],
@@ -104,13 +100,14 @@ pub fn connect_and_handshake_with(
     support_fast: bool,
     timeout: Duration,
     encryption: Encryption,
+    transport: &Transport,
 ) -> Result<(Box<dyn PeerStream>, Handshake), ConnectionError> {
     let outbound = Handshake::new(info_hash, our_peer_id, support_extensions).with_fast(support_fast).to_bytes();
 
     if encryption != Encryption::Off {
-        let stream = open(addr, timeout)?;
+        let stream = transport.open(addr, timeout)?;
         // Our handshake goes ahead as the initial payload, saving a round trip.
-        match mse::initiate(Box::new(stream), &info_hash, encryption == Encryption::Prefer, &outbound) {
+        match mse::initiate(stream, &info_hash, encryption == Encryption::Prefer, &outbound) {
             Ok(secured) => {
                 let mut secured: Box<dyn PeerStream> = Box::new(secured);
                 let peer_handshake = read_handshake(&mut *secured, info_hash)?;
@@ -122,7 +119,7 @@ pub fn connect_and_handshake_with(
         }
     }
 
-    let mut stream: Box<dyn PeerStream> = Box::new(open(addr, timeout)?);
+    let mut stream = transport.open(addr, timeout)?;
     stream.write_all(&outbound)?;
     let peer_handshake = read_handshake(&mut *stream, info_hash)?;
     Ok((stream, peer_handshake))
@@ -191,7 +188,7 @@ mod tests {
     }
 
     fn connect(addr: SocketAddr, encryption: Encryption) -> Result<(), ConnectionError> {
-        connect_and_handshake_with(addr, HASH, [0x11; 20], false, false, Duration::from_secs(5), encryption).map(|(_, hs)| assert_eq!(hs.info_hash, HASH))
+        connect_and_handshake_with(addr, HASH, [0x11; 20], false, false, Duration::from_secs(5), encryption, &Transport::default()).map(|(_, hs)| assert_eq!(hs.info_hash, HASH))
     }
 
     fn settle(seen: &Arc<Mutex<Vec<Saw>>>, count: usize) -> Vec<Saw> {
@@ -286,7 +283,7 @@ mod tests {
     fn the_fast_extension_is_offered_only_when_asked_for() {
         for asked in [true, false] {
             let (addr, said) = fast_peer(true);
-            let (_, theirs) = connect_and_handshake_with(addr, HASH, [0x11; 20], false, asked, Duration::from_secs(5), Encryption::Off).unwrap();
+            let (_, theirs) = connect_and_handshake_with(addr, HASH, [0x11; 20], false, asked, Duration::from_secs(5), Encryption::Off, &Transport::default()).unwrap();
             assert_eq!(said.recv_timeout(Duration::from_secs(5)).unwrap(), asked, "our handshake");
             assert!(theirs.supports_fast(), "and the peer's bit is handed back for the caller to combine with ours");
         }

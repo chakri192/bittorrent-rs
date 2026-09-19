@@ -72,6 +72,10 @@ pub struct Options {
     /// on disk but no resume file, such as after a completed download or
     /// files copied in from elsewhere.
     pub recheck: bool,
+    /// How outgoing connections are made, and whether uTP is taken on the
+    /// listening side (`--transport`). A mode that wants uTP without a running
+    /// uTP socket falls back to TCP, and says so.
+    pub transport: crate::peer::TransportMode,
     /// Message stream encryption (`--encryption`). `None` is the default:
     /// outgoing connections are plain, incoming ones may be either.
     pub encryption: Option<crate::peer::Encryption>,
@@ -213,10 +217,16 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // (BEP 9), but only if it re-encodes to what the hash was taken over.
     let info_bytes = crate::bencode::encode(&torrent.info);
     let metadata = (Sha1::digest(&info_bytes).as_slice() == torrent.info_hash).then(|| Arc::new(info_bytes));
-    let seeder_options = seeder::SeederOptions { metadata, encryption: options.encryption.unwrap_or(crate::peer::Encryption::Prefer), ..Default::default() };
+    let seeder_options = seeder::SeederOptions { metadata, encryption: options.encryption.unwrap_or(crate::peer::Encryption::Prefer), utp: services.utp(), ..Default::default() };
     match seeder::start_with(options.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options) {
         Ok(handle) => {
             sink.log(format!("listening for inbound peers on port {}", handle.port));
+            if let Some(utp) = services.utp() {
+                let udp_port = utp.local_addr().map(|a| a.port()).unwrap_or(0);
+                if udp_port != handle.port {
+                    sink.log(format!("warning: uTP is on UDP port {} but TCP is on {}; peers will dial uTP at the port announced, so inbound uTP will not reach us", udp_port, handle.port));
+                }
+            }
             services.attach_seeder(handle);
         }
         Err(e) => sink.log(format!("warning: could not start listener (download-only): {}", e)),
@@ -278,7 +288,15 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
         sink.log(format!("skipped {} IPv6 peer(s) with no local route (pass --ipv6 to force)", pool.skipped_ipv6()));
     }
 
-    let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: options.pipeline_depth, connect_timeout: options.connect_timeout, down_limit, interrupt: Default::default(), peers: Default::default(), encryption: options.encryption.unwrap_or_default() });
+    let transport = match (options.transport.wants_utp(), services.utp()) {
+        (true, Some(utp)) => crate::peer::Transport { mode: options.transport, utp: Some(utp) },
+        (true, None) => {
+            sink.log("uTP is not running; connections will be made over TCP".to_string());
+            crate::peer::Transport::default()
+        }
+        (false, _) => crate::peer::Transport::default(),
+    };
+    let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: options.pipeline_depth, connect_timeout: options.connect_timeout, down_limit, interrupt: Default::default(), peers: Default::default(), encryption: options.encryption.unwrap_or_default(), transport: transport.clone() });
     let mut workers = Workers::new(Arc::clone(&queue), Arc::clone(&spans), config, piece_length, options.max_peers, torrent.private, shared_log(sink));
 
     // Web-seed workers: one thread per url-list entry, draining the same
@@ -357,6 +375,7 @@ mod tests {
             recheck: false,
             sequential: false,
             encryption: None,
+            transport: Default::default(),
             prefer: Vec::new(),
             retry_delay: Duration::from_secs(15),
             pipeline_depth: 5,
@@ -573,6 +592,46 @@ mod tests {
         let mut services = Services::new();
         let (prepared, _) = run_prepare(&torrent(), &[true, true], Vec::new(), &lsd_options(&dir), &mut services);
         assert!(prepared.is_ok(), "no tracker, no DHT, no address -- but the local network may yet turn one up");
+    }
+
+    #[test]
+    fn with_a_utp_socket_the_listener_takes_utp_connections_too_and_warns_when_the_ports_differ() {
+        let dir = tmp_dir("utp");
+        let mut services = Services::new();
+        services.start_utp(0, |_| {});
+        let utp = services.utp().expect("running");
+        let mut with_utp = options(&dir);
+        with_utp.transport = crate::peer::TransportMode::Both;
+
+        let (prepared, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &with_utp, &mut services);
+        assert_eq!(prepared.unwrap().workers.transport_mode(), crate::peer::TransportMode::Both, "and the workers dial the way it says");
+
+        // A uTP peer connects and completes the BitTorrent handshake.
+        let client = crate::utp::UtpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let mut stream = client.connect(SocketAddr::from(([127, 0, 0, 1], utp.local_addr().unwrap().port())), Duration::from_secs(5)).expect("the listener takes uTP");
+        crate::peer::PeerStream::set_read_timeout(&stream, Some(Duration::from_secs(5))).unwrap();
+        std::io::Write::write_all(&mut stream, &crate::peer::Handshake::new(torrent().info_hash, [7; 20], false).to_bytes()).unwrap();
+        let mut answer = [0u8; crate::peer::handshake::HANDSHAKE_LEN];
+        std::io::Read::read_exact(&mut stream, &mut answer).unwrap();
+        assert_eq!(crate::peer::Handshake::from_bytes(&answer).unwrap().info_hash, torrent().info_hash);
+
+        // Both ports were left to be chosen, so they differ, and that is said.
+        assert!(log.logged("warning: uTP is on UDP port"), "{:?}", log.lines.lock().unwrap());
+    }
+
+    #[test]
+    fn a_transport_that_wants_utp_falls_back_to_tcp_when_there_is_no_socket() {
+        let dir = tmp_dir("utp-missing");
+        let mut services = Services::new();
+        let mut wants = options(&dir);
+        wants.transport = crate::peer::TransportMode::Utp;
+        let (prepared, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &wants, &mut services);
+        assert_eq!(prepared.unwrap().workers.transport_mode(), crate::peer::TransportMode::Tcp, "it still runs, over TCP");
+        assert!(log.logged("uTP is not running; connections will be made over TCP"));
+
+        let mut services = Services::new();
+        let (_, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        assert!(!log.logged("uTP is not running"), "and says nothing when TCP was asked for");
     }
 
     #[test]

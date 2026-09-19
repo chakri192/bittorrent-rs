@@ -51,6 +51,12 @@ const RELOOKUP_INTERVAL: Duration = Duration::from_secs(180);
 pub fn spawn_service(bind_port: u16, bootstrap_nodes: Vec<String>, info_hash: [u8; 20], announce_port: Arc<AtomicU16>) -> io::Result<DhtService> {
     let transport = UdpTransport::bind(bind_port)?;
     let port = transport.local_port();
+    spawn_service_on(transport, port, bootstrap_nodes, info_hash, announce_port)
+}
+
+/// [`spawn_service`] on a transport already made -- one shared with uTP, say --
+/// which listens on UDP `port`.
+pub fn spawn_service_on<T: super::Transport + 'static>(transport: T, port: u16, bootstrap_nodes: Vec<String>, info_hash: [u8; 20], announce_port: Arc<AtomicU16>) -> io::Result<DhtService> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
     let nodes = Arc::new(AtomicUsize::new(0));
@@ -211,5 +217,24 @@ mod tests {
             let (host, port) = router.rsplit_once(':').unwrap_or_else(|| panic!("{} has no port", router));
             assert!(!host.is_empty() && port.parse::<u16>().is_ok(), "{}", router);
         }
+    }
+
+    #[test]
+    fn the_service_answers_a_ping_that_reaches_it_through_the_port_utp_shares() {
+        let (tx, rx) = mpsc::channel();
+        let socket = Arc::new(crate::utp::UtpSocket::with_socket(UdpSocket::bind("127.0.0.1:0").unwrap(), Some(tx)).unwrap());
+        let transport = crate::dht::SharedTransport::new(Arc::clone(&socket), rx);
+        let port = transport.local_port();
+        let mut service = spawn_service_on(transport, port, Vec::new(), INFO_HASH, Arc::new(AtomicU16::new(0))).unwrap();
+        assert_eq!(service.port, port, "it says it is on the shared port");
+
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        peer.send_to(b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe", ("127.0.0.1", port)).unwrap();
+        let mut buf = [0u8; 512];
+        let (n, from) = peer.recv_from(&mut buf).expect("the DHT node answers");
+        assert_eq!(from.port(), port, "from the shared port");
+        assert!(buf[..n].windows(4).any(|w| w == b"1:rd"), "a KRPC response: {:?}", String::from_utf8_lossy(&buf[..n]));
+        service.stop();
     }
 }
