@@ -21,6 +21,10 @@ pub const DEFAULT_BOOTSTRAP: &[&str] = &["router.bittorrent.com:6881", "dht.tran
 /// up in the dial queue.
 const RELOOKUP_INTERVAL: Duration = Duration::from_secs(180);
 
+/// How long one lookup is given when a node has a single torrent to look for; with more, each is given a share of it, so
+/// that a network that does not answer holds up every torrent's turn for about this long in all, not this long each.
+const LOOKUP_BUDGET: Duration = Duration::from_secs(10);
+
 /// How often the node looks up whether there is something to do: a torrent added, a lookup
 /// due, or (before the listener is up) a port to announce that it did not have.
 const ANNOUNCE_POLL: Duration = Duration::from_millis(500);
@@ -62,11 +66,12 @@ impl DhtNode {
     /// [`start`](Self::start) on a transport already made -- one shared with uTP, say --
     /// which listens on UDP `port`.
     pub fn start_on<T: super::Transport + 'static>(transport: T, port: u16, bootstrap_nodes: Vec<String>, ipv6: bool) -> io::Result<DhtNode> {
-        DhtNode::start_every(transport, port, bootstrap_nodes, ipv6, RELOOKUP_INTERVAL)
+        DhtNode::start_every(transport, port, bootstrap_nodes, ipv6, RELOOKUP_INTERVAL, LOOKUP_BUDGET)
     }
 
-    /// [`start_on`](Self::start_on), looking each torrent up again every `relookup`.
-    fn start_every<T: super::Transport + 'static>(transport: T, port: u16, bootstrap_nodes: Vec<String>, ipv6: bool, relookup: Duration) -> io::Result<DhtNode> {
+    /// [`start_on`](Self::start_on), looking each torrent up again every `relookup`, and giving one lookup at most `budget`
+    /// (less, shared out between the torrents, when there are several).
+    fn start_every<T: super::Transport + 'static>(transport: T, port: u16, bootstrap_nodes: Vec<String>, ipv6: bool, relookup: Duration, budget: Duration) -> io::Result<DhtNode> {
         let stop = Arc::new(AtomicBool::new(false));
         let (nodes, nodes6) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let mut commands = Vec::new();
@@ -75,7 +80,7 @@ impl DhtNode {
             let (tx, rx) = mpsc::channel();
             commands.push(tx);
             let stop = Arc::clone(&stop);
-            handles.push(thread::spawn(move || run_node(Dht::new(transport), bootstrap, rx, table_size, stop, relookup)));
+            handles.push(thread::spawn(move || run_node(Dht::new(transport), bootstrap, rx, table_size, stop, relookup, budget)));
         };
         spawn(Box::new(transport), Arc::clone(&nodes), bootstrap_nodes.clone());
         let mut port6 = None;
@@ -115,6 +120,13 @@ impl DhtNode {
     }
 }
 
+/// How long one lookup may take when the node has `torrents` of them: the whole `budget` for one, and for more a share
+/// of it, but never less than a fifth: what a lookup finds arrives in the first moments, and one that has to be cut
+/// short is one the network was not answering.
+fn lookup_deadline(budget: Duration, torrents: usize) -> Duration {
+    (budget / torrents.max(1) as u32).max(budget / 5)
+}
+
 /// One torrent being looked up on a node.
 struct Tracked {
     info_hash: [u8; 20],
@@ -128,7 +140,7 @@ struct Tracked {
 
 /// One DHT node, of whichever family its transport is, on a thread of its own: it serves the
 /// network, and between times looks up and announces each torrent it has been given.
-fn run_node<T: super::Transport>(mut dht: Dht<T>, bootstrap: Vec<String>, commands: mpsc::Receiver<Command>, table_size: Arc<AtomicUsize>, stop: Arc<AtomicBool>, relookup: Duration) {
+fn run_node<T: super::Transport>(mut dht: Dht<T>, bootstrap: Vec<String>, commands: mpsc::Receiver<Command>, table_size: Arc<AtomicUsize>, stop: Arc<AtomicBool>, relookup: Duration, budget: Duration) {
     dht.bootstrap(&bootstrap, &stop);
     table_size.store(dht.table_len(), Ordering::SeqCst);
     let mut torrents: Vec<Tracked> = Vec::new();
@@ -147,7 +159,7 @@ fn run_node<T: super::Transport>(mut dht: Dht<T>, bootstrap: Vec<String>, comman
         let now = Instant::now();
         // The one most overdue, so that none goes without for want of the ones before it in the list.
         if let Some(index) = (0..torrents.len()).filter(|&i| torrents[i].next_lookup <= now).min_by_key(|&i| torrents[i].next_lookup) {
-            let found = dht.get_peers(&torrents[index].info_hash, Duration::from_secs(10), &stop);
+            let found = dht.get_peers(&torrents[index].info_hash, lookup_deadline(budget, torrents.len()), &stop);
             let torrent = &mut torrents[index];
             if !found.peers.is_empty() && torrent.tx.send(found.peers.clone()).is_err() {
                 torrents.remove(index); // nobody wants it any more
@@ -270,15 +282,20 @@ mod tests {
         }
 
         fn start_on(bind: &str, peer: SocketAddr) -> Self {
-            FakeNode::start_with(bind, Some(peer))
+            FakeNode::start_with(bind, Some(peer), false)
+        }
+
+        /// One that answers `find_node` but never `get_peers`: a network that lets lookups time out.
+        fn start_silent_on_peers() -> Self {
+            FakeNode::start_with("127.0.0.1:0", None, true)
         }
 
         /// One that answers each info hash with a peer of its own, `peer_for` it.
         fn start_by_hash() -> Self {
-            FakeNode::start_with("127.0.0.1:0", None)
+            FakeNode::start_with("127.0.0.1:0", None, false)
         }
 
-        fn start_with(bind: &str, peer: Option<SocketAddr>) -> Self {
+        fn start_with(bind: &str, peer: Option<SocketAddr>, silent_on_peers: bool) -> Self {
             let socket = UdpSocket::bind(bind).unwrap();
             socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
             let port = socket.local_addr().unwrap().port();
@@ -293,6 +310,10 @@ mod tests {
                     let Ok((n, from)) = socket.recv_from(&mut buf) else { continue };
                     let Ok(KrpcMessage::Query { t, query }) = KrpcMessage::decode(&buf[..n]) else { continue };
                     let response = match query {
+                        Query::GetPeers { info_hash, .. } if silent_on_peers => {
+                            asked_log.lock().unwrap().push(info_hash);
+                            continue;
+                        }
                         Query::GetPeers { info_hash, .. } => {
                             asked_log.lock().unwrap().push(info_hash);
                             Response { id: NODE_ID, values: vec![peer.unwrap_or_else(|| peer_for(&info_hash))], token: Some(b"tk".to_vec()), ..Default::default() }
@@ -591,7 +612,7 @@ mod tests {
         let router = FakeNode::start_by_hash();
         let transport = UdpTransport::bind(0).unwrap();
         let port = transport.local_port();
-        let node = Arc::new(DhtNode::start_every(transport, port, vec![router.router()], false, Duration::from_millis(300)).unwrap());
+        let node = Arc::new(DhtNode::start_every(transport, port, vec![router.router()], false, Duration::from_millis(300), LOOKUP_BUDGET).unwrap());
         let mut service = node.add_torrent([1; 20], Arc::new(AtomicU16::new(6881)));
         let mut other = node.add_torrent([2; 20], Arc::new(AtomicU16::new(6882)));
 
@@ -611,6 +632,36 @@ mod tests {
         wait_until("the first lookup", || !router.asked.lock().unwrap().is_empty());
         thread::sleep(Duration::from_millis(500));
         assert!(router.announced.lock().unwrap().is_empty(), "having found nobody to tell, the node lets the torrent go, and does not announce it");
+        node.stop();
+    }
+
+    #[test]
+    fn a_lookup_is_given_the_whole_budget_alone_and_a_share_with_company_but_never_under_a_fifth() {
+        let budget = Duration::from_secs(10);
+        assert_eq!(lookup_deadline(budget, 0), budget, "no torrents is treated as one");
+        assert_eq!(lookup_deadline(budget, 1), budget);
+        assert_eq!(lookup_deadline(budget, 2), Duration::from_secs(5));
+        assert_eq!(lookup_deadline(budget, 4), Duration::from_millis(2500));
+        assert_eq!(lookup_deadline(budget, 5), Duration::from_secs(2));
+        assert_eq!(lookup_deadline(budget, 500), Duration::from_secs(2), "the floor");
+    }
+
+    #[test]
+    fn a_network_that_does_not_answer_holds_up_every_torrent_for_the_budget_in_all_not_each() {
+        // Six torrents against a node that never answers a lookup. With the whole budget each (2 s here), the last would
+        // be looked up after ten seconds; with a share each, within about one budget's time.
+        let router = FakeNode::start_silent_on_peers();
+        let budget = Duration::from_secs(2);
+        let transport = UdpTransport::bind(0).unwrap();
+        let port = transport.local_port();
+        let node = Arc::new(DhtNode::start_every(transport, port, vec![router.router()], false, Duration::from_secs(3600), budget).unwrap());
+        let started = Instant::now();
+        let services: Vec<_> = (1..=6u8).map(|i| node.add_torrent([i; 20], Arc::new(AtomicU16::new(0)))).collect();
+
+        wait_until("every torrent to have been looked up once", || router.asked.lock().unwrap().iter().collect::<std::collections::HashSet<_>>().len() == 6);
+
+        assert!(started.elapsed() < Duration::from_secs(6), "took {:?}: a turn each of the whole budget would take {:?}", started.elapsed(), budget * 5);
+        drop(services);
         node.stop();
     }
 }
