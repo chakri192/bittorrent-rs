@@ -8,7 +8,7 @@ someone about to change the code.
 
 ```
                  bin/download.rs                         bin/create_torrent.rs
-        flags, config file, signals, dashboard                  create.rs
+   flags, config, signals, dashboard, --json                    create.rs
                         │
                         ▼
    ┌──────────────── session/ ─────────────────────────────────────────┐
@@ -19,9 +19,10 @@ someone about to change the code.
    └───┬───────────────┬───────────────────┬────────────────┬──────────┘
        │               │                   │                │
        ▼               ▼                   ▼                ▼
-  downloader/       tracker/ +          dht/             seeder.rs
-  one worker        tracker_discovery   Kademlia node    inbound peers
-  thread per peer   HTTP·HTTPS·UDP      (BEP 5)          + Have broadcast
+  downloader/       tracker/ +          dht/             seeder.rs + choker.rs
+  one worker        tracker_discovery   Kademlia node    inbound peers, a few
+  thread per peer   HTTP·HTTPS·UDP      (BEP 5)          unchoked at a time,
+                    (redirects followed)                 serves the info dict
        │
        ▼
   peer/  handshake · wire messages · extensions (BEP 10) · PEX (BEP 11)
@@ -45,12 +46,14 @@ behind locks.
 | orchestration | `session::run`, then seeding | it returns |
 | one per peer | `downloader::worker::run_worker` | queue empty, connection fails, or interrupted |
 | one per web seed | `webseed::run_web_worker` | queue empty or told to stop |
-| seeder accept + one per inbound peer | `seeder` | `SeederHandle::stop` |
+| seeder accept, one per inbound peer, and one for the choking rounds | `seeder` | `SeederHandle::stop` |
 | DHT | `dht::service` | `Services::shutdown` |
 
-**Shared state**, all small: the `WorkQueue` (pieces still to fetch, and how
-common each is), the `HaveMap` (pieces verified on disk, read by the seeder),
-and the `RateLimiter`s. Disk needs no lock of its own: each verified piece is
+**Shared state**, all small: the `WorkQueue` (pieces still to fetch, how
+common each is, and blocks left over from peers that failed part-way), the
+`HaveMap` (pieces verified on disk, read by the seeder), the `RateLimiter`s,
+the `Choker` (who the seeder serves) and the `PeerRegistry` (what each
+connected peer is doing, for the dashboard). Disk needs no lock of its own: each verified piece is
 written at its own offset in the files, and no two workers hold the same
 piece except in endgame, where the copies are identical. Locks come from
 `sync::lock`, which carries on if another thread panicked while holding it:
@@ -77,11 +80,22 @@ return at once. A second signal skips all of this and exits with status 130.
    peers, re-announce when due, publish a snapshot to the dashboard.
 4. **In a worker** (`downloader::worker`): connect, handshake, exchange
    extended handshakes, express interest, wait to be unchoked. Then loop:
-   take the rarest piece this peer has (`WorkQueue::take_for`), request its
-   blocks with a pipeline sized to the peer's speed (`pipeline`), assemble
-   them (`PieceAssembler`), **check the SHA-1**, write to disk, report.
+   take the rarest piece this peer has (`WorkQueue::take_for`; or the lowest
+   with `--sequential`, preferred files first), request its blocks with a
+   pipeline sized to the peer's speed (`pipeline`), assemble them
+   (`PieceAssembler`), **check the SHA-1**, write to disk, report. A choke
+   mid-piece is waited out and the missing blocks asked for again; a
+   connection that fails leaves its blocks in the queue for the next peer.
 5. **Finish.** Announce `completed`, seed if asked (until `--seed-ratio`,
    `--seed-time` or a signal), announce `stopped`, shut the services down.
+   A disk that cannot be written to ends the run at any point, saying so.
+
+**The seeder** runs for the whole session, not only after completion: it
+serves what has been verified so far, tells connected peers of each new piece
+(`Have`), serves at most four peers at a time chosen by `choker` (three by
+how much they took, one optimistic), and offers the info dictionary to peers
+that have only a magnet link (BEP 9), saying `upload_only` once it has every
+piece (BEP 21).
 
 Piece data reaches disk only after its hash has matched. Everything before
 that is untrusted bytes in a buffer.
@@ -97,8 +111,13 @@ that is untrusted bytes in a buffer.
   hostile torrent cannot write outside the download directory. The e2e
   harness has a scenario that would notice a file landing anywhere else.
 - **Time is injected** where logic depends on it (`Instant` parameters in
-  `PeerPool`, `RateLimiter`, `Throughput`, `SeedLimits`), so tests need not
-  sleep.
+  `PeerPool`, `RateLimiter`, `Throughput`, `SeedLimits`, `PeerRegistry`), so
+  tests need not sleep.
+- **Anything that waits can be told to stop.** Blocked reads by shutting the
+  socket (`Interrupt`), web-seed fetches by polling from a thread of their
+  own, rate-limit sleeps in tenth-of-a-second slices.
+- **Machine-readable output is a separate mode, not a format of the log**:
+  `--json` writes flat JSON objects (`json.rs`) and nothing else to stdout.
 - **Network sits behind traits** where a real network cannot be used in
   tests: `dht::Transport`, `session::TrackerClient`, `ProgressSink`.
 
@@ -126,7 +145,10 @@ Four layers, each catching what the one below cannot.
 ## Where the simplifications are
 
 Deliberate, and the README's Limitations lists them: one thread per
-connection (fine for tens of peers, not thousands); the seeder unchokes every
-interested peer up to a connection cap rather than running tit-for-tat;
+connection (fine for tens of peers, not thousands); choking is only the
+seeding half of tit-for-tat, since inbound peers are never downloaded from;
 trackers are asked concurrently rather than by BEP 12 tier; a piece
-interrupted part-way starts again; no encryption or uTP.
+interrupted part-way is handed to the next peer within a run but not saved
+across runs; one piece is downloaded at a time per connection, so a request
+pipeline drains at each piece boundary; no encryption, uTP, BEP 6, BEP 14 or
+BEP 32, and no BEP 52 (v2) torrents.
