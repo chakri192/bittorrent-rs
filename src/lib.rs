@@ -11,6 +11,7 @@ pub mod config;
 pub mod create;
 pub mod dht;
 pub mod downloader;
+pub mod json;
 #[cfg(test)]
 mod fuzz;
 #[cfg(test)]

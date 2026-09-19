@@ -168,6 +168,10 @@ impl<'a> Session<'a> {
         for result in self.workers.shutdown() {
             self.progress.absorb(result, |m| sink.log(m));
         }
+        // What the loop last published predates the pieces absorbed above,
+        // so without this the final numbers shown -- and, in `--json`, the
+        // last progress event -- describe a download that was not quite done.
+        self.publish();
 
         Report { complete: self.queue.is_empty(), remaining: self.queue.len(), dialed: self.pool.dialed(), elapsed: self.run_start.elapsed(), bytes_this_run: self.progress.bytes_this_run() }
     }
@@ -249,7 +253,9 @@ impl<'a> Session<'a> {
         let remaining = self.display_total.saturating_sub(done);
         let eta_secs = if self.rates.down_rate() > 1.0 { Some((remaining as f64 / self.rates.down_rate()) as u64) } else { None };
         let web_active = self.workers.web_active();
-        let status = if self.queue.in_endgame() {
+        let status = if self.queue.is_empty() {
+            "complete"
+        } else if self.queue.in_endgame() {
             "endgame"
         } else if self.progress.bytes_this_run() > 0 || web_active {
             "downloading"
@@ -474,6 +480,23 @@ mod tests {
             assert!(sink.lines.lock().unwrap().iter().any(|l| l.starts_with(&format!("piece {} verified (", piece))), "piece {} was reported", piece);
         }
         assert!(sink.snapshots.lock().unwrap().iter().any(|snap| snap.status == "downloading"), "and the dashboard saw it downloading");
+    }
+
+    #[test]
+    fn the_last_thing_a_finished_run_publishes_is_that_it_is_finished() {
+        let dir = tmp_dir("final-snapshot");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let mut s = session(&sink, &services, &dir, &[fake_peer(true)], None);
+
+        s.run(&AtomicBool::new(false));
+
+        let last = sink.last_snapshot();
+        assert_eq!((last.verified, last.total_pieces), (PIECES, PIECES), "every piece counted, not the count as it stood a tick earlier");
+        assert_eq!(last.done_bytes, data().len() as u64);
+        assert!(!last.endgame, "and no longer in endgame");
+        assert_eq!(last.status, "complete");
+        assert_eq!(last.fraction(), 1.0);
     }
 
     #[test]

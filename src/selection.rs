@@ -119,6 +119,25 @@ pub fn format_list(name: &str, files: &Files, mask: &[bool]) -> String {
     out
 }
 
+/// `--list --json`: one line per file, `{"event":"file","index":1,
+/// "path":"Show/ep1.mkv","bytes":1000,"selected":true}`, with the index
+/// counted from 1 as `--files` counts.
+pub fn list_events(files: &Files, mask: &[bool]) -> Vec<String> {
+    files
+        .iter()
+        .enumerate()
+        .map(|(idx, (parts, len))| {
+            crate::json::Object::new()
+                .string("event", "file")
+                .uint("index", idx as u64 + 1)
+                .string("path", &file_path(parts))
+                .uint("bytes", (*len).max(0) as u64)
+                .boolean("selected", mask.get(idx).copied().unwrap_or(false))
+                .finish()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +229,27 @@ mod tests {
         assert!(listing.contains("[x] 1"), "selected file marked and numbered: {:?}", listing);
         assert!(listing.contains("[ ] 2"), "unselected file blank-marked: {:?}", listing);
         assert!(listing.contains("Show/ep1.mkv"));
+    }
+
+    #[test]
+    fn list_events_describe_each_file_and_whether_it_is_selected() {
+        let events = list_events(&files(), &[true, false, true]);
+
+        assert_eq!(events.len(), 3);
+        let read: Vec<_> = events.iter().map(|e| crate::json::parse_object(e).unwrap()).collect();
+        assert_eq!(read[0]["event"].as_str(), Some("file"));
+        assert_eq!((read[0]["index"].as_f64(), read[2]["index"].as_f64()), (Some(1.0), Some(3.0)), "counted from 1, as --files counts");
+        assert_eq!(read[1]["path"].as_str(), Some("Show/ep2.mkv"));
+        assert_eq!((read[0]["bytes"].as_f64(), read[2]["bytes"].as_f64()), (Some(1000.0), Some(50.0)));
+        assert_eq!((read[0]["selected"].as_bool(), read[1]["selected"].as_bool(), read[2]["selected"].as_bool()), (Some(true), Some(false), Some(true)));
+    }
+
+    #[test]
+    fn a_short_mask_leaves_the_rest_unselected_and_odd_names_are_escaped() {
+        let files = vec![(vec!["we\"ird".to_string(), "name\n.bin".to_string()], 5i64)];
+        let events = list_events(&files, &[]);
+        let read = crate::json::parse_object(&events[0]).unwrap();
+        assert_eq!(read["selected"].as_bool(), Some(false));
+        assert_eq!(read["path"].as_str(), Some("we\"ird/name\n.bin"));
     }
 }

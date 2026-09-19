@@ -66,6 +66,8 @@ struct Args {
     sequential: bool,
     /// Where to write the torrent's `.torrent` file, if asked.
     save_torrent: Option<PathBuf>,
+    /// Write status as JSON lines on stdout instead of a dashboard.
+    json: bool,
     /// Bytes per second limits on download and upload, if set.
     max_down: Option<u64>,
     max_up: Option<u64>,
@@ -135,6 +137,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
     let mut recheck = false;
     let mut sequential = false;
     let mut save_torrent = None;
+    let mut json = false;
     let mut max_down = None;
     let mut max_up = None;
     let mut verbosity = Verbosity::Normal;
@@ -177,6 +180,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
             }
             "--recheck" => recheck = true,
             "--sequential" => sequential = true,
+            "--json" => json = true,
             "--save-torrent" => save_torrent = Some(PathBuf::from(argv.next().ok_or("--save-torrent requires a file name")?)),
             "--max-down" => {
                 let v = argv.next().ok_or("--max-down requires a rate such as 500K or 2M")?;
@@ -258,6 +262,10 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
         }
     }
 
+    if json && verbosity == Verbosity::Quiet {
+        return Err("--json and --quiet are mutually exclusive".to_string());
+    }
+
     // A seeding limit is a request to seed.
     if seed_limits.is_set() {
         if no_seed_flag {
@@ -266,11 +274,11 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
         seed = true;
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, sequential, save_torrent, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
+    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, sequential, save_torrent, json, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--sequential] [--save-torrent FILE] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--sequential] [--save-torrent FILE] [--json] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -315,7 +323,8 @@ fn main() -> ExitCode {
     ui.set_log_path(log_path_display);
 
     // `--list` is a quick print-and-exit; never spin up the dashboard for it.
-    let interactive = !quiet && !args.no_tui && !args.list && std::io::stdout().is_terminal();
+    let json = args.json;
+    let interactive = !quiet && !json && !args.no_tui && !args.list && std::io::stdout().is_terminal();
     let stop = Arc::new(AtomicBool::new(false));
     // Ctrl-C and `kill` wind the client down like the dashboard's `q`, even
     // with no terminal: the port mapping is removed, not left on the router.
@@ -330,6 +339,8 @@ fn main() -> ExitCode {
     let shared = ui.shared();
     let user_quit = if quiet {
         tui::run_silent(&shared, &stop)
+    } else if json {
+        tui::run_json(&shared, &stop)
     } else if interactive {
         tui::run(&shared, &stop)
     } else {
@@ -340,14 +351,15 @@ fn main() -> ExitCode {
     let result = orchestration.join().unwrap_or_else(|_| Err("download thread panicked".to_string()));
 
     if user_quit || bittorrent_rs::signal::received() {
-        if !quiet {
+        if !quiet && !json {
             println!("stopped \u{2014} rerun the same command to resume.");
         }
         return ExitCode::SUCCESS;
     }
     match result {
         Ok(summary) => {
-            if !quiet {
+            // In JSON mode the `done` event has already said it.
+            if !quiet && !json {
                 println!("{}", summary);
             }
             ExitCode::SUCCESS
@@ -412,6 +424,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     }
 
     ui.set_title(torrent.name.clone());
+    ui.set_info_hash(torrent::info_hash_hex(&torrent.info_hash));
     ui.log(format!("torrent: {} ({}, {} pieces)", torrent.name, ui::format_bytes(torrent.total_length()), torrent.pieces.len()));
 
     // File selection (--only / --files). `--list` prints the file table
@@ -420,7 +433,14 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     if args.list {
         let listing = bittorrent_rs::selection::format_list(&torrent.name, &torrent.files, &mask);
         services.shutdown();
-        ui.finish(Ok(listing.clone()));
+        if args.json {
+            for line in bittorrent_rs::selection::list_events(&torrent.files, &mask) {
+                ui.event(line);
+            }
+            ui.finish(Ok(format!("{} file(s)", torrent.files.len())));
+        } else {
+            ui.finish(Ok(listing.clone()));
+        }
         return Ok(listing);
     }
     let options = Options {
@@ -517,6 +537,15 @@ mod tests {
 
     fn cfg_from(toml: &str) -> Config {
         toml::from_str(toml).unwrap()
+    }
+
+    #[test]
+    fn json_is_off_unless_asked_for_and_refuses_quiet() {
+        assert!(!parse(&Config::default(), &["x"]).unwrap().json);
+        assert!(parse(&Config::default(), &["x", "--json"]).unwrap().json);
+        assert!(parse(&Config::default(), &["x", "--json", "--verbose"]).unwrap().json);
+        assert!(parse(&Config::default(), &["x", "--json", "--quiet"]).err().unwrap().contains("mutually exclusive"));
+        assert!(parse(&Config::default(), &["x", "--quiet", "--json"]).err().unwrap().contains("mutually exclusive"));
     }
 
     #[test]

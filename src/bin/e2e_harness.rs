@@ -87,6 +87,9 @@ enum Kind {
     /// SIGTERM mid-download, with the only peer silent: a prompt, clean exit
     /// that keeps the resume file.
     SigtermMidDownload,
+    /// `--json`: stdout is nothing but JSON events, in a sensible order,
+    /// for a download, a failure, a `--list` and an interruption.
+    JsonEvents,
     /// `create_torrent` makes what an independently written builder makes,
     /// and the client downloads from it.
     CreateTorrent,
@@ -131,6 +134,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "limit-upload", kind: Kind::LimitUpload },
     Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
     Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
+    Scenario { name: "json-events", kind: Kind::JsonEvents },
     Scenario { name: "create-torrent", kind: Kind::CreateTorrent },
     Scenario { name: "partial-peers", kind: Kind::PartialPeers },
     Scenario { name: "have-broadcast", kind: Kind::HaveBroadcast },
@@ -166,6 +170,7 @@ fn main() {
             Kind::LimitUpload => run_limit_upload(scenario.name),
             Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
             Kind::SigtermMidDownload => run_sigterm_mid_download(scenario.name),
+            Kind::JsonEvents => run_json_events(scenario.name),
             Kind::CreateTorrent => run_create_torrent(scenario.name),
             Kind::PartialPeers => run_partial_peers(scenario.name),
             Kind::HaveBroadcast => run_have_broadcast(scenario.name),
@@ -1919,4 +1924,100 @@ fn run_partial_peers(name: &str) -> Result<String, String> {
     let served_by_first = swarm.logs[0].lock().unwrap().served.clone();
     let served_by_second = swarm.logs[1].lock().unwrap().served.clone();
     Ok(format!("two partial peers ({:?} and {:?}) together supplied the whole file: {} pieces from the first, {} from the second, none requested that a peer lacked", first, second, served_by_first.len(), served_by_second.len()))
+}
+
+/// Every line of `stdout` as a flat JSON object, or the first line that is
+/// not one.
+fn json_lines(stdout: &str) -> Result<Vec<std::collections::BTreeMap<String, bittorrent_rs::json::Value>>, String> {
+    stdout.lines().map(|line| bittorrent_rs::json::parse_object(line).map_err(|e| format!("stdout has a line that is not JSON ({}): {:?}", e, line))).collect()
+}
+
+fn event_kinds(events: &[std::collections::BTreeMap<String, bittorrent_rs::json::Value>]) -> Vec<String> {
+    events.iter().map(|e| e.get("event").and_then(|v| v.as_str()).unwrap_or("?").to_string()).collect()
+}
+
+/// `--json` writes JSON lines and nothing else to stdout, whatever happens.
+fn run_json_events(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir) = (dir.join("e2e.torrent"), dir.join("out"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    // 1. A download that succeeds.
+    let output = client_command(&torrent, &out_dir, &dir.join("client.log"), 1)
+        .arg("--no-dht")
+        .arg("--json")
+        .output()
+        .map_err(|e| format!("running the client: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("--json download exited with {:?}: {}", output.status.code(), String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    let events = json_lines(&String::from_utf8_lossy(&output.stdout))?;
+    let kinds = event_kinds(&events);
+    if kinds.first().map(String::as_str) != Some("torrent") || kinds.last().map(String::as_str) != Some("done") || kinds.iter().filter(|k| *k == "torrent" || *k == "done").count() != 2 {
+        return Err(format!("expected torrent first and done last, once each; got {:?}", kinds));
+    }
+    if let Some(odd) = kinds.iter().find(|k| !["torrent", "progress", "done"].contains(&k.as_str())) {
+        return Err(format!("unexpected event {:?} in {:?}", odd, kinds));
+    }
+    let torrent_event = &events[0];
+    let want_hash = bittorrent_rs::torrent::info_hash_hex(&fx.info_hash);
+    if torrent_event["info_hash"].as_str() != Some(want_hash.as_str()) || torrent_event["pieces"].as_f64() != Some(fx.piece_count as f64) || torrent_event["total_bytes"].as_f64() != Some(fx.data.len() as f64) {
+        return Err(format!("the torrent event is wrong: {:?}", torrent_event));
+    }
+    let last_progress = events.iter().rev().find(|e| e["event"].as_str() == Some("progress")).ok_or("no progress event")?;
+    if last_progress["verified_pieces"].as_f64() != Some(fx.piece_count as f64) || last_progress["percent"].as_f64() != Some(100.0) {
+        return Err(format!("the last progress event does not show a finished download: {:?}", last_progress));
+    }
+    check_downloaded(&fx, &out_dir)?;
+
+    // 2. A failure: a torrent that is not there. The error is an event, and stdout has nothing else.
+    let failed = client_command(dir.join("missing.torrent"), &out_dir, &dir.join("client2.log"), 1).arg("--json").output().map_err(|e| format!("running the client: {}", e))?;
+    let failure_events = json_lines(&String::from_utf8_lossy(&failed.stdout))?;
+    if failed.status.success() || event_kinds(&failure_events) != ["error"] {
+        return Err(format!("a missing torrent should exit non-zero with a single error event; exit {:?}, events {:?}", failed.status.code(), event_kinds(&failure_events)));
+    }
+    let message = failure_events[0]["message"].as_str().unwrap_or("");
+    if !message.contains("missing.torrent") {
+        return Err(format!("the error does not name the file: {:?}", message));
+    }
+
+    // 3. --list: a file event each, and done.
+    let multi = Fixture::build_paths("pack", &[(vec!["a.bin"], pattern(700, 1)), (vec!["sub", "we\"ird.bin"], pattern(900, 2))], 256, false, true);
+    let multi_torrent = dir.join("multi.torrent");
+    fs::write(&multi_torrent, multi.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let listed = client_command(&multi_torrent, &out_dir, &dir.join("client3.log"), 1).args(["--no-dht", "--json", "--list", "--only", "ird"]).output().map_err(|e| format!("running the client: {}", e))?;
+    let list_events = json_lines(&String::from_utf8_lossy(&listed.stdout))?;
+    if !listed.status.success() || event_kinds(&list_events) != ["file", "file", "done"] {
+        return Err(format!("--list --json should give two file events then done; exit {:?}, events {:?}", listed.status.code(), event_kinds(&list_events)));
+    }
+    if list_events[0]["path"].as_str() != Some("a.bin") || list_events[0]["selected"].as_bool() != Some(false) || list_events[1]["path"].as_str() != Some("sub/we\"ird.bin") || list_events[1]["selected"].as_bool() != Some(true) || list_events[1]["bytes"].as_f64() != Some(900.0) {
+        return Err(format!("the file events are wrong: {:?}", list_events));
+    }
+
+    // 4. Interrupted while seeding: the last event is `stopped`.
+    let seed_out = dir.join("seed-out");
+    let seed_log = dir.join("seed.log");
+    let child = client_command(&torrent, &seed_out, &seed_log, 1)
+        .args(["--no-dht", "--json", "--seed", "--port", "0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&seed_log, "seeding e2e.bin on port", Duration::from_secs(20), &mut client.0)?;
+    send_signal(&client.0, "INT")?;
+    let mut stdout = String::new();
+    if let Some(mut pipe) = client.0.stdout.take() {
+        pipe.read_to_string(&mut stdout).map_err(|e| e.to_string())?;
+    }
+    let status = wait_or_kill(&mut client.0, Duration::from_secs(10))?;
+    let seed_events = json_lines(&stdout)?;
+    let seed_kinds = event_kinds(&seed_events);
+    if status.code() != Some(0) || seed_kinds.last().map(String::as_str) != Some("stopped") || seed_kinds.iter().any(|k| k == "done" || k == "error") {
+        return Err(format!("an interrupted --json run should exit 0 ending in a stopped event; exit {:?}, events {:?}", status.code(), seed_kinds));
+    }
+
+    Ok(format!("--json: {} events for a download (torrent, progress, done), a lone error for a missing torrent, file events for --list, and a final stopped after SIGINT; stdout was JSON throughout", events.len()))
 }
