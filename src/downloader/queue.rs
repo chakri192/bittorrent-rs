@@ -19,9 +19,36 @@
 //! crawls" tail. First verified copy wins: `mark_done` retires the piece
 //! everywhere, and late duplicate downloads abandon via `is_done`.
 
-use crate::downloader::piece_assembler::PieceWork;
+use crate::downloader::piece_assembler::{PartialPiece, PieceWork};
 use std::collections::{HashMap, HashSet};
+use crate::sync::lock;
 use std::sync::Mutex;
+
+/// Which pending piece comes out first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Order {
+    /// The piece fewest peers have (`--sequential` off). Keeps pieces from
+    /// becoming unavailable, and gets the most out of a swarm.
+    #[default]
+    RarestFirst,
+    /// The lowest index, whatever its rarity (`--sequential`), so a file
+    /// can be played or inspected while it downloads. Costs the swarm
+    /// health rarest-first buys: pieces only one peer has are fetched
+    /// only when their turn comes.
+    Sequential,
+}
+
+/// What [`WorkQueue::take_for`] found for a peer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Take {
+    /// A piece to download from this peer.
+    Piece(PieceWork),
+    /// Pieces remain, but this peer has none of them (yet): wait for it to
+    /// announce more, or let it go.
+    NothingForThisPeer,
+    /// Every piece is done.
+    Done,
+}
 
 struct Inner {
     /// Not yet done, not currently claimed by any worker.
@@ -31,7 +58,15 @@ struct Inner {
     claimed: HashMap<u32, PieceWork>,
     /// Verified and written to disk.
     done: HashSet<u32>,
+    /// Blocks of pieces whose connection failed part-way, for the next
+    /// connection to start from. Bounded by [`MAX_STASHED_BYTES`].
+    partial: HashMap<u32, PartialPiece>,
 }
+
+/// The most memory the queue keeps in partly downloaded pieces. Without a
+/// bound, peers that keep failing part-way through different pieces could
+/// leave a good part of the torrent held in memory.
+pub const MAX_STASHED_BYTES: usize = 64 << 20;
 
 pub struct WorkQueue {
     inner: Mutex<Inner>,
@@ -43,6 +78,9 @@ pub struct WorkQueue {
     /// than it might currently be is a reasonable simplification for a
     /// downloader that doesn't track per-peer liveness at this layer.
     availability: Mutex<Vec<u32>>,
+    order: Order,
+    /// Pieces to hand out before any other (`--prefer`).
+    preferred: HashSet<u32>,
 }
 
 impl WorkQueue {
@@ -51,9 +89,24 @@ impl WorkQueue {
     /// present in `pieces` (in practice: `torrent.pieces.len()`).
     pub fn new(pieces: Vec<PieceWork>, total_pieces: usize) -> Self {
         WorkQueue {
-            inner: Mutex::new(Inner { pending: pieces, claimed: HashMap::new(), done: HashSet::new() }),
+            inner: Mutex::new(Inner { pending: pieces, claimed: HashMap::new(), done: HashSet::new(), partial: HashMap::new() }),
             availability: Mutex::new(vec![0u32; total_pieces]),
+            order: Order::default(),
+            preferred: HashSet::new(),
         }
+    }
+
+    /// Makes the pieces in `preferred` come out before all others, in
+    /// whichever order is in force among themselves.
+    pub fn with_preferred(mut self, preferred: HashSet<u32>) -> Self {
+        self.preferred = preferred;
+        self
+    }
+
+    /// Chooses which pending piece comes out first (rarest by default).
+    pub fn with_order(mut self, order: Order) -> Self {
+        self.order = order;
+        self
     }
 
     /// Pops the rarest pending piece (ties broken arbitrarily) and marks
@@ -61,26 +114,70 @@ impl WorkQueue {
     /// returns a **duplicate** of the rarest claimed piece (endgame).
     /// Returns `None` only when every piece is done.
     ///
-    /// Workers that can't service the piece they popped (peer doesn't
-    /// have it, download failed) call `push_back` to return it.
+    /// For a source that has every piece (a web seed). A peer that may
+    /// lack some should use [`take_for`](Self::take_for).
     pub fn pop(&self) -> Option<PieceWork> {
-        let mut inner = self.inner.lock().unwrap();
-        let availability = self.availability.lock().unwrap();
-        let rarity = |w: &PieceWork| availability.get(w.index as usize).copied().unwrap_or(0);
+        match self.take_for(|_| true) {
+            Take::Piece(work) => Some(work),
+            Take::NothingForThisPeer | Take::Done => None,
+        }
+    }
 
-        if !inner.pending.is_empty() {
-            let rarest_idx = inner.pending.iter().enumerate().min_by_key(|(_, w)| rarity(w)).map(|(i, _)| i)?;
+    /// Hands out the rarest pending piece that `has` says this peer has,
+    /// and marks it claimed. If nothing pending is on offer from this peer
+    /// but some pieces are claimed, a duplicate of the rarest claimed one it
+    /// has (endgame).
+    ///
+    /// The choice has to be made among the pieces the peer has. Rarity says
+    /// which pieces matter most, and by definition few peers have the
+    /// rarest; a worker given the rarest piece regardless would find its
+    /// peer lacks it, and a peer holding only common pieces would sit idle
+    /// for as long as the rare ones were unclaimed.
+    ///
+    /// Workers that can't finish the piece they were given (the download
+    /// failed) call `push_back` to return it.
+    pub fn take_for(&self, has: impl Fn(u32) -> bool) -> Take {
+        let mut inner = lock(&self.inner);
+        let availability = lock(&self.availability);
+        // Lower comes first. The index breaks ties, so the choice is
+        // deterministic rather than an accident of the list's order.
+        let order = self.order;
+        let preferred = &self.preferred;
+        let rank = |w: &PieceWork| {
+            let later = u8::from(!preferred.contains(&w.index));
+            match order {
+                Order::RarestFirst => (later, availability.get(w.index as usize).copied().unwrap_or(0), w.index),
+                Order::Sequential => (later, 0, w.index),
+            }
+        };
+
+        let first_offered = inner.pending.iter().enumerate().filter(|(_, w)| has(w.index)).min_by_key(|(_, w)| rank(w)).map(|(i, _)| i);
+        if let Some(index) = first_offered {
             // swap_remove is O(1) (vs. a true rarest-first-preserving
             // remove being O(n) regardless of representation) -- fine
-            // since pop makes no ordering promise among equal-rarity
+            // since there is no ordering promise among equal-rarity
             // pieces to begin with.
-            let work = inner.pending.swap_remove(rarest_idx);
+            let work = inner.pending.swap_remove(index);
             inner.claimed.insert(work.index, work.clone());
-            return Some(work);
+            return Take::Piece(work);
         }
 
-        // Endgame: duplicate-assign a still-unfinished claimed piece.
-        inner.claimed.values().min_by_key(|w| rarity(w)).cloned()
+        // Endgame: nothing is pending at all, so duplicate-assign a
+        // still-unfinished claimed piece this peer has. Only then: while
+        // pieces remain pending that this peer lacks, letting it duplicate
+        // claimed ones would have every partial peer in the swarm
+        // downloading the same few pieces.
+        if inner.pending.is_empty() {
+            if let Some(work) = inner.claimed.values().filter(|w| has(w.index)).min_by_key(|w| rank(w)).cloned() {
+                return Take::Piece(work);
+            }
+        }
+
+        if inner.pending.is_empty() && inner.claimed.is_empty() {
+            Take::Done
+        } else {
+            Take::NothingForThisPeer
+        }
     }
 
     /// Returns a piece to the queue after a failed attempt. No-ops if the
@@ -89,7 +186,7 @@ impl WorkQueue {
     /// piece, that's fine: it effectively continues as an endgame
     /// duplicate, and whichever copy verifies first retires the piece.
     pub fn push_back(&self, work: PieceWork) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock(&self.inner);
         if inner.done.contains(&work.index) {
             return;
         }
@@ -99,14 +196,45 @@ impl WorkQueue {
         }
     }
 
+    /// Keeps the blocks of a piece a connection had received when it failed,
+    /// for whichever connection takes the piece next (see
+    /// [`take_partial`](Self::take_partial)). Ignored if the piece is
+    /// already done, or if keeping it would go over [`MAX_STASHED_BYTES`]
+    /// (unless it replaces a smaller stash of the same piece). Where there
+    /// is already a stash for the piece, the one with more blocks is kept.
+    pub fn stash_partial(&self, index: u32, partial: PartialPiece) {
+        let mut inner = lock(&self.inner);
+        if inner.done.contains(&index) {
+            return;
+        }
+        let held: usize = inner.partial.iter().filter(|(&i, _)| i != index).map(|(_, p)| p.size()).sum();
+        if held + partial.size() > MAX_STASHED_BYTES {
+            return;
+        }
+        match inner.partial.get(&index) {
+            Some(existing) if existing.blocks_held() >= partial.blocks_held() => {}
+            _ => {
+                inner.partial.insert(index, partial);
+            }
+        }
+    }
+
+    /// Takes the stashed blocks of `index`, if any. Whoever takes them owns
+    /// them: a second caller gets nothing, so two connections never
+    /// resume the same stash.
+    pub fn take_partial(&self, index: u32) -> Option<PartialPiece> {
+        lock(&self.inner).partial.remove(&index)
+    }
+
     /// Retires a piece everywhere after it has been verified and written.
     /// Returns `true` if this call was the first to mark it done (callers
     /// use this to avoid double-counting duplicate endgame completions).
     pub fn mark_done(&self, index: u32) -> bool {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock(&self.inner);
         let newly_done = inner.done.insert(index);
         inner.claimed.remove(&index);
         inner.pending.retain(|w| w.index != index);
+        inner.partial.remove(&index);
         newly_done
     }
 
@@ -114,24 +242,24 @@ impl WorkQueue {
     /// worker. Endgame workers poll this mid-download to abandon pieces
     /// that completed elsewhere instead of wasting the peer's bandwidth.
     pub fn is_done(&self, index: u32) -> bool {
-        self.inner.lock().unwrap().done.contains(&index)
+        lock(&self.inner).done.contains(&index)
     }
 
     /// True once every piece is done (nothing pending, nothing claimed).
     pub fn is_empty(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock(&self.inner);
         inner.pending.is_empty() && inner.claimed.is_empty()
     }
 
     /// Pieces not yet done (pending + claimed).
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock(&self.inner);
         inner.pending.len() + inner.claimed.len()
     }
 
     /// True while `pop` is handing out duplicates of claimed pieces.
     pub fn in_endgame(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock(&self.inner);
         inner.pending.is_empty() && !inner.claimed.is_empty()
     }
 
@@ -139,21 +267,28 @@ impl WorkQueue {
     /// indices (a malformed or lying peer) are silently ignored rather
     /// than panicking -- this is untrusted network input.
     pub fn note_have(&self, piece_index: u32) {
-        if let Ok(mut availability) = self.availability.lock() {
-            if let Some(count) = availability.get_mut(piece_index as usize) {
-                *count += 1;
-            }
+        let mut availability = lock(&self.availability);
+        if let Some(count) = availability.get_mut(piece_index as usize) {
+            *count += 1;
         }
     }
 
     /// Records an entire bitfield at once (bit `i` = piece `i`, per BEP 3
     /// `bitfield` semantics already decoded by `PeerState`).
     pub fn note_bitfield(&self, have: &[bool]) {
-        for (i, &has_it) in have.iter().enumerate() {
+        // One lock for the lot, and only as many entries as there are
+        // pieces: a peer's bitfield can be far longer than the torrent.
+        let mut availability = lock(&self.availability);
+        for (count, &has_it) in availability.iter_mut().zip(have) {
             if has_it {
-                self.note_have(i as u32);
+                *count += 1;
             }
         }
+    }
+
+    /// How many pieces the torrent has (what the queue was built for).
+    pub fn total_pieces(&self) -> usize {
+        lock(&self.availability).len()
     }
 }
 
@@ -335,5 +470,295 @@ mod tests {
         }
         let availability = q.availability.lock().unwrap();
         assert!(availability.iter().all(|&c| c == 2), "every piece should show availability 2, got {:?}", availability);
+    }
+
+    /// A worker thread that panics while holding the queue's lock.
+    fn poison(queue: &WorkQueue) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _inner = queue.inner.lock().unwrap();
+            let _availability = queue.availability.lock().unwrap();
+            panic!("a worker died holding the queue's locks");
+        }));
+        assert!(queue.inner.is_poisoned() && queue.availability.is_poisoned(), "the setup must really poison both");
+    }
+
+    #[test]
+    fn a_worker_panicking_with_the_queue_locked_does_not_take_the_queue_down() {
+        let q = WorkQueue::new((0..3).map(|i| PieceWork { index: i, hash: [0; 20], length: 16 }).collect(), 3);
+        let claimed = q.pop().expect("a piece to claim");
+        poison(&q);
+
+        // Every operation the other workers rely on still works, and still
+        // remembers what happened before the panic.
+        q.note_have(1);
+        assert_eq!(q.len(), 3, "nothing was lost: 2 pending and the claimed one");
+        q.push_back(claimed.clone());
+        assert!(q.mark_done(claimed.index));
+        assert!(q.is_done(claimed.index));
+        assert!(q.pop().is_some());
+        assert!(!q.is_empty());
+        assert!(!q.in_endgame());
+    }
+
+    #[test]
+    fn a_bitfield_longer_than_the_torrent_counts_only_real_pieces() {
+        let q = WorkQueue::new((0..3).map(|i| PieceWork { index: i, hash: [0; 20], length: 16 }).collect(), 3);
+        assert_eq!(q.total_pieces(), 3);
+        q.note_bitfield(&vec![true; 1_000_000]); // far more entries than pieces
+        assert_eq!(q.total_pieces(), 3, "nothing grew");
+        // Every real piece was counted once, so none is rarer than another.
+        let popped: Vec<u32> = std::iter::from_fn(|| q.pop()).take(3).map(|w| w.index).collect();
+        assert_eq!(popped.len(), 3);
+    }
+
+    #[test]
+    fn a_short_bitfield_counts_the_pieces_it_covers() {
+        let q = WorkQueue::new((0..4).map(|i| PieceWork { index: i, hash: [0; 20], length: 16 }).collect(), 4);
+        q.note_bitfield(&[true, false]); // piece 0 only
+        // Pieces 1, 2, 3 have no holder, so all of them come out before 0.
+        let order: Vec<u32> = std::iter::from_fn(|| q.pop()).take(4).map(|w| w.index).collect();
+        assert_eq!(order.last(), Some(&0));
+    }
+
+    // ---- take_for: choosing among what the peer has ----
+
+    fn has(set: &'static [u32]) -> impl Fn(u32) -> bool {
+        move |piece| set.contains(&piece)
+    }
+
+    fn piece_index(take: Take) -> Option<u32> {
+        match take {
+            Take::Piece(w) => Some(w.index),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn take_for_gives_the_rarest_piece_the_peer_has_not_the_rarest_overall() {
+        let q = WorkQueue::new(vec![work(0), work(1), work(2)], 3);
+        // Piece 0 is the rarest of all (nobody seen with it), then 1, then 2.
+        q.note_have(1);
+        q.note_have(2);
+        q.note_have(2);
+
+        // This peer lacks piece 0: rarest-first among 1 and 2 gives 1.
+        assert_eq!(piece_index(q.take_for(has(&[1, 2]))), Some(1));
+        assert_eq!(piece_index(q.take_for(has(&[2]))), Some(2));
+    }
+
+    #[test]
+    fn take_for_leaves_the_pieces_the_peer_lacks_for_others() {
+        let q = WorkQueue::new(vec![work(0), work(1)], 2);
+        assert_eq!(piece_index(q.take_for(has(&[1]))), Some(1));
+        assert_eq!(q.len(), 2, "piece 0 is still pending and piece 1 is claimed");
+        assert_eq!(piece_index(q.take_for(has(&[0]))), Some(0), "another peer gets the one this one lacked");
+    }
+
+    #[test]
+    fn a_peer_with_none_of_what_is_pending_is_told_so_and_nothing_changes() {
+        let q = WorkQueue::new(vec![work(0), work(1)], 2);
+
+        assert_eq!(q.take_for(has(&[7])), Take::NothingForThisPeer);
+        assert_eq!(q.take_for(|_| false), Take::NothingForThisPeer);
+
+        assert_eq!((q.len(), q.in_endgame()), (2, false), "nothing was claimed by asking");
+        assert!(piece_index(q.take_for(has(&[0, 1]))).is_some());
+    }
+
+    #[test]
+    fn done_is_reported_only_when_every_piece_is_done() {
+        let q = WorkQueue::new(vec![work(0)], 1);
+        assert_eq!(q.take_for(|_| false), Take::NothingForThisPeer, "a piece remains, even if this peer has nothing");
+        let w = q.pop().unwrap();
+        assert_eq!(q.take_for(|_| false), Take::NothingForThisPeer, "still claimed, not done");
+        q.mark_done(w.index);
+        assert_eq!(q.take_for(|_| false), Take::Done);
+        assert_eq!(q.take_for(|_| true), Take::Done);
+    }
+
+    #[test]
+    fn endgame_duplicates_go_only_to_peers_that_have_the_piece() {
+        let q = WorkQueue::new(vec![work(0), work(1)], 2);
+        q.pop();
+        q.pop(); // both claimed, nothing pending: endgame
+
+        assert_eq!(q.take_for(has(&[1])), Take::Piece(work(1)), "a peer with piece 1 duplicates piece 1");
+        assert_eq!(q.take_for(has(&[9])), Take::NothingForThisPeer, "a peer with neither gets nothing, and it is not Done");
+    }
+
+    #[test]
+    fn a_peer_lacking_the_pending_pieces_does_not_duplicate_claimed_ones() {
+        let q = WorkQueue::new(vec![work(0), work(1)], 2);
+        assert_eq!(piece_index(q.take_for(has(&[1]))), Some(1)); // piece 1 claimed, piece 0 pending
+        // Another peer has only piece 1. Piece 0 is pending, so this is not
+        // endgame, and it must not pile onto the piece already in progress.
+        assert_eq!(q.take_for(has(&[1])), Take::NothingForThisPeer);
+    }
+
+    #[test]
+    fn pop_still_serves_a_source_with_every_piece() {
+        let q = WorkQueue::new(vec![work(0), work(1)], 2);
+        assert!(q.pop().is_some() && q.pop().is_some());
+        assert!(q.pop().is_some(), "endgame duplicate");
+        q.mark_done(0);
+        q.mark_done(1);
+        assert!(q.pop().is_none());
+    }
+
+    // ---- order ----
+
+    #[test]
+    fn sequential_gives_the_lowest_index_however_rare_the_others_are() {
+        let q = WorkQueue::new(vec![work(2), work(0), work(1)], 3).with_order(Order::Sequential);
+        // Piece 2 is the rarest and piece 0 the commonest.
+        q.note_have(0);
+        q.note_have(0);
+        q.note_have(1);
+
+        let order: Vec<u32> = std::iter::from_fn(|| piece_index(q.take_for(|_| true))).take(3).collect();
+
+        assert_eq!(order, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn sequential_takes_the_lowest_index_the_peer_has() {
+        let q = WorkQueue::new(vec![work(0), work(1), work(2)], 3).with_order(Order::Sequential);
+        assert_eq!(piece_index(q.take_for(has(&[1, 2]))), Some(1), "piece 0 is not on offer");
+        assert_eq!(piece_index(q.take_for(has(&[0, 1, 2]))), Some(0));
+    }
+
+    #[test]
+    fn sequential_duplicates_the_lowest_claimed_piece_in_endgame() {
+        let q = WorkQueue::new(vec![work(0), work(1), work(2)], 3).with_order(Order::Sequential);
+        for _ in 0..3 {
+            q.pop();
+        }
+        assert_eq!(q.take_for(|_| true), Take::Piece(work(0)));
+    }
+
+    #[test]
+    fn rarest_first_is_the_default_and_ties_go_to_the_lowest_index() {
+        let q = WorkQueue::new(vec![work(2), work(0), work(1), work(3)], 4);
+        q.note_have(0);
+        q.note_have(1);
+        // 2 and 3 are equally rare, and rarer than 0 and 1.
+        let order: Vec<u32> = std::iter::from_fn(|| piece_index(q.take_for(|_| true))).take(4).collect();
+        assert_eq!(order, vec![2, 3, 0, 1], "rarity first, then index, however the list was arranged");
+    }
+
+    // ---- partly downloaded pieces ----
+
+    fn partial_of(index: u32, blocks: u32, length: u32) -> PartialPiece {
+        let mut a = crate::downloader::piece_assembler::PieceAssembler::new(PieceWork { index, hash: [0; 20], length });
+        for n in 0..blocks {
+            let begin = n * crate::downloader::piece_assembler::BLOCK_SIZE;
+            let len = (length - begin).min(crate::downloader::piece_assembler::BLOCK_SIZE) as usize;
+            a.record_block(begin, &vec![n as u8; len]).unwrap();
+        }
+        a.into_partial().expect("at least one block")
+    }
+
+    const PIECE: u32 = 4 * 16384;
+
+    #[test]
+    fn a_stashed_partial_is_taken_once_by_whoever_asks_first() {
+        let q = WorkQueue::new(vec![work(0), work(1)], 2);
+        q.stash_partial(1, partial_of(1, 2, PIECE));
+
+        assert!(q.take_partial(0).is_none(), "another piece's");
+        let got = q.take_partial(1).expect("the stash");
+        assert_eq!(got.blocks_held(), 2);
+        assert!(q.take_partial(1).is_none(), "gone: two connections never resume the same one");
+    }
+
+    #[test]
+    fn a_finished_piece_has_no_stash_and_takes_none() {
+        let q = WorkQueue::new(vec![work(0)], 1);
+        q.stash_partial(0, partial_of(0, 1, PIECE));
+        q.mark_done(0);
+        assert!(q.take_partial(0).is_none(), "retiring the piece dropped it");
+
+        q.stash_partial(0, partial_of(0, 1, PIECE));
+        assert!(q.take_partial(0).is_none(), "and one arriving after is not kept");
+    }
+
+    #[test]
+    fn where_there_are_two_stashes_the_fuller_one_is_kept() {
+        let q = WorkQueue::new(vec![work(0)], 1);
+        q.stash_partial(0, partial_of(0, 3, PIECE));
+        q.stash_partial(0, partial_of(0, 1, PIECE));
+        assert_eq!(q.take_partial(0).unwrap().blocks_held(), 3, "a smaller one does not replace it");
+
+        q.stash_partial(0, partial_of(0, 1, PIECE));
+        q.stash_partial(0, partial_of(0, 2, PIECE));
+        assert_eq!(q.take_partial(0).unwrap().blocks_held(), 2, "a fuller one does");
+    }
+
+    #[test]
+    fn the_stash_is_bounded_so_failing_peers_cannot_fill_memory() {
+        // Two stashes of 40 MiB: the second would take it past the limit.
+        let big = 40 << 20;
+        let q = WorkQueue::new(vec![work(0), work(1)], 2);
+        q.stash_partial(0, partial_of(0, 1, big));
+        q.stash_partial(1, partial_of(1, 1, big));
+
+        assert!(q.take_partial(0).is_some(), "the first fits");
+        assert!(q.take_partial(1).is_none(), "the second does not");
+        // Space freed by taking one makes room again.
+        q.stash_partial(1, partial_of(1, 1, big));
+        assert!(q.take_partial(1).is_some());
+    }
+
+    // ---- preferred pieces ----
+
+    fn preferred(pieces: &[u32]) -> HashSet<u32> {
+        pieces.iter().copied().collect()
+    }
+
+    #[test]
+    fn preferred_pieces_come_out_first_however_common_they_are() {
+        let q = WorkQueue::new(vec![work(0), work(1), work(2), work(3)], 4).with_preferred(preferred(&[2, 3]));
+        // Pieces 2 and 3 are the commonest, so plain rarest-first would leave them for last.
+        for _ in 0..3 {
+            q.note_have(2);
+            q.note_have(3);
+        }
+
+        let order: Vec<u32> = std::iter::from_fn(|| piece_index(q.take_for(|_| true))).take(4).collect();
+
+        assert_eq!(order, vec![2, 3, 0, 1], "the preferred first, then the rest");
+    }
+
+    #[test]
+    fn among_the_preferred_the_usual_order_still_holds() {
+        let q = WorkQueue::new(vec![work(0), work(1), work(2), work(3)], 4).with_preferred(preferred(&[1, 2, 3]));
+        q.note_have(1);
+        q.note_have(1);
+        q.note_have(2);
+        // Rarest first among 1, 2 and 3: 3 (unseen), 2, 1; then 0.
+        let order: Vec<u32> = std::iter::from_fn(|| piece_index(q.take_for(|_| true))).take(4).collect();
+        assert_eq!(order, vec![3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn sequential_takes_the_preferred_pieces_in_order_before_the_rest() {
+        let q = WorkQueue::new(vec![work(0), work(1), work(2), work(3)], 4).with_order(Order::Sequential).with_preferred(preferred(&[2, 3]));
+        let order: Vec<u32> = std::iter::from_fn(|| piece_index(q.take_for(|_| true))).take(4).collect();
+        assert_eq!(order, vec![2, 3, 0, 1]);
+    }
+
+    #[test]
+    fn a_preferred_piece_the_peer_lacks_does_not_hold_back_the_others() {
+        let q = WorkQueue::new(vec![work(0), work(1)], 2).with_preferred(preferred(&[1]));
+        assert_eq!(piece_index(q.take_for(has(&[0]))), Some(0), "the peer has only piece 0, so it gets that");
+        assert_eq!(piece_index(q.take_for(has(&[0, 1]))), Some(1));
+    }
+
+    #[test]
+    fn with_nothing_preferred_the_order_is_unchanged() {
+        let q = WorkQueue::new(vec![work(2), work(0), work(1)], 3).with_preferred(HashSet::new());
+        q.note_have(0);
+        let order: Vec<u32> = std::iter::from_fn(|| piece_index(q.take_for(|_| true))).take(3).collect();
+        assert_eq!(order, vec![1, 2, 0]);
     }
 }

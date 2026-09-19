@@ -65,6 +65,8 @@ impl Bencode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
+    /// Lists and dicts nested deeper than [`MAX_DEPTH`].
+    TooDeep,
     UnexpectedEof,
     InvalidDigit(u8),
     InvalidTag(u8),
@@ -78,6 +80,7 @@ pub enum DecodeError {
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DecodeError::TooDeep => write!(f, "lists/dicts nested deeper than {} levels", MAX_DEPTH),
             DecodeError::UnexpectedEof => write!(f, "unexpected end of input"),
             DecodeError::InvalidDigit(b) => write!(f, "invalid digit byte: {:#04x}", b),
             DecodeError::InvalidTag(b) => write!(f, "invalid bencode tag byte: {:#04x} ({:?})", b, *b as char),
@@ -107,15 +110,25 @@ pub struct Decoder<'a> {
     /// rejecting them costs us an otherwise-usable peer. Strict stays the
     /// default for anything we might hash or re-serialize.
     strict: bool,
+    /// How many lists/dicts enclose the value being decoded.
+    depth: usize,
 }
+
+/// The deepest nesting of lists and dicts the decoder will follow.
+///
+/// Decoding is recursive, so without a limit a few hundred kilobytes of
+/// `llll...` from a peer, a tracker or a DHT node overflows the stack and
+/// aborts the whole process. Real data is shallow (a `.torrent`'s deepest
+/// value is about six levels in); libtorrent's default limit is also 100.
+pub const MAX_DEPTH: usize = 100;
 
 impl<'a> Decoder<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Decoder { data, pos: 0, strict: true }
+        Decoder { data, pos: 0, strict: true, depth: 0 }
     }
 
     pub fn new_lenient(data: &'a [u8]) -> Self {
-        Decoder { data, pos: 0, strict: false }
+        Decoder { data, pos: 0, strict: false, depth: 0 }
     }
 
     pub fn pos(&self) -> usize {
@@ -232,10 +245,18 @@ impl<'a> Decoder<'a> {
     }
 
     pub fn decode_value(&mut self) -> Result<Bencode, DecodeError> {
-        match self.peek()? {
+        let tag = self.peek()?;
+        if tag == b'l' || tag == b'd' {
+            if self.depth >= MAX_DEPTH {
+                return Err(DecodeError::TooDeep);
+            }
+            self.depth += 1;
+            let value = if tag == b'l' { self.decode_list().map(Bencode::List) } else { self.decode_dict().map(Bencode::Dict) };
+            self.depth -= 1;
+            return value;
+        }
+        match tag {
             b'i' => Ok(Bencode::Int(self.decode_int()?)),
-            b'l' => Ok(Bencode::List(self.decode_list()?)),
-            b'd' => Ok(Bencode::Dict(self.decode_dict()?)),
             b'0'..=b'9' => Ok(Bencode::Bytes(self.decode_bytes()?)),
             other => Err(DecodeError::InvalidTag(other)),
         }
@@ -467,5 +488,68 @@ mod tests {
         let mut dec = Decoder::new(src);
         let (_val, (start, end)) = dec.decode_value_with_span().unwrap();
         assert_eq!(&src[start..end], &src[..]);
+    }
+
+    /// `n` lists nested in each other around an integer: `lll...i0e...eee`.
+    fn nested_lists(n: usize) -> Vec<u8> {
+        let mut v = b"l".repeat(n);
+        v.extend_from_slice(b"i0e");
+        v.extend_from_slice(&b"e".repeat(n));
+        v
+    }
+
+    /// The same with dicts: `d1:ad1:ad...i0e...ee`.
+    fn nested_dicts(n: usize) -> Vec<u8> {
+        let mut v = b"d1:a".repeat(n);
+        v.extend_from_slice(b"i0e");
+        v.extend_from_slice(&b"e".repeat(n));
+        v
+    }
+
+    #[test]
+    fn nesting_up_to_the_limit_is_accepted() {
+        assert!(decode(&nested_lists(MAX_DEPTH)).is_ok());
+        assert!(decode(&nested_dicts(MAX_DEPTH)).is_ok());
+        assert!(decode_lenient(&nested_lists(MAX_DEPTH)).is_ok());
+    }
+
+    #[test]
+    fn nesting_beyond_the_limit_is_an_error() {
+        assert_eq!(decode(&nested_lists(MAX_DEPTH + 1)), Err(DecodeError::TooDeep));
+        assert_eq!(decode(&nested_dicts(MAX_DEPTH + 1)), Err(DecodeError::TooDeep));
+        assert_eq!(decode_lenient(&nested_lists(MAX_DEPTH + 1)), Err(DecodeError::TooDeep));
+        assert_eq!(decode_lenient(&nested_dicts(MAX_DEPTH + 1)), Err(DecodeError::TooDeep));
+    }
+
+    #[test]
+    fn a_hostile_payload_is_an_error_not_a_stack_overflow() {
+        // 200 KB of `l`, the size of a modest extended handshake, decoded on
+        // a stack no larger than a worker thread's. It used to abort the
+        // whole process; peers, trackers and DHT nodes could all send it.
+        let result = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| (decode(&b"l".repeat(200_000)), decode_lenient(&b"d1:a".repeat(200_000))))
+            .unwrap()
+            .join()
+            .expect("the decoder must not overflow the stack");
+        assert_eq!(result, (Err(DecodeError::TooDeep), Err(DecodeError::TooDeep)));
+    }
+
+    #[test]
+    fn the_depth_count_comes_back_down_after_each_container() {
+        // Two siblings, each MAX_DEPTH - 1 deep. If leaving a container did
+        // not decrement the count, the second would look too deep.
+        let branch = nested_lists(MAX_DEPTH - 1);
+        let mut v = b"l".to_vec();
+        v.extend_from_slice(&branch);
+        v.extend_from_slice(&branch);
+        v.push(b'e');
+        assert!(decode(&v).is_ok());
+    }
+
+    #[test]
+    fn the_span_decoder_used_for_the_info_hash_has_the_same_limit() {
+        let deep = nested_lists(MAX_DEPTH + 1);
+        assert_eq!(Decoder::new(&deep).decode_value_with_span().unwrap_err(), DecodeError::TooDeep);
     }
 }

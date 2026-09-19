@@ -59,6 +59,13 @@ pub enum TrackerError {
     TrackerFailure(String),
     Timeout,
     Tls(String),
+    /// The tracker answered with an HTTP status that is neither success nor
+    /// a redirect it gave a location for.
+    HttpStatus(u16),
+    /// The tracker redirected to this location. Not an error to the caller
+    /// of [`announce_http`], which follows it.
+    Redirect(String),
+    TooManyRedirects,
 }
 
 impl From<std::io::Error> for TrackerError {
@@ -84,11 +91,81 @@ impl fmt::Display for TrackerError {
             TrackerError::TrackerFailure(s) => write!(f, "tracker returned failure reason: {}", s),
             TrackerError::Timeout => write!(f, "tracker request timed out"),
             TrackerError::Tls(s) => write!(f, "TLS error: {}", s),
+            TrackerError::HttpStatus(code) => write!(f, "tracker replied HTTP {}", code),
+            TrackerError::Redirect(to) => write!(f, "redirected to {}", to),
+            TrackerError::TooManyRedirects => write!(f, "too many redirects (more than {})", MAX_REDIRECTS),
         }
     }
 }
 
 impl std::error::Error for TrackerError {}
+
+/// How many redirects an announce follows before giving up.
+pub const MAX_REDIRECTS: usize = 5;
+
+/// An HTTP or HTTPS announce that follows redirects. Trackers do redirect
+/// -- `http://` to `https://`, an old address to a new one -- and answering
+/// such a reply with an error lost every peer they would have given. A
+/// redirect from `https://` to `http://` is refused: the URL often carries a
+/// private tracker's passkey, and sending it in the clear is not what
+/// whoever chose `https` agreed to.
+pub fn announce_http(url: &str, req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
+    let mut current = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        let result = if current.starts_with("https://") { https::announce(&current, req) } else { http::announce(&current, req) };
+        match result {
+            Err(TrackerError::Redirect(location)) => {
+                let next = resolve_redirect(&current, &location)?;
+                check_redirect_allowed(&current, &next)?;
+                current = next;
+            }
+            other => return other,
+        }
+    }
+    Err(TrackerError::TooManyRedirects)
+}
+
+/// Refuses a redirect that would send a secure request over plain HTTP.
+fn check_redirect_allowed(from: &str, to: &str) -> Result<(), TrackerError> {
+    if from.starts_with("https://") && to.starts_with("http://") {
+        return Err(TrackerError::BadUrl(format!("refusing a redirect from https to http: {}", to)));
+    }
+    Ok(())
+}
+
+/// The absolute URL a `Location` header points to, from the URL that was
+/// requested: an absolute URL as it is, `//host/path` with the same scheme,
+/// `/path` on the same host, and `path` relative to the requested one's
+/// directory.
+fn resolve_redirect(base: &str, location: &str) -> Result<String, TrackerError> {
+    let location = location.trim();
+    if location.is_empty() {
+        return Err(TrackerError::MalformedResponse("empty redirect location"));
+    }
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return Ok(location.to_string());
+    }
+    // Some other scheme (`ftp://...`): not something to announce to.
+    if let Some((scheme, _)) = location.split_once("://") {
+        if !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+            return Err(TrackerError::UnsupportedScheme(scheme.to_string()));
+        }
+    }
+    let (scheme, rest) = base.split_once("://").ok_or_else(|| TrackerError::BadUrl(base.to_string()))?;
+    if let Some(rest_of_location) = location.strip_prefix("//") {
+        return Ok(format!("{}://{}", scheme, rest_of_location));
+    }
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, path_and_query) = rest.split_at(authority_end);
+    if location.starts_with('/') {
+        return Ok(format!("{}://{}{}", scheme, authority, location));
+    }
+    // Relative to the directory of the requested path (its query dropped).
+    let path = path_and_query.split('?').next().unwrap_or("");
+    let directory = &path[..path.rfind('/').map_or(0, |i| i + 1)];
+    let directory = if directory.is_empty() { "/" } else { directory };
+    Ok(format!("{}://{}{}{}", scheme, authority, directory, location))
+}
 
 /// Generates a 20-byte Azureus-style peer_id: "-RS0001-" + 12 pseudo-random
 /// bytes. "RS" is an arbitrary client ID for this project; 0001 is the
@@ -304,5 +381,117 @@ mod tests {
     #[test]
     fn empty_compact_peers_v6_is_ok() {
         assert_eq!(parse_compact_peers_v6(&[]).unwrap(), vec![]);
+    }
+
+    // ---- redirects ----
+
+    #[test]
+    fn a_location_is_resolved_against_the_url_that_was_requested() {
+        let base = "http://tracker.example:8080/dir/announce?passkey=k";
+        assert_eq!(resolve_redirect(base, "https://other.example/a").unwrap(), "https://other.example/a", "absolute");
+        assert_eq!(resolve_redirect(base, "//cdn.example/a").unwrap(), "http://cdn.example/a", "same scheme");
+        assert_eq!(resolve_redirect(base, "/new/announce").unwrap(), "http://tracker.example:8080/new/announce", "same host and port");
+        assert_eq!(resolve_redirect(base, "sibling").unwrap(), "http://tracker.example:8080/dir/sibling", "relative to the directory");
+        assert_eq!(resolve_redirect("http://tracker.example", "a").unwrap(), "http://tracker.example/a", "a base with no path");
+        assert_eq!(resolve_redirect("https://t.example?x=1", "/a").unwrap(), "https://t.example/a", "a query straight after the host");
+        assert!(resolve_redirect(base, "   ").is_err(), "an empty location goes nowhere");
+        assert!(matches!(resolve_redirect(base, "ftp://x/y"), Err(TrackerError::UnsupportedScheme(ref s)) if s == "ftp"), "another scheme is not an announce URL");
+        assert_eq!(resolve_redirect(base, "a:b/c").unwrap(), "http://tracker.example:8080/dir/a:b/c", "a colon in a relative path is not a scheme");
+    }
+
+    #[test]
+    fn a_redirect_may_upgrade_to_https_but_never_downgrade_from_it() {
+        assert!(check_redirect_allowed("http://a/x", "https://a/x").is_ok());
+        assert!(check_redirect_allowed("http://a/x", "http://b/x").is_ok());
+        assert!(check_redirect_allowed("https://a/x", "https://b/x").is_ok());
+        let err = check_redirect_allowed("https://a/x?passkey=k", "http://b/x").unwrap_err();
+        assert!(matches!(err, TrackerError::BadUrl(ref m) if m.contains("refusing")), "{}", err);
+    }
+
+    /// A one-thread HTTP server: `handler` gets each request's head and
+    /// returns the whole reply. Returns the port and the heads seen.
+    fn serve(handler: impl Fn(&str) -> Vec<u8> + Send + 'static) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&heads);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let response = handler(&head);
+                seen.lock().unwrap().push(head);
+                let _ = stream.write_all(&response);
+            }
+        });
+        (port, heads)
+    }
+
+    fn ok_with_one_peer() -> Vec<u8> {
+        let body = b"d8:intervali900e5:peers6:\x0a\x00\x00\x07\x1a\xe1e";
+        let mut reply = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+        reply.extend_from_slice(body);
+        reply
+    }
+
+    fn request() -> AnnounceRequest {
+        AnnounceRequest { info_hash: [1; 20], peer_id: [2; 20], port: 6881, uploaded: 0, downloaded: 0, left: 1, compact: true, event: None, numwant: None }
+    }
+
+    #[test]
+    fn an_announce_follows_a_redirect_to_another_server_and_gets_its_peers() {
+        let (final_port, final_heads) = serve(|_| ok_with_one_peer());
+        let (first_port, first_heads) = serve(move |_| format!("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/moved?x=1\r\nContent-Length: 0\r\n\r\n", final_port).into_bytes());
+
+        let response = announce_http(&format!("http://127.0.0.1:{}/announce", first_port), &request()).expect("the redirect is followed");
+
+        assert_eq!(response.peers.len(), 1, "the peers from the server it was sent to");
+        assert_eq!(first_heads.lock().unwrap().len(), 1);
+        let heads = final_heads.lock().unwrap();
+        assert_eq!(heads.len(), 1);
+        assert!(heads[0].starts_with("GET /moved?x=1&info_hash="), "the new path and its own query kept, the announce added: {:?}", heads[0]);
+    }
+
+    #[test]
+    fn a_relative_redirect_stays_on_the_same_server() {
+        let (port, heads) = serve(|head| if head.starts_with("GET /announce?") { b"HTTP/1.1 301 Moved\r\nLocation: /v2/announce\r\nContent-Length: 0\r\n\r\n".to_vec() } else { ok_with_one_peer() });
+
+        let response = announce_http(&format!("http://127.0.0.1:{}/announce", port), &request()).unwrap();
+
+        assert_eq!(response.peers.len(), 1);
+        let heads = heads.lock().unwrap();
+        assert_eq!(heads.len(), 2);
+        assert!(heads[1].starts_with("GET /v2/announce?"), "{:?}", heads[1]);
+    }
+
+    #[test]
+    fn a_redirect_loop_is_given_up_on_after_a_bounded_number_of_hops() {
+        let (port, heads) = serve(|_| b"HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n".to_vec());
+
+        let result = announce_http(&format!("http://127.0.0.1:{}/announce", port), &request());
+
+        assert!(matches!(result, Err(TrackerError::TooManyRedirects)), "{:?}", result.err());
+        assert_eq!(heads.lock().unwrap().len(), 6, "the first request and five redirects, no more");
+    }
+
+    #[test]
+    fn a_redirect_to_a_scheme_that_is_not_http_is_refused() {
+        let (port, _) = serve(|_| b"HTTP/1.1 302 Found\r\nLocation: ftp://elsewhere/announce\r\nContent-Length: 0\r\n\r\n".to_vec());
+        let result = announce_http(&format!("http://127.0.0.1:{}/announce", port), &request());
+        assert!(matches!(result, Err(TrackerError::UnsupportedScheme(_))), "{:?}", result.err());
+    }
+
+    #[test]
+    fn a_plain_failure_status_is_reported_with_its_code() {
+        let (port, heads) = serve(|_| b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_vec());
+        let result = announce_http(&format!("http://127.0.0.1:{}/announce", port), &request());
+        assert!(matches!(result, Err(TrackerError::HttpStatus(503))), "{:?}", result.err());
+        assert_eq!(heads.lock().unwrap().len(), 1, "no retry, no redirect");
     }
 }

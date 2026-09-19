@@ -24,11 +24,23 @@ jobs:
       - name: Tests
         run: cargo test
       - name: Loopback end-to-end harness
-        # Build first: the harness spawns target/debug/download, which
-        # `cargo run --bin e2e_harness` alone would not have built.
+        # Build first: the harness spawns target/debug/download and
+        # create_torrent, which `cargo run --bin e2e_harness` alone would
+        # not have built.
         run: |
-          cargo build --bin download
+          cargo build --bins
           cargo run --bin e2e_harness
+
+  # Keeps `rust-version` in Cargo.toml honest: builds everything, with the
+  # committed lockfile, on exactly the declared minimum toolchain.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build on the minimum supported Rust version
+        run: cargo check --locked --all-targets
 
   fuzz-build:
     runs-on: ubuntu-latest
@@ -43,6 +55,6 @@ jobs:
       - name: Fuzz targets compile and run against seed inputs
         working-directory: fuzz
         run: |
-          for target in bencode_decode magnet_parse torrent_parse; do
+          for target in bencode_decode magnet_parse torrent_parse krpc_decode peer_message extension_handshake metadata_message pex_parse; do
             cargo +nightly fuzz run "$target" -- -runs=1000
           done

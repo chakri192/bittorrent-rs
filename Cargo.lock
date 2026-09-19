@@ -43,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "getrandom",
  "igd-next",
+ "libc",
  "ratatui",
  "rustls",
  "serde",
@@ -50,7 +51,6 @@ dependencies = [
  "toml",
  "ureq",
  "webpki-roots 0.26.11",
- "zeroize",
 ]
 
 [[package]]

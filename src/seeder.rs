@@ -2,6 +2,17 @@
 //! pieces off disk. Runs concurrently with a download (serving whatever
 //! is verified so far) and standalone after completion (`--seed`).
 //!
+//! A peer is told of every piece verified after it connected, with `Have`.
+//!
+//! Who is served is decided by [`crate::choker`]: a few unchoke slots,
+//! most to the peers taking the most from us and one rotating optimistic
+//! slot, re-decided every [`RECHOKE_INTERVAL`]. Everyone else is choked and
+//! their requests ignored. (Only the seeding half of tit-for-tat: inbound
+//! peers are never downloaded from, so there is no reciprocation to reward.)
+//!
+//! What follows is the older description of the policy, kept for its
+//! reasoning about the connection cap.
+//!
 //! Policy is deliberately simple for a from-scratch client: every
 //! interested peer gets unchoked, bounded by a global inbound-connection
 //! cap, with no tit-for-tat rate measurement. Real tit-for-tat exists to
@@ -10,13 +21,17 @@
 //! choke-round machinery (README documents this as a known
 //! simplification).
 
+use crate::choker::{Choker, DEFAULT_SLOTS};
 use crate::downloader::file_writer::{read_block, FileSpan};
+use crate::metadata::{MetadataMessage, METADATA_PIECE_SIZE};
+use crate::peer::extension::{ExtendedHandshake, EXTENDED_HANDSHAKE_ID};
 use crate::peer::handshake::{Handshake, HANDSHAKE_LEN};
 use crate::peer::message::Message;
 use crate::peer::state::PeerState;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use crate::sync;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,45 +44,68 @@ const MAX_REQUEST_LEN: u32 = 128 * 1024;
 /// Concurrent inbound peers served at once; connections beyond this are
 /// accepted-and-closed immediately so the backlog doesn't grow unbounded.
 const MAX_INBOUND_PEERS: usize = 40;
+/// The id peers send `ut_metadata` requests to us under.
+const SEEDER_UT_METADATA_ID: u8 = 1;
+/// How often the choice of who to unchoke is made again.
+pub const RECHOKE_INTERVAL: Duration = Duration::from_secs(10);
 /// An inbound peer silent for this long gets dropped.
 const IDLE_DISCONNECT: Duration = Duration::from_secs(300);
 /// Send a keep-alive if we've written nothing for this long (BEP 3
 /// suggests 2 minutes).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(110);
+/// How long a peer has to send its handshake after connecting. Far longer
+/// than [`SERVE_READ_TIMEOUT`]: a peer on a slow or distant link may take
+/// seconds, and that is no reason to drop it.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per-read socket timeout inside the serve loop -- also the granularity
-/// at which shutdown/idle checks run.
-const SERVE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// at which shutdown, idle and new-piece checks run, so it is how long a
+/// peer waits to hear that a piece has been verified.
+const SERVE_READ_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Thread-safe record of which pieces are verified on disk -- written by
 /// download workers/resume as pieces complete, read by the seeder to
 /// build bitfields and validate requests.
 pub struct HaveMap {
     bits: RwLock<Vec<bool>>,
+    /// Bumped whenever a piece is added, so a connection can tell cheaply
+    /// whether there is anything new to announce.
+    version: AtomicU64,
 }
 
 impl HaveMap {
     pub fn new(total_pieces: usize) -> Self {
-        HaveMap { bits: RwLock::new(vec![false; total_pieces]) }
+        HaveMap { bits: RwLock::new(vec![false; total_pieces]), version: AtomicU64::new(0) }
     }
 
     pub fn set(&self, index: u32) {
-        if let Ok(mut bits) = self.bits.write() {
-            if let Some(b) = bits.get_mut(index as usize) {
+        if let Some(b) = sync::write(&self.bits).get_mut(index as usize) {
+            if !*b {
                 *b = true;
+                self.version.fetch_add(1, Ordering::SeqCst);
             }
         }
     }
 
+    /// Changes each time a piece is added (and never otherwise).
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::SeqCst)
+    }
+
     pub fn get(&self, index: u32) -> bool {
-        self.bits.read().map(|bits| bits.get(index as usize).copied().unwrap_or(false)).unwrap_or(false)
+        sync::read(&self.bits).get(index as usize).copied().unwrap_or(false)
     }
 
     pub fn snapshot(&self) -> Vec<bool> {
-        self.bits.read().map(|b| b.clone()).unwrap_or_default()
+        sync::read(&self.bits).clone()
     }
 
     pub fn count(&self) -> usize {
-        self.bits.read().map(|b| b.iter().filter(|&&x| x).count()).unwrap_or(0)
+        sync::read(&self.bits).iter().filter(|&&x| x).count()
+    }
+
+    /// How many pieces the torrent has, verified or not.
+    pub fn total(&self) -> usize {
+        sync::read(&self.bits).len()
     }
 }
 
@@ -79,9 +117,15 @@ struct SeederShared {
     piece_length: u64,
     total_length: u64,
     have: Arc<HaveMap>,
+    /// Shared limit on the bytes uploaded across every peer (`--max-up`).
+    up_limit: Option<Arc<crate::ratelimit::RateLimiter>>,
     running: Arc<AtomicBool>,
     uploaded: Arc<AtomicU64>,
     active_conns: AtomicUsize,
+    /// Who is unchoked.
+    choker: Arc<Choker>,
+    /// The info dictionary, for peers that ask for it.
+    metadata: Option<Arc<Vec<u8>>>,
 }
 
 impl SeederShared {
@@ -103,14 +147,34 @@ pub struct SeederHandle {
     pub uploaded: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
     accept_thread: Option<thread::JoinHandle<()>>,
+    rechoke_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl SeederHandle {
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        if let Some(h) = self.accept_thread.take() {
-            let _ = h.join();
+        for thread in [self.accept_thread.take(), self.rechoke_thread.take()].into_iter().flatten() {
+            let _ = thread.join();
         }
+    }
+}
+
+/// How the seeder chooses who to serve.
+#[derive(Debug, Clone)]
+pub struct SeederOptions {
+    /// Peers served at once (see [`crate::choker`]).
+    pub unchoke_slots: usize,
+    /// How often that choice is made again.
+    pub rechoke_interval: Duration,
+    /// The torrent's info dictionary, exactly as its hash was taken over,
+    /// to offer to peers that ask for it (BEP 9). Without it the seeder
+    /// speaks no extensions.
+    pub metadata: Option<Arc<Vec<u8>>>,
+}
+
+impl Default for SeederOptions {
+    fn default() -> Self {
+        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL, metadata: None }
     }
 }
 
@@ -123,6 +187,23 @@ pub fn start(
     piece_length: u64,
     total_length: u64,
     have: Arc<HaveMap>,
+    up_limit: Option<Arc<crate::ratelimit::RateLimiter>>,
+) -> std::io::Result<SeederHandle> {
+    start_with(preferred_port, info_hash, our_peer_id, spans, piece_length, total_length, have, up_limit, SeederOptions::default())
+}
+
+/// [`start`] with the choking policy chosen.
+#[allow(clippy::too_many_arguments)]
+pub fn start_with(
+    preferred_port: u16,
+    info_hash: [u8; 20],
+    our_peer_id: [u8; 20],
+    spans: Arc<Vec<FileSpan>>,
+    piece_length: u64,
+    total_length: u64,
+    have: Arc<HaveMap>,
+    up_limit: Option<Arc<crate::ratelimit::RateLimiter>>,
+    options: SeederOptions,
 ) -> std::io::Result<SeederHandle> {
     // Preferred port first (conventionally 6881), ephemeral fallback --
     // another client on the same machine owning 6881 shouldn't stop this
@@ -140,9 +221,29 @@ pub fn start(
         piece_length,
         total_length,
         have,
+        up_limit,
         running: Arc::clone(&running),
         uploaded: Arc::clone(&uploaded),
         active_conns: AtomicUsize::new(0),
+        choker: Arc::new(Choker::new(options.unchoke_slots)),
+        metadata: options.metadata.clone(),
+    });
+
+    // The rounds: who is served changes here, and each connection notices
+    // within a read timeout and tells its peer.
+    let rechoke_shared = Arc::clone(&shared);
+    let rechoke_interval = options.rechoke_interval;
+    let rechoke_thread = thread::spawn(move || {
+        let mut waited = Duration::ZERO;
+        while rechoke_shared.running.load(Ordering::SeqCst) {
+            let slice = Duration::from_millis(50);
+            thread::sleep(slice);
+            waited += slice;
+            if waited >= rechoke_interval {
+                waited = Duration::ZERO;
+                rechoke_shared.choker.rechoke();
+            }
+        }
     });
 
     let accept_shared = Arc::clone(&shared);
@@ -150,6 +251,15 @@ pub fn start(
         while accept_shared.running.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _addr)) => {
+                    // The listener is non-blocking so that it can notice a stop,
+                    // and where an accepted socket inherits that (macOS, the
+                    // BSDs) each read on it would fail at once when nothing has
+                    // arrived yet: a peer whose handshake came after the accept
+                    // would be dropped. The serving thread wants to block, with
+                    // its own read timeout.
+                    if stream.set_nonblocking(false).is_err() {
+                        continue;
+                    }
                     if accept_shared.active_conns.load(Ordering::SeqCst) >= MAX_INBOUND_PEERS {
                         drop(stream); // over cap: close immediately
                         continue;
@@ -169,13 +279,13 @@ pub fn start(
         }
     });
 
-    Ok(SeederHandle { port, uploaded, running, accept_thread: Some(accept_thread) })
+    Ok(SeederHandle { port, uploaded, running, accept_thread: Some(accept_thread), rechoke_thread: Some(rechoke_thread) })
 }
 
 /// Serves one inbound peer: handshake, bitfield, then Request/Piece until
 /// the peer leaves, goes idle too long, or the seeder shuts down.
 fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(SERVE_READ_TIMEOUT))?;
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
 
     // Inbound side of the BEP 3 handshake: they send first, we validate
@@ -187,21 +297,44 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
     if their_hs.info_hash != shared.info_hash {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "inbound handshake for a different info_hash"));
     }
-    // No extension support advertised on the upload path: this loop
-    // serves piece requests only, so inviting extended messages would
-    // just be traffic to ignore.
-    let ours = Handshake::new(shared.info_hash, shared.our_peer_id, false);
+    // Extensions are offered only when there is something to offer through
+    // them: the info dictionary, for a peer that has only a magnet link.
+    let ours = Handshake::new(shared.info_hash, shared.our_peer_id, shared.metadata.is_some());
     stream.write_all(&ours.to_bytes())?;
+    let speaks_extensions = shared.metadata.is_some() && their_hs.supports_extensions();
+    // From here the loop wakes often to check for a stop, new pieces and a
+    // change of choke.
+    stream.set_read_timeout(Some(SERVE_READ_TIMEOUT))?;
 
-    // Snapshot of what we can serve right now. Pieces verified *after*
-    // this moment aren't advertised to this particular peer (no Have
-    // broadcast channel in this simple seeder) -- a peer that wants them
-    // reconnects or hears about them elsewhere; the bitfield is honest at
-    // connect time, which is what BEP 3 requires.
-    let snapshot = shared.have.snapshot();
-    Message::Bitfield(PeerState::encode_bitfield(&snapshot)).write_to(&mut stream).map_err(wire_to_io)?;
+    // What we can serve right now, honest at connect time as BEP 3
+    // requires. Pieces verified afterwards are announced with `Have` as
+    // they appear (see `announce_new_pieces`). The version is read first:
+    // a piece added between the two reads then shows up as a difference
+    // to announce, never as one that is missed.
+    let mut seen_version = shared.have.version();
+    let mut advertised = shared.have.snapshot();
+    Message::Bitfield(PeerState::encode_bitfield(&advertised)).write_to(&mut stream).map_err(wire_to_io)?;
+    if let (true, Some(metadata)) = (speaks_extensions, &shared.metadata) {
+        // A seed says so (BEP 21): nothing is to be gained by offering it pieces.
+        let seed = shared.have.count() == shared.have.total();
+        Message::Extended { id: EXTENDED_HANDSHAKE_ID, payload: ExtendedHandshake::build_for_seeding(SEEDER_UT_METADATA_ID, metadata.len(), seed) }.write_to(&mut stream).map_err(wire_to_io)?;
+    }
+    // The id the peer wants metadata requests answered under, once it has
+    // said, and how many it has made (bounded: see MAX_METADATA_REQUESTS).
+    let mut peer_metadata_id: Option<u8> = None;
+    let mut metadata_requests = 0usize;
 
-    let mut peer_unchoked = false;
+    let choker_id = shared.choker.register();
+    // Forgets the peer, freeing any slot it held, however this function ends.
+    struct Leaving<'a>(&'a Choker, crate::choker::PeerId);
+    impl Drop for Leaving<'_> {
+        fn drop(&mut self) {
+            self.0.unregister(self.1);
+        }
+    }
+    let _leaving = Leaving(&shared.choker, choker_id);
+    // Whether the peer has been told it is unchoked.
+    let mut told_unchoked = false;
     let mut last_heard = Instant::now();
     let mut last_sent = Instant::now();
 
@@ -217,6 +350,18 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
             last_sent = Instant::now();
         }
 
+        if announce_new_pieces(&mut stream, &shared.have, &mut seen_version, &mut advertised)? {
+            last_sent = Instant::now();
+        }
+
+        // Tell the peer when the choker has changed its mind.
+        let allowed = shared.choker.is_unchoked(choker_id);
+        if allowed != told_unchoked {
+            (if allowed { Message::Unchoke } else { Message::Choke }).write_to(&mut stream).map_err(wire_to_io)?;
+            told_unchoked = allowed;
+            last_sent = Instant::now();
+        }
+
         let msg = match Message::read_from(&mut stream) {
             Ok(m) => m,
             Err(crate::peer::message::WireError::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
@@ -229,17 +374,13 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
 
         match msg {
             Message::Interested => {
-                if !peer_unchoked {
-                    Message::Unchoke.write_to(&mut stream).map_err(wire_to_io)?;
-                    peer_unchoked = true;
-                    last_sent = Instant::now();
-                }
+                shared.choker.set_interested(choker_id, true);
+                // A free slot is theirs at once; the loop tells them next time round.
+                shared.choker.grant_if_free(choker_id);
             }
-            Message::NotInterested => {
-                // Leave them unchoked; they'll either re-request or idle out.
-            }
+            Message::NotInterested => shared.choker.set_interested(choker_id, false),
             Message::Request { index, begin, length } => {
-                if !peer_unchoked {
+                if !shared.choker.is_unchoked(choker_id) {
                     continue; // BEP 3: requests while choked are ignored
                 }
                 if length > MAX_REQUEST_LEN {
@@ -251,8 +392,37 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
                     continue; // request for data we don't have / can't have; ignore
                 }
                 let block = read_block(&shared.spans, index, shared.piece_length, begin, length)?;
+                if let Some(limit) = &shared.up_limit {
+                    limit.acquire(length as usize);
+                }
                 Message::Piece { index, begin, block }.write_to(&mut stream).map_err(wire_to_io)?;
                 shared.uploaded.fetch_add(length as u64, Ordering::Relaxed);
+                shared.choker.record_upload(choker_id, length as u64);
+                last_sent = Instant::now();
+            }
+            Message::Extended { id: EXTENDED_HANDSHAKE_ID, payload } if speaks_extensions => {
+                peer_metadata_id = ExtendedHandshake::parse(&payload).ok().and_then(|hs| hs.peer_ut_metadata_id());
+            }
+            Message::Extended { id: SEEDER_UT_METADATA_ID, payload } if speaks_extensions => {
+                let (Some(metadata), Some(reply_id)) = (&shared.metadata, peer_metadata_id) else { continue };
+                let Ok(MetadataMessage::Request { piece }) = MetadataMessage::decode(&payload) else { continue };
+                metadata_requests += 1;
+                // The whole dictionary a few times over is plenty; more is a
+                // peer using us to move data for nothing.
+                if metadata_requests > 2 * metadata.len().div_ceil(METADATA_PIECE_SIZE) + 8 {
+                    return Ok(());
+                }
+                let start = piece as usize * METADATA_PIECE_SIZE;
+                let reply = if start < metadata.len() {
+                    let chunk = &metadata[start..(start + METADATA_PIECE_SIZE).min(metadata.len())];
+                    if let Some(limit) = &shared.up_limit {
+                        limit.acquire(chunk.len());
+                    }
+                    MetadataMessage::Data { piece, total_size: metadata.len() as u32, data: chunk.to_vec() }
+                } else {
+                    MetadataMessage::Reject { piece }
+                };
+                Message::Extended { id: reply_id, payload: reply.encode() }.write_to(&mut stream).map_err(wire_to_io)?;
                 last_sent = Instant::now();
             }
             // Piece-availability chatter from a fellow leecher; a pure
@@ -263,6 +433,28 @@ fn serve_peer(mut stream: TcpStream, shared: &SeederShared) -> std::io::Result<(
             Message::Have { .. } | Message::Bitfield(_) | Message::Cancel { .. } | Message::Choke | Message::Unchoke | Message::KeepAlive | Message::Piece { .. } | Message::Port(_) | Message::Extended { .. } => {}
         }
     }
+}
+
+/// Tells a connected peer about pieces verified since it was last told: a
+/// `Have` for each. Without this a peer that connected early would never
+/// learn of what this client downloads afterwards, and a client that is
+/// still downloading would be a poor source. Returns whether it sent any.
+fn announce_new_pieces(stream: &mut TcpStream, have: &HaveMap, seen_version: &mut u64, advertised: &mut [bool]) -> std::io::Result<bool> {
+    let version = have.version();
+    if version == *seen_version {
+        return Ok(false);
+    }
+    *seen_version = version;
+    let now = have.snapshot();
+    let mut sent = false;
+    for (index, (&has, told)) in now.iter().zip(advertised.iter_mut()).enumerate() {
+        if has && !*told {
+            Message::Have { piece_index: index as u32 }.write_to(stream).map_err(wire_to_io)?;
+            *told = true;
+            sent = true;
+        }
+    }
+    Ok(sent)
 }
 
 fn wire_to_io(e: crate::peer::message::WireError) -> std::io::Error {
@@ -311,6 +503,17 @@ mod tests {
     }
 
     fn start_test_seeder(dir: &std::path::Path, pieces: &[Vec<u8>], piece_length: u64, have_indices: &[u32]) -> (SeederHandle, [u8; 20]) {
+        start_limited_seeder(dir, pieces, piece_length, have_indices, None)
+    }
+
+    fn start_limited_seeder(dir: &std::path::Path, pieces: &[Vec<u8>], piece_length: u64, have_indices: &[u32], up_limit: Option<Arc<crate::ratelimit::RateLimiter>>) -> (SeederHandle, [u8; 20]) {
+        let (handle, info_hash, _have) = start_seeder_with_map(dir, pieces, piece_length, have_indices, up_limit);
+        (handle, info_hash)
+    }
+
+    /// A seeder that also gives back its have-map, for tests that verify
+    /// more pieces after peers have connected.
+    fn start_seeder_with_map(dir: &std::path::Path, pieces: &[Vec<u8>], piece_length: u64, have_indices: &[u32], up_limit: Option<Arc<crate::ratelimit::RateLimiter>>) -> (SeederHandle, [u8; 20], Arc<HaveMap>) {
         let total: i64 = pieces.iter().map(|p| p.len() as i64).sum();
         let files = vec![(vec!["seed.bin".to_string()], total)];
         let spans = Arc::new(build_file_spans(dir, &files));
@@ -322,8 +525,85 @@ mod tests {
             have.set(i);
         }
         let info_hash = [0x66; 20];
-        let handle = start(0, info_hash, [0x20; 20], spans, piece_length, total as u64, have).unwrap();
-        (handle, info_hash)
+        let handle = start(0, info_hash, [0x20; 20], spans, piece_length, total as u64, Arc::clone(&have), up_limit).unwrap();
+        (handle, info_hash, have)
+    }
+
+    /// The next `Have` the peer sends, skipping anything else; `None` if
+    /// nothing arrives within the stream's read timeout.
+    fn next_have(stream: &mut TcpStream) -> Option<u32> {
+        loop {
+            match Message::read_from(stream) {
+                Ok(Message::Have { piece_index }) => return Some(piece_index),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn three_pieces() -> Vec<Vec<u8>> {
+        (0..3u8).map(|i| vec![i + 1; 16384]).collect()
+    }
+
+    #[test]
+    fn a_piece_verified_after_a_peer_connected_is_announced_to_it() {
+        let dir = tmp_dir("have-broadcast");
+        let (mut handle, info_hash, have) = start_seeder_with_map(&dir, &three_pieces(), 16384, &[0], None);
+        let (mut stream, bitfield) = leech_connect(handle.port, info_hash);
+        assert_eq!(&bitfield[..3], &[true, false, false], "the bitfield was honest at connect time");
+
+        have.set(1);
+
+        assert_eq!(next_have(&mut stream), Some(1), "the peer hears about the new piece without asking");
+        handle.stop();
+    }
+
+    #[test]
+    fn each_new_piece_is_announced_once_and_only_the_new_one() {
+        let dir = tmp_dir("have-once");
+        let (mut handle, info_hash, have) = start_seeder_with_map(&dir, &three_pieces(), 16384, &[0], None);
+        let (mut stream, _) = leech_connect(handle.port, info_hash);
+
+        have.set(1);
+        assert_eq!(next_have(&mut stream), Some(1));
+        have.set(2);
+        assert_eq!(next_have(&mut stream), Some(2), "the second announcement is for piece 2, not piece 1 again");
+
+        // Setting what is already set changes nothing, so nothing is sent.
+        stream.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+        have.set(1);
+        have.set(0);
+        assert_eq!(next_have(&mut stream), None, "nothing new, nothing announced");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_peer_that_connects_later_learns_of_the_piece_from_its_bitfield_not_a_have() {
+        let dir = tmp_dir("have-late");
+        let (mut handle, info_hash, have) = start_seeder_with_map(&dir, &three_pieces(), 16384, &[0], None);
+        have.set(1);
+
+        let (mut stream, bitfield) = leech_connect(handle.port, info_hash);
+
+        assert_eq!(&bitfield[..3], &[true, true, false]);
+        stream.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+        assert_eq!(next_have(&mut stream), None, "already in the bitfield, so not announced again");
+        handle.stop();
+    }
+
+    #[test]
+    fn the_have_map_changes_version_only_when_a_piece_is_added() {
+        let have = HaveMap::new(4);
+        let v0 = have.version();
+        have.set(2);
+        let v1 = have.version();
+        assert_ne!(v0, v1, "a new piece");
+        have.set(2);
+        assert_eq!(have.version(), v1, "the same piece again");
+        have.set(99);
+        assert_eq!(have.version(), v1, "a piece the torrent does not have");
+        have.set(3);
+        assert_ne!(have.version(), v1);
     }
 
     #[test]
@@ -422,5 +702,398 @@ mod tests {
         assert!(!have.get(99));
         assert_eq!(have.count(), 2);
         assert_eq!(have.snapshot(), vec![false, true, false, true]);
+    }
+
+    #[test]
+    fn a_thread_panicking_with_the_have_map_locked_does_not_freeze_it() {
+        let have = HaveMap::new(4);
+        have.set(1);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = have.bits.write().unwrap();
+            panic!("a worker died holding the have-map's write lock");
+        }));
+        assert!(have.bits.is_poisoned(), "the setup must really poison it");
+
+        // A piece verified after the panic must still be advertised to peers.
+        have.set(2);
+        assert!(have.get(1) && have.get(2) && !have.get(0));
+        assert_eq!(have.count(), 2);
+        assert_eq!(have.snapshot(), vec![false, true, true, false]);
+    }
+
+    #[test]
+    fn an_upload_limit_slows_what_a_leecher_receives_but_not_its_correctness() {
+        // Two 16 KiB blocks at 20,000 B/s: the first fits the burst, the
+        // second waits out the rest.
+        let dir = tmp_dir("limited");
+        let pieces = vec![vec![0x11u8; 16384], vec![0x22u8; 16384]];
+        let limiter = Arc::new(crate::ratelimit::RateLimiter::new(20_000));
+        let (mut handle, info_hash) = start_limited_seeder(&dir, &pieces, 16384, &[0, 1], Some(limiter));
+        let (mut stream, _) = leech_connect(handle.port, info_hash);
+        Message::Interested.write_to(&mut stream).unwrap();
+        while !matches!(Message::read_from(&mut stream).unwrap(), Message::Unchoke) {}
+
+        let started = std::time::Instant::now();
+        for (i, piece) in pieces.iter().enumerate() {
+            Message::Request { index: i as u32, begin: 0, length: 16384 }.write_to(&mut stream).unwrap();
+            let block = loop {
+                if let Message::Piece { block, .. } = Message::read_from(&mut stream).unwrap() {
+                    break block;
+                }
+            };
+            assert_eq!(&block, piece);
+        }
+
+        assert!(started.elapsed() >= Duration::from_millis(500), "32 KiB at 20,000 B/s cannot take {:?}", started.elapsed());
+        handle.stop();
+    }
+
+    // ---- choking ----
+
+    fn start_choking_seeder(dir: &std::path::Path, slots: usize, interval: Duration) -> (SeederHandle, [u8; 20]) {
+        let pieces = [vec![0x5Au8; 16384]];
+        let files = vec![(vec!["seed.bin".to_string()], 16384i64)];
+        let spans = Arc::new(build_file_spans(dir, &files));
+        write_piece(&spans, 0, 16384, &pieces[0]).unwrap();
+        let have = Arc::new(HaveMap::new(1));
+        have.set(0);
+        let info_hash = [0x67; 20];
+        let options = SeederOptions { unchoke_slots: slots, rechoke_interval: interval, metadata: None };
+        let handle = start_with(0, info_hash, [0x20; 20], spans, 16384, 16384, have, None, options).unwrap();
+        (handle, info_hash)
+    }
+
+    /// A leecher that has connected and said it is interested.
+    fn interested_leecher(port: u16, info_hash: [u8; 20]) -> TcpStream {
+        let (mut stream, _) = leech_connect(port, info_hash);
+        Message::Interested.write_to(&mut stream).unwrap();
+        stream
+    }
+
+    /// The next Choke or Unchoke the peer sends within `wait`, skipping the rest.
+    fn next_choke_message(stream: &mut TcpStream, wait: Duration) -> Option<Message> {
+        stream.set_read_timeout(Some(wait)).unwrap();
+        loop {
+            match Message::read_from(stream) {
+                Ok(m @ (Message::Choke | Message::Unchoke)) => return Some(m),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    #[test]
+    fn only_as_many_peers_are_unchoked_as_there_are_slots() {
+        let dir = tmp_dir("slots");
+        let (mut handle, info_hash) = start_choking_seeder(&dir, 2, Duration::from_secs(3600));
+        let mut leechers: Vec<TcpStream> = (0..4).map(|_| interested_leecher(handle.port, info_hash)).collect();
+
+        let told: Vec<Option<Message>> = leechers.iter_mut().map(|l| next_choke_message(l, Duration::from_millis(700))).collect();
+
+        assert_eq!(told[0], Some(Message::Unchoke));
+        assert_eq!(told[1], Some(Message::Unchoke));
+        assert_eq!(told[2], None, "no slot left, so no Unchoke");
+        assert_eq!(told[3], None);
+        handle.stop();
+    }
+
+    #[test]
+    fn a_choked_peers_requests_are_ignored_and_an_unchoked_peers_are_served() {
+        let dir = tmp_dir("choked-requests");
+        let (mut handle, info_hash) = start_choking_seeder(&dir, 1, Duration::from_secs(3600));
+        let mut first = interested_leecher(handle.port, info_hash);
+        let mut second = interested_leecher(handle.port, info_hash);
+        assert_eq!(next_choke_message(&mut first, Duration::from_secs(2)), Some(Message::Unchoke));
+
+        Message::Request { index: 0, begin: 0, length: 16384 }.write_to(&mut second).unwrap();
+        Message::Request { index: 0, begin: 0, length: 16384 }.write_to(&mut first).unwrap();
+
+        first.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let served = loop {
+            match Message::read_from(&mut first) {
+                Ok(Message::Piece { block, .. }) => break Some(block.len()),
+                Ok(_) => continue,
+                Err(_) => break None,
+            }
+        };
+        assert_eq!(served, Some(16384), "the unchoked peer got its block");
+        second.set_read_timeout(Some(Duration::from_millis(700))).unwrap();
+        let mut got_piece = false;
+        while let Ok(m) = Message::read_from(&mut second) {
+            got_piece |= matches!(m, Message::Piece { .. });
+        }
+        assert!(!got_piece, "the choked peer got nothing");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_round_hands_a_slot_on_to_a_peer_that_was_waiting_and_tells_the_one_that_lost_it() {
+        let dir = tmp_dir("rotation");
+        // One regular slot and one optimistic; rounds every 150 ms.
+        let (mut handle, info_hash) = start_choking_seeder(&dir, 2, Duration::from_millis(150));
+        let mut a = interested_leecher(handle.port, info_hash);
+        let mut b = interested_leecher(handle.port, info_hash);
+        let mut c = interested_leecher(handle.port, info_hash);
+        assert_eq!(next_choke_message(&mut a, Duration::from_secs(2)), Some(Message::Unchoke));
+        assert_eq!(next_choke_message(&mut b, Duration::from_secs(2)), Some(Message::Unchoke));
+
+        // The optimistic slot goes round the interested peers, so c, which
+        // had no slot, gets one, and whoever it displaces is choked.
+        assert_eq!(next_choke_message(&mut c, Duration::from_secs(6)), Some(Message::Unchoke), "the peer that waited got its turn");
+        let choked = next_choke_message(&mut b, Duration::from_secs(3));
+        assert_eq!(choked, Some(Message::Choke), "and b, which had the optimistic slot, was told it lost it");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_slot_freed_by_a_peer_leaving_goes_to_the_next_at_the_following_round() {
+        let dir = tmp_dir("slot-freed");
+        let (mut handle, info_hash) = start_choking_seeder(&dir, 1, Duration::from_millis(150));
+        let mut first = interested_leecher(handle.port, info_hash);
+        let mut second = interested_leecher(handle.port, info_hash);
+        assert_eq!(next_choke_message(&mut first, Duration::from_secs(2)), Some(Message::Unchoke));
+        assert_eq!(next_choke_message(&mut second, Duration::from_millis(400)), None, "one slot, taken");
+
+        drop(first);
+
+        assert_eq!(next_choke_message(&mut second, Duration::from_secs(4)), Some(Message::Unchoke), "the waiting peer is served once the slot is free");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_peer_that_says_it_is_no_longer_interested_is_choked() {
+        let dir = tmp_dir("not-interested");
+        let (mut handle, info_hash) = start_choking_seeder(&dir, 2, Duration::from_secs(3600));
+        let mut a = interested_leecher(handle.port, info_hash);
+        assert_eq!(next_choke_message(&mut a, Duration::from_secs(2)), Some(Message::Unchoke));
+
+        Message::NotInterested.write_to(&mut a).unwrap();
+
+        assert_eq!(next_choke_message(&mut a, Duration::from_secs(2)), Some(Message::Choke));
+        handle.stop();
+    }
+
+    #[test]
+    fn the_peer_taking_the_most_keeps_its_slot_while_the_others_take_turns() {
+        let dir = tmp_dir("keeps-slot");
+        // One slot by speed, one optimistic, rounds every 100 ms.
+        let (mut handle, info_hash) = start_choking_seeder(&dir, 2, Duration::from_millis(100));
+        let mut idle = interested_leecher(handle.port, info_hash); // connects first, so wins any tie
+        let mut busy = interested_leecher(handle.port, info_hash);
+        let mut waiting = interested_leecher(handle.port, info_hash);
+        assert_eq!(next_choke_message(&mut idle, Duration::from_secs(2)), Some(Message::Unchoke));
+        assert_eq!(next_choke_message(&mut busy, Duration::from_secs(2)), Some(Message::Unchoke));
+
+        // `busy` downloads as fast as it can for a couple of seconds.
+        let (choked_tx, choked_rx) = std::sync::mpsc::channel();
+        let downloader = thread::spawn(move || {
+            busy.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            let until = Instant::now() + Duration::from_millis(2500);
+            let mut blocks = 0;
+            while Instant::now() < until {
+                let _ = Message::Request { index: 0, begin: 0, length: 16384 }.write_to(&mut busy);
+                while let Ok(m) = Message::read_from(&mut busy) {
+                    match m {
+                        Message::Choke => {
+                            let _ = choked_tx.send(());
+                        }
+                        Message::Piece { .. } => blocks += 1,
+                        _ => {}
+                    }
+                }
+            }
+            blocks
+        });
+        // Meanwhile the others are told in turn, as the optimistic slot moves.
+        let turns = next_choke_message(&mut waiting, Duration::from_secs(3)).is_some() | next_choke_message(&mut idle, Duration::from_millis(50)).is_some();
+        let blocks = downloader.join().unwrap();
+
+        assert!(blocks > 10, "the busy peer was actually served: {}", blocks);
+        assert!(choked_rx.try_recv().is_err(), "and never choked, for it took the most every round");
+        assert!(turns, "while the others were told about their turns");
+        handle.stop();
+    }
+
+    // ---- serving the info dictionary (BEP 9) and saying it is a seed (BEP 21) ----
+
+    use crate::peer::extension::{ExtendedHandshake as ExtHs, EXTENDED_HANDSHAKE_ID as EXT_HS_ID};
+    use sha1::{Digest, Sha1};
+
+    /// A seeder that offers `metadata`, with all or none of its one piece.
+    fn start_metadata_seeder(dir: &std::path::Path, metadata: Option<Vec<u8>>, complete: bool) -> (SeederHandle, [u8; 20]) {
+        let files = vec![(vec!["seed.bin".to_string()], 16384i64)];
+        let spans = Arc::new(build_file_spans(dir, &files));
+        write_piece(&spans, 0, 16384, &[0x5Au8; 16384]).unwrap();
+        let have = Arc::new(HaveMap::new(1));
+        if complete {
+            have.set(0);
+        }
+        // The seeder's info hash is the metadata's, as a real torrent's is.
+        let info_hash: [u8; 20] = metadata.as_ref().map_or([0x66; 20], |m| Sha1::digest(m).into());
+        let options = SeederOptions { metadata: metadata.map(Arc::new), ..Default::default() };
+        (start_with(0, info_hash, [0x20; 20], spans, 16384, 16384, have, None, options).unwrap(), info_hash)
+    }
+
+    fn some_metadata(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(7)).collect()
+    }
+
+    /// Connects as a peer that speaks extensions and returns the stream, the
+    /// seeder's handshake and (if it sent one) its extended handshake.
+    fn extension_leecher(port: u16, info_hash: [u8; 20]) -> (TcpStream, Handshake, Option<ExtHs>) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        stream.write_all(&Handshake::new(info_hash, [0x21; 20], true).to_bytes()).unwrap();
+        let mut buf = [0u8; HANDSHAKE_LEN];
+        stream.read_exact(&mut buf).unwrap();
+        let theirs = Handshake::from_bytes(&buf).unwrap();
+        // Say hello in the extension protocol too, asking for replies under id 9.
+        Message::Extended { id: EXT_HS_ID, payload: ExtHs::build(9, None) }.write_to(&mut stream).unwrap();
+        let mut ext = None;
+        stream.set_read_timeout(Some(Duration::from_millis(800))).unwrap();
+        while let Ok(m) = Message::read_from(&mut stream) {
+            if let Message::Extended { id: EXT_HS_ID, payload } = m {
+                ext = Some(ExtHs::parse(&payload).unwrap());
+                break;
+            }
+        }
+        (stream, theirs, ext)
+    }
+
+    #[test]
+    fn the_seeders_own_metadata_client_can_fetch_the_info_dict_from_it_across_several_pieces() {
+        use crate::session::metadata::{fetch_metadata, MetadataConfig};
+        use crate::session::sink::RecordingSink;
+        use std::sync::atomic::AtomicBool;
+        let dir = tmp_dir("serve-metadata");
+        let metadata = some_metadata(40_000); // three pieces of 16 KiB, the last short
+        let (mut handle, info_hash) = start_metadata_seeder(&dir, Some(metadata.clone()), true);
+        let peer: std::net::SocketAddr = format!("127.0.0.1:{}", handle.port).parse().unwrap();
+        let config = MetadataConfig { budget: Duration::from_secs(5), parallelism: 1, connect_timeout: Duration::from_secs(2) };
+
+        let fetched = fetch_metadata(info_hash, [7; 20], vec![peer], None, &config, &RecordingSink::default(), &AtomicBool::new(false)).expect("the seeder serves the metadata");
+
+        assert_eq!(fetched.raw_info, metadata, "every byte, verified against the hash by the fetcher");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_seeder_with_all_its_pieces_says_upload_only_and_one_without_does_not() {
+        let dir = tmp_dir("upload-only");
+        let (mut seed, hash_a) = start_metadata_seeder(&dir, Some(some_metadata(100)), true);
+        let (_, _, ext) = extension_leecher(seed.port, hash_a);
+        let ext = ext.expect("an extended handshake");
+        assert!(ext.upload_only, "a seed says so (BEP 21)");
+        assert_eq!(ext.metadata_size, Some(100));
+        assert!(ext.peer_ut_metadata_id().is_some());
+        assert!(ext.peer_ut_pex_id().is_none(), "and it offers no peer exchange");
+        seed.stop();
+
+        let dir = tmp_dir("not-upload-only");
+        let (mut partial, hash_b) = start_metadata_seeder(&dir, Some(some_metadata(100)), false);
+        let (_, _, ext) = extension_leecher(partial.port, hash_b);
+        assert!(!ext.expect("an extended handshake").upload_only, "a client still downloading does not");
+        partial.stop();
+    }
+
+    #[test]
+    fn a_seeder_with_no_metadata_speaks_no_extensions() {
+        let dir = tmp_dir("no-extensions");
+        let (mut handle, info_hash) = start_metadata_seeder(&dir, None, true);
+
+        let (_, theirs, ext) = extension_leecher(handle.port, info_hash);
+
+        assert!(!theirs.supports_extensions(), "the extension bit is clear");
+        assert!(ext.is_none(), "and no extended handshake is sent");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_request_past_the_end_is_rejected_and_one_before_the_peers_own_handshake_is_ignored() {
+        let dir = tmp_dir("metadata-edge");
+        let (mut handle, info_hash) = start_metadata_seeder(&dir, Some(some_metadata(100)), true);
+        let (mut stream, _, _) = extension_leecher(handle.port, info_hash);
+        let ut_metadata_id = 1; // the id the seeder advertised
+
+        Message::Extended { id: ut_metadata_id, payload: MetadataMessage::Request { piece: 5 }.encode() }.write_to(&mut stream).unwrap();
+
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let reply = loop {
+            match Message::read_from(&mut stream) {
+                Ok(Message::Extended { id: 9, payload }) => break MetadataMessage::decode(&payload).unwrap(),
+                Ok(_) => continue,
+                Err(e) => panic!("no reply: {:?}", e),
+            }
+        };
+        assert_eq!(reply, MetadataMessage::Reject { piece: 5 });
+        handle.stop();
+
+        // A peer that never sent its extended handshake has told us no id to reply under.
+        let dir = tmp_dir("metadata-no-hello");
+        let (mut handle, info_hash) = start_metadata_seeder(&dir, Some(some_metadata(100)), true);
+        let mut silent = TcpStream::connect(("127.0.0.1", handle.port)).unwrap();
+        silent.write_all(&Handshake::new(info_hash, [0x22; 20], true).to_bytes()).unwrap();
+        let mut buf = [0u8; HANDSHAKE_LEN];
+        silent.read_exact(&mut buf).unwrap();
+        Message::Extended { id: 1, payload: MetadataMessage::Request { piece: 0 }.encode() }.write_to(&mut silent).unwrap();
+        silent.set_read_timeout(Some(Duration::from_millis(700))).unwrap();
+        let mut got_data = false;
+        while let Ok(m) = Message::read_from(&mut silent) {
+            got_data |= matches!(m, Message::Extended { id, .. } if id != EXT_HS_ID);
+        }
+        assert!(!got_data, "nothing to answer under");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_peer_that_keeps_asking_for_the_metadata_is_eventually_dropped() {
+        let dir = tmp_dir("metadata-flood");
+        let (mut handle, info_hash) = start_metadata_seeder(&dir, Some(some_metadata(100)), true);
+        let (mut stream, _, _) = extension_leecher(handle.port, info_hash);
+
+        // Set before the seeder hangs up: macOS refuses to set it on a closed socket.
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        // One piece, so 2 * 1 + 8 = 10 requests are allowed.
+        for _ in 0..40 {
+            let request = Message::Extended { id: 1, payload: MetadataMessage::Request { piece: 0 }.encode() };
+            if request.write_to(&mut stream).is_err() {
+                break;
+            }
+        }
+
+        let mut answers = 0;
+        let ended = loop {
+            match Message::read_from(&mut stream) {
+                Ok(Message::Extended { id: 9, .. }) => answers += 1,
+                Ok(_) => {}
+                Err(_) => break true,
+            }
+            if answers > 40 {
+                break false;
+            }
+        };
+        assert!(ended, "the connection was closed");
+        assert!(answers <= 10, "after at most ten answers: {}", answers);
+        handle.stop();
+    }
+
+    #[test]
+    fn a_peer_whose_handshake_arrives_after_the_connection_is_accepted_is_still_served() {
+        // The listener polls without blocking, so a connection is often
+        // accepted before its first byte arrives. Where an accepted socket
+        // inherits the listener's non-blocking mode (macOS, the BSDs) the
+        // handshake read then failed at once and the peer was dropped.
+        let dir = tmp_dir("late-handshake");
+        let (mut handle, info_hash) = start_test_seeder(&dir, &[vec![0x11u8; 16384]], 16384, &[0]);
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+        thread::sleep(Duration::from_millis(1300)); // several accept polls pass, and the serve timeout, with nothing sent
+        stream.write_all(&Handshake::new(info_hash, [0x23; 20], false).to_bytes()).unwrap();
+
+        let mut buf = [0u8; HANDSHAKE_LEN];
+        stream.read_exact(&mut buf).expect("the seeder answered a handshake that came late");
+        assert_eq!(Handshake::from_bytes(&buf).unwrap().info_hash, info_hash);
+        handle.stop();
     }
 }

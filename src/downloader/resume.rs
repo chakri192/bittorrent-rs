@@ -30,23 +30,44 @@ pub fn progress_file_path(out_dir: &Path, info_hash: &[u8; 20]) -> PathBuf {
 /// rather than causing an error or writing corrupt data into the final
 /// file.
 pub fn load_and_verify(path: &Path, spans: &[FileSpan], torrent: &TorrentFile) -> HashSet<u32> {
-    let claimed = read_claimed_indices(path);
-    let mut confirmed = HashSet::new();
+    read_claimed_indices(path).into_iter().filter(|&index| piece_is_on_disk(spans, torrent, index)).collect()
+}
 
-    for index in claimed {
-        if index as usize >= torrent.pieces.len() {
-            continue; // stale entry from a different torrent/layout
-        }
-        let piece_len = torrent.piece_len(index as usize);
-        let Ok(data) = read_piece_bytes(spans, index, torrent.piece_length as u64, piece_len) else {
-            continue; // file missing or shorter than expected -- not actually there
-        };
-        let mut hasher = Sha1::new();
-        hasher.update(&data);
-        let hash: [u8; 20] = hasher.finalize().into();
-        if hash == torrent.pieces[index as usize] {
+/// Whether piece `index`'s bytes are on disk and hash to the torrent's
+/// value for it. A missing file, a short file, or different bytes all just
+/// mean "no": the piece will be fetched again.
+fn piece_is_on_disk(spans: &[FileSpan], torrent: &TorrentFile, index: u32) -> bool {
+    if index as usize >= torrent.pieces.len() {
+        return false; // stale entry from a different torrent/layout
+    }
+    let piece_len = torrent.piece_len(index as usize);
+    let Ok(data) = read_piece_bytes(spans, index, torrent.piece_length as u64, piece_len) else {
+        return false; // file missing or shorter than expected -- not actually there
+    };
+    let hash: [u8; 20] = Sha1::digest(&data).into();
+    hash == torrent.pieces[index as usize]
+}
+
+/// Whether any of the torrent's files already exists with some content.
+pub fn any_data_on_disk(spans: &[FileSpan]) -> bool {
+    spans.iter().any(|s| fs::metadata(&s.path).is_ok_and(|m| m.is_file() && m.len() > 0))
+}
+
+/// Hashes **every** piece of the torrent that is present on disk and
+/// returns those that verify, without trusting any resume file. This is
+/// what lets a finished download (whose resume file is deleted) be
+/// checked and seeded again, and files that came from elsewhere be adopted.
+///
+/// `progress(done, total)` is called after each piece: a large torrent
+/// takes minutes to hash, and the caller should say something.
+pub fn scan_all(spans: &[FileSpan], torrent: &TorrentFile, mut progress: impl FnMut(usize, usize)) -> HashSet<u32> {
+    let total = torrent.pieces.len();
+    let mut confirmed = HashSet::new();
+    for index in 0..total as u32 {
+        if piece_is_on_disk(spans, torrent, index) {
             confirmed.insert(index);
         }
+        progress(index as usize + 1, total);
     }
     confirmed
 }
@@ -273,5 +294,96 @@ mod tests {
         let dir = tmp_dir("clear-missing");
         let path = dir.join("never-existed.resume");
         clear(&path); // must not panic
+    }
+
+    // ---- scan_all -----------------------------------------------------------
+
+    fn write_single(dir: &std::path::Path, torrent: &TorrentFile, bytes: &[u8]) -> Vec<FileSpan> {
+        let spans = build_file_spans(dir, &torrent.files);
+        stdfs::write(&spans[0].path, bytes).unwrap();
+        spans
+    }
+
+    #[test]
+    fn a_scan_finds_every_piece_that_verifies_and_reports_progress() {
+        let (p0, p1) = (vec![0xAAu8; 50], vec![0xBBu8; 50]);
+        let torrent = build_test_torrent(&p0, &p1);
+        let dir = tmp_dir("scan-all");
+        let spans = write_single(&dir, &torrent, &[p0.clone(), p1.clone()].concat());
+
+        let mut calls = Vec::new();
+        let found = scan_all(&spans, &torrent, |done, total| calls.push((done, total)));
+
+        assert_eq!(found, HashSet::from([0, 1]));
+        assert_eq!(calls, vec![(1, 2), (2, 2)], "one report per piece, so a long scan can show progress");
+    }
+
+    #[test]
+    fn a_scan_does_not_trust_a_piece_whose_bytes_changed() {
+        let (p0, p1) = (vec![0xAAu8; 50], vec![0xBBu8; 50]);
+        let torrent = build_test_torrent(&p0, &p1);
+        let dir = tmp_dir("scan-corrupt");
+        let mut bytes = [p0.clone(), p1.clone()].concat();
+        bytes[60] ^= 0x01; // one bit in the second piece
+        let spans = write_single(&dir, &torrent, &bytes);
+
+        assert_eq!(scan_all(&spans, &torrent, |_, _| {}), HashSet::from([0]));
+    }
+
+    #[test]
+    fn a_scan_of_a_short_file_finds_only_the_pieces_that_are_all_there() {
+        let (p0, p1) = (vec![0xAAu8; 50], vec![0xBBu8; 50]);
+        let torrent = build_test_torrent(&p0, &p1);
+        let dir = tmp_dir("scan-short");
+        let spans = write_single(&dir, &torrent, &[p0.clone(), vec![0xBB; 20]].concat()); // second piece cut off
+
+        assert_eq!(scan_all(&spans, &torrent, |_, _| {}), HashSet::from([0]));
+    }
+
+    #[test]
+    fn a_scan_with_no_files_finds_nothing_but_still_reports_every_piece() {
+        let torrent = build_test_torrent(&[1; 50], &[2; 50]);
+        let dir = tmp_dir("scan-missing");
+        let spans = build_file_spans(&dir, &torrent.files);
+        let mut reports = 0;
+
+        assert!(scan_all(&spans, &torrent, |_, _| reports += 1).is_empty());
+        assert_eq!(reports, 2);
+    }
+
+    #[test]
+    fn a_scan_checks_a_piece_that_straddles_two_files() {
+        // "abcdefghijkl" in pieces of 4, split across a="abcdef", b="ghijkl":
+        // piece 1, "efgh", is the end of a and the start of b.
+        let data = b"abcdefghijkl";
+        let mut bytes = b"d4:infod5:filesld6:lengthi6e4:pathl1:aeed6:lengthi6e4:pathl1:beee4:name1:t12:piece lengthi4e6:pieces60:".to_vec();
+        for chunk in data.chunks(4) {
+            bytes.extend_from_slice(&sha1_of(chunk));
+        }
+        bytes.extend_from_slice(b"ee");
+        let torrent = parse_torrent_file(&bytes).unwrap();
+        let dir = tmp_dir("scan-straddle");
+        let spans = build_file_spans(&dir, &torrent.files);
+        stdfs::create_dir_all(spans[0].path.parent().unwrap()).unwrap();
+        stdfs::write(&spans[0].path, b"abcdef").unwrap();
+        stdfs::write(&spans[1].path, b"ghijkl").unwrap();
+        assert_eq!(scan_all(&spans, &torrent, |_, _| {}), HashSet::from([0, 1, 2]));
+
+        stdfs::write(&spans[1].path, b"Xhijkl").unwrap(); // b's first byte, which is piece 1's last
+        assert_eq!(scan_all(&spans, &torrent, |_, _| {}), HashSet::from([0, 2]), "only the straddling piece fails");
+    }
+
+    #[test]
+    fn any_data_on_disk_ignores_missing_and_empty_files() {
+        let torrent = build_test_torrent(&[1; 50], &[2; 50]);
+        let dir = tmp_dir("any-data");
+        let spans = build_file_spans(&dir, &torrent.files);
+        assert!(!any_data_on_disk(&spans), "no file at all");
+
+        stdfs::write(&spans[0].path, b"").unwrap();
+        assert!(!any_data_on_disk(&spans), "an empty file is not data");
+
+        stdfs::write(&spans[0].path, b"x").unwrap();
+        assert!(any_data_on_disk(&spans));
     }
 }

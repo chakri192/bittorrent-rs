@@ -12,6 +12,7 @@
 //! bounded in-memory ring the dashboard tails; the summary numbers live in
 //! a `Snapshot`.
 
+use crate::sync::lock;
 use crate::ui::{format_bytes, format_duration, format_rate, Logger, Snapshot};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -40,11 +41,20 @@ pub struct AppState {
     pub pieces: Vec<bool>,
     /// `Some` once the run has ended: `Ok(summary)` or `Err(reason)`.
     pub finished: Option<Result<String, String>>,
+    /// The torrent's info hash in hex, once known (for `--json`).
+    pub info_hash: Option<String>,
+    /// JSON event lines waiting to be written, for `--json`: what is not
+    /// the periodic progress, such as one line per file of a `--list`.
+    pub events: VecDeque<String>,
 }
+
+/// The most events kept waiting: a run with no one reading them must not
+/// grow without bound.
+const EVENT_QUEUE_CAP: usize = 4096;
 
 impl AppState {
     fn new(title: String, out_path: String, log_path: Option<String>) -> Self {
-        AppState { title, out_path, log_path, snap: Snapshot::default(), down_hist: VecDeque::new(), up_hist: VecDeque::new(), logs: VecDeque::new(), pieces: Vec::new(), finished: None }
+        AppState { title, out_path, log_path, snap: Snapshot::default(), down_hist: VecDeque::new(), up_hist: VecDeque::new(), logs: VecDeque::new(), pieces: Vec::new(), finished: None, info_hash: None, events: VecDeque::new() }
     }
 }
 
@@ -68,15 +78,27 @@ impl Ui {
     }
 
     pub fn set_title(&self, title: impl Into<String>) {
-        if let Ok(mut s) = self.state.lock() {
-            s.title = title.into();
+        let mut s = lock(&self.state);
+        s.title = title.into();
+    }
+
+    pub fn set_info_hash(&self, hex: String) {
+        lock(&self.state).info_hash = Some(hex);
+    }
+
+    /// Queues one line of JSON for `--json` mode to write (dropped in any
+    /// other mode, where nothing drains the queue).
+    pub fn event(&self, line: String) {
+        let mut s = lock(&self.state);
+        if s.events.len() >= EVENT_QUEUE_CAP {
+            s.events.pop_front();
         }
+        s.events.push_back(line);
     }
 
     pub fn set_log_path(&self, path: Option<String>) {
-        if let Ok(mut s) = self.state.lock() {
-            s.log_path = path;
-        }
+        let mut s = lock(&self.state);
+        s.log_path = path;
     }
 
     /// Appends one activity line: to the on-screen ring (bounded) and, if
@@ -84,46 +106,41 @@ impl Ui {
     pub fn log(&self, msg: impl AsRef<str>) {
         let msg = msg.as_ref();
         self.log.line(msg);
-        if let Ok(mut s) = self.state.lock() {
-            s.logs.push_back(msg.to_string());
-            while s.logs.len() > LOG_RING_CAP {
-                s.logs.pop_front();
-            }
+        let mut s = lock(&self.state);
+        s.logs.push_back(msg.to_string());
+        while s.logs.len() > LOG_RING_CAP {
+            s.logs.pop_front();
         }
     }
 
     /// Replaces the summary numbers shown in the stat panes.
     pub fn set_snapshot(&self, snap: Snapshot) {
-        if let Ok(mut s) = self.state.lock() {
-            s.snap = snap;
-        }
+        let mut s = lock(&self.state);
+        s.snap = snap;
     }
 
     /// Updates the per-piece completion map (cheap `Vec<bool>` snapshot).
     pub fn set_pieces(&self, pieces: Vec<bool>) {
-        if let Ok(mut s) = self.state.lock() {
-            s.pieces = pieces;
-        }
+        let mut s = lock(&self.state);
+        s.pieces = pieces;
     }
 
     /// Records one throughput sample for the sparklines.
     pub fn push_rates(&self, down: u64, up: u64) {
-        if let Ok(mut s) = self.state.lock() {
-            s.down_hist.push_back(down);
-            s.up_hist.push_back(up);
-            while s.down_hist.len() > RATE_HISTORY_CAP {
-                s.down_hist.pop_front();
-            }
-            while s.up_hist.len() > RATE_HISTORY_CAP {
-                s.up_hist.pop_front();
-            }
+        let mut s = lock(&self.state);
+        s.down_hist.push_back(down);
+        s.up_hist.push_back(up);
+        while s.down_hist.len() > RATE_HISTORY_CAP {
+            s.down_hist.pop_front();
+        }
+        while s.up_hist.len() > RATE_HISTORY_CAP {
+            s.up_hist.pop_front();
         }
     }
 
     pub fn finish(&self, result: Result<String, String>) {
-        if let Ok(mut s) = self.state.lock() {
-            s.finished = Some(result);
-        }
+        let mut s = lock(&self.state);
+        s.finished = Some(result);
     }
 }
 
@@ -160,7 +177,7 @@ pub fn run(state: &Arc<Mutex<AppState>>, stop: &AtomicBool) -> bool {
         frame = frame.wrapping_add(1);
         // Clone a lightweight view under the lock, then render lock-free.
         let view = {
-            let s = state.lock().unwrap();
+            let s = lock(state);
             View {
                 title: s.title.clone(),
                 out_path: s.out_path.clone(),
@@ -252,8 +269,82 @@ fn render(f: &mut Frame, view: &View) {
     render_throughput(f, lower[0], view);
     render_swarm(f, lower[1], view);
 
-    render_log(f, rows[3], view);
+    // The peer table sits beside the activity log when there is room for both.
+    if rows[3].width >= PEER_PANEL_WIDTH + MIN_LOG_WIDTH {
+        let bottom = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Min(MIN_LOG_WIDTH), Constraint::Length(PEER_PANEL_WIDTH)]).split(rows[3]);
+        render_log(f, bottom[0], view);
+        render_peers(f, bottom[1], view);
+    } else {
+        render_log(f, rows[3], view);
+    }
     render_footer(f, rows[4], view);
+}
+
+/// The peer table's width, borders included: an IPv4 address and port, a
+/// state, a rate and a total, each in its column.
+const PEER_PANEL_WIDTH: u16 = 54;
+/// The narrowest the activity log is squeezed to make room for it.
+const MIN_LOG_WIDTH: u16 = 50;
+const ADDR_COL: usize = 21;
+const STATE_COL: usize = 11;
+const RATE_COL: usize = 9;
+const TOTAL_COL: usize = 8;
+
+/// `text` cut to `width` characters, with an ellipsis if it was longer.
+fn fit(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        text.to_string()
+    } else {
+        let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
+        cut.push('\u{2026}');
+        cut
+    }
+}
+
+fn activity_color(activity: &str) -> Color {
+    match activity {
+        "downloading" => Color::Green,
+        "choked" => Color::Yellow,
+        "connecting" => Color::Cyan,
+        _ => Color::DarkGray,
+    }
+}
+
+/// The peer table as lines of at most `height`: a header, then the peers
+/// (already fastest first), with a count of those that did not fit.
+fn peer_table_lines(peers: &[crate::downloader::PeerRow], height: usize) -> Vec<Line<'static>> {
+    if peers.is_empty() {
+        return vec![Line::from(Span::styled("no peers connected yet", Style::default().fg(Color::DarkGray)))];
+    }
+    let header = Style::default().fg(TITLE);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{:<ADDR_COL$} ", "ADDRESS"), header),
+        Span::styled(format!("{:<STATE_COL$} ", "STATE"), header),
+        Span::styled(format!("{:>RATE_COL$} ", "RATE"), header),
+        Span::styled(format!("{:>TOTAL_COL$}", "TOTAL"), header),
+    ])];
+    let room = height.saturating_sub(1);
+    let shown = if peers.len() > room { room.saturating_sub(1) } else { peers.len() };
+    for peer in peers.iter().take(shown) {
+        let rate = if peer.rate >= 1.0 { format_rate(peer.rate) } else { "-".to_string() };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<ADDR_COL$} ", fit(&peer.addr, ADDR_COL)), Style::default().fg(Color::White)),
+            Span::styled(format!("{:<STATE_COL$} ", peer.activity), Style::default().fg(activity_color(peer.activity))),
+            Span::styled(format!("{:>RATE_COL$} ", fit(&rate, RATE_COL)), Style::default().fg(Color::Gray)),
+            Span::styled(format!("{:>TOTAL_COL$}", fit(&format_bytes(peer.bytes), TOTAL_COL)), Style::default().fg(Color::Gray)),
+        ]));
+    }
+    if shown < peers.len() && room > 0 {
+        lines.push(Line::from(Span::styled(format!("+ {} more", peers.len() - shown), Style::default().fg(Color::DarkGray))));
+    }
+    lines
+}
+
+fn render_peers(f: &mut Frame, area: Rect, view: &View) {
+    let block = panel(&format!("peers ({})", view.snap.peers.len()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(peer_table_lines(&view.snap.peers, inner.height as usize)), inner);
 }
 
 /// Braille spinner frames for the "live" indicator in the header.
@@ -476,7 +567,7 @@ pub fn run_plain(state: &Arc<Mutex<AppState>>, stop: &AtomicBool) -> bool {
     let mut last = Instant::now() - Duration::from_secs(10);
     loop {
         let (snap, finished, title) = {
-            let s = state.lock().unwrap();
+            let s = lock(state);
             (s.snap.clone(), s.finished.clone(), s.title.clone())
         };
         // The caller prints the final summary once, on the normal screen,
@@ -511,12 +602,106 @@ pub fn run_plain(state: &Arc<Mutex<AppState>>, stop: &AtomicBool) -> bool {
     }
 }
 
+/// `--json` mode: one JSON object per line on stdout and nothing else, for
+/// scripts to read. Returns `false` (never a user-initiated quit).
+///
+/// The events, each with an `"event"` field:
+///
+/// - `torrent`: once, when the torrent is known: `name`, `info_hash`,
+///   `total_bytes`, `pieces`.
+/// - `progress`: every second while running, and once more at the end:
+///   `status`, `percent`, `done_bytes`, `total_bytes`, `verified_pieces`,
+///   `total_pieces`, `down_bytes_per_sec`, `up_bytes_per_sec`,
+///   `uploaded_bytes`, `peers`, `peers_dialed`, `peers_known`,
+///   `trackers_ok`, `trackers_total`, `dht_nodes`, `web_seeds`,
+///   `eta_seconds` (`null` when unknown), `elapsed_seconds`, `endgame`.
+/// - `done` (`summary`) when the run finishes, or `error` (`message`) when
+///   it fails, or `stopped` when it is interrupted. Exactly one of them,
+///   last.
+///
+/// Anything else that is queued through [`Ui::event`] comes out in order.
+pub fn run_json(state: &Arc<Mutex<AppState>>, stop: &AtomicBool) -> bool {
+    run_json_to(state, stop, &mut std::io::stdout(), Duration::from_secs(1))
+}
+
+/// [`run_json`] writing to `out`, with progress every `every`.
+pub fn run_json_to(state: &Arc<Mutex<AppState>>, stop: &AtomicBool, out: &mut impl std::io::Write, every: Duration) -> bool {
+    use crate::json::Object;
+    // A write that fails (the reader has gone away) is not a reason to stop
+    // downloading, so errors are dropped.
+    let mut emit = |line: String| {
+        let _ = writeln!(out, "{}", line);
+        let _ = out.flush();
+    };
+    let mut torrent_announced = false;
+    let mut last_progress: Option<Instant> = None;
+    loop {
+        let (snap, finished, title, hash, events) = {
+            let mut s = lock(state);
+            (s.snap.clone(), s.finished.clone(), s.title.clone(), s.info_hash.clone(), std::mem::take(&mut s.events))
+        };
+        // Whatever was queued while the run was still going, first.
+        for line in events {
+            emit(line);
+        }
+        if !torrent_announced && snap.total_pieces > 0 {
+            torrent_announced = true;
+            emit(Object::new().string("event", "torrent").string("name", &title).opt_string("info_hash", hash.as_deref()).uint("total_bytes", snap.total_length).uint("pieces", snap.total_pieces as u64).finish());
+        }
+        let stopping = stop.load(Ordering::SeqCst);
+        let ending = finished.is_some() || stopping;
+        if torrent_announced && (ending || last_progress.is_none_or(|t| t.elapsed() >= every)) {
+            last_progress = Some(Instant::now());
+            emit(
+                Object::new()
+                    .string("event", "progress")
+                    .string("status", snap.status)
+                    .float("percent", snap.fraction() * 100.0, 2)
+                    .uint("done_bytes", snap.done_bytes)
+                    .uint("total_bytes", snap.total_length)
+                    .uint("verified_pieces", snap.verified as u64)
+                    .uint("total_pieces", snap.total_pieces as u64)
+                    .float("down_bytes_per_sec", snap.down_rate, 0)
+                    .float("up_bytes_per_sec", snap.up_rate, 0)
+                    .uint("uploaded_bytes", snap.up_bytes)
+                    .uint("peers", snap.active_peers as u64)
+                    .uint("peers_dialed", snap.dialed_peers as u64)
+                    .uint("peers_known", snap.known_peers as u64)
+                    .uint("trackers_ok", snap.trackers_ok as u64)
+                    .uint("trackers_total", snap.trackers_total as u64)
+                    .uint("dht_nodes", snap.dht_nodes as u64)
+                    .uint("web_seeds", snap.web_seeds as u64)
+                    .opt_uint("eta_seconds", snap.eta_secs)
+                    .uint("elapsed_seconds", snap.elapsed_secs)
+                    .boolean("endgame", snap.endgame)
+                    .finish(),
+            );
+        }
+        match finished {
+            Some(Ok(summary)) => {
+                emit(Object::new().string("event", "done").string("summary", &summary).finish());
+                return false;
+            }
+            Some(Err(message)) => {
+                emit(Object::new().string("event", "error").string("message", &message).finish());
+                return false;
+            }
+            None if stopping => {
+                emit(Object::new().string("event", "stopped").finish());
+                return false;
+            }
+            None => {}
+        }
+        std::thread::sleep(Duration::from_millis(50).min(every));
+    }
+}
+
 /// `--quiet` mode: no output at all. Waits for the run to finish (or the
 /// process to be killed) without touching stdout. Returns `false` (no
 /// interactive quit path here).
 pub fn run_silent(state: &Arc<Mutex<AppState>>, stop: &AtomicBool) -> bool {
     loop {
-        if state.lock().unwrap().finished.is_some() || stop.load(Ordering::SeqCst) {
+        if lock(state).finished.is_some() || stop.load(Ordering::SeqCst) {
             return false;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -567,5 +752,299 @@ mod tests {
         ui.finish(Ok("all done".to_string()));
         let s = ui.shared();
         assert!(matches!(s.lock().unwrap().finished, Some(Ok(ref m)) if m == "all done"));
+    }
+
+    #[test]
+    fn a_poisoned_display_still_learns_that_the_download_finished() {
+        // If finish() were skipped, plain mode would wait for a `finished`
+        // that never arrives.
+        let ui = Ui::new("t", "out", Logger::disabled());
+        let shared = ui.shared();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shared.lock().unwrap();
+            panic!("a thread died holding the dashboard's lock");
+        }));
+        assert!(shared.is_poisoned(), "the setup must really poison it");
+
+        ui.log("still logging");
+        ui.finish(Ok("done".to_string()));
+
+        let state = lock(&shared);
+        assert!(matches!(state.finished, Some(Ok(ref m)) if m == "done"));
+        assert_eq!(state.logs.back().map(String::as_str), Some("still logging"));
+    }
+
+    // ---- --json ----
+
+    use crate::json::{parse_object, Value};
+    use std::collections::BTreeMap;
+
+    fn events(out: Vec<u8>) -> Vec<BTreeMap<String, Value>> {
+        String::from_utf8(out).unwrap().lines().map(|l| parse_object(l).unwrap_or_else(|e| panic!("{:?} is not a flat JSON object: {}", l, e))).collect()
+    }
+
+    fn kinds(events: &[BTreeMap<String, Value>]) -> Vec<&str> {
+        events.iter().map(|e| e["event"].as_str().unwrap()).collect()
+    }
+
+    fn known_torrent_ui() -> Ui {
+        let ui = Ui::new("Some Torrent", "/out", Logger::disabled());
+        ui.set_info_hash("ab".repeat(20));
+        ui.set_snapshot(Snapshot { total_length: 4000, total_pieces: 4, verified: 1, done_bytes: 1000, down_rate: 512.4, up_bytes: 77, active_peers: 3, dialed_peers: 5, known_peers: 9, eta_secs: Some(42), elapsed_secs: 7, status: "downloading", ..Default::default() });
+        ui
+    }
+
+    fn run_to_end(ui: &Ui, stop: &AtomicBool) -> Vec<BTreeMap<String, Value>> {
+        let mut out = Vec::new();
+        let quit = run_json_to(&ui.shared(), stop, &mut out, Duration::from_millis(20));
+        assert!(!quit, "json mode never reports a user quit");
+        events(out)
+    }
+
+    #[test]
+    fn a_finished_run_is_a_torrent_event_progress_and_done_and_nothing_else() {
+        let ui = known_torrent_ui();
+        ui.finish(Ok("download complete".to_string()));
+
+        let ev = run_to_end(&ui, &AtomicBool::new(false));
+
+        assert_eq!(kinds(&ev), vec!["torrent", "progress", "done"]);
+        assert_eq!(ev[0]["name"].as_str(), Some("Some Torrent"));
+        assert_eq!(ev[0]["info_hash"].as_str(), Some("ab".repeat(20).as_str()));
+        assert_eq!((ev[0]["total_bytes"].as_f64(), ev[0]["pieces"].as_f64()), (Some(4000.0), Some(4.0)));
+        let p = &ev[1];
+        assert_eq!(p["status"].as_str(), Some("downloading"));
+        assert_eq!(p["percent"].as_f64(), Some(25.0));
+        assert_eq!((p["done_bytes"].as_f64(), p["total_bytes"].as_f64()), (Some(1000.0), Some(4000.0)));
+        assert_eq!((p["verified_pieces"].as_f64(), p["total_pieces"].as_f64()), (Some(1.0), Some(4.0)));
+        assert_eq!(p["down_bytes_per_sec"].as_f64(), Some(512.0));
+        assert_eq!((p["peers"].as_f64(), p["peers_dialed"].as_f64(), p["peers_known"].as_f64()), (Some(3.0), Some(5.0), Some(9.0)));
+        assert_eq!((p["eta_seconds"].as_f64(), p["elapsed_seconds"].as_f64(), p["uploaded_bytes"].as_f64()), (Some(42.0), Some(7.0), Some(77.0)));
+        assert_eq!(p["endgame"].as_bool(), Some(false));
+        assert_eq!(ev[2]["summary"].as_str(), Some("download complete"));
+    }
+
+    #[test]
+    fn an_unknown_eta_and_hash_are_null_not_missing_or_zero() {
+        let ui = Ui::new("t", "/out", Logger::disabled());
+        ui.set_snapshot(Snapshot { total_length: 10, total_pieces: 1, eta_secs: None, status: "connecting", ..Default::default() });
+        ui.finish(Ok("x".to_string()));
+
+        let ev = run_to_end(&ui, &AtomicBool::new(false));
+
+        assert_eq!(ev[0]["info_hash"], Value::Null);
+        assert_eq!(ev[1]["eta_seconds"], Value::Null);
+    }
+
+    #[test]
+    fn a_failure_is_an_error_event_with_the_reason_and_no_done() {
+        let ui = known_torrent_ui();
+        ui.finish(Err("incomplete: 3 piece(s) never downloaded \"quoted\"\nsecond line".to_string()));
+
+        let ev = run_to_end(&ui, &AtomicBool::new(false));
+
+        assert_eq!(kinds(&ev), vec!["torrent", "progress", "error"]);
+        assert_eq!(ev[2]["message"].as_str(), Some("incomplete: 3 piece(s) never downloaded \"quoted\"\nsecond line"), "escaped on the way out, intact on the way back");
+    }
+
+    #[test]
+    fn a_failure_before_the_torrent_is_known_is_just_the_error() {
+        let ui = Ui::new("t", "/out", Logger::disabled());
+        ui.finish(Err("parsing x.torrent: not a dict".to_string()));
+
+        let ev = run_to_end(&ui, &AtomicBool::new(false));
+
+        assert_eq!(kinds(&ev), vec!["error"], "no torrent, no progress to report");
+    }
+
+    #[test]
+    fn being_stopped_ends_with_a_stopped_event_after_a_last_progress() {
+        let ui = known_torrent_ui();
+
+        let ev = run_to_end(&ui, &AtomicBool::new(true));
+
+        assert_eq!(kinds(&ev), vec!["torrent", "progress", "stopped"]);
+    }
+
+    #[test]
+    fn queued_events_come_out_in_order_before_the_end() {
+        let ui = Ui::new("t", "/out", Logger::disabled());
+        ui.event(r#"{"event":"file","index":1}"#.to_string());
+        ui.event(r#"{"event":"file","index":2}"#.to_string());
+        ui.finish(Ok("2 files".to_string()));
+
+        let ev = run_to_end(&ui, &AtomicBool::new(false));
+
+        assert_eq!(kinds(&ev), vec!["file", "file", "done"]);
+        assert_eq!((ev[0]["index"].as_f64(), ev[1]["index"].as_f64()), (Some(1.0), Some(2.0)));
+    }
+
+    #[test]
+    fn the_event_queue_is_bounded() {
+        let ui = Ui::new("t", "/out", Logger::disabled());
+        for i in 0..(EVENT_QUEUE_CAP + 10) {
+            ui.event(format!("{{\"n\":{}}}", i));
+        }
+        let shared = ui.shared();
+        let s = lock(&shared);
+        assert_eq!(s.events.len(), EVENT_QUEUE_CAP);
+        assert_eq!(s.events.front().map(String::as_str), Some("{\"n\":10}"), "the oldest were dropped");
+    }
+
+    #[test]
+    fn progress_repeats_while_the_run_goes_on_and_the_torrent_is_announced_once() {
+        let ui = known_torrent_ui();
+        let shared = ui.shared();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut out = Vec::new();
+                run_json_to(&shared, &stop, &mut out, Duration::from_millis(30));
+                out
+            })
+        };
+        std::thread::sleep(Duration::from_millis(400));
+        ui.finish(Ok("done".to_string()));
+
+        let ev = events(writer.join().unwrap());
+
+        let progress = kinds(&ev).iter().filter(|k| **k == "progress").count();
+        assert!(progress >= 4, "about every 30 ms for 400 ms, saw {}", progress);
+        assert_eq!(kinds(&ev).iter().filter(|k| **k == "torrent").count(), 1);
+        assert_eq!(kinds(&ev)[0], "torrent");
+        assert_eq!(*kinds(&ev).last().unwrap(), "done");
+    }
+
+    #[test]
+    fn a_reader_that_has_gone_away_does_not_stop_the_run() {
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the reader left"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let ui = known_torrent_ui();
+        ui.finish(Ok("done".to_string()));
+        // Returns normally instead of panicking, as `println!` would.
+        assert!(!run_json_to(&ui.shared(), &AtomicBool::new(false), &mut Broken, Duration::from_millis(10)));
+    }
+
+    // ---- the peer table ----
+
+    use crate::downloader::PeerRow;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn peer(addr: &str, activity: &'static str, rate: f64, bytes: u64) -> PeerRow {
+        PeerRow { addr: addr.to_string(), activity, rate, bytes }
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn view_with(peers: Vec<PeerRow>) -> View {
+        View {
+            title: "Some Torrent".to_string(),
+            out_path: "/out".to_string(),
+            log_path: None,
+            snap: Snapshot { total_length: 1000, total_pieces: 4, active_peers: peers.len(), status: "downloading", peers, ..Default::default() },
+            down_hist: VecDeque::new(),
+            up_hist: VecDeque::new(),
+            logs: vec!["torrent: Some Torrent".to_string()],
+            pieces: vec![false; 4],
+            finished: None,
+            frame: 0,
+        }
+    }
+
+    /// The whole dashboard drawn on a terminal of the given size, as text.
+    fn screen(view: &View, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render(f, view)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height).map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn the_table_lists_each_peer_with_its_state_rate_and_total() {
+        let lines = peer_table_lines(&[peer("203.0.113.7:51413", "downloading", 1_500_000.0, 45_000_000), peer("198.51.100.2:6881", "choked", 0.0, 0)], 10);
+
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert_eq!(lines.len(), 3, "a header and two peers");
+        assert!(text[0].starts_with("ADDRESS") && text[0].contains("STATE") && text[0].contains("RATE") && text[0].contains("TOTAL"), "{:?}", text[0]);
+        assert!(text[1].starts_with("203.0.113.7:51413 ") && text[1].contains("downloading") && text[1].contains("1.4 MiB/s") && text[1].contains("42.9 MiB"), "{:?}", text[1]);
+        assert!(text[2].contains("198.51.100.2:6881") && text[2].contains("choked") && text[2].contains(" -"), "a peer moving nothing shows a dash: {:?}", text[2]);
+    }
+
+    #[test]
+    fn every_row_has_the_same_width_so_the_columns_line_up() {
+        let lines = peer_table_lines(&[peer("1.2.3.4:5", "idle", 5.0, 1), peer("255.255.255.255:65535", "downloading", 999_999_999.0, 99_999_999_999)], 10);
+        let widths: Vec<usize> = lines.iter().map(|l| line_text(l).chars().count()).collect();
+        assert!(widths.iter().all(|&w| w == widths[0]), "{:?}", widths);
+        assert!(widths[0] <= (PEER_PANEL_WIDTH - 2) as usize, "and they fit the panel: {}", widths[0]);
+    }
+
+    #[test]
+    fn a_long_ipv6_address_is_cut_with_an_ellipsis_not_allowed_to_push_the_columns() {
+        let long = "[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:51413";
+        let lines = peer_table_lines(&[peer(long, "idle", 0.0, 0)], 5);
+        let row = line_text(&lines[1]);
+        assert!(row.starts_with("[2001:0db8:85a3:0000\u{2026} "), "{:?}", row);
+        assert_eq!(row.chars().count(), line_text(&lines[0]).chars().count());
+    }
+
+    #[test]
+    fn what_does_not_fit_is_counted_not_drawn() {
+        let peers: Vec<PeerRow> = (0..10).map(|i| peer(&format!("10.0.0.{}:1", i), "idle", 0.0, 0)).collect();
+
+        let lines = peer_table_lines(&peers, 5); // a header and four lines: three peers and the count
+
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(text.len(), 5);
+        assert!(text[3].contains("10.0.0.2:1"));
+        assert_eq!(text[4], "+ 7 more");
+        assert_eq!(peer_table_lines(&peers, 11).len(), 11, "with room for all ten, all ten");
+        assert_eq!(peer_table_lines(&peers, 1).len(), 1, "with room only for the header, just that");
+        assert_eq!(peer_table_lines(&peers, 0).len(), 1, "and never a panic on no room at all");
+    }
+
+    #[test]
+    fn with_no_peers_the_panel_says_so() {
+        assert_eq!(line_text(&peer_table_lines(&[], 5)[0]), "no peers connected yet");
+    }
+
+    #[test]
+    fn a_wide_terminal_shows_the_peer_panel_beside_the_log() {
+        let view = view_with(vec![peer("203.0.113.7:51413", "downloading", 2_000_000.0, 1024), peer("198.51.100.2:6881", "choked", 0.0, 0)]);
+
+        let drawn = screen(&view, 130, 40);
+
+        assert!(drawn.contains("peers (2)"), "the panel is titled with the count");
+        assert!(drawn.contains("203.0.113.7:51413") && drawn.contains("downloading") && drawn.contains("198.51.100.2:6881") && drawn.contains("choked"));
+        assert!(drawn.contains("activity"), "and the log is still there");
+    }
+
+    #[test]
+    fn a_narrow_terminal_leaves_the_peer_panel_out_and_keeps_the_log() {
+        let view = view_with(vec![peer("203.0.113.7:51413", "downloading", 2_000_000.0, 1024)]);
+
+        let drawn = screen(&view, 90, 40);
+
+        assert!(!drawn.contains("203.0.113.7:51413"), "no room for it beside the log");
+        assert!(drawn.contains("activity"));
+    }
+
+    #[test]
+    fn the_dashboard_survives_a_tiny_terminal_with_peers_to_show() {
+        let view = view_with((0..30).map(|i| peer(&format!("10.0.0.{}:6881", i), "downloading", 1e6, 1e6 as u64)).collect());
+        for (w, h) in [(1, 1), (10, 5), (54, 3), (104, 12), (200, 60)] {
+            let _ = screen(&view, w, h); // must not panic
+        }
     }
 }

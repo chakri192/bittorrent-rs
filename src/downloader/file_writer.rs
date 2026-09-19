@@ -33,6 +33,15 @@ pub fn build_file_spans(base_dir: &Path, files: &[(Vec<String>, i64)]) -> Vec<Fi
     spans
 }
 
+/// The file that holds byte `offset` of the torrent, if any. Spans are in
+/// order and contiguous, so this is a binary search: a torrent of tens of
+/// thousands of files would otherwise cost a scan of all of them for every
+/// piece written. Empty files (start == end) hold no byte and are skipped.
+fn span_at(spans: &[FileSpan], offset: u64) -> Option<&FileSpan> {
+    let first_ending_after = spans.partition_point(|s| s.end <= offset);
+    spans.get(first_ending_after).filter(|s| s.start <= offset)
+}
+
 /// Writes `data` starting at global offset `global_offset`, splitting
 /// across file spans as needed. Creates parent directories and files on
 /// demand; never truncates an existing file (uses `create + write`, seeks
@@ -42,10 +51,7 @@ pub fn write_at_global_offset(spans: &[FileSpan], global_offset: u64, data: &[u8
     let mut remaining = data;
 
     while !remaining.is_empty() {
-        let span = spans
-            .iter()
-            .find(|s| offset >= s.start && offset < s.end)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("offset {} is outside all known files", offset)))?;
+        let span = span_at(spans, offset).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("offset {} is outside all known files", offset)))?;
 
         let file_offset = offset - span.start;
         let available_in_file = span.end - offset;
@@ -68,6 +74,26 @@ pub fn write_at_global_offset(spans: &[FileSpan], global_offset: u64, data: &[u8
     Ok(())
 }
 
+/// Creates the empty files among `spans` that `wanted` says are wanted
+/// (with their directories). A file of no bytes is part of a torrent
+/// (`.gitkeep`, `__init__.py`) but no piece holds any of it, so nothing
+/// downloads it and nothing else would ever create it. An existing file is
+/// left alone, whatever its size. Returns how many were created.
+pub fn create_empty_files(spans: &[FileSpan], wanted: impl Fn(usize) -> bool) -> io::Result<usize> {
+    let mut created = 0;
+    for (index, span) in spans.iter().enumerate() {
+        if span.start != span.end || !wanted(index) || span.path.exists() {
+            continue;
+        }
+        if let Some(parent) = span.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&span.path)?;
+        created += 1;
+    }
+    Ok(created)
+}
+
 /// Convenience: writes a whole verified piece at `piece_index`.
 pub fn write_piece(spans: &[FileSpan], piece_index: u32, piece_length: u64, data: &[u8]) -> io::Result<()> {
     let global_offset = piece_index as u64 * piece_length;
@@ -88,10 +114,7 @@ pub fn read_at_global_offset(spans: &[FileSpan], global_offset: u64, len: usize)
     let mut remaining = len;
 
     while remaining > 0 {
-        let span = spans
-            .iter()
-            .find(|s| offset >= s.start && offset < s.end)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("offset {} is outside all known files", offset)))?;
+        let span = span_at(spans, offset).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("offset {} is outside all known files", offset)))?;
 
         let file_offset = offset - span.start;
         let available_in_file = span.end - offset;
@@ -248,5 +271,87 @@ mod tests {
         assert_eq!(&buf[0..100], &vec![1u8; 100][..]);
         assert_eq!(&buf[100..200], &vec![2u8; 100][..]);
         assert_eq!(&buf[200..300], &vec![3u8; 100][..]);
+    }
+
+    // ---- finding the file for an offset, and empty files ----
+
+    /// Spans for files of the given lengths laid end to end.
+    fn spans_of(lengths: &[u64]) -> Vec<FileSpan> {
+        let mut cursor = 0;
+        lengths
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| {
+                let span = FileSpan { path: std::path::PathBuf::from(format!("f{}", i)), start: cursor, end: cursor + len };
+                cursor += len;
+                span
+            })
+            .collect()
+    }
+
+    /// What span_at must agree with: the obvious scan.
+    fn linear(spans: &[FileSpan], offset: u64) -> Option<usize> {
+        spans.iter().position(|s| offset >= s.start && offset < s.end)
+    }
+
+    #[test]
+    fn the_file_for_an_offset_is_found_however_the_files_are_laid_out() {
+        // Empty files at the start, the middle (twice running) and the end.
+        let spans = spans_of(&[0, 5, 0, 0, 7, 1, 0, 3, 0]);
+        let total: u64 = 16;
+        for offset in 0..total + 3 {
+            let found = span_at(&spans, offset).map(|s| spans.iter().position(|o| o.path == s.path).unwrap());
+            assert_eq!(found, linear(&spans, offset), "offset {}", offset);
+        }
+        assert!(span_at(&spans, total).is_none(), "one past the end");
+        assert!(span_at(&[], 0).is_none(), "no files at all");
+    }
+
+    #[test]
+    fn a_torrent_of_a_hundred_thousand_files_is_searched_in_no_time() {
+        let spans = spans_of(&vec![10; 100_000]);
+        let started = std::time::Instant::now();
+        let mut checksum = 0usize;
+        for piece in 0..100_000u64 {
+            let span = span_at(&spans, piece * 10 + 3).unwrap();
+            checksum += (span.start / 10) as usize;
+        }
+        assert_eq!(checksum, (0..100_000usize).sum::<usize>());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "a scan of every file for each of them would take far longer: {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn empty_files_are_created_with_their_directories_and_only_the_wanted_ones() {
+        let dir = tmp_dir("empty-files");
+        let files = vec![(vec!["a.bin".to_string()], 4i64), (vec!["d".to_string(), "e".to_string(), ".keep".to_string()], 0), (vec!["skipped".to_string()], 0), (vec!["z.txt".to_string()], 0)];
+        let spans = build_file_spans(&dir, &files);
+
+        let made = create_empty_files(&spans, |file| file != 2).unwrap();
+
+        assert_eq!(made, 2);
+        assert!(dir.join("d/e/.keep").is_file() && fs::metadata(dir.join("d/e/.keep")).unwrap().len() == 0);
+        assert!(dir.join("z.txt").is_file());
+        assert!(!dir.join("skipped").exists(), "not wanted");
+        assert!(!dir.join("a.bin").exists(), "a file with content is for the pieces to create");
+    }
+
+    #[test]
+    fn an_empty_file_that_already_exists_is_left_as_it_is() {
+        let dir = tmp_dir("empty-exists");
+        fs::write(dir.join("keep.txt"), b"someone's data").unwrap();
+        let spans = build_file_spans(&dir, &[(vec!["keep.txt".to_string()], 0i64)]);
+
+        assert_eq!(create_empty_files(&spans, |_| true).unwrap(), 0);
+
+        assert_eq!(fs::read(dir.join("keep.txt")).unwrap(), b"someone's data", "not truncated");
+    }
+
+    #[test]
+    fn an_empty_file_that_cannot_be_created_is_an_error() {
+        let dir = tmp_dir("empty-blocked");
+        fs::write(dir.join("d"), b"a file where the directory must go").unwrap();
+        let spans = build_file_spans(&dir, &[(vec!["d".to_string(), "x".to_string()], 0i64)]);
+
+        assert!(create_empty_files(&spans, |_| true).is_err());
     }
 }

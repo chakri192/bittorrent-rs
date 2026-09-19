@@ -55,6 +55,27 @@ pub fn build_mask(files: &Files, indices: &[usize], patterns: &[String]) -> Resu
     Ok(mask)
 }
 
+/// The per-file mask for `--prefer`: files whose joined path contains any
+/// of `patterns` (case-insensitively). Errors on a pattern that matches
+/// nothing, like `--only`, so a typo does not silently prefer nothing.
+pub fn build_prefer_mask(files: &Files, patterns: &[String]) -> Result<Vec<bool>, String> {
+    let mut mask = vec![false; files.len()];
+    for pat in patterns {
+        let needle = pat.to_lowercase();
+        let mut matched = false;
+        for (idx, (parts, _)) in files.iter().enumerate() {
+            if file_path(parts).to_lowercase().contains(&needle) {
+                mask[idx] = true;
+                matched = true;
+            }
+        }
+        if !matched {
+            return Err(format!("--prefer {:?}: matched no file in this torrent", pat));
+        }
+    }
+    Ok(mask)
+}
+
 /// True when every file is selected (the common, non-selective case --
 /// lets callers skip all the filtering work).
 pub fn selects_everything(mask: &[bool]) -> bool {
@@ -117,6 +138,25 @@ pub fn format_list(name: &str, files: &Files, mask: &[bool]) -> String {
         out.push_str(&format!("  [{}] {:>width$}  {:>10}  {}\n", check, idx + 1, format_bytes(*len as u64), file_path(parts), width = width));
     }
     out
+}
+
+/// `--list --json`: one line per file, `{"event":"file","index":1,
+/// "path":"Show/ep1.mkv","bytes":1000,"selected":true}`, with the index
+/// counted from 1 as `--files` counts.
+pub fn list_events(files: &Files, mask: &[bool]) -> Vec<String> {
+    files
+        .iter()
+        .enumerate()
+        .map(|(idx, (parts, len))| {
+            crate::json::Object::new()
+                .string("event", "file")
+                .uint("index", idx as u64 + 1)
+                .string("path", &file_path(parts))
+                .uint("bytes", (*len).max(0) as u64)
+                .boolean("selected", mask.get(idx).copied().unwrap_or(false))
+                .finish()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -210,5 +250,50 @@ mod tests {
         assert!(listing.contains("[x] 1"), "selected file marked and numbered: {:?}", listing);
         assert!(listing.contains("[ ] 2"), "unselected file blank-marked: {:?}", listing);
         assert!(listing.contains("Show/ep1.mkv"));
+    }
+
+    #[test]
+    fn list_events_describe_each_file_and_whether_it_is_selected() {
+        let events = list_events(&files(), &[true, false, true]);
+
+        assert_eq!(events.len(), 3);
+        let read: Vec<_> = events.iter().map(|e| crate::json::parse_object(e).unwrap()).collect();
+        assert_eq!(read[0]["event"].as_str(), Some("file"));
+        assert_eq!((read[0]["index"].as_f64(), read[2]["index"].as_f64()), (Some(1.0), Some(3.0)), "counted from 1, as --files counts");
+        assert_eq!(read[1]["path"].as_str(), Some("Show/ep2.mkv"));
+        assert_eq!((read[0]["bytes"].as_f64(), read[2]["bytes"].as_f64()), (Some(1000.0), Some(50.0)));
+        assert_eq!((read[0]["selected"].as_bool(), read[1]["selected"].as_bool(), read[2]["selected"].as_bool()), (Some(true), Some(false), Some(true)));
+    }
+
+    #[test]
+    fn a_short_mask_leaves_the_rest_unselected_and_odd_names_are_escaped() {
+        let files = vec![(vec!["we\"ird".to_string(), "name\n.bin".to_string()], 5i64)];
+        let events = list_events(&files, &[]);
+        let read = crate::json::parse_object(&events[0]).unwrap();
+        assert_eq!(read["selected"].as_bool(), Some(false));
+        assert_eq!(read["path"].as_str(), Some("we\"ird/name\n.bin"));
+    }
+
+    #[test]
+    fn the_prefer_mask_marks_matching_files_case_insensitively() {
+        let mask = build_prefer_mask(&files(), &["EP2".to_string(), ".nfo".to_string()]).unwrap();
+        assert_eq!(mask, vec![false, true, true]);
+        assert_eq!(build_prefer_mask(&files(), &[]).unwrap(), vec![false, false, false], "nothing asked, nothing preferred");
+    }
+
+    #[test]
+    fn a_prefer_pattern_matching_nothing_is_an_error_naming_it() {
+        let err = build_prefer_mask(&files(), &["ep2".to_string(), "typo".to_string()]).unwrap_err();
+        assert!(err.contains("--prefer") && err.contains("typo"), "{}", err);
+    }
+
+    #[test]
+    fn preferred_files_map_to_the_pieces_they_touch() {
+        // Files of 1000, 1000 and 50 bytes in 256-byte pieces: the second file
+        // covers bytes 1000..2000, pieces 3 through 7.
+        let (pieces, _) = selected_pieces(&files(), 256, &build_prefer_mask(&files(), &["ep2".to_string()]).unwrap());
+        let mut got: Vec<u32> = pieces.into_iter().collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![3, 4, 5, 6, 7]);
     }
 }

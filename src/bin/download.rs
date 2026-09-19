@@ -13,29 +13,23 @@
 //! `tui` dashboard (or plain status lines when stdout isn't a TTY);
 //! high-volume detail goes to a log file. Usage:
 //!   download <file.torrent | magnet:?xt=urn:btih:...> [options]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 use bittorrent_rs::config::Config;
-use bittorrent_rs::dht;
-use bittorrent_rs::downloader::{build_file_spans, build_work_queue, load_and_verify, progress_file_path, rewrite_compact, run_worker, PexSender, ResumeWriter, WorkQueue, WorkerConfig};
-use bittorrent_rs::magnet::{parse_magnet_uri, MagnetLink};
-use bittorrent_rs::magnet_fetch::fetch_metadata_from_peer;
-use bittorrent_rs::seeder::{self, HaveMap};
-use bittorrent_rs::torrent::{self, TorrentFile};
-use bittorrent_rs::tracker::{generate_peer_id, Event};
-use bittorrent_rs::tracker_discovery::{announce_to_all, build_request, TransferTotals};
+use bittorrent_rs::magnet::parse_magnet_uri;
+use bittorrent_rs::session::{prepare, resolve_magnet, seed_limits, Ipv6Mode, MetadataConfig, Options, ProgressSink, SeedEnd, SeedLimits, Services};
+use bittorrent_rs::torrent;
+use bittorrent_rs::tracker::generate_peer_id;
 use bittorrent_rs::tui::{self, Ui};
-use bittorrent_rs::ui::{self, Logger, Snapshot};
-use std::collections::{HashSet, VecDeque};
+use bittorrent_rs::ui::{self, Logger};
 use std::fs;
 use std::io::IsTerminal;
-use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Conventional BitTorrent port: preferred TCP listen port for the
 /// seeder and UDP bind for the DHT node (both fall back to ephemeral if
@@ -44,16 +38,6 @@ const DEFAULT_PORT: u16 = 6881;
 const DEFAULT_MAX_PEERS: usize = 30;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PIPELINE_DEPTH: usize = 5;
-/// Floor on re-announce spacing regardless of what a tracker requests,
-/// and the fast-path wait when the dial queue runs completely dry.
-const MIN_REANNOUNCE: Duration = Duration::from_secs(30);
-const DEFAULT_REANNOUNCE: Duration = Duration::from_secs(120);
-/// Main-loop cadence: also the dashboard refresh interval.
-const UI_TICK: Duration = Duration::from_millis(250);
-/// Give up only after this many consecutive re-announce rounds where NO
-/// discovery source produced a single new address *and* nothing is
-/// running -- bounds "retry forever" against a genuinely dead swarm.
-const MAX_FRUITLESS_ROUNDS: u32 = 5;
 /// Budget for resolving a magnet's metadata before declaring the swarm
 /// unreachable.
 const METADATA_RESOLVE_BUDGET: Duration = Duration::from_secs(120);
@@ -69,40 +53,32 @@ enum Verbosity {
     Verbose,
 }
 
-/// Whether to dial IPv6 peers. `Auto` probes for a local IPv6 route once
-/// at startup and enables v6 only if one exists -- dialing v6 addresses
-/// on a v4-only host just burns connect timeouts on guaranteed
-/// `NetworkUnreachable`/`HostUnreachable` failures (the dominant failure
-/// mode observed in the wild).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ipv6Mode {
-    Auto,
-    Always,
-    Never,
-}
-
-/// Probes for outbound IPv6 connectivity without sending a single packet:
-/// a UDP `connect` only resolves a route and fixes the default
-/// destination. No route (v4-only host) fails immediately with
-/// `NetworkUnreachable`, so this is a cheap, side-effect-free egress test.
-fn has_ipv6_egress() -> bool {
-    match UdpSocket::bind("[::]:0") {
-        // 2001:4860:4860::8888 is a well-known global v6 address (Google
-        // DNS); we never talk to it, only ask the kernel if it's routable.
-        Ok(sock) => sock.connect("[2001:4860:4860::8888]:53").is_ok(),
-        Err(_) => false,
-    }
-}
-
 struct Args {
     source: String,
     out_dir: PathBuf,
     max_peers: usize,
     reannounce_override: Option<u64>,
+    /// First delay before retrying a peer that failed.
+    retry_delay: Duration,
+    /// Verify every piece on disk instead of trusting the resume file.
+    recheck: bool,
+    /// Fetch pieces in order rather than rarest first.
+    sequential: bool,
+    /// Case-insensitive path substrings of files to fetch first.
+    prefer: Vec<String>,
+    /// Where to write the torrent's `.torrent` file, if asked.
+    save_torrent: Option<PathBuf>,
+    /// Write status as JSON lines on stdout instead of a dashboard.
+    json: bool,
+    /// Bytes per second limits on download and upload, if set.
+    max_down: Option<u64>,
+    max_up: Option<u64>,
     verbosity: Verbosity,
     timeout: Option<Duration>,
     port: u16,
     seed: bool,
+    /// When to stop seeding on its own; unset means only when told to.
+    seed_limits: SeedLimits,
     no_dht: bool,
     no_portmap: bool,
     no_webseed: bool,
@@ -145,7 +121,10 @@ fn load_config_from_args() -> Result<Config, String> {
 }
 
 fn parse_args(cfg: &Config) -> Result<Args, String> {
-    let mut argv = std::env::args().skip(1);
+    parse_args_from(cfg, std::env::args().skip(1))
+}
+
+fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
     let source = argv.next().ok_or_else(usage)?;
     if source == "--help" || source == "-h" {
         return Err(usage());
@@ -156,10 +135,23 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
     let mut out_dir = cfg.out.clone().unwrap_or_else(default_downloads_dir);
     let mut max_peers = cfg.peers.filter(|&n| n > 0).unwrap_or(DEFAULT_MAX_PEERS);
     let mut reannounce_override = cfg.reannounce;
+    let mut retry_delay = Duration::from_secs(15);
+    let mut recheck = false;
+    let mut sequential = false;
+    let mut prefer: Vec<String> = Vec::new();
+    let mut save_torrent = None;
+    let mut json = false;
+    let mut max_down = None;
+    let mut max_up = None;
     let mut verbosity = Verbosity::Normal;
     let mut timeout = None;
     let mut port = cfg.port.unwrap_or(DEFAULT_PORT);
     let mut seed = cfg.seed.unwrap_or(false);
+    let mut seed_limits = SeedLimits {
+        ratio: cfg.seed_ratio.map(seed_limits::check_ratio).transpose().map_err(|e| format!("config seed_ratio: {}", e))?,
+        time: cfg.seed_time.as_deref().map(seed_limits::parse_duration).transpose().map_err(|e| format!("config seed_time: {}", e))?,
+    };
+    let mut no_seed_flag = false;
     let mut no_dht = !cfg.dht.unwrap_or(true);
     let mut no_portmap = !cfg.portmap.unwrap_or(true);
     let mut no_webseed = !cfg.webseed.unwrap_or(true);
@@ -189,6 +181,23 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
                 let n = argv.next().ok_or("--reannounce requires a number of seconds")?;
                 reannounce_override = Some(n.parse().map_err(|_| format!("--reannounce: not a number: {}", n))?);
             }
+            "--recheck" => recheck = true,
+            "--sequential" => sequential = true,
+            "--prefer" => prefer.push(argv.next().ok_or("--prefer requires a path substring")?),
+            "--json" => json = true,
+            "--save-torrent" => save_torrent = Some(PathBuf::from(argv.next().ok_or("--save-torrent requires a file name")?)),
+            "--max-down" => {
+                let v = argv.next().ok_or("--max-down requires a rate such as 500K or 2M")?;
+                max_down = Some(bittorrent_rs::ratelimit::parse_rate(&v).map_err(|e| format!("--max-down: {}", e))?);
+            }
+            "--max-up" => {
+                let v = argv.next().ok_or("--max-up requires a rate such as 500K or 2M")?;
+                max_up = Some(bittorrent_rs::ratelimit::parse_rate(&v).map_err(|e| format!("--max-up: {}", e))?);
+            }
+            "--retry-delay" => {
+                let n = argv.next().ok_or("--retry-delay requires a number of seconds")?;
+                retry_delay = Duration::from_secs(n.parse().map_err(|_| format!("--retry-delay: not a number: {}", n))?);
+            }
             "--timeout" => {
                 let n = argv.next().ok_or("--timeout requires a number of seconds")?;
                 let secs: u64 = n.parse().map_err(|_| format!("--timeout: not a number: {}", n))?;
@@ -202,7 +211,18 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
             "--no-log" => no_log = true,
             "--no-tui" => no_tui = true,
             "--seed" => seed = true,
-            "--no-seed" => seed = false,
+            "--no-seed" => {
+                seed = false;
+                no_seed_flag = true;
+            }
+            "--seed-ratio" => {
+                let v = argv.next().ok_or("--seed-ratio requires a ratio such as 1 or 2.5")?;
+                seed_limits.ratio = Some(seed_limits::parse_ratio(&v).map_err(|e| format!("--seed-ratio: {}", e))?);
+            }
+            "--seed-time" => {
+                let v = argv.next().ok_or("--seed-time requires a duration such as 30m, 12h or 1d")?;
+                seed_limits.time = Some(seed_limits::parse_duration(&v).map_err(|e| format!("--seed-time: {}", e))?);
+            }
             "--no-dht" => no_dht = true,
             "--dht" => no_dht = false,
             "--no-portmap" => no_portmap = true,
@@ -246,11 +266,23 @@ fn parse_args(cfg: &Config) -> Result<Args, String> {
         }
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, verbosity, timeout, port, seed, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
+    if json && verbosity == Verbosity::Quiet {
+        return Err("--json and --quiet are mutually exclusive".to_string());
+    }
+
+    // A seeding limit is a request to seed.
+    if seed_limits.is_set() {
+        if no_seed_flag {
+            return Err("--no-seed cannot be combined with --seed-ratio or --seed-time".to_string());
+        }
+        seed = true;
+    }
+
+    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, sequential, prefer, save_torrent, json, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -295,8 +327,12 @@ fn main() -> ExitCode {
     ui.set_log_path(log_path_display);
 
     // `--list` is a quick print-and-exit; never spin up the dashboard for it.
-    let interactive = !quiet && !args.no_tui && !args.list && std::io::stdout().is_terminal();
+    let json = args.json;
+    let interactive = !quiet && !json && !args.no_tui && !args.list && std::io::stdout().is_terminal();
     let stop = Arc::new(AtomicBool::new(false));
+    // Ctrl-C and `kill` wind the client down like the dashboard's `q`, even
+    // with no terminal: the port mapping is removed, not left on the router.
+    bittorrent_rs::signal::install(Arc::clone(&stop));
 
     let orchestration = {
         let ui = ui.clone();
@@ -307,6 +343,8 @@ fn main() -> ExitCode {
     let shared = ui.shared();
     let user_quit = if quiet {
         tui::run_silent(&shared, &stop)
+    } else if json {
+        tui::run_json(&shared, &stop)
     } else if interactive {
         tui::run(&shared, &stop)
     } else {
@@ -316,15 +354,16 @@ fn main() -> ExitCode {
 
     let result = orchestration.join().unwrap_or_else(|_| Err("download thread panicked".to_string()));
 
-    if user_quit {
-        if !quiet {
+    if user_quit || bittorrent_rs::signal::received() {
+        if !quiet && !json {
             println!("stopped \u{2014} rerun the same command to resume.");
         }
         return ExitCode::SUCCESS;
     }
     match result {
         Ok(summary) => {
-            if !quiet {
+            // In JSON mode the `done` event has already said it.
+            if !quiet && !json {
                 println!("{}", summary);
             }
             ExitCode::SUCCESS
@@ -337,55 +376,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// One dial queue fed by every discovery source (tracker, DHT, PEX,
-/// magnet bootstrap). `known` remembers every address ever seen so a peer
-/// is dialed at most once; `reserve` holds the ones not yet dialed.
-struct PeerPool {
-    known: HashSet<SocketAddr>,
-    reserve: VecDeque<SocketAddr>,
-    /// When false, IPv6 peer addresses are dropped on arrival rather than
-    /// wasting a dial slot on an unroutable host.
-    allow_ipv6: bool,
-    /// Count of IPv6 addresses dropped for lack of a route (diagnostics).
-    skipped_ipv6: usize,
-}
-
-impl PeerPool {
-    fn new(allow_ipv6: bool) -> Self {
-        PeerPool { known: HashSet::new(), reserve: VecDeque::new(), allow_ipv6, skipped_ipv6: 0 }
-    }
-
-    fn add(&mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> usize {
-        let mut fresh = 0;
-        for addr in addrs {
-            if addr.port() == 0 {
-                continue;
-            }
-            if addr.is_ipv6() && !self.allow_ipv6 {
-                self.skipped_ipv6 += 1;
-                continue;
-            }
-            if self.known.insert(addr) {
-                self.reserve.push_back(addr);
-                fresh += 1;
-            }
-        }
-        fresh
-    }
-
-    fn next_to_dial(&mut self) -> Option<SocketAddr> {
-        self.reserve.pop_front()
-    }
-
-    fn reserve_is_empty(&self) -> bool {
-        self.reserve.is_empty()
-    }
-
-    fn dialed(&self) -> usize {
-        self.known.len() - self.reserve.len()
-    }
-}
-
 /// The whole download, start to finish, publishing to `ui`. Returns a
 /// human-readable completion summary (`Ok`) or a failure reason (`Err`);
 /// either way it also calls `ui.finish` so the dashboard can wind down
@@ -394,447 +384,140 @@ impl PeerPool {
 fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String> {
     let our_peer_id = generate_peer_id();
 
-    let dht_announce_port = Arc::new(AtomicU16::new(0));
+    // Dropping `services` (including on any early `return Err`) stops the
+    // DHT, the listener and the port mapping.
+    let mut services = Services::new();
 
-    let (torrent, mut dht_service, bootstrap_peers) = if args.source.starts_with("magnet:?") {
+    let (torrent, bootstrap_peers) = if args.source.starts_with("magnet:?") {
         let magnet = parse_magnet_uri(&args.source).map_err(|e| finish_err(ui, format!("parsing magnet uri: {}", e)))?;
-        let dht_service = start_dht(&args, magnet.info_hash, &dht_announce_port, ui);
-        if magnet.trackers.is_empty() && dht_service.is_none() {
-            return Err(finish_err(ui, "magnet link has no trackers and DHT is disabled (--no-dht) -- no way to find any peer".to_string()));
+        if !args.no_dht {
+            services.start_dht(args.port, magnet.info_hash, |m| ui.log(m));
         }
-        let (torrent, peers) = resolve_magnet(&magnet, our_peer_id, args.port, dht_service.as_ref(), ui, stop)?;
-        (torrent, dht_service, peers)
+        if magnet.trackers.is_empty() && magnet.peers.is_empty() && services.dht().is_none() {
+            return Err(finish_err(ui, "magnet link has no trackers or peers and DHT is disabled (--no-dht) -- no way to find any peer".to_string()));
+        }
+        if let Some(name) = &magnet.display_name {
+            ui.set_title(name.clone());
+        }
+        let metadata = MetadataConfig { budget: METADATA_RESOLVE_BUDGET, parallelism: METADATA_PARALLELISM, connect_timeout: CONNECT_TIMEOUT };
+        let (torrent, peers) = resolve_magnet(&magnet, our_peer_id, args.port, services.dht(), &metadata, ui, stop).map_err(|e| finish_err(ui, e))?;
+        // The DHT had to run to fetch the metadata, since a magnet link
+        // doesn't say whether the torrent is private until the info dict
+        // arrives. Now that it has, shut the DHT down: no lookups, no
+        // announces, no answering queries for a private info-hash.
+        if torrent.private {
+            services.stop_dht();
+        }
+        (torrent, peers)
     } else {
         let bytes = fs::read(&args.source).map_err(|e| finish_err(ui, format!("reading {}: {}", args.source, e)))?;
         let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| finish_err(ui, format!("parsing {}: {}", args.source, e)))?;
         // A `.torrent` already carries the file list, so `--list` needs no
         // network at all.
-        let dht_service = if args.list { None } else { start_dht(&args, torrent.info_hash, &dht_announce_port, ui) };
-        (torrent, dht_service, Vec::new())
+        if !args.no_dht && !args.list && !torrent.private {
+            services.start_dht(args.port, torrent.info_hash, |m| ui.log(m));
+        }
+        (torrent, Vec::new())
     };
+    if let Some(path) = &args.save_torrent {
+        bittorrent_rs::create::save_torrent(&torrent, path).map_err(|e| finish_err(ui, format!("--save-torrent: {}", e)))?;
+        ui.log(format!("saved the torrent to {}", path.display()));
+    }
+    if torrent.private && !args.list {
+        ui.log("private torrent (BEP 27): DHT and peer exchange disabled, peers come from the tracker only");
+    }
 
     ui.set_title(torrent.name.clone());
+    ui.set_info_hash(torrent::info_hash_hex(&torrent.info_hash));
     ui.log(format!("torrent: {} ({}, {} pieces)", torrent.name, ui::format_bytes(torrent.total_length()), torrent.pieces.len()));
-
-    let total_pieces = torrent.pieces.len();
-    let total_length = torrent.total_length();
-    let piece_length = torrent.piece_length as u64;
 
     // File selection (--only / --files). `--list` prints the file table
     // and exits without downloading anything.
     let mask = bittorrent_rs::selection::build_mask(&torrent.files, &args.files_sel, &args.only).map_err(|e| finish_err(ui, e))?;
     if args.list {
         let listing = bittorrent_rs::selection::format_list(&torrent.name, &torrent.files, &mask);
-        if let Some(d) = dht_service.as_mut() {
-            d.stop();
+        services.shutdown();
+        if args.json {
+            for line in bittorrent_rs::selection::list_events(&torrent.files, &mask) {
+                ui.event(line);
+            }
+            ui.finish(Ok(format!("{} file(s)", torrent.files.len())));
+        } else {
+            ui.finish(Ok(listing.clone()));
         }
-        ui.finish(Ok(listing.clone()));
         return Ok(listing);
     }
-    let selective = !bittorrent_rs::selection::selects_everything(&mask);
-    // `selected_set` = pieces we intend to download; `display_total` /
-    // `goal_pieces` drive the progress UI for the selected subset. The
-    // *true* torrent length still governs on-disk piece math (spans,
-    // seeder), so those stay `total_length`.
-    let (selected_set, selected_bytes) = bittorrent_rs::selection::selected_pieces(&torrent.files, piece_length, &mask);
-    let display_total = if selective { selected_bytes } else { total_length };
-    let goal_pieces = if selective { selected_set.len() } else { total_pieces };
-    let is_wanted = |idx: u32| !selective || selected_set.contains(&idx);
-    if selective {
-        ui.log(format!("selective download: {} of {} file(s), {} piece(s), {}", mask.iter().filter(|&&b| b).count(), torrent.files.len(), selected_set.len(), ui::format_bytes(display_total)));
-    }
-
-    let tracker_urls = collect_tracker_urls(&torrent);
-    let base_dir = if torrent.files.len() > 1 { args.out_dir.join(&torrent.name) } else { args.out_dir.clone() };
-    let spans = Arc::new(build_file_spans(&base_dir, &torrent.files));
-
-    // Resume: re-verify any pieces a previous run claimed complete against
-    // their actual current bytes on disk before trusting them.
-    fs::create_dir_all(&args.out_dir).map_err(|e| finish_err(ui, format!("creating output directory {}: {}", args.out_dir.display(), e)))?;
-    let progress_path = progress_file_path(&args.out_dir, &torrent.info_hash);
-    let confirmed_resumed = load_and_verify(&progress_path, &spans, &torrent);
-    if !confirmed_resumed.is_empty() {
-        ui.log(format!("resuming: {} piece(s) already verified on disk", confirmed_resumed.len()));
-        rewrite_compact(&progress_path, &confirmed_resumed).map_err(|e| finish_err(ui, format!("writing resume file: {}", e)))?;
-    }
-    let mut resume_writer = ResumeWriter::create(&progress_path).map_err(|e| finish_err(ui, format!("opening resume file: {}", e)))?;
-
-    // Upload side: serve verified pieces to inbound peers for the whole
-    // run. A bind failure downgrades to download-only with a warning.
-    let have = Arc::new(HaveMap::new(total_pieces));
-    for &idx in &confirmed_resumed {
-        have.set(idx);
-    }
-    let mut seeder_handle = match seeder::start(args.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have)) {
-        Ok(handle) => {
-            ui.log(format!("listening for inbound peers on port {}", handle.port));
-            dht_announce_port.store(handle.port, Ordering::SeqCst);
-            Some(handle)
-        }
-        Err(e) => {
-            ui.log(format!("warning: could not start listener (download-only): {}", e));
-            None
-        }
+    let options = Options {
+        out_dir: args.out_dir.clone(),
+        port: args.port,
+        max_peers: args.max_peers,
+        reannounce_override: args.reannounce_override.map(Duration::from_secs),
+        retry_delay: args.retry_delay,
+        recheck: args.recheck,
+        sequential: args.sequential,
+        prefer: bittorrent_rs::selection::build_prefer_mask(&torrent.files, &args.prefer).map_err(|e| finish_err(ui, e))?,
+        max_down: args.max_down,
+        max_up: args.max_up,
+        ipv6: args.ipv6,
+        no_portmap: args.no_portmap,
+        no_webseed: args.no_webseed,
+        timeout: args.timeout,
+        pipeline_depth: PIPELINE_DEPTH,
+        connect_timeout: CONNECT_TIMEOUT,
     };
-    let announce_port = seeder_handle.as_ref().map(|s| s.port).unwrap_or(args.port);
-    // Read uploaded bytes without borrowing `seeder_handle` (so it stays
-    // free to `stop()` later).
-    let uploaded_counter: Option<Arc<AtomicU64>> = seeder_handle.as_ref().map(|s| Arc::clone(&s.uploaded));
-    let uploaded = || uploaded_counter.as_ref().map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+    let sink: Arc<dyn ProgressSink> = Arc::new(ui.clone());
+    let prepared = prepare(&torrent, &mask, bootstrap_peers, our_peer_id, &options, &mut services, &sink).map_err(|e| finish_err(ui, e))?;
+    let info = prepared.info.clone();
+    let mut session = prepared.into_session(&*sink, &services);
+    let report = session.run(stop);
 
-    // Best-effort port forwarding (UPnP/NAT-PMP) so inbound peers and DHT
-    // queries reach us behind a home router. Runs on its own thread and
-    // never blocks; silently no-ops if the router doesn't cooperate.
-    let mut portmap_handle = if args.no_portmap || seeder_handle.is_none() {
-        None
-    } else {
-        let udp_port = dht_service.as_ref().map(|d| d.port).unwrap_or(announce_port);
-        let logger = ui.clone();
-        bittorrent_rs::portmap::map_ports(announce_port, udp_port, move |m| logger.log(m))
-    };
-
-    // Only wanted pieces enter the queue and the progress totals; already-
-    // verified wanted pieces count as done from the start. (Resumed
-    // *unwanted* pieces from a prior full run stay advertised for seeding
-    // via `have` above, but don't count toward this run's goal.)
-    let all_work = build_work_queue(&torrent);
-    let confirmed_wanted: std::collections::HashSet<u32> = confirmed_resumed.iter().copied().filter(|i| is_wanted(*i)).collect();
-    let bytes_already_done: u64 = all_work.iter().filter(|w| confirmed_wanted.contains(&w.index)).map(|w| w.length as u64).sum();
-    let remaining_work: Vec<_> = all_work.into_iter().filter(|w| is_wanted(w.index) && !confirmed_resumed.contains(&w.index)).collect();
-    let queue = Arc::new(WorkQueue::new(remaining_work, total_pieces));
-
-    let allow_ipv6 = match args.ipv6 {
-        Ipv6Mode::Always => true,
-        Ipv6Mode::Never => false,
-        Ipv6Mode::Auto => has_ipv6_egress(),
-    };
-    ui.log(if allow_ipv6 {
-        "IPv6 peers enabled".to_string()
-    } else {
-        format!("IPv6 peers disabled ({})", if args.ipv6 == Ipv6Mode::Never { "--no-ipv6" } else { "no local IPv6 route" })
-    });
-    let mut pool = PeerPool::new(allow_ipv6);
-    pool.add(bootstrap_peers);
-
-    let mut bytes_downloaded_this_run: u64 = 0;
-    let mut trackers_ok = 0usize;
-    let mut pex_total = 0usize;
-
-    // First real announce, now that the true size is known.
-    let mut reannounce_wait = DEFAULT_REANNOUNCE;
-    if !tracker_urls.is_empty() {
-        let totals = TransferTotals { uploaded: uploaded(), downloaded: 0, left: display_total.saturating_sub(bytes_already_done) };
-        let req = build_request(torrent.info_hash, our_peer_id, announce_port, totals, Some(Event::Started));
-        let (peers, failures, interval) = announce_to_all(&tracker_urls, &req);
-        trackers_ok = tracker_urls.len().saturating_sub(failures.len());
-        for f in &failures {
-            ui.log(format!("tracker {} failed: {}", f.url, f.error));
-        }
-        if let Some(secs) = interval {
-            reannounce_wait = Duration::from_secs(secs as u64).max(MIN_REANNOUNCE);
-        }
-        pool.add(peers);
-    }
-    if let Some(secs) = args.reannounce_override {
-        reannounce_wait = Duration::from_secs(secs).max(MIN_REANNOUNCE);
-    }
-
-    // BEP 19 web seeds (from the torrent's url-list). These can carry the
-    // whole download even with zero peers, so their presence keeps the run
-    // alive below.
-    let web_seeds: Vec<String> = if args.no_webseed { Vec::new() } else { torrent.url_list.clone() };
-
-    if pool.known.is_empty() && dht_service.is_none() && web_seeds.is_empty() {
-        return Err(finish_err(ui, "no peers found from any tracker (and DHT + web seeds unavailable)".to_string()));
-    }
-    ui.log(format!("{} peer(s) known; dialing up to {} concurrently", pool.known.len(), args.max_peers));
-    if pool.skipped_ipv6 > 0 {
-        ui.log(format!("skipped {} IPv6 peer(s) with no local route (pass --ipv6 to force)", pool.skipped_ipv6));
-    }
-
-    let (tx, rx) = mpsc::channel();
-    let (pex_tx, pex_rx): (PexSender, mpsc::Receiver<Vec<SocketAddr>>) = mpsc::channel();
-    let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: PIPELINE_DEPTH, connect_timeout: CONNECT_TIMEOUT });
-
-    // Web-seed workers: one thread per url-list entry, draining the same
-    // shared queue into the same verify-write-record pipeline as peers.
-    let web_stop = Arc::new(AtomicBool::new(false));
-    let mut web_handles: Vec<thread::JoinHandle<()>> = Vec::new();
-    if !web_seeds.is_empty() {
-        ui.log(format!("web seed: {} url(s) from the torrent's url-list", web_seeds.len()));
-        let files_arc = Arc::new(torrent.files.clone());
-        for url in &web_seeds {
-            let url = url.clone();
-            let name = torrent.name.clone();
-            let files = Arc::clone(&files_arc);
-            let queue = Arc::clone(&queue);
-            let spans = Arc::clone(&spans);
-            let tx = tx.clone();
-            let web_stop = Arc::clone(&web_stop);
-            let ui2 = ui.clone();
-            web_handles.push(thread::spawn(move || {
-                bittorrent_rs::webseed::run_web_worker(&url, &name, &files, &queue, &spans, piece_length, total_length, &tx, &web_stop, move |m| ui2.log(m));
-            }));
-        }
-    }
-
-    let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
-    let mut verified = confirmed_wanted.len();
-    let run_start = Instant::now();
-    let mut last_announce = Instant::now();
-    let mut fruitless_rounds = 0u32;
-    let mut fresh_since_announce = 0usize;
-    let mut endgame_announced = false;
-
-    // Rate sampling / smoothing for the dashboard.
-    let mut last_sample = Instant::now();
-    let mut last_done_bytes = bytes_already_done;
-    let mut last_up_bytes = uploaded();
-    let mut smoothed_down = 0.0f64;
-    let mut smoothed_up = 0.0f64;
-
-    macro_rules! spawn_up_to_cap {
-        () => {
-            while handles.len() < args.max_peers && !queue.is_empty() {
-                let Some(addr) = pool.next_to_dial() else { break };
-                let queue = Arc::clone(&queue);
-                let spans = Arc::clone(&spans);
-                let config = Arc::clone(&config);
-                let tx = tx.clone();
-                let pex_tx = pex_tx.clone();
-                let ui2 = ui.clone();
-                handles.push(thread::spawn(move || {
-                    if let Err(e) = run_worker(addr, &config, &queue, &spans, piece_length, &tx, Some(&pex_tx)) {
-                        ui2.log(format!("peer {} disconnected: {:?}", addr, e));
-                    }
-                }));
+    if report.complete {
+        bittorrent_rs::downloader::resume::clear(&info.progress_path);
+        let scope = if info.selective { format!("{} selected", ui::format_bytes(info.display_total)) } else { ui::format_bytes(info.total_length) };
+        let avg = report.bytes_this_run as f64 / report.elapsed.as_secs_f64().max(0.001);
+        // Built again after seeding, when there is more to say about uploads.
+        let summarize = |uploaded: u64, seed_end: Option<SeedEnd>| {
+            let mut text = format!(
+                "download complete: {} -> {}\n  {} in {} \u{b7} {} avg \u{b7} {} uploaded",
+                torrent.name,
+                info.base_dir.display(),
+                scope,
+                ui::format_duration(report.elapsed.as_secs()),
+                ui::format_rate(avg),
+                ui::format_bytes(uploaded),
+            );
+            if let Some(end) = seed_end {
+                text.push_str(&format!("\n  {}, seeding finished", end));
             }
+            text
         };
-    }
-
-    macro_rules! publish_snapshot {
-        () => {{
-            let now = Instant::now();
-            let dt = now.duration_since(last_sample).as_secs_f64();
-            if dt >= 0.25 {
-                let cur_done = bytes_already_done + bytes_downloaded_this_run;
-                let cur_up = uploaded();
-                let inst_down = cur_done.saturating_sub(last_done_bytes) as f64 / dt;
-                let inst_up = cur_up.saturating_sub(last_up_bytes) as f64 / dt;
-                smoothed_down = 0.6 * smoothed_down + 0.4 * inst_down;
-                smoothed_up = 0.6 * smoothed_up + 0.4 * inst_up;
-                last_sample = now;
-                last_done_bytes = cur_done;
-                last_up_bytes = cur_up;
-                ui.push_rates(smoothed_down as u64, smoothed_up as u64);
-                ui.set_pieces(have.snapshot()); // drives the piece-map heatmap
-            }
-            let done = bytes_already_done + bytes_downloaded_this_run;
-            let remaining = display_total.saturating_sub(done);
-            let eta_secs = if smoothed_down > 1.0 { Some((remaining as f64 / smoothed_down) as u64) } else { None };
-            let web_active = web_handles.iter().any(|h| !h.is_finished());
-            let status = if queue.in_endgame() {
-                "endgame"
-            } else if bytes_downloaded_this_run > 0 || web_active {
-                "downloading"
-            } else if handles.is_empty() && pool.reserve_is_empty() {
-                "waiting"
-            } else {
-                "connecting"
-            };
-            ui.set_snapshot(Snapshot {
-                total_length: display_total,
-                total_pieces: goal_pieces,
-                verified,
-                done_bytes: done,
-                down_rate: smoothed_down,
-                up_bytes: uploaded(),
-                up_rate: smoothed_up,
-                active_peers: handles.len(),
-                dialed_peers: pool.dialed(),
-                known_peers: pool.known.len(),
-                endgame: queue.in_endgame(),
-                trackers_ok,
-                trackers_total: tracker_urls.len(),
-                dht_nodes: dht_service.as_ref().map(|d| d.nodes.load(Ordering::SeqCst)).unwrap_or(0),
-                pex_total,
-                web_seeds: web_handles.iter().filter(|h| !h.is_finished()).count(),
-                eta_secs,
-                elapsed_secs: run_start.elapsed().as_secs(),
-                status,
-            });
-        }};
-    }
-
-    spawn_up_to_cap!();
-    publish_snapshot!();
-
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
-        if let Some(timeout) = args.timeout {
-            if run_start.elapsed() >= timeout {
-                ui.log(format!("--timeout of {}s reached with {} piece(s) remaining", timeout.as_secs(), queue.len()));
-                break;
-            }
-        }
-
-        match rx.recv_timeout(UI_TICK) {
-            Ok(result) => {
-                verified += 1;
-                bytes_downloaded_this_run += result.data.len() as u64;
-                have.set(result.index);
-                if let Err(e) = resume_writer.record(result.index) {
-                    ui.log(format!("warning: failed to record resume progress for piece {}: {}", result.index, e));
-                }
-                ui.log(format!("piece {} verified ({}/{})", result.index, verified, goal_pieces));
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-
-        if queue.is_empty() {
-            break;
-        }
-
-        handles.retain(|h| !h.is_finished());
-
-        // Passive discovery feeds -> dial queue.
-        let pex_fresh: usize = pex_rx.try_iter().map(|batch| pool.add(batch)).sum();
-        if pex_fresh > 0 {
-            pex_total += pex_fresh;
-            ui.log(format!("PEX: {} new peer address(es) from connected peers", pex_fresh));
-        }
-        fresh_since_announce += pex_fresh;
-        if let Some(dht) = &dht_service {
-            let dht_fresh: usize = dht.peers_rx.try_iter().map(|batch| pool.add(batch)).sum();
-            if dht_fresh > 0 {
-                ui.log(format!("DHT: {} new peer address(es)", dht_fresh));
-            }
-            fresh_since_announce += dht_fresh;
-        }
-
-        spawn_up_to_cap!();
-
-        if !endgame_announced && queue.in_endgame() {
-            endgame_announced = true;
-            ui.log(format!("endgame: {} piece(s) left, requesting duplicates from every capable peer", queue.len()));
-        }
-
-        publish_snapshot!();
-
-        let starved = handles.is_empty() && pool.reserve_is_empty();
-        let effective_wait = if starved { MIN_REANNOUNCE } else { reannounce_wait };
-        if last_announce.elapsed() < effective_wait {
-            continue;
-        }
-        last_announce = Instant::now();
-
-        if !tracker_urls.is_empty() {
-            ui.log(format!("{} piece(s) remaining, re-announcing to trackers", queue.len()));
-            let totals = TransferTotals { uploaded: uploaded(), downloaded: bytes_downloaded_this_run, left: display_total.saturating_sub(bytes_already_done + bytes_downloaded_this_run) };
-            let req = build_request(torrent.info_hash, our_peer_id, announce_port, totals, None);
-            let (peers, failures, interval) = announce_to_all(&tracker_urls, &req);
-            trackers_ok = tracker_urls.len().saturating_sub(failures.len());
-            for f in &failures {
-                ui.log(format!("tracker {} failed: {}", f.url, f.error));
-            }
-            if args.reannounce_override.is_none() {
-                if let Some(secs) = interval {
-                    reannounce_wait = Duration::from_secs(secs as u64).max(MIN_REANNOUNCE);
-                }
-            }
-            fresh_since_announce += pool.add(peers);
-        }
-
-        spawn_up_to_cap!();
-
-        // A run isn't fruitless while a web seed is still pulling pieces --
-        // it can finish the whole download with no peers at all.
-        let web_active = web_handles.iter().any(|h| !h.is_finished());
-        if fresh_since_announce == 0 && handles.is_empty() && pool.reserve_is_empty() && !web_active {
-            fruitless_rounds += 1;
-            ui.log(format!("no new peers from any source ({}/{} fruitless rounds)", fruitless_rounds, MAX_FRUITLESS_ROUNDS));
-            if fruitless_rounds >= MAX_FRUITLESS_ROUNDS {
-                break;
-            }
-        } else {
-            fruitless_rounds = 0;
-        }
-        fresh_since_announce = 0;
-    }
-
-    web_stop.store(true, Ordering::SeqCst);
-    drop(tx);
-    drop(pex_tx);
-    for h in handles {
-        let _ = h.join();
-    }
-    for h in web_handles {
-        let _ = h.join();
-    }
-    for result in rx.try_iter() {
-        verified += 1;
-        bytes_downloaded_this_run += result.data.len() as u64;
-        have.set(result.index);
-        let _ = resume_writer.record(result.index);
-        ui.log(format!("piece {} verified ({}/{})", result.index, verified, goal_pieces));
-    }
-
-    let complete = queue.is_empty();
-    let elapsed = run_start.elapsed();
-    let avg = bytes_downloaded_this_run as f64 / elapsed.as_secs_f64().max(0.001);
-
-    if complete {
-        bittorrent_rs::downloader::resume::clear(&progress_path);
-        let scope = if selective { format!("{} selected", ui::format_bytes(display_total)) } else { ui::format_bytes(total_length) };
-        let summary = format!(
-            "download complete: {} -> {}\n  {} in {} \u{b7} {} avg \u{b7} {} uploaded",
-            torrent.name,
-            base_dir.display(),
-            scope,
-            ui::format_duration(elapsed.as_secs()),
-            ui::format_rate(avg),
-            ui::format_bytes(uploaded()),
-        );
+        let mut summary = summarize(session.uploaded_bytes(), None);
         ui.log("download complete");
 
-        if !tracker_urls.is_empty() && bytes_downloaded_this_run > 0 {
-            let totals = TransferTotals { uploaded: uploaded(), downloaded: bytes_downloaded_this_run, left: 0 };
-            let req = build_request(torrent.info_hash, our_peer_id, announce_port, totals, Some(Event::Completed));
-            let _ = announce_to_all(&tracker_urls, &req);
-        }
+        session.announce_completed();
 
-        if args.seed && seeder_handle.is_some() {
-            // Keep the UI live and seeding until the user quits. The UI
-            // totals reflect the selected subset (display_total/goal).
-            seed_loop(&torrent, our_peer_id, &tracker_urls, announce_port, reannounce_wait, uploaded_counter.clone(), display_total, goal_pieces, bytes_downloaded_this_run, ui, stop);
+        if args.seed && services.has_seeder() {
+            // Keep the UI live and seeding until the user quits or a seed
+            // limit is reached. The UI totals reflect the selected subset
+            // (info.display_total/goal).
+            if let Some(end) = session.seed(&torrent.name, info.announce_port, stop, args.seed_limits) {
+                summary = summarize(session.uploaded_bytes(), Some(end));
+                ui.finish(Ok(summary.clone()));
+            }
         } else {
             ui.finish(Ok(summary.clone()));
         }
 
-        if let Some(p) = portmap_handle.as_mut() {
-            p.stop();
-        }
-        if let Some(s) = seeder_handle.as_mut() {
-            s.stop();
-        }
-        if let Some(d) = dht_service.as_mut() {
-            d.stop();
-        }
+        session.announce_stopped();
+        services.shutdown();
         Ok(summary)
     } else {
-        let reason = format!("incomplete: {} piece(s) never downloaded ({} peer(s) dialed) -- rerun the same command to resume", queue.len(), pool.dialed());
-        if let Some(p) = portmap_handle.as_mut() {
-            p.stop();
-        }
-        if let Some(s) = seeder_handle.as_mut() {
-            s.stop();
-        }
-        if let Some(d) = dht_service.as_mut() {
-            d.stop();
-        }
+        let reason = match &report.aborted {
+            Some(why) => format!("cannot write to disk: {} -- {} piece(s) not downloaded; fix that and rerun the same command to resume", why, report.remaining),
+            None => format!("incomplete: {} piece(s) never downloaded ({} peer(s) dialed) -- rerun the same command to resume", report.remaining, report.dialed),
+        };
+        session.announce_stopped();
+        services.shutdown();
         // If we're here because the user quit, don't flash a failure
         // banner -- main prints the "stopped" line.
         if !stop.load(Ordering::SeqCst) {
@@ -851,259 +534,105 @@ fn finish_err(ui: &Ui, reason: String) -> String {
     reason
 }
 
-/// Post-completion seeding: keep the listener and DHT alive, re-announce
-/// with `left = 0` on the tracker interval, publish upload stats. Returns
-/// when `stop` is set (user quit).
-#[allow(clippy::too_many_arguments)]
-fn seed_loop(
-    torrent: &TorrentFile,
-    our_peer_id: [u8; 20],
-    tracker_urls: &[String],
-    announce_port: u16,
-    reannounce_wait: Duration,
-    uploaded_counter: Option<Arc<AtomicU64>>,
-    total_length: u64,
-    total_pieces: usize,
-    downloaded_this_run: u64,
-    ui: &Ui,
-    stop: &AtomicBool,
-) {
-    let uploaded = || uploaded_counter.as_ref().map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
-    ui.log(format!("seeding {} on port {} -- press q to stop", torrent.name, announce_port));
-
-    let mut last_announce = Instant::now();
-    let mut last_sample = Instant::now();
-    let mut last_up = uploaded();
-    let mut smoothed_up = 0.0f64;
-
-    while !stop.load(Ordering::SeqCst) {
-        let now = Instant::now();
-        let dt = now.duration_since(last_sample).as_secs_f64();
-        if dt >= 0.25 {
-            let cur = uploaded();
-            smoothed_up = 0.6 * smoothed_up + 0.4 * (cur.saturating_sub(last_up) as f64 / dt);
-            last_sample = now;
-            last_up = cur;
-            ui.push_rates(0, smoothed_up as u64);
-        }
-        ui.set_snapshot(Snapshot {
-            total_length,
-            total_pieces,
-            verified: total_pieces,
-            done_bytes: total_length,
-            down_rate: 0.0,
-            up_bytes: uploaded(),
-            up_rate: smoothed_up,
-            endgame: false,
-            status: "seeding",
-            ..Default::default()
-        });
-
-        if !tracker_urls.is_empty() && last_announce.elapsed() >= reannounce_wait.max(MIN_REANNOUNCE) {
-            let totals = TransferTotals { uploaded: uploaded(), downloaded: downloaded_this_run, left: 0 };
-            let req = build_request(torrent.info_hash, our_peer_id, announce_port, totals, None);
-            let _ = announce_to_all(tracker_urls, &req);
-            last_announce = Instant::now();
-        }
-        thread::sleep(UI_TICK);
-    }
-}
-
-fn start_dht(args: &Args, info_hash: [u8; 20], announce_port: &Arc<AtomicU16>, ui: &Ui) -> Option<dht::DhtService> {
-    if args.no_dht {
-        return None;
-    }
-    match dht::spawn_service(args.port, dht::DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect(), info_hash, Arc::clone(announce_port)) {
-        Ok(service) => {
-            ui.log(format!("DHT node running on UDP port {}", service.port));
-            Some(service)
-        }
-        Err(e) => {
-            ui.log(format!("DHT disabled (couldn't bind UDP socket): {}", e));
-            None
-        }
-    }
-}
-
-/// Bootstraps a magnet link into a full `TorrentFile`: gathers peers from
-/// the magnet's trackers and the DHT, then probes them concurrently for
-/// the info dict (BEP 9) until one delivers a copy that SHA-1-verifies
-/// against the magnet's InfoHash. Returns the torrent plus every peer
-/// address gathered (they seed the download phase's dial queue).
-fn resolve_magnet(magnet: &MagnetLink, our_peer_id: [u8; 20], announce_port: u16, dht: Option<&dht::DhtService>, ui: &Ui, stop: &AtomicBool) -> Result<(TorrentFile, Vec<SocketAddr>), String> {
-    if let Some(name) = &magnet.display_name {
-        ui.set_title(name.clone());
-    }
-
-    let mut known: HashSet<SocketAddr> = HashSet::new();
-    let untried: Arc<Mutex<VecDeque<SocketAddr>>> = Arc::new(Mutex::new(VecDeque::new()));
-
-    if !magnet.trackers.is_empty() {
-        ui.log(format!("querying {} tracker(s) to bootstrap peer list", magnet.trackers.len()));
-        let bootstrap_req = build_request(magnet.info_hash, our_peer_id, announce_port, TransferTotals { uploaded: 0, downloaded: 0, left: 1 }, Some(Event::Started));
-        let (peers, failures, _interval) = announce_to_all(&magnet.trackers, &bootstrap_req);
-        for f in &failures {
-            ui.log(format!("tracker {} failed: {}", f.url, f.error));
-        }
-        let mut q = untried.lock().unwrap();
-        for p in peers {
-            if known.insert(p) {
-                q.push_back(p);
-            }
-        }
-    } else {
-        ui.log("magnet link has no trackers; waiting on the DHT for peers");
-    }
-
-    // Concurrent BEP 9 probe pool. First worker to verify metadata wins.
-    let pool_stop = Arc::new(AtomicBool::new(false));
-    let attempts = Arc::new(AtomicU64::new(0));
-    let last_err = Arc::new(Mutex::new(String::from("no peer source produced any address")));
-    let (found_tx, found_rx) = mpsc::channel::<Vec<u8>>();
-
-    let mut workers = Vec::with_capacity(METADATA_PARALLELISM);
-    for _ in 0..METADATA_PARALLELISM {
-        let untried = Arc::clone(&untried);
-        let pool_stop = Arc::clone(&pool_stop);
-        let attempts = Arc::clone(&attempts);
-        let last_err = Arc::clone(&last_err);
-        let found_tx = found_tx.clone();
-        let info_hash = magnet.info_hash;
-        workers.push(thread::spawn(move || {
-            while !pool_stop.load(Ordering::SeqCst) {
-                let Some(peer) = untried.lock().unwrap().pop_front() else {
-                    thread::sleep(Duration::from_millis(200));
-                    continue;
-                };
-                attempts.fetch_add(1, Ordering::Relaxed);
-                match fetch_metadata_from_peer(peer, info_hash, our_peer_id, CONNECT_TIMEOUT) {
-                    Ok(raw_info) => {
-                        if !pool_stop.swap(true, Ordering::SeqCst) {
-                            let _ = found_tx.send(raw_info);
-                        }
-                        return;
-                    }
-                    Err(e) => *last_err.lock().unwrap() = e.to_string(),
-                }
-            }
-        }));
-    }
-    drop(found_tx);
-
-    let deadline = Instant::now() + METADATA_RESOLVE_BUDGET;
-    let mut last_log = Instant::now();
-    let raw_info = loop {
-        if stop.load(Ordering::SeqCst) {
-            break None; // user quit
-        }
-        if let Some(dht) = dht {
-            let mut q = untried.lock().unwrap();
-            for batch in dht.peers_rx.try_iter() {
-                for p in batch {
-                    if known.insert(p) {
-                        q.push_back(p);
-                    }
-                }
-            }
-        }
-
-        // Keep the dashboard alive during resolution.
-        ui.set_snapshot(Snapshot {
-            known_peers: known.len(),
-            dht_nodes: dht.map(|d| d.nodes.load(Ordering::SeqCst)).unwrap_or(0),
-            status: "resolving",
-            ..Default::default()
-        });
-        if last_log.elapsed() >= Duration::from_secs(3) {
-            ui.log(format!("resolving metadata: {} peer(s) probed, {} known, {}s left", attempts.load(Ordering::Relaxed), known.len(), deadline.saturating_duration_since(Instant::now()).as_secs()));
-            last_log = Instant::now();
-        }
-
-        match found_rx.recv_timeout(Duration::from_millis(300)) {
-            Ok(raw) => break Some(raw),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if Instant::now() >= deadline {
-                    break None;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break None,
-        }
-    };
-    pool_stop.store(true, Ordering::SeqCst);
-    for w in workers {
-        let _ = w.join();
-    }
-
-    match raw_info {
-        Some(raw) => {
-            ui.log("metadata received and verified against magnet InfoHash");
-            let announce = magnet.trackers.first().cloned();
-            let announce_list = vec![magnet.trackers.clone()];
-            let torrent = torrent::from_info_dict_bytes(&raw, magnet.info_hash, announce, announce_list).map_err(|e| finish_err(ui, format!("building torrent from metadata: {}", e)))?;
-            Ok((torrent, known.into_iter().collect()))
-        }
-        None => {
-            let n = attempts.load(Ordering::Relaxed);
-            let last = last_err.lock().unwrap().clone();
-            let reason = if stop.load(Ordering::SeqCst) {
-                "stopped before metadata could be resolved".to_string()
-            } else if Instant::now() >= deadline {
-                format!("metadata resolution budget ({}s) exhausted after {} concurrent probe(s) across {} known peer(s) (last error: {})", METADATA_RESOLVE_BUDGET.as_secs(), n, known.len(), last)
-            } else {
-                format!("no peer among {} would provide metadata after {} probe(s) (last error: {})", known.len(), n, last)
-            };
-            Err(finish_err(ui, reason))
-        }
-    }
-}
-
-fn collect_tracker_urls(torrent: &TorrentFile) -> Vec<String> {
-    let mut urls: Vec<String> = torrent.announce.iter().cloned().collect();
-    for tier in &torrent.announce_list {
-        urls.extend(tier.iter().cloned());
-    }
-    urls.sort();
-    urls.dedup();
-    urls
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-    fn v4(s: &str) -> SocketAddr {
-        s.parse().unwrap()
-    }
-    fn v6(s: &str) -> SocketAddr {
-        s.parse().unwrap()
+    fn parse(cfg: &Config, args: &[&str]) -> Result<Args, String> {
+        parse_args_from(cfg, args.iter().map(|a| a.to_string()))
     }
 
-    #[test]
-    fn pool_dedups_and_skips_port_zero() {
-        let mut pool = PeerPool::new(true);
-        let added = pool.add([v4("10.0.0.1:6881"), v4("10.0.0.1:6881"), v4("10.0.0.2:0")]);
-        assert_eq!(added, 1, "duplicate collapses, port-0 is dropped");
-        assert_eq!(pool.dialed(), 0);
-        assert_eq!(pool.next_to_dial(), Some(v4("10.0.0.1:6881")));
-        assert_eq!(pool.dialed(), 1);
-        assert!(pool.reserve_is_empty());
+    fn cfg_from(toml: &str) -> Config {
+        toml::from_str(toml).unwrap()
     }
 
     #[test]
-    fn pool_drops_ipv6_when_disallowed_and_counts_it() {
-        let mut pool = PeerPool::new(false);
-        let added = pool.add([v4("10.0.0.1:6881"), v6("[2001:db8::1]:6881"), v6("[2001:db8::2]:51413")]);
-        assert_eq!(added, 1, "only the v4 peer is queued");
-        assert_eq!(pool.skipped_ipv6, 2);
-        assert_eq!(pool.next_to_dial(), Some(v4("10.0.0.1:6881")));
-        assert!(pool.reserve_is_empty());
+    fn prefer_can_be_given_more_than_once() {
+        assert!(parse(&Config::default(), &["x"]).unwrap().prefer.is_empty());
+        assert_eq!(parse(&Config::default(), &["x", "--prefer", ".nfo", "--prefer", "ep1"]).unwrap().prefer, vec![".nfo".to_string(), "ep1".to_string()]);
+        assert!(parse(&Config::default(), &["x", "--prefer"]).err().unwrap().contains("requires"));
     }
 
     #[test]
-    fn pool_keeps_ipv6_when_allowed() {
-        let mut pool = PeerPool::new(true);
-        let added = pool.add([v6("[2001:db8::1]:6881")]);
-        assert_eq!(added, 1);
-        assert_eq!(pool.skipped_ipv6, 0);
+    fn json_is_off_unless_asked_for_and_refuses_quiet() {
+        assert!(!parse(&Config::default(), &["x"]).unwrap().json);
+        assert!(parse(&Config::default(), &["x", "--json"]).unwrap().json);
+        assert!(parse(&Config::default(), &["x", "--json", "--verbose"]).unwrap().json);
+        assert!(parse(&Config::default(), &["x", "--json", "--quiet"]).err().unwrap().contains("mutually exclusive"));
+        assert!(parse(&Config::default(), &["x", "--quiet", "--json"]).err().unwrap().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn save_torrent_takes_a_file_name() {
+        assert_eq!(parse(&Config::default(), &["x"]).unwrap().save_torrent, None);
+        assert_eq!(parse(&Config::default(), &["x", "--save-torrent", "kept.torrent"]).unwrap().save_torrent, Some(PathBuf::from("kept.torrent")));
+        assert!(parse(&Config::default(), &["x", "--save-torrent"]).err().unwrap().contains("requires"));
+    }
+
+    #[test]
+    fn sequential_is_off_unless_asked_for() {
+        assert!(!parse(&Config::default(), &["x.torrent"]).unwrap().sequential);
+        assert!(parse(&Config::default(), &["x.torrent", "--sequential"]).unwrap().sequential);
+    }
+
+    #[test]
+    fn seeding_is_off_and_unlimited_unless_asked_for() {
+        let args = parse(&Config::default(), &["x.torrent"]).unwrap();
+        assert!(!args.seed);
+        assert!(!args.seed_limits.is_set());
+    }
+
+    #[test]
+    fn a_seed_limit_on_the_command_line_turns_seeding_on() {
+        let args = parse(&Config::default(), &["x.torrent", "--seed-ratio", "1.5"]).unwrap();
+        assert!(args.seed);
+        assert_eq!(args.seed_limits, SeedLimits { ratio: Some(1.5), time: None });
+
+        let args = parse(&Config::default(), &["x.torrent", "--seed-time", "90m"]).unwrap();
+        assert!(args.seed);
+        assert_eq!(args.seed_limits, SeedLimits { ratio: None, time: Some(Duration::from_secs(5400)) });
+    }
+
+    #[test]
+    fn both_limits_can_be_given_and_seed_is_not_needed_beside_them() {
+        let args = parse(&Config::default(), &["x.torrent", "--seed", "--seed-ratio", "2", "--seed-time", "1h"]).unwrap();
+        assert!(args.seed);
+        assert_eq!(args.seed_limits, SeedLimits { ratio: Some(2.0), time: Some(Duration::from_secs(3600)) });
+    }
+
+    #[test]
+    fn a_seed_limit_contradicts_no_seed() {
+        for args in [["x.torrent", "--no-seed", "--seed-ratio", "2"], ["x.torrent", "--seed-time", "2h", "--no-seed"]] {
+            let err = parse(&Config::default(), &args).err().expect("refused");
+            assert!(err.contains("--no-seed"), "{}", err);
+        }
+    }
+
+    #[test]
+    fn a_bad_limit_is_refused_naming_the_flag() {
+        assert!(parse(&Config::default(), &["x.torrent", "--seed-ratio", "0"]).err().unwrap().starts_with("--seed-ratio:"));
+        assert!(parse(&Config::default(), &["x.torrent", "--seed-time", "soon"]).err().unwrap().starts_with("--seed-time:"));
+        assert!(parse(&Config::default(), &["x.torrent", "--seed-ratio"]).err().unwrap().contains("requires"));
+        assert!(parse(&Config::default(), &["x.torrent", "--seed-time"]).err().unwrap().contains("requires"));
+    }
+
+    #[test]
+    fn the_config_file_can_set_the_limits_and_the_command_line_overrides_them() {
+        let cfg = cfg_from("seed_ratio = 3.0\nseed_time = \"12h\"\n");
+
+        let args = parse(&cfg, &["x.torrent"]).unwrap();
+        assert!(args.seed, "a limit in the config file means seeding too");
+        assert_eq!(args.seed_limits, SeedLimits { ratio: Some(3.0), time: Some(Duration::from_secs(12 * 3600)) });
+
+        let args = parse(&cfg, &["x.torrent", "--seed-ratio", "1"]).unwrap();
+        assert_eq!(args.seed_limits.ratio, Some(1.0), "the flag wins");
+        assert_eq!(args.seed_limits.time, Some(Duration::from_secs(12 * 3600)), "what it does not mention stays");
+    }
+
+    #[test]
+    fn a_bad_limit_in_the_config_file_is_refused_naming_the_key() {
+        assert!(parse(&cfg_from("seed_ratio = -1.0"), &["x.torrent"]).err().unwrap().starts_with("config seed_ratio:"));
+        assert!(parse(&cfg_from("seed_time = \"later\""), &["x.torrent"]).err().unwrap().starts_with("config seed_time:"));
     }
 }

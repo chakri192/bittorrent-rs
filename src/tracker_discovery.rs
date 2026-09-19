@@ -26,7 +26,7 @@
 //! stragglers keep running in the background and are simply not waited
 //! on; their result (if any) is just never used for this particular call.
 
-use crate::tracker::{http, https, udp, AnnounceRequest, Event};
+use crate::tracker::{announce_http, udp, AnnounceRequest, Event};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::mpsc;
@@ -58,6 +58,13 @@ pub struct TrackerAttempt {
 /// the max rather than the min means we never violate the slowest
 /// tracker's request just because a faster one also happened to answer.
 pub fn announce_to_all(tracker_urls: &[String], req: &AnnounceRequest) -> (Vec<SocketAddr>, Vec<TrackerAttempt>, Option<u32>) {
+    announce_to_all_within(tracker_urls, req, OVERALL_ANNOUNCE_DEADLINE)
+}
+
+/// [`announce_to_all`] with a caller-chosen deadline, for announces that
+/// must not hold anything up for long -- the `stopped` one sent as the
+/// client exits.
+pub fn announce_to_all_within(tracker_urls: &[String], req: &AnnounceRequest, deadline: Duration) -> (Vec<SocketAddr>, Vec<TrackerAttempt>, Option<u32>) {
     let (tx, rx) = mpsc::channel();
 
     for url in tracker_urls {
@@ -71,10 +78,8 @@ pub fn announce_to_all(tracker_urls: &[String], req: &AnnounceRequest) -> (Vec<S
                 // trackers) -- strip it.
                 let host_port = host_port.split('/').next().unwrap_or(host_port).to_string();
                 udp::announce(&host_port, &req).map_err(|e| e.to_string())
-            } else if url.starts_with("https://") {
-                https::announce(&url, &req).map_err(|e| e.to_string())
-            } else if url.starts_with("http://") {
-                http::announce(&url, &req).map_err(|e| e.to_string())
+            } else if url.starts_with("https://") || url.starts_with("http://") {
+                announce_http(&url, &req).map_err(|e| e.to_string())
             } else {
                 Err(format!("unsupported tracker scheme: {}", url))
             };
@@ -92,9 +97,9 @@ pub fn announce_to_all(tracker_urls: &[String], req: &AnnounceRequest) -> (Vec<S
     let mut max_interval: Option<u32> = None;
     let mut answered: HashSet<String> = HashSet::new();
 
-    let deadline = Instant::now() + OVERALL_ANNOUNCE_DEADLINE;
+    let give_up_at = Instant::now() + deadline;
     while answered.len() < tracker_urls.len() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = give_up_at.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
@@ -121,11 +126,20 @@ pub fn announce_to_all(tracker_urls: &[String], req: &AnnounceRequest) -> (Vec<S
     // happened instead of silently omitting slow trackers.
     for url in tracker_urls {
         if !answered.contains(url) {
-            failures.push(TrackerAttempt { url: url.clone(), error: format!("no response within {}s", OVERALL_ANNOUNCE_DEADLINE.as_secs()) });
+            failures.push(TrackerAttempt { url: url.clone(), error: format!("no response within {}", describe(deadline)) });
         }
     }
 
     (peers.into_iter().collect(), failures, max_interval)
+}
+
+/// A deadline as a person would say it: "20s", or "500ms" when under a second.
+fn describe(deadline: Duration) -> String {
+    if deadline.subsec_nanos() == 0 {
+        format!("{}s", deadline.as_secs())
+    } else {
+        format!("{}ms", deadline.as_millis())
+    }
 }
 
 /// Session transfer totals reported to trackers (BEP 3): `uploaded`/
@@ -180,6 +194,35 @@ mod tests {
         assert_eq!(interval, None);
     }
 
+    /// A tracker that accepts the connection and never says a word.
+    fn silent_tracker() -> (String, std::net::TcpListener) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        (format!("http://{}/announce", listener.local_addr().unwrap()), listener)
+    }
+
+    #[test]
+    fn a_tracker_that_never_answers_is_given_up_on_at_the_deadline() {
+        let (url, _listener) = silent_tracker(); // connections queue in the backlog, unanswered
+        let req = build_started_request([0; 20], [0; 20], 6881, 1000);
+
+        let started = Instant::now();
+        let (peers, failures, _) = announce_to_all_within(std::slice::from_ref(&url), &req, Duration::from_millis(400));
+        let waited = started.elapsed();
+
+        assert!(peers.is_empty());
+        assert!(waited >= Duration::from_millis(400), "it waited the deadline out: {:?}", waited);
+        assert!(waited < Duration::from_secs(5), "and not the 15 s the request itself would allow: {:?}", waited);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].url, url);
+        assert_eq!(failures[0].error, "no response within 400ms");
+    }
+
+    #[test]
+    fn a_whole_second_deadline_is_described_in_seconds() {
+        assert_eq!(describe(Duration::from_secs(20)), "20s");
+        assert_eq!(describe(Duration::from_millis(1500)), "1500ms");
+    }
+
     #[test]
     fn empty_tracker_list_returns_no_peers_no_failures() {
         let req = build_started_request([0; 20], [0; 20], 6881, 1000);
@@ -195,5 +238,38 @@ mod tests {
         assert_eq!(req.left, 12345);
         assert_eq!(req.event, Some(Event::Started));
         assert!(req.compact);
+    }
+
+    #[test]
+    fn a_tracker_that_redirects_still_gives_its_peers_to_the_announce_round() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let Ok(mut stream) = stream else { continue };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                let reply: Vec<u8> = if head.starts_with(b"GET /old") {
+                    b"HTTP/1.1 301 Moved Permanently\r\nLocation: /new\r\nContent-Length: 0\r\n\r\n".to_vec()
+                } else {
+                    let body = b"d8:intervali900e5:peers6:\x0a\x00\x00\x07\x1a\xe1e";
+                    let mut r = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+                    r.extend_from_slice(body);
+                    r
+                };
+                let _ = stream.write_all(&reply);
+            }
+        });
+        let req = build_started_request([0; 20], [0; 20], 6881, 1000);
+
+        let (peers, failures, interval) = announce_to_all(&[format!("http://127.0.0.1:{}/old", port)], &req);
+
+        assert!(failures.is_empty(), "{:?}", failures);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(interval, Some(900));
     }
 }
