@@ -83,13 +83,14 @@ pub fn fetch_metadata_from_peer(addr: SocketAddr, info_hash: [u8; 20], our_peer_
                 let hs = ExtendedHandshake::parse(&payload)?;
                 let their_id = hs.peer_ut_metadata_id().ok_or(MetadataFetchError::PeerLacksUtMetadata)?;
                 let size = hs.metadata_size.ok_or(MetadataFetchError::PeerDoesNotKnowMetadataSizeYet)?;
-                break (their_id, size as usize);
+                break (their_id, size);
             }
             _ => continue,
         }
     };
 
-    let mut assembler = MetadataAssembler::new(total_size);
+    // The size is the peer's claim, and sizes an allocation: check it first.
+    let mut assembler = MetadataAssembler::for_claimed_size(total_size)?;
     for piece in 0..assembler.num_pieces() as u32 {
         send_message(&mut stream, &Message::Extended { id: peer_ut_metadata_id, payload: MetadataMessage::Request { piece }.encode() })?;
     }
@@ -198,5 +199,36 @@ mod tests {
         assert_eq!(torrent.name, "a");
         assert_eq!(torrent.total_length(), 5);
         mock.join().unwrap();
+    }
+
+    /// A peer that completes both handshakes and advertises `size` as the
+    /// metadata size, then goes quiet.
+    fn peer_claiming_metadata_size(size: i64) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let mut hs = [0u8; 68];
+            if std::io::Read::read_exact(&mut stream, &mut hs).is_err() {
+                return;
+            }
+            let ours = Handshake::new(Handshake::from_bytes(&hs).unwrap().info_hash, [0x55; 20], true);
+            let _ = std::io::Write::write_all(&mut stream, &ours.to_bytes());
+            let _ = WireMessage::Extended { id: 0, payload: ExtendedHandshake::build(7, Some(size)) }.write_to(&mut stream);
+            thread::sleep(Duration::from_secs(2));
+        });
+        addr
+    }
+
+    #[test]
+    fn a_peer_claiming_an_absurd_metadata_size_is_refused_before_anything_is_allocated() {
+        // The size decides how much memory the assembler asks for. A peer
+        // could pick it: 2^63 - 1 pieces' worth, or a negative number that
+        // becomes one when cast to usize.
+        for size in [-1, 0, i64::MIN, crate::metadata::MAX_METADATA_SIZE + 1, i64::MAX] {
+            let addr = peer_claiming_metadata_size(size);
+            let result = fetch_metadata_from_peer(addr, [0x11; 20], [0x22; 20], Duration::from_secs(2));
+            assert!(matches!(result, Err(MetadataFetchError::Metadata(crate::metadata::MetadataError::SizeNotAcceptable(n))) if n == size), "size {}: {:?}", size, result.err());
+        }
     }
 }

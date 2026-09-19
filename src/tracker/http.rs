@@ -71,6 +71,10 @@ pub(crate) fn build_query(req: &AnnounceRequest) -> String {
     q
 }
 
+/// The most a tracker's whole HTTP response (headers and body) may be.
+/// A real announce reply is a few KB: fifty peers are 300 bytes.
+const MAX_RESPONSE_BYTES: usize = 4 << 20;
+
 /// Reads an HTTP/1.1 response off `stream` until the body is fully
 /// received, and returns just the body bytes. Handles `Content-Length`
 /// and `Transfer-Encoding: chunked`; falls back to "read until EOF" if
@@ -84,7 +88,14 @@ pub(crate) fn read_http_response_body<S: Read>(stream: &mut S) -> Result<Vec<u8>
     loop {
         match stream.read(&mut chunk) {
             Ok(0) => break, // EOF
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                // The read timeout restarts with every read, so a tracker
+                // that never stops sending would otherwise fill memory.
+                if buf.len() > MAX_RESPONSE_BYTES {
+                    return Err(TrackerError::MalformedResponse("tracker response too large"));
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) => return Err(TrackerError::Io(e)),
         }
@@ -134,7 +145,8 @@ fn decode_chunked_body(mut data: &[u8]) -> Result<Vec<u8>, TrackerError> {
         if size == 0 {
             break;
         }
-        if data.len() < size + 2 {
+        // `size` is whatever the tracker wrote: `size + 2` can overflow.
+        if size.checked_add(2).is_none_or(|needed| data.len() < needed) {
             return Err(TrackerError::MalformedResponse("chunk body truncated"));
         }
         out.extend_from_slice(&data[..size]);
@@ -291,5 +303,49 @@ mod tests {
         let body = b"d14:failure reason17:torrent not founde";
         let err = parse_announce_body(body).unwrap_err();
         assert!(matches!(err, TrackerError::TrackerFailure(_)));
+    }
+
+    /// A stream that never ends and never stalls: a hostile or broken
+    /// tracker that keeps sending.
+    struct Endless;
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf.fill(b'a');
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn an_endless_response_is_cut_off_instead_of_filling_memory() {
+        let started = std::time::Instant::now();
+        let result = read_http_response_body(&mut Endless);
+        assert!(matches!(result, Err(TrackerError::MalformedResponse("tracker response too large"))), "{:?}", result.err());
+        assert!(started.elapsed() < Duration::from_secs(5), "and promptly, not after reading gigabytes");
+    }
+
+    #[test]
+    fn a_large_but_reasonable_response_is_still_read_in_full() {
+        let body = vec![b'x'; 1 << 20];
+        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        response.extend_from_slice(&body);
+        assert_eq!(read_http_response_body(&mut response.as_slice()).unwrap().len(), 1 << 20);
+    }
+
+    #[test]
+    fn a_chunk_size_that_overflows_is_an_error_not_a_panic() {
+        // `size + 2` overflowed on these, and the slice after it then ran
+        // off the end of the buffer.
+        for size in ["ffffffffffffffff", "fffffffffffffffe", "fffffffffffffffd", "7fffffffffffffff", "8000000000000000"] {
+            let response = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{}\r\nabc\r\n0\r\n\r\n", size);
+            let result = read_http_response_body(&mut response.as_bytes());
+            assert!(matches!(result, Err(TrackerError::MalformedResponse(_))), "chunk size {}: {:?}", size, result.err());
+        }
+    }
+
+    #[test]
+    fn well_formed_chunks_still_decode() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+        assert_eq!(read_http_response_body(&mut response.as_slice()).unwrap(), b"abcde");
     }
 }

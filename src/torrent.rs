@@ -71,10 +71,11 @@ impl std::fmt::Display for TorrentError {
 
 impl std::error::Error for TorrentError {}
 
-/// The largest piece length accepted, 1 GiB. Real torrents use 16 KiB to
-/// 64 MiB. A whole piece is held in memory while it downloads, and its
-/// length is carried as a `u32` further down.
-pub const MAX_PIECE_LENGTH: i64 = 1 << 30;
+/// The largest piece length accepted, 128 MiB. Real torrents use 16 KiB to
+/// 64 MiB, and the biggest common clients stop at 128 MiB. A whole piece
+/// is held in memory by each worker while it downloads, so a larger claim
+/// is a way to exhaust memory, and the length is carried as a `u32` below.
+pub const MAX_PIECE_LENGTH: i64 = 128 << 20;
 
 /// Whether `part` is exactly one ordinary path component: not empty, not
 /// `.` or `..`, no separator of either kind, no NUL, and not absolute or a

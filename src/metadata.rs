@@ -34,6 +34,9 @@ pub enum MetadataError {
     PieceSizeMismatch { index: usize, expected: usize, got: usize },
     IncompleteAssembly,
     InfoHashMismatch,
+    /// The size a peer claims for the metadata is zero, negative, or over
+    /// [`MAX_METADATA_SIZE`].
+    SizeNotAcceptable(i64),
 }
 
 impl From<bencode::DecodeError> for MetadataError {
@@ -56,6 +59,7 @@ impl std::fmt::Display for MetadataError {
             }
             MetadataError::IncompleteAssembly => write!(f, "not all metadata pieces received yet"),
             MetadataError::InfoHashMismatch => write!(f, "assembled metadata's SHA-1 does not match the magnet InfoHash"),
+            MetadataError::SizeNotAcceptable(n) => write!(f, "peer claims {} bytes of metadata; between 1 and {} is acceptable", n, MAX_METADATA_SIZE),
         }
     }
 }
@@ -162,7 +166,24 @@ pub struct MetadataAssembler {
     pieces: Vec<Option<Vec<u8>>>,
 }
 
+/// The largest info dict accepted over BEP 9: 16 MiB, a thousand pieces.
+/// Real ones are a few KB to a few MB (libtorrent's default limit is 3 MiB).
+/// The size comes from the peer, and a table is allocated per 16 KiB of it,
+/// so an unchecked `metadata_size` lets a stranger choose how much memory
+/// to allocate.
+pub const MAX_METADATA_SIZE: i64 = 16 << 20;
+
 impl MetadataAssembler {
+    /// An assembler for the size a *peer* claimed, refusing one that is
+    /// zero, negative or absurd. Use this, not [`new`](Self::new), for any
+    /// size that came off the network.
+    pub fn for_claimed_size(claimed: i64) -> Result<Self, MetadataError> {
+        if !(1..=MAX_METADATA_SIZE).contains(&claimed) {
+            return Err(MetadataError::SizeNotAcceptable(claimed));
+        }
+        Ok(Self::new(claimed as usize))
+    }
+
     pub fn new(total_size: usize) -> Self {
         let num_pieces = total_size.div_ceil(METADATA_PIECE_SIZE).max(1);
         MetadataAssembler { total_size, num_pieces, pieces: vec![None; num_pieces] }
@@ -340,5 +361,20 @@ mod tests {
         asm.add_piece(0, vec![1, 2, 3, 4]).unwrap();
         let wrong_hash = [0u8; 20];
         assert!(matches!(asm.assemble_and_verify(&wrong_hash), Err(MetadataError::InfoHashMismatch)));
+    }
+
+    #[test]
+    fn a_claimed_metadata_size_is_accepted_only_within_bounds() {
+        for ok in [1, 16384, 16385, MAX_METADATA_SIZE] {
+            assert!(MetadataAssembler::for_claimed_size(ok).is_ok(), "{} should be accepted", ok);
+        }
+        for bad in [0, -1, i64::MIN, MAX_METADATA_SIZE + 1, i64::MAX] {
+            assert!(matches!(MetadataAssembler::for_claimed_size(bad), Err(MetadataError::SizeNotAcceptable(n)) if n == bad), "{} should be refused", bad);
+        }
+    }
+
+    #[test]
+    fn the_largest_accepted_size_is_a_bounded_number_of_pieces() {
+        assert_eq!(MetadataAssembler::for_claimed_size(MAX_METADATA_SIZE).unwrap().num_pieces(), 1024);
     }
 }
