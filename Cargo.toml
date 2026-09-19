@@ -5,7 +5,8 @@ edition = "2021"
 # Floor set by the locked dependency graph (darling 0.23 and instability
 # 0.3, pulled in by ratatui, need 1.88); CI's `msrv` job builds with it.
 rust-version = "1.88"
-# `cargo run` maps to the client; the others are helpers (e2e_harness, infohash).
+# `cargo run` maps to the client; the others are helpers (create_torrent,
+# e2e_harness, infohash).
 default-run = "download"
 
 [dependencies]

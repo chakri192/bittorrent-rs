@@ -24,10 +24,11 @@ jobs:
       - name: Tests
         run: cargo test
       - name: Loopback end-to-end harness
-        # Build first: the harness spawns target/debug/download, which
-        # `cargo run --bin e2e_harness` alone would not have built.
+        # Build first: the harness spawns target/debug/download and
+        # create_torrent, which `cargo run --bin e2e_harness` alone would
+        # not have built.
         run: |
-          cargo build --bin download
+          cargo build --bins
           cargo run --bin e2e_harness
 
   # Keeps `rust-version` in Cargo.toml honest: builds everything, with the

@@ -9,7 +9,7 @@ Every layer is written here — the bencode parser, the peer wire protocol, trac
 <p>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-1c1c1e?style=flat-square&logo=rust&logoColor=DEA584" />
   <img alt="Size" src="https://img.shields.io/badge/~10k-lines-1c1c1e?style=flat-square" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-529%20passing-1c1c1e?style=flat-square" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-554%20passing-1c1c1e?style=flat-square" />
   <img alt="BEPs" src="https://img.shields.io/badge/BEP-3%20·%205%20·%209%2F10%20·%2011%20·%2015%20·%2019%20·%2027-1c1c1e?style=flat-square" />
   <img alt="Fuzzed" src="https://img.shields.io/badge/parsers-fuzzed-1c1c1e?style=flat-square" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-1c1c1e?style=flat-square" />
@@ -92,6 +92,28 @@ Defaults may be placed in `~/.config/bittorrent-rs.toml`. Every key is optional,
 
 Ctrl-C and `SIGTERM` stop the client cleanly whether or not there is a terminal: the listener and DHT stop, the router's port mapping is removed, the trackers are told the client is leaving (BEP 3 `stopped`), and the resume file is kept. Every connection is shut down at once, so a peer that has gone silent does not delay the stop, and a tracker that does not answer `stopped` is waited for at most three seconds. A second signal exits immediately (status 130).
 
+### Making a torrent
+
+`create_torrent` is the other direction: it hashes a file or a directory and writes the `.torrent`.
+
+```sh
+./target/release/create_torrent ~/Videos/holiday --announce http://tracker.example/announce
+./target/release/create_torrent ./album --announce "udp://a:1337,udp://b:6969" --announce http://c/announce \
+    --web-seed https://mirror.example/album/ --piece-length 1M --private --comment "for the group"
+```
+
+| Flag | Description |
+|---|---|
+| `--out FILE` | Where to write. Defaults to `<name>.torrent`; an existing file is not replaced without `--force` |
+| `--announce URLS` | One tier of trackers (BEP 12), comma-separated; give the flag again for another tier |
+| `--web-seed URL` | A BEP 19 web seed; repeatable |
+| `--piece-length SIZE` | A power of two from `1K` to `128M`. By default chosen to give about 1500 pieces, between 16 KiB and 16 MiB |
+| `--private` | Sets the BEP 27 flag: no DHT, no peer exchange. It is part of the info dictionary, so it changes the info hash |
+| `--comment TEXT` · `--name NAME` | A comment; a name other than the file's or directory's |
+| `--no-date` | Leave out the creation date, so the same input always gives the same file |
+
+Files are listed in path order, so the result is reproducible. Symbolic links are skipped instead of followed, and file names that are not valid UTF-8 are refused.
+
 ## Architecture
 
 ```
@@ -139,9 +161,9 @@ cargo test
 cargo run --bin e2e_harness      # loopback scenarios: public, private, magnet, hostile torrent, resume, --only, dropped peer, retry, ban, --timeout, --seed
 ```
 
-529 tests (527 unit, 1 integration, 1 doctest), all passing, all confined to loopback.
+554 tests (552 unit, 1 integration, 1 doctest), all passing, all confined to loopback.
 
-Coverage spans parsing, the KRPC codec verified against BEP 5's published byte strings, DHT lookup and announce over a scripted transport, workers driven against mock peers, the seeder against a mock leecher, and web-seed range arithmetic. An end-to-end harness runs the real binary against a synthetic tracker and peer on `127.0.0.1` and compares output byte for byte. Its scenarios cover a public torrent, a hostile one whose paths would write outside the download directory (it must be refused with nothing written), a private one (no DHT, no PEX), a client killed mid-download that must resume and fetch only the pieces it lacks, `--only` on one file of three (only the pieces that file touches may be requested), a peer that hangs up halfway through a piece while another supplies the rest, and `--timeout` against a peer that goes silent (the client must stop, exit non-zero, report the download incomplete and keep its resume file), `--seed` (the client announces started and completed, stays up, and serves every piece back to a leecher on the port it announced), a leecher connected to the client's listener before the download began (it must be told of each piece as the client verifies it, once each), `--seed-ratio` (still seeding at half the ratio, gone once the whole torrent has been uploaded) and `--seed-time`, a magnet link (a peer found through the tracker serves the metadata, which the client verifies before downloading), the only peer dropping the first connection (the client must dial it again and finish), a peer that sends corrupt data beside an honest one (the download must be correct and the liar dialed exactly once), a finished download run again (verified in place, nothing fetched), one with a single damaged piece (exactly that piece fetched), `--max-down` / `--max-up` (a download and a leecher's pull must each take as long as the limit says, with every byte still correct), and real SIGINT and SIGTERM sent to the running binary (a clean stop with status 0, the resume file kept and the tracker told what was left, within a few hundred milliseconds even while the only peer is silent; a tracker that ignores the `stopped` announce delays the exit by about three seconds and no more, and a second signal during that wait exits at once with status 130). Every parser that reads untrusted bytes also runs through a deterministic mutation fuzzer inside `cargo test` (bit flips, every truncation, extreme lengths, splices), which must never panic and must round-trip whatever it accepts; eight `cargo-fuzz` targets do the same open-ended on a nightly toolchain.
+Coverage spans parsing, the KRPC codec verified against BEP 5's published byte strings, DHT lookup and announce over a scripted transport, workers driven against mock peers, the seeder against a mock leecher, and web-seed range arithmetic. An end-to-end harness runs the real binary against a synthetic tracker and peer on `127.0.0.1` and compares output byte for byte. Its scenarios cover a public torrent, a hostile one whose paths would write outside the download directory (it must be refused with nothing written), a private one (no DHT, no PEX), a client killed mid-download that must resume and fetch only the pieces it lacks, `--only` on one file of three (only the pieces that file touches may be requested), a peer that hangs up halfway through a piece while another supplies the rest, and `--timeout` against a peer that goes silent (the client must stop, exit non-zero, report the download incomplete and keep its resume file), `--seed` (the client announces started and completed, stays up, and serves every piece back to a leecher on the port it announced), a leecher connected to the client's listener before the download began (it must be told of each piece as the client verifies it, once each), `--seed-ratio` (still seeding at half the ratio, gone once the whole torrent has been uploaded) and `--seed-time`, a magnet link (a peer found through the tracker serves the metadata, which the client verifies before downloading), the only peer dropping the first connection (the client must dial it again and finish), a peer that sends corrupt data beside an honest one (the download must be correct and the liar dialed exactly once), a finished download run again (verified in place, nothing fetched), one with a single damaged piece (exactly that piece fetched), `--max-down` / `--max-up` (a download and a leecher's pull must each take as long as the limit says, with every byte still correct), `create_torrent` on a directory (it must make the same info hash as an independent builder in the harness, refuse to overwrite, and produce a torrent the client downloads byte for byte), and real SIGINT and SIGTERM sent to the running binary (a clean stop with status 0, the resume file kept and the tracker told what was left, within a few hundred milliseconds even while the only peer is silent; a tracker that ignores the `stopped` announce delays the exit by about three seconds and no more, and a second signal during that wait exits at once with status 130). Every parser that reads untrusted bytes also runs through a deterministic mutation fuzzer inside `cargo test` (bit flips, every truncation, extreme lengths, splices), which must never panic and must round-trip whatever it accepts; eight `cargo-fuzz` targets do the same open-ended on a nightly toolchain.
 
 ## Security
 
@@ -179,6 +201,7 @@ Port mapping is attempted on a best-effort basis through UPnP and NAT-PMP. The N
 ```
 src/
 ├── bencode.rs        BEP 3 decoder with lenient wire mode, and encoder
+├── create.rs         Making a .torrent from files on disk
 ├── torrent.rs        .torrent parsing, exact-byte infohash computation
 ├── magnet*.rs        Magnet URIs and BEP 9/10 metadata retrieval
 ├── tracker/          HTTP, HTTPS (rustls), and UDP announce
@@ -192,7 +215,7 @@ src/
 ├── session/          Setup and the download loop: magnet resolution, prepare, workers, announcer
 ├── config.rs         Optional TOML configuration
 ├── tui.rs · ui.rs    Terminal dashboard
-└── bin/download.rs   Command-line entry point
+└── bin/              download (the client), create_torrent, and two helpers
 
 fuzz/                 Bencode, magnet, and torrent parser fuzz targets
 ```

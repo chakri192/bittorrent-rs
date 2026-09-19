@@ -84,7 +84,7 @@ pub const MAX_PIECE_LENGTH: i64 = 128 << 20;
 /// This is what stands between a hostile torrent and files written outside
 /// the download directory: `PathBuf::join` with an absolute component
 /// *replaces* the path, and `..` climbs out of it.
-fn is_safe_component(part: &str) -> bool {
+pub(crate) fn is_safe_component(part: &str) -> bool {
     if part.is_empty() || part.contains(['/', '\\', '\0']) {
         return false;
     }

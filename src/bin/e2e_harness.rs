@@ -87,6 +87,9 @@ enum Kind {
     /// SIGTERM mid-download, with the only peer silent: a prompt, clean exit
     /// that keeps the resume file.
     SigtermMidDownload,
+    /// `create_torrent` makes what an independently written builder makes,
+    /// and the client downloads from it.
+    CreateTorrent,
     /// A leecher connected to the client's listener during the download is
     /// told of each piece as it is verified.
     HaveBroadcast,
@@ -125,6 +128,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "limit-upload", kind: Kind::LimitUpload },
     Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
     Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
+    Scenario { name: "create-torrent", kind: Kind::CreateTorrent },
     Scenario { name: "have-broadcast", kind: Kind::HaveBroadcast },
     Scenario { name: "seed-ratio-ends-seeding", kind: Kind::SeedRatio },
     Scenario { name: "seed-time-ends-seeding", kind: Kind::SeedTime },
@@ -158,6 +162,7 @@ fn main() {
             Kind::LimitUpload => run_limit_upload(scenario.name),
             Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
             Kind::SigtermMidDownload => run_sigterm_mid_download(scenario.name),
+            Kind::CreateTorrent => run_create_torrent(scenario.name),
             Kind::HaveBroadcast => run_have_broadcast(scenario.name),
             Kind::SeedRatio => run_seed_ratio(scenario.name),
             Kind::SeedTime => run_seed_time(scenario.name),
@@ -1772,4 +1777,77 @@ fn run_have_broadcast(name: &str) -> Result<String, String> {
     }
     check_downloaded(&fx, &out_dir)?;
     Ok(format!("a leecher connected before the download began was told of all {} pieces as they were verified, each once", fx.piece_count))
+}
+
+/// The `create_torrent` binary, run on a directory the harness wrote, must
+/// produce the info dict this harness builds independently (byte for byte,
+/// so the same info hash) -- and a torrent the client can download from.
+fn run_create_torrent(name: &str) -> Result<String, String> {
+    const PIECE_LEN: usize = 1024;
+    // Sizes that put piece boundaries in the middle of files, and a file
+    // in a subdirectory whose path sorts between the others.
+    let files = [(vec!["a.bin"], pattern(1500, 1)), (vec!["sub", "b.bin"], pattern(2200, 2)), (vec!["z.bin"], pattern(900, 3))];
+    let fx = Fixture::build_paths("pack", &files, PIECE_LEN, false, true);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+
+    let source = dir.join("src");
+    for (relative, content) in &fx.files {
+        let path = source.join(relative);
+        fs::create_dir_all(path.parent().ok_or("a file with no directory")?).map_err(|e| e.to_string())?;
+        fs::write(&path, content).map_err(|e| format!("writing {:?}: {}", path, e))?;
+    }
+    let torrent_path = dir.join("made.torrent");
+    let tracker = format!("http://{}/announce", swarm.tracker_addr);
+    let create_bin = std::env::current_exe().map_err(|e| e.to_string())?.parent().ok_or("no exe dir")?.join("create_torrent");
+    let run = |extra: &[&str]| {
+        Command::new(&create_bin)
+            .arg(source.join("pack"))
+            .arg("--out")
+            .arg(&torrent_path)
+            .args(["--announce", &tracker, "--piece-length", "1K", "--no-date", "--quiet"])
+            .args(extra)
+            .output()
+            .map_err(|e| format!("running create_torrent: {}", e))
+    };
+
+    let made = run(&[])?;
+    if !made.status.success() {
+        return Err(format!("create_torrent failed: {}", String::from_utf8_lossy(&made.stderr).trim()));
+    }
+    let bytes = fs::read(&torrent_path).map_err(|e| format!("reading the torrent it wrote: {}", e))?;
+    let parsed = bittorrent_rs::torrent::parse_torrent_file(&bytes).map_err(|e| format!("the client cannot read what create_torrent wrote: {}", e))?;
+    if parsed.info_hash != fx.info_hash {
+        return Err(format!("info hash {} differs from the independently built {}", bittorrent_rs::torrent::info_hash_hex(&parsed.info_hash), bittorrent_rs::torrent::info_hash_hex(&fx.info_hash)));
+    }
+    if parsed.announce.as_deref() != Some(tracker.as_str()) {
+        return Err(format!("announce is {:?}, expected {:?}", parsed.announce, tracker));
+    }
+
+    // It will not silently replace a torrent that is already there.
+    let again = run(&[])?;
+    if again.status.success() || !String::from_utf8_lossy(&again.stderr).contains("already exists") {
+        return Err(format!("a second run should refuse to overwrite; it exited {:?} saying {:?}", again.status.code(), String::from_utf8_lossy(&again.stderr).trim()));
+    }
+    if fs::read(&torrent_path).map_err(|e| e.to_string())? != bytes {
+        return Err("the refused run changed the file anyway".to_string());
+    }
+    if !run(&["--force"])?.status.success() {
+        return Err("--force should replace the file".to_string());
+    }
+
+    // And the client downloads from the torrent that was made.
+    let (out_dir, log_path) = (dir.join("out"), dir.join("client.log"));
+    let mut child = client_command(&torrent_path, &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if status.code() != Some(0) {
+        return Err(format!("the client exited with {:?} downloading the created torrent", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+    Ok(format!("create_torrent made the same info hash ({}) as the independent builder: {} pieces across 3 files, refused to overwrite, and the client downloaded it byte for byte", &bittorrent_rs::torrent::info_hash_hex(&parsed.info_hash)[..8], fx.piece_count))
 }
