@@ -29,11 +29,11 @@ pub fn allowed_fast_set(ip: Ipv4Addr, info_hash: &[u8; 20], piece_count: u32, co
     let mut x = seed;
     while set.len() < count {
         x = Sha1::digest(&x).to_vec();
-        for chunk in x.chunks_exact(4) {
+        for chunk in x.as_chunks::<4>().0 {
             if set.len() == count {
                 break;
             }
-            let index = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) % piece_count;
+            let index = u32::from_be_bytes(*chunk) % piece_count;
             if !set.contains(&index) {
                 set.push(index);
             }

@@ -246,14 +246,8 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
     if pieces_raw.len() % 20 != 0 {
         return Err(TorrentError::PiecesLengthNotMultipleOf20);
     }
-    let pieces: Vec<[u8; 20]> = pieces_raw
-        .chunks_exact(20)
-        .map(|c| {
-            let mut h = [0u8; 20];
-            h.copy_from_slice(c);
-            h
-        })
-        .collect();
+    // (No remainder: the length was checked to be a multiple of 20.)
+    let pieces: Vec<[u8; 20]> = pieces_raw.as_chunks::<20>().0.to_vec();
 
     if piece_length > MAX_PIECE_LENGTH {
         return Err(TorrentError::TooLarge("piece length"));

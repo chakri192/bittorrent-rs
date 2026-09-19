@@ -304,7 +304,7 @@ pub fn parse_layers(layers: Option<&Bencode>) -> Result<BTreeMap<Hash, Vec<Hash>
         if bytes.len() % 32 != 0 {
             return Err(V2Error::BadLayer);
         }
-        out.insert(root, bytes.chunks_exact(32).map(|c| Hash::try_from(c).unwrap_or([0; 32])).collect());
+        out.insert(root, bytes.as_chunks::<32>().0.to_vec());
     }
     Ok(out)
 }

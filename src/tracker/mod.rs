@@ -247,7 +247,9 @@ pub fn parse_compact_peers(data: &[u8]) -> Result<Vec<SocketAddrV4>, TrackerErro
         return Err(TrackerError::MalformedResponse("compact peers length not a multiple of 6"));
     }
     Ok(data
-        .chunks_exact(6)
+        .as_chunks::<6>()
+        .0
+        .iter()
         .map(|c| {
             let ip = Ipv4Addr::new(c[0], c[1], c[2], c[3]);
             let port = u16::from_be_bytes([c[4], c[5]]);
@@ -271,7 +273,9 @@ pub fn parse_compact_peers_v6(data: &[u8]) -> Result<Vec<SocketAddr>, TrackerErr
         return Err(TrackerError::MalformedResponse("compact peers6 length not a multiple of 18"));
     }
     Ok(data
-        .chunks_exact(18)
+        .as_chunks::<18>()
+        .0
+        .iter()
         .map(|c| {
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&c[..16]);

@@ -112,7 +112,9 @@ pub fn parse_compact_nodes(data: &[u8]) -> Result<Vec<CompactNode>, KrpcError> {
         return Err(KrpcError::MalformedCompact("nodes length not a multiple of 26"));
     }
     Ok(data
-        .chunks_exact(NODE4_LEN)
+        .as_chunks::<NODE4_LEN>()
+        .0
+        .iter()
         .map(|c| {
             let mut id = [0u8; 20];
             id.copy_from_slice(&c[..20]);
@@ -130,7 +132,9 @@ pub fn parse_compact_nodes6(data: &[u8]) -> Result<Vec<CompactNode>, KrpcError> 
         return Err(KrpcError::MalformedCompact("nodes6 length not a multiple of 38"));
     }
     Ok(data
-        .chunks_exact(NODE6_LEN)
+        .as_chunks::<NODE6_LEN>()
+        .0
+        .iter()
         .map(|c| {
             let mut id = [0u8; 20];
             id.copy_from_slice(&c[..20]);
