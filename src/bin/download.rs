@@ -64,6 +64,8 @@ struct Args {
     recheck: bool,
     /// Fetch pieces in order rather than rarest first.
     sequential: bool,
+    /// Where to write the torrent's `.torrent` file, if asked.
+    save_torrent: Option<PathBuf>,
     /// Bytes per second limits on download and upload, if set.
     max_down: Option<u64>,
     max_up: Option<u64>,
@@ -132,6 +134,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
     let mut retry_delay = Duration::from_secs(15);
     let mut recheck = false;
     let mut sequential = false;
+    let mut save_torrent = None;
     let mut max_down = None;
     let mut max_up = None;
     let mut verbosity = Verbosity::Normal;
@@ -174,6 +177,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
             }
             "--recheck" => recheck = true,
             "--sequential" => sequential = true,
+            "--save-torrent" => save_torrent = Some(PathBuf::from(argv.next().ok_or("--save-torrent requires a file name")?)),
             "--max-down" => {
                 let v = argv.next().ok_or("--max-down requires a rate such as 500K or 2M")?;
                 max_down = Some(bittorrent_rs::ratelimit::parse_rate(&v).map_err(|e| format!("--max-down: {}", e))?);
@@ -262,11 +266,11 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
         seed = true;
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, sequential, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
+    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, sequential, save_torrent, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--sequential] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--sequential] [--save-torrent FILE] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -399,6 +403,10 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         }
         (torrent, Vec::new())
     };
+    if let Some(path) = &args.save_torrent {
+        bittorrent_rs::create::save_torrent(&torrent, path).map_err(|e| finish_err(ui, format!("--save-torrent: {}", e)))?;
+        ui.log(format!("saved the torrent to {}", path.display()));
+    }
     if torrent.private && !args.list {
         ui.log("private torrent (BEP 27): DHT and peer exchange disabled, peers come from the tracker only");
     }
@@ -509,6 +517,13 @@ mod tests {
 
     fn cfg_from(toml: &str) -> Config {
         toml::from_str(toml).unwrap()
+    }
+
+    #[test]
+    fn save_torrent_takes_a_file_name() {
+        assert_eq!(parse(&Config::default(), &["x"]).unwrap().save_torrent, None);
+        assert_eq!(parse(&Config::default(), &["x", "--save-torrent", "kept.torrent"]).unwrap().save_torrent, Some(PathBuf::from("kept.torrent")));
+        assert!(parse(&Config::default(), &["x", "--save-torrent"]).err().unwrap().contains("requires"));
     }
 
     #[test]

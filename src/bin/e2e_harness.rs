@@ -1136,10 +1136,12 @@ fn run_magnet_download(name: &str) -> Result<String, String> {
     let fx = Fixture::new(false);
     let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
     let dir = scratch_dir(name);
-    let (out_dir, log_path) = (dir.join("out"), dir.join("client.log"));
+    let (out_dir, log_path, saved_path) = (dir.join("out"), dir.join("client.log"), dir.join("saved.torrent"));
 
     let mut child = client_command(fx.magnet_uri(swarm.tracker_addr), &out_dir, &log_path, 1)
         .arg("--no-dht")
+        .arg("--save-torrent")
+        .arg(&saved_path)
         .spawn()
         .map_err(|e| format!("failed to spawn the client: {}", e))?;
     let status = wait_or_kill(&mut child, RUN_LIMIT)?;
@@ -1172,7 +1174,22 @@ fn run_magnet_download(name: &str) -> Result<String, String> {
     check_announce(completed, "completed", &total, "0")?;
     check_announce(stopped, "stopped", &total, "0")?;
 
-    Ok(format!("magnet link -> metadata ({} piece) -> {} bytes, all matching; announced bootstrap, started, completed, stopped", served, fx.data.len()))
+    // --save-torrent kept what the magnet link resolved to, as a torrent
+    // anyone can use: the same info hash, and the tracker from the link.
+    let saved = fs::read(&saved_path).map_err(|e| format!("--save-torrent wrote nothing: {}", e))?;
+    let parsed = bittorrent_rs::torrent::parse_torrent_file(&saved).map_err(|e| format!("the saved torrent cannot be read: {}", e))?;
+    if parsed.info_hash != fx.info_hash {
+        return Err("the saved torrent has a different info hash".to_string());
+    }
+    let tracker = format!("http://{}/announce", swarm.tracker_addr);
+    if parsed.announce.as_deref() != Some(tracker.as_str()) {
+        return Err(format!("the saved torrent's announce is {:?}, expected {}", parsed.announce, tracker));
+    }
+    if saved_path.with_extension("torrent.part").exists() {
+        return Err("a .part file was left beside the saved torrent".to_string());
+    }
+
+    Ok(format!("magnet link -> metadata ({} piece) -> {} bytes, all matching; announced bootstrap, started, completed, stopped; --save-torrent kept a torrent with the same info hash", served, fx.data.len()))
 }
 
 /// A torrent whose paths would escape the download directory, with correct

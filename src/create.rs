@@ -80,6 +80,9 @@ pub enum CreateError {
     BadPieceLength(String),
     /// A file changed size while it was being read.
     ChangedWhileReading(PathBuf),
+    /// A torrent's info dictionary does not re-encode to the bytes its info
+    /// hash was taken over.
+    Unreproducible,
 }
 
 impl fmt::Display for CreateError {
@@ -91,6 +94,7 @@ impl fmt::Display for CreateError {
             CreateError::UnsafeName(name) => write!(f, "{:?} cannot be used as a file or torrent name", name),
             CreateError::BadPieceLength(why) => write!(f, "{}", why),
             CreateError::ChangedWhileReading(path) => write!(f, "{}: changed size while it was being read", path.display()),
+            CreateError::Unreproducible => write!(f, "this torrent's info dictionary cannot be written back exactly as it was hashed"),
         }
     }
 }
@@ -200,17 +204,34 @@ pub fn create(source: &Path, options: &CreateOptions, mut progress: impl FnMut(u
     let info = Bencode::Dict(info);
     let info_hash: [u8; 20] = Sha1::digest(bencode::encode(&info)).into();
 
-    let mut top = BTreeMap::new();
     let all_trackers: Vec<&String> = options.trackers.iter().flatten().collect();
-    if let Some(first) = all_trackers.first() {
-        top.insert(b"announce".to_vec(), text(first));
-    }
     // BEP 12: a list of tiers, only worth writing when there is a choice.
-    if all_trackers.len() > 1 {
-        let tiers = options.trackers.iter().filter(|tier| !tier.is_empty()).map(|tier| Bencode::List(tier.iter().map(|url| text(url)).collect())).collect();
+    let announce_list = if all_trackers.len() > 1 { options.trackers.iter().filter(|tier| !tier.is_empty()).cloned().collect() } else { Vec::new() };
+    let extras = Extras { comment: options.comment.as_deref(), created_by: options.created_by.as_deref(), creation_date: options.creation_date };
+    let bytes = top_level(info, all_trackers.first().map(|url| url.as_str()), &announce_list, &options.web_seeds, &extras);
+
+    Ok(Created { bytes, info_hash, name, total_length, piece_length, piece_count, file_count: entries.len() })
+}
+
+/// The optional descriptive fields of a torrent file.
+struct Extras<'a> {
+    comment: Option<&'a str>,
+    created_by: Option<&'a str>,
+    creation_date: Option<u64>,
+}
+
+/// The `.torrent` file around an info dictionary: where to announce, where
+/// else to fetch from, and who made it.
+fn top_level(info: Bencode, announce: Option<&str>, announce_list: &[Vec<String>], web_seeds: &[String], extras: &Extras) -> Vec<u8> {
+    let mut top = BTreeMap::new();
+    if let Some(url) = announce {
+        top.insert(b"announce".to_vec(), text(url));
+    }
+    if !announce_list.is_empty() {
+        let tiers = announce_list.iter().map(|tier| Bencode::List(tier.iter().map(|url| text(url)).collect())).collect();
         top.insert(b"announce-list".to_vec(), Bencode::List(tiers));
     }
-    match options.web_seeds.as_slice() {
+    match web_seeds {
         [] => {}
         [one] => {
             top.insert(b"url-list".to_vec(), text(one));
@@ -219,18 +240,53 @@ pub fn create(source: &Path, options: &CreateOptions, mut progress: impl FnMut(u
             top.insert(b"url-list".to_vec(), Bencode::List(many.iter().map(|url| text(url)).collect()));
         }
     }
-    if let Some(comment) = &options.comment {
+    if let Some(comment) = extras.comment {
         top.insert(b"comment".to_vec(), text(comment));
     }
-    if let Some(created_by) = &options.created_by {
+    if let Some(created_by) = extras.created_by {
         top.insert(b"created by".to_vec(), text(created_by));
     }
-    if let Some(date) = options.creation_date {
+    if let Some(date) = extras.creation_date {
         top.insert(b"creation date".to_vec(), Bencode::Int(date.min(i64::MAX as u64) as i64));
     }
     top.insert(b"info".to_vec(), info);
+    bencode::encode(&Bencode::Dict(top))
+}
 
-    Ok(Created { bytes: bencode::encode(&Bencode::Dict(top)), info_hash, name, total_length, piece_length, piece_count, file_count: entries.len() })
+/// The `.torrent` file for a torrent already in hand -- what a magnet link
+/// resolved to -- so that it can be kept and used without the metadata
+/// exchange next time. The info dictionary is written back exactly as it
+/// was hashed; if it would not come out byte for byte (it always does for
+/// anything the strict parser accepted) this refuses rather than write a
+/// file whose info hash differs from the torrent's.
+pub fn torrent_file_bytes(torrent: &crate::torrent::TorrentFile) -> Result<Vec<u8>, CreateError> {
+    let info_bytes = bencode::encode(&torrent.info);
+    let rehashed: [u8; 20] = Sha1::digest(&info_bytes).into();
+    if rehashed != torrent.info_hash {
+        return Err(CreateError::Unreproducible);
+    }
+    let extras = Extras { comment: None, created_by: None, creation_date: None };
+    Ok(top_level(torrent.info.clone(), torrent.announce.as_deref(), &torrent.announce_list, &torrent.url_list, &extras))
+}
+
+/// Writes `torrent` to `path` as a `.torrent` file (see
+/// [`torrent_file_bytes`]), replacing what is there. The file appears
+/// whole or not at all: it is written beside the target and renamed into
+/// place, so an interrupted run cannot leave half a torrent behind.
+pub fn save_torrent(torrent: &crate::torrent::TorrentFile, path: &Path) -> Result<(), CreateError> {
+    let bytes = torrent_file_bytes(torrent)?;
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".part");
+    let partial = PathBuf::from(partial);
+    let io_err = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| CreateError::Io { path, source }
+    };
+    fs::write(&partial, &bytes).map_err(io_err(&partial))?;
+    fs::rename(&partial, path).map_err(|source| {
+        let _ = fs::remove_file(&partial);
+        CreateError::Io { path: path.to_path_buf(), source }
+    })
 }
 
 fn text(s: &str) -> Bencode {
@@ -657,5 +713,116 @@ mod tests {
         for bad in ["", "K", "1.5M", "-1", "12x", "99999999999999999999", "18446744073709551615G"] {
             assert!(parse_size(bad).is_err(), "{:?} should be refused", bad);
         }
+    }
+
+    // ---- writing back a torrent that is already in hand ----
+
+    #[test]
+    fn a_parsed_torrent_is_written_back_byte_for_byte_when_it_carries_nothing_extra() {
+        let dir = tmp_dir("write-back");
+        let root = dir.join("pack");
+        write(&root, "a.bin", &bytes(1500, 1));
+        write(&root, "sub/b.bin", &bytes(2500, 2));
+        let options = CreateOptions {
+            trackers: vec![vec!["http://a/announce".into(), "http://b/announce".into()], vec!["udp://c:1".into()]],
+            web_seeds: vec!["http://m1/".into(), "http://m2/".into()],
+            private: true,
+            ..opts(1024)
+        };
+        let (created, parsed) = make(&root, &options);
+
+        let written = torrent_file_bytes(&parsed).unwrap();
+
+        assert_eq!(written, created.bytes, "the same file comes back out");
+    }
+
+    #[test]
+    fn a_torrent_from_a_magnet_link_can_be_saved_and_read_again() {
+        let dir = tmp_dir("magnet-save");
+        write(&dir, "f.bin", &bytes(3000, 4));
+        let (created, parsed) = make(&dir.join("f.bin"), &opts(1024));
+        let info = match bencode::decode(&created.bytes).unwrap() {
+            Bencode::Dict(top) => bencode::encode(&top[b"info".as_slice()]),
+            other => panic!("{:?}", other),
+        };
+        // What a magnet download holds: the info dict alone, and the trackers from the link.
+        let from_magnet = crate::torrent::from_info_dict_bytes(&info, created.info_hash, Some("http://t/announce".into()), vec![vec!["http://t/announce".into()], vec!["http://u/announce".into()]]).unwrap();
+
+        let saved = torrent_file_bytes(&from_magnet).unwrap();
+        let reread = parse_torrent_file(&saved).expect("the saved file is a torrent");
+
+        assert_eq!(reread.info_hash, parsed.info_hash, "the same torrent");
+        assert_eq!(reread.announce.as_deref(), Some("http://t/announce"));
+        assert_eq!(reread.announce_list, vec![vec!["http://t/announce".to_string()], vec!["http://u/announce".to_string()]]);
+        assert_eq!(reread.pieces, parsed.pieces);
+    }
+
+    #[test]
+    fn the_announce_url_is_kept_as_it_was_even_when_the_list_starts_elsewhere() {
+        let dir = tmp_dir("announce-kept");
+        write(&dir, "f.bin", &bytes(2000, 4));
+        let (_, mut parsed) = make(&dir.join("f.bin"), &opts(1024));
+        parsed.announce = Some("http://main/announce".into());
+        parsed.announce_list = vec![vec!["http://other/announce".into()]];
+
+        let reread = parse_torrent_file(&torrent_file_bytes(&parsed).unwrap()).unwrap();
+
+        assert_eq!(reread.announce.as_deref(), Some("http://main/announce"));
+        assert_eq!(reread.announce_list, vec![vec!["http://other/announce".to_string()]]);
+    }
+
+    #[test]
+    fn a_torrent_with_no_trackers_is_saved_with_none() {
+        let dir = tmp_dir("no-trackers-save");
+        write(&dir, "f.bin", &bytes(2000, 4));
+        let (_, parsed) = make(&dir.join("f.bin"), &opts(1024));
+
+        let reread = parse_torrent_file(&torrent_file_bytes(&parsed).unwrap()).unwrap();
+
+        assert_eq!((reread.announce, reread.announce_list.len(), reread.url_list.len()), (None, 0, 0));
+    }
+
+    #[test]
+    fn an_info_dict_that_would_not_hash_the_same_is_refused_rather_than_saved() {
+        let dir = tmp_dir("unreproducible");
+        write(&dir, "f.bin", &bytes(2000, 4));
+        let (_, mut parsed) = make(&dir.join("f.bin"), &opts(1024));
+        if let Bencode::Dict(info) = &mut parsed.info {
+            info.insert(b"name".to_vec(), text("something else"));
+        }
+
+        assert!(matches!(torrent_file_bytes(&parsed), Err(CreateError::Unreproducible)));
+    }
+
+    #[test]
+    fn saving_writes_the_file_whole_and_replaces_an_old_one_without_leaving_a_partial() {
+        let dir = tmp_dir("save");
+        write(&dir, "f.bin", &bytes(2000, 4));
+        let (created, parsed) = make(&dir.join("f.bin"), &opts(1024));
+        let target = dir.join("kept.torrent");
+        fs::write(&target, b"an older file").unwrap();
+
+        save_torrent(&parsed, &target).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), created.bytes);
+        assert!(!dir.join("kept.torrent.part").exists(), "nothing left beside it");
+    }
+
+    #[test]
+    fn saving_where_it_cannot_is_an_error_naming_the_place_and_leaves_no_partial() {
+        let dir = tmp_dir("save-fails");
+        write(&dir, "f.bin", &bytes(2000, 4));
+        let (_, parsed) = make(&dir.join("f.bin"), &opts(1024));
+        let target = dir.join("no-such-dir").join("kept.torrent");
+
+        let err = save_torrent(&parsed, &target).unwrap_err();
+
+        assert!(matches!(err, CreateError::Io { .. }));
+        assert!(err.to_string().contains("no-such-dir"), "{}", err);
+        // A target that is itself a directory: the rename fails, and the partial is cleaned up.
+        let as_dir = dir.join("a-directory");
+        fs::create_dir_all(&as_dir).unwrap();
+        assert!(save_torrent(&parsed, &as_dir).is_err());
+        assert!(!dir.join("a-directory.part").exists(), "a failed rename does not leave the partial behind");
     }
 }
