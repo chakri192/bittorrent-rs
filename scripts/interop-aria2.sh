@@ -6,6 +6,8 @@
 #     fetching the metadata of a magnet link from it (BEP 9)
 #   * the DHT, over IPv4 and over IPv6 (BEP 32), with an aria2 node as the
 #     router, in both directions
+#   * the daemon, with two torrents on its one port: aria2 downloads both
+#     from it, and it downloads both from two aria2 seeders
 #   * local service discovery (BEP 14) in both directions, over the real
 #     multicast group -- skipped unless INTEROP_LSD=1, since it needs
 #     multicast to work on this machine and takes some seconds
@@ -20,7 +22,7 @@ BIN=${BIN:-$ROOT/target/debug}
 for tool in aria2c python3; do
     command -v "$tool" >/dev/null || { echo "interop: $tool is needed"; exit 2; }
 done
-for bin in download create_torrent; do
+for bin in download create_torrent daemon; do
     [ -x "$BIN/$bin" ] || { echo "interop: $BIN/$bin is not built"; exit 2; }
 done
 
@@ -182,6 +184,70 @@ dht_family() { # 4 or 6
 }
 dht_family 4
 dht_family 6
+
+# ---- 5. the daemon: two torrents on one port ---------------------------------
+python3 -c "import os; open('$WORK/data2.bin', 'wb').write(os.urandom(2 * 1024 * 1024 + 777))"
+T1=$TRACKER_PORT; T2=$((TRACKER_PORT + 1))
+"$BIN/create_torrent" "$WORK/data2.bin" --announce "http://127.0.0.1:$T2/announce" --out "$WORK/tracked2.torrent" --piece-length 256K --no-date --quiet
+tracker_at() { # port, peer port: prints the pid
+    python3 "$WORK/tracker.py" "$1" "$2" >/dev/null 2>&1 &
+    echo $!
+}
+daemon_run() { # extra flags...: a daemon on loopback, on $OURS_PORT
+    "$BIN/daemon" run --port "$OURS_PORT" --no-dht --no-lsd --no-portmap --no-ipv6 --quiet --state-dir "$WORK/dstate" --socket "$WORK/d.sock" "$@" >/dev/null 2>&1 &
+    DAEMON_PID=$!
+    PIDS+=($DAEMON_PID)
+    sleep 1.5
+}
+daemon_ctl() { "$BIN/daemon" "$@" --socket "$WORK/d.sock" --json; }
+daemon_stop() {
+    daemon_ctl stop >/dev/null 2>&1
+    wait "$DAEMON_PID" 2>/dev/null
+    rm -rf "$WORK/dstate"
+}
+daemon_seeding() { # how many of its torrents are seeding
+    daemon_ctl list 2>/dev/null | grep -c '"state":"seeding"'
+}
+
+# 5a. aria2 downloads both torrents from the daemon's one port
+rm -rf "$WORK/dseed"; mkdir -p "$WORK/dseed"; cp "$WORK/data.bin" "$WORK/data2.bin" "$WORK/dseed/"
+TP1=$(tracker_at "$T1" "$OURS_PORT"); TP2=$(tracker_at "$T2" "$OURS_PORT"); PIDS+=($TP1 $TP2)
+sleep 0.7
+daemon_run
+daemon_ctl add "$WORK/tracked.torrent" --out "$WORK/dseed" >/dev/null
+daemon_ctl add "$WORK/tracked2.torrent" --out "$WORK/dseed" >/dev/null
+for _ in $(seq 1 60); do [ "$(daemon_seeding)" = 2 ] && break; sleep 0.5; done
+for n in 1 2; do
+    file=data.bin; torrent=tracked.torrent
+    [ $n = 2 ] && { file=data2.bin; torrent=tracked2.torrent; }
+    rm -rf "$WORK/leech"; mkdir -p "$WORK/leech"
+    timeout 60 aria2c --enable-dht=false --bt-enable-lpd=false --enable-peer-exchange=false --listen-port="$ARIA_LEECH_PORT" --seed-time=0 \
+        -d "$WORK/leech" --console-log-level=error "$WORK/$torrent" >/dev/null 2>&1
+    check "aria2 downloads torrent $n from the daemon (two torrents, one port)" same "$WORK/leech/$file" "$WORK/$file"
+done
+daemon_stop
+kill "$TP1" "$TP2" 2>/dev/null; wait "$TP1" "$TP2" 2>/dev/null
+
+# 5b. the daemon downloads both from two aria2 seeders at once
+rm -rf "$WORK/seed1" "$WORK/seed2" "$WORK/dout"; mkdir -p "$WORK/seed1" "$WORK/seed2" "$WORK/dout"
+cp "$WORK/data.bin" "$WORK/seed1/"; cp "$WORK/data2.bin" "$WORK/seed2/"
+TP1=$(tracker_at "$T1" "$ARIA_PORT"); TP2=$(tracker_at "$T2" "$((ARIA_PORT + 1))"); PIDS+=($TP1 $TP2)
+sleep 0.7
+for n in 1 2; do
+    torrent=tracked.torrent; [ $n = 2 ] && torrent=tracked2.torrent
+    aria2c --enable-dht=false --bt-enable-lpd=false --enable-peer-exchange=false --listen-port=$((ARIA_PORT + n - 1)) --seed-ratio=0.0 --seed-time=20 \
+        -d "$WORK/seed$n" --bt-seed-unverified=true --bt-external-ip=127.0.0.1 "$WORK/$torrent" >"$WORK/aria-seed$n.log" 2>&1 &
+    PIDS+=($!)
+done
+sleep 3
+daemon_run
+daemon_ctl add "$WORK/tracked.torrent" --out "$WORK/dout" >/dev/null
+daemon_ctl add "$WORK/tracked2.torrent" --out "$WORK/dout" >/dev/null
+for _ in $(seq 1 120); do [ "$(daemon_seeding)" = 2 ] && break; sleep 0.5; done
+check "the daemon downloads two torrents from aria2 at once (first)" same "$WORK/dout/data.bin" "$WORK/data.bin"
+check "the daemon downloads two torrents from aria2 at once (second)" same "$WORK/dout/data2.bin" "$WORK/data2.bin"
+daemon_stop
+kill "$TP1" "$TP2" 2>/dev/null; wait "$TP1" "$TP2" 2>/dev/null
 
 echo "interop: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
