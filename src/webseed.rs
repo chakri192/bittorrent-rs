@@ -21,6 +21,20 @@ use std::time::Duration;
 /// churning the queue.
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
+/// How a web worker's run ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebEnd {
+    /// The queue ran out of pieces.
+    Drained,
+    /// It was told to stop.
+    Stopped,
+    /// The mirror failed too many times in a row.
+    Disabled,
+    /// A verified piece could not be written to disk. Not the mirror's
+    /// fault, and no other source can do better.
+    DiskFailed(String),
+}
+
 /// One file's HTTP location plus its byte range in the torrent's
 /// concatenated address space.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,8 +177,8 @@ fn fetch_piece_or_stop(agent: &ureq::Agent, targets: &Arc<Vec<FileTarget>>, piec
 }
 
 /// Runs one web seed against the shared work queue until the queue drains,
-/// the seed fails too many times, or `stop` is set. `log` receives
-/// human-readable progress/errors (routed to the dashboard log).
+/// the seed fails too many times, or `stop` is set, and says which. `log`
+/// receives human-readable progress/errors (routed to the dashboard log).
 #[allow(clippy::too_many_arguments)]
 pub fn run_web_worker<L: Fn(String)>(
     base_url: &str,
@@ -179,14 +193,14 @@ pub fn run_web_worker<L: Fn(String)>(
     results_tx: &Sender<PieceResult>,
     stop: &AtomicBool,
     log: L,
-) {
+) -> WebEnd {
     let targets = Arc::new(build_targets(base_url, name, files, multi_file));
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
     let mut consecutive_failures = 0u32;
 
     while !stop.load(Ordering::SeqCst) {
         let Some(work) = queue.pop() else {
-            break; // queue fully drained
+            return WebEnd::Drained;
         };
         let idx = work.index;
         if queue.is_done(idx) {
@@ -195,7 +209,7 @@ pub fn run_web_worker<L: Fn(String)>(
 
         let Some(fetched) = fetch_piece_or_stop(&agent, &targets, idx, piece_length, total_length, stop) else {
             queue.push_back(work);
-            return; // told to stop while waiting on the mirror
+            return WebEnd::Stopped; // told to stop while waiting on the mirror
         };
         match fetched {
             Ok(data) => {
@@ -203,7 +217,7 @@ pub fn run_web_worker<L: Fn(String)>(
                     limiter.acquire_while(data.len(), || !stop.load(Ordering::SeqCst));
                     if stop.load(Ordering::SeqCst) {
                         queue.push_back(work);
-                        return; // told to stop while held back by --max-down
+                        return WebEnd::Stopped; // told to stop while held back by --max-down
                     }
                 }
                 let mut h = Sha1::new();
@@ -217,7 +231,7 @@ pub fn run_web_worker<L: Fn(String)>(
                     if let Err(e) = write_piece(spans, idx, piece_length, &data) {
                         queue.push_back(work);
                         log(format!("web seed {}: disk write failed on piece {}: {}", base_url, idx, e));
-                        return;
+                        return WebEnd::DiskFailed(e.to_string());
                     }
                     // First copy wins (peers may be racing the same piece).
                     if queue.mark_done(idx) {
@@ -235,7 +249,106 @@ pub fn run_web_worker<L: Fn(String)>(
 
         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
             log(format!("web seed {} disabled after {} consecutive failures", base_url, consecutive_failures));
+            return WebEnd::Disabled;
+        }
+    }
+    WebEnd::Stopped
+}
+
+/// A small HTTP server on loopback for tests of web-seed fetching, here so
+/// that other modules' tests can use it too.
+#[cfg(test)]
+pub(crate) mod mirror {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    #[derive(Clone, Copy, PartialEq)]
+    pub(crate) enum Mode {
+        /// Honours Range with a 206.
+        Serve,
+        /// Sends the whole file with a 200 whatever the range.
+        IgnoreRange,
+        /// 404 for everything.
+        NotFound,
+        /// Range honoured, but every byte is wrong.
+        Corrupt,
+        /// Accepts the connection and never answers.
+        Silent,
+    }
+
+    pub(crate) struct Mirror {
+        /// `http://127.0.0.1:port/`
+        pub(crate) base: String,
+        pub(crate) requests: Arc<AtomicUsize>,
+    }
+
+    pub(crate) fn spawn_mirror(files: Vec<(&str, Vec<u8>)>, mode: Mode) -> Mirror {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let files: Vec<(String, Vec<u8>)> = files.into_iter().map(|(path, content)| (format!("/{}", path), content)).collect();
+        thread::spawn(move || {
+            let mut held = Vec::new(); // silent connections stay open
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                counted.fetch_add(1, Ordering::SeqCst);
+                if mode == Mode::Silent {
+                    held.push(stream);
+                    continue;
+                }
+                let files = files.clone();
+                thread::spawn(move || serve(stream, &files, mode));
+            }
+        });
+        Mirror { base, requests }
+    }
+
+    fn serve(stream: TcpStream, files: &[(String, Vec<u8>)], mode: Mode) {
+        let Ok(read_half) = stream.try_clone() else { return };
+        let mut reader = BufReader::new(read_half);
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
             return;
+        }
+        let path = request_line.split_whitespace().nth(1).unwrap_or("").to_string();
+        let mut range = None;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some(spec) = line.to_ascii_lowercase().trim_end().strip_prefix("range: bytes=") {
+                if let Some((from, to)) = spec.split_once('-') {
+                    range = from.parse::<usize>().ok().zip(to.parse::<usize>().ok());
+                }
+            }
+        }
+        let mut stream = stream;
+        let respond = |stream: &mut TcpStream, status: &str, extra: &str, body: &[u8]| {
+            let head = format!("HTTP/1.1 {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n", status, body.len(), extra);
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+        };
+        let Some((_, content)) = files.iter().find(|(p, _)| *p == path) else {
+            respond(&mut stream, "404 Not Found", "", b"");
+            return;
+        };
+        match mode {
+            Mode::NotFound => respond(&mut stream, "404 Not Found", "", b""),
+            Mode::IgnoreRange => respond(&mut stream, "200 OK", "", content),
+            Mode::Serve | Mode::Corrupt => {
+                let (from, to) = range.unwrap_or((0, content.len() - 1));
+                let mut body = content[from..=to.min(content.len() - 1)].to_vec();
+                if mode == Mode::Corrupt {
+                    body.iter_mut().for_each(|b| *b ^= 0xFF);
+                }
+                respond(&mut stream, "206 Partial Content", &format!("Content-Range: bytes {}-{}/{}\r\n", from, to, content.len()), &body);
+            }
+            Mode::Silent => {}
         }
     }
 }
@@ -329,98 +442,9 @@ mod tests {
 
     use crate::downloader::file_writer::build_file_spans;
     use crate::downloader::piece_assembler::PieceWork;
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::AtomicUsize;
+    use crate::webseed::mirror::{spawn_mirror, Mode};
     use std::sync::Mutex;
     use std::time::Instant;
-
-    #[derive(Clone, Copy, PartialEq)]
-    enum Mode {
-        /// Honours Range with a 206.
-        Serve,
-        /// Sends the whole file with a 200 whatever the range.
-        IgnoreRange,
-        /// 404 for everything.
-        NotFound,
-        /// Range honoured, but every byte is wrong.
-        Corrupt,
-        /// Accepts the connection and never answers.
-        Silent,
-    }
-
-    struct Mirror {
-        /// `http://127.0.0.1:port/`
-        base: String,
-        requests: Arc<AtomicUsize>,
-    }
-
-    fn spawn_mirror(files: Vec<(&str, Vec<u8>)>, mode: Mode) -> Mirror {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}/", listener.local_addr().unwrap());
-        let requests = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&requests);
-        let files: Vec<(String, Vec<u8>)> = files.into_iter().map(|(path, content)| (format!("/{}", path), content)).collect();
-        thread::spawn(move || {
-            let mut held = Vec::new(); // silent connections stay open
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { continue };
-                counted.fetch_add(1, Ordering::SeqCst);
-                if mode == Mode::Silent {
-                    held.push(stream);
-                    continue;
-                }
-                let files = files.clone();
-                thread::spawn(move || serve(stream, &files, mode));
-            }
-        });
-        Mirror { base, requests }
-    }
-
-    fn serve(stream: TcpStream, files: &[(String, Vec<u8>)], mode: Mode) {
-        let Ok(read_half) = stream.try_clone() else { return };
-        let mut reader = BufReader::new(read_half);
-        let mut request_line = String::new();
-        if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
-            return;
-        }
-        let path = request_line.split_whitespace().nth(1).unwrap_or("").to_string();
-        let mut range = None;
-        loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                break;
-            }
-            if let Some(spec) = line.to_ascii_lowercase().trim_end().strip_prefix("range: bytes=") {
-                if let Some((from, to)) = spec.split_once('-') {
-                    range = from.parse::<usize>().ok().zip(to.parse::<usize>().ok());
-                }
-            }
-        }
-        let mut stream = stream;
-        let respond = |stream: &mut TcpStream, status: &str, extra: &str, body: &[u8]| {
-            let head = format!("HTTP/1.1 {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n", status, body.len(), extra);
-            let _ = stream.write_all(head.as_bytes());
-            let _ = stream.write_all(body);
-        };
-        let Some((_, content)) = files.iter().find(|(p, _)| *p == path) else {
-            respond(&mut stream, "404 Not Found", "", b"");
-            return;
-        };
-        match mode {
-            Mode::NotFound => respond(&mut stream, "404 Not Found", "", b""),
-            Mode::IgnoreRange => respond(&mut stream, "200 OK", "", content),
-            Mode::Serve | Mode::Corrupt => {
-                let (from, to) = range.unwrap_or((0, content.len() - 1));
-                let mut body = content[from..=to.min(content.len() - 1)].to_vec();
-                if mode == Mode::Corrupt {
-                    body.iter_mut().for_each(|b| *b ^= 0xFF);
-                }
-                respond(&mut stream, "206 Partial Content", &format!("Content-Range: bytes {}-{}/{}\r\n", from, to, content.len()), &body);
-            }
-            Mode::Silent => {}
-        }
-    }
 
     fn sha1_of(data: &[u8]) -> [u8; 20] {
         Sha1::digest(data).into()
@@ -459,9 +483,9 @@ mod tests {
             Rig { data, piece_length, queue: Arc::new(WorkQueue::new(work, piece_count)), spans, dir, tx, rx, logs: Arc::new(Mutex::new(Vec::new())) }
         }
 
-        fn run(&self, base: &str, name: &str, files: &[(Vec<String>, i64)], multi: bool, limiter: Option<&crate::ratelimit::RateLimiter>, stop: &AtomicBool) {
+        fn run(&self, base: &str, name: &str, files: &[(Vec<String>, i64)], multi: bool, limiter: Option<&crate::ratelimit::RateLimiter>, stop: &AtomicBool) -> WebEnd {
             let logs = Arc::clone(&self.logs);
-            run_web_worker(base, name, files, multi, limiter, &self.queue, &self.spans, self.piece_length, self.data.len() as u64, &self.tx, stop, move |m| logs.lock().unwrap().push(m));
+            run_web_worker(base, name, files, multi, limiter, &self.queue, &self.spans, self.piece_length, self.data.len() as u64, &self.tx, stop, move |m| logs.lock().unwrap().push(m))
         }
 
         fn logged(&self, needle: &str) -> bool {
@@ -486,8 +510,9 @@ mod tests {
         let mirror = spawn_mirror(vec![("file.bin", content.clone())], Mode::Serve);
         let rig = Rig::new("serves", &[(vec!["file.bin"], content.clone())], 2048);
 
-        rig.run(&mirror.base, "file.bin", &listed, false, None, &AtomicBool::new(false));
+        let end = rig.run(&mirror.base, "file.bin", &listed, false, None, &AtomicBool::new(false));
 
+        assert_eq!(end, WebEnd::Drained);
         assert_eq!(rig.completed(), vec![0, 1, 2]);
         assert!(rig.queue.is_empty());
         assert_eq!(std::fs::read(rig.dir.join("file.bin")).unwrap(), content, "written to disk, every byte");
@@ -534,8 +559,9 @@ mod tests {
         let mirror = spawn_mirror(vec![("file.bin", content.clone())], Mode::Corrupt);
         let rig = Rig::new("corrupt", &[(vec!["file.bin"], content)], 1024);
 
-        rig.run(&mirror.base, "file.bin", &listed, false, None, &AtomicBool::new(false));
+        let end = rig.run(&mirror.base, "file.bin", &listed, false, None, &AtomicBool::new(false));
 
+        assert_eq!(end, WebEnd::Disabled);
         assert!(rig.logged("failed hash check"));
         assert!(rig.logged("disabled after 5 consecutive failures"));
         assert!(rig.completed().is_empty(), "nothing unverified was accepted");
@@ -549,8 +575,9 @@ mod tests {
         let mirror = spawn_mirror(vec![("file.bin", content.clone())], Mode::NotFound);
         let rig = Rig::new("not-found", &[(vec!["file.bin"], content)], 1024);
 
-        rig.run(&mirror.base, "file.bin", &listed, false, None, &AtomicBool::new(false));
+        let end = rig.run(&mirror.base, "file.bin", &listed, false, None, &AtomicBool::new(false));
 
+        assert_eq!(end, WebEnd::Disabled);
         assert!(rig.logged("404"));
         assert!(rig.logged("disabled after 5 consecutive failures"));
         assert_eq!(mirror.requests.load(Ordering::SeqCst), 5, "it stopped asking after the fifth failure");
@@ -618,5 +645,32 @@ mod tests {
         let took = returned.expect("the worker must stop within seconds, not sleep out its debt");
         assert!(took < Duration::from_secs(2), "{:?}", took);
         assert_eq!(queue.len(), 1, "the piece was not counted as done");
+    }
+
+    #[test]
+    fn a_web_worker_that_cannot_write_says_the_disk_failed_and_gives_the_piece_back() {
+        let (listed, content) = single("file.bin", 3000);
+        let mirror = spawn_mirror(vec![("file.bin", content.clone())], Mode::Serve);
+        let rig = Rig::new("disk-fails", &[(vec!["file.bin"], content)], 1024);
+        std::fs::create_dir_all(rig.dir.join("file.bin")).unwrap(); // a directory where the file goes
+
+        let end = rig.run(&mirror.base, "file.bin", &listed, false, None, &AtomicBool::new(false));
+
+        assert!(matches!(end, WebEnd::DiskFailed(ref why) if !why.is_empty()), "{:?}", end);
+        assert!(rig.logged("disk write failed"));
+        assert_eq!(rig.queue.len(), 3, "the piece it could not write is back on the queue");
+        assert_eq!(mirror.requests.load(Ordering::SeqCst), 1, "and it did not go on asking");
+    }
+
+    #[test]
+    fn a_web_worker_told_to_stop_before_it_starts_says_it_stopped() {
+        let (listed, content) = single("file.bin", 3000);
+        let mirror = spawn_mirror(vec![("file.bin", content.clone())], Mode::Serve);
+        let rig = Rig::new("stopped-end", &[(vec!["file.bin"], content)], 1024);
+
+        let end = rig.run(&mirror.base, "file.bin", &listed, false, None, &AtomicBool::new(true));
+
+        assert_eq!(end, WebEnd::Stopped);
+        assert_eq!(mirror.requests.load(Ordering::SeqCst), 0);
     }
 }

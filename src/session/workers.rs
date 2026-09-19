@@ -4,11 +4,12 @@
 use crate::downloader::{run_worker, FileSpan, PexSender, PieceResult, WorkQueue, WorkerConfig, WorkerError};
 use crate::session::peer_pool::Outcome;
 use crate::session::PeerPool;
-use crate::webseed::run_web_worker;
+use crate::sync::lock;
+use crate::webseed::{run_web_worker, WebEnd};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -50,6 +51,9 @@ pub struct Workers {
     peers: Vec<JoinHandle<()>>,
     web_seeds: Vec<JoinHandle<()>>,
     web_stop: Arc<AtomicBool>,
+    /// Why writing to disk failed, once it has: with nothing to write to,
+    /// no peer can help, and the run cannot go on.
+    disk_failure: Arc<Mutex<Option<String>>>,
 }
 
 impl Workers {
@@ -60,7 +64,7 @@ impl Workers {
         let (results_tx, results_rx) = mpsc::channel();
         let (pex_tx, pex_rx) = mpsc::channel();
         let (outcomes_tx, outcomes_rx) = mpsc::channel();
-        Workers { queue, spans, config, piece_length, max_peers, log, results_tx, results_rx, pex_tx: (!private).then_some(pex_tx), pex_rx, outcomes_tx, outcomes_rx, peers: Vec::new(), web_seeds: Vec::new(), web_stop: Arc::new(AtomicBool::new(false)) }
+        Workers { queue, spans, config, piece_length, max_peers, log, results_tx, results_rx, pex_tx: (!private).then_some(pex_tx), pex_rx, outcomes_tx, outcomes_rx, peers: Vec::new(), web_seeds: Vec::new(), web_stop: Arc::new(AtomicBool::new(false)), disk_failure: Arc::new(Mutex::new(None)) }
     }
 
     /// Starts one worker per BEP 19 web seed, each dialing nobody: they
@@ -72,8 +76,12 @@ impl Workers {
             let (queue, spans, tx, stop, log) = (Arc::clone(&self.queue), Arc::clone(&self.spans), self.results_tx.clone(), Arc::clone(&self.web_stop), Arc::clone(&self.log));
             let limiter = self.config.down_limit.clone();
             let piece_length = self.piece_length;
+            let disk_failure = Arc::clone(&self.disk_failure);
             self.web_seeds.push(thread::spawn(move || {
-                run_web_worker(&url, &name, &files, multi_file, limiter.as_deref(), &queue, &spans, piece_length, total_length, &tx, &stop, move |m| log(m));
+                let end = run_web_worker(&url, &name, &files, multi_file, limiter.as_deref(), &queue, &spans, piece_length, total_length, &tx, &stop, move |m| log(m));
+                if let WebEnd::DiskFailed(why) = end {
+                    lock(&disk_failure).get_or_insert(why);
+                }
             }));
         }
     }
@@ -87,11 +95,15 @@ impl Workers {
             let (queue, spans, config) = (Arc::clone(&self.queue), Arc::clone(&self.spans), Arc::clone(&self.config));
             let (tx, pex_tx, log) = (self.results_tx.clone(), self.pex_tx.clone(), Arc::clone(&self.log));
             let outcomes = self.outcomes_tx.clone();
+            let disk_failure = Arc::clone(&self.disk_failure);
             let piece_length = self.piece_length;
             self.peers.push(thread::spawn(move || {
                 let result = run_worker(addr, &config, &queue, &spans, piece_length, &tx, pex_tx.as_ref());
                 if let Err(e) = &result {
                     log(format!("peer {} disconnected: {:?}", addr, e));
+                    if let WorkerError::Connection { stage: "write_piece_to_disk", error } = e {
+                        lock(&disk_failure).get_or_insert(error.to_string());
+                    }
                 }
                 let _ = outcomes.send((addr, classify(&result)));
             }));
@@ -120,6 +132,11 @@ impl Workers {
     /// The next verified-and-written piece, waiting up to `timeout`.
     pub fn recv_result(&self, timeout: Duration) -> Result<PieceResult, RecvTimeoutError> {
         self.results_rx.recv_timeout(timeout)
+    }
+
+    /// Why the disk could not be written to, if that has happened.
+    pub fn disk_failure(&self) -> Option<String> {
+        lock(&self.disk_failure).clone()
     }
 
     /// How each peer worker that has ended since the last call ended.
@@ -325,5 +342,31 @@ mod tests {
 
         assert_eq!(outcomes, vec![(addr, Outcome::Unreachable)]);
         assert!(w.take_outcomes().is_empty(), "each outcome is delivered once");
+    }
+
+    #[test]
+    fn a_web_seed_that_cannot_write_to_disk_is_reported_as_a_disk_failure() {
+        use crate::downloader::build_file_spans;
+        use crate::webseed::mirror::{spawn_mirror, Mode};
+        use sha1::{Digest, Sha1};
+
+        let content: Vec<u8> = (0..3000).map(|i| (i as u8).wrapping_mul(3)).collect();
+        let mirror = spawn_mirror(vec![("file.bin", content.clone())], Mode::Serve);
+        let dir = std::env::temp_dir().join(format!("bittorrent-rs-workers-disk-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("file.bin")).unwrap(); // a directory where the file goes
+        let work = content.chunks(1024).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32 }).collect();
+        let queue = Arc::new(WorkQueue::new(work, 3));
+        let files = vec![(vec!["file.bin".to_string()], 3000i64)];
+        let spans = Arc::new(build_file_spans(&dir, &files));
+        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default() });
+        let (log, _) = recording_log();
+        let mut w = Workers::new(queue, spans, config, 1024, 1, false, log);
+        assert_eq!(w.disk_failure(), None, "nothing has failed yet");
+
+        w.start_web_seeds(std::slice::from_ref(&mirror.base), "file.bin", &files, false, 3000);
+
+        wait_until("the disk failure to be reported", || w.disk_failure().is_some());
+        w.shutdown();
     }
 }

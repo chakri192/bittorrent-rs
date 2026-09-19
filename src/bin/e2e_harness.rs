@@ -87,6 +87,9 @@ enum Kind {
     /// SIGTERM mid-download, with the only peer silent: a prompt, clean exit
     /// that keeps the resume file.
     SigtermMidDownload,
+    /// A disk that cannot be written to ends the run at once with a message
+    /// saying so, instead of dialing the same peers over and over.
+    DiskFailure,
     /// `--prefer`: the pieces of the preferred file are requested first;
     /// a pattern that matches nothing is refused before any download.
     PreferFiles,
@@ -137,6 +140,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "limit-upload", kind: Kind::LimitUpload },
     Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
     Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
+    Scenario { name: "disk-failure", kind: Kind::DiskFailure },
     Scenario { name: "prefer-files", kind: Kind::PreferFiles },
     Scenario { name: "json-events", kind: Kind::JsonEvents },
     Scenario { name: "create-torrent", kind: Kind::CreateTorrent },
@@ -174,6 +178,7 @@ fn main() {
             Kind::LimitUpload => run_limit_upload(scenario.name),
             Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
             Kind::SigtermMidDownload => run_sigterm_mid_download(scenario.name),
+            Kind::DiskFailure => run_disk_failure(scenario.name),
             Kind::PreferFiles => run_prefer_files(scenario.name),
             Kind::JsonEvents => run_json_events(scenario.name),
             Kind::CreateTorrent => run_create_torrent(scenario.name),
@@ -2081,4 +2086,41 @@ fn run_prefer_files(name: &str) -> Result<String, String> {
     }
 
     Ok("--prefer b.bin requested its 7 pieces (5..11) before the other 5, and the whole torrent downloaded; a pattern matching nothing was refused before any request".to_string())
+}
+
+/// The place the file must go holds a directory, so no piece can be
+/// written. With peers ready to serve, the client must not sit dialing
+/// them: it stops within seconds, exits non-zero, and says the disk is
+/// the problem (not "incomplete", which would blame the swarm).
+fn run_disk_failure(name: &str) -> Result<String, String> {
+    const LIMIT: Duration = Duration::from_secs(15);
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve, Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path, stderr_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"), dir.join("stderr.txt"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    fs::create_dir_all(out_dir.join("e2e.bin")).map_err(|e| e.to_string())?;
+
+    let started = Instant::now();
+    let mut child = client_command(&torrent, &out_dir, &log_path, 2)
+        .arg("--no-dht")
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&stderr_path).expect("create stderr file"))
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, LIMIT)?;
+    let took = started.elapsed();
+
+    if status.code() != Some(1) {
+        return Err(format!("exit status {:?}; an unwritable disk is a failure, status 1", status.code()));
+    }
+    let stderr = fs::read_to_string(&stderr_path).map_err(|e| e.to_string())?;
+    if !stderr.contains("cannot write to disk") || stderr.contains("incomplete:") {
+        return Err(format!("stderr should blame the disk, not the swarm: {:?}", stderr.trim()));
+    }
+    let log = fs::read_to_string(&log_path).map_err(|e| e.to_string())?;
+    if !log.contains("cannot write to disk") {
+        return Err("the log does not say why the run ended".to_string());
+    }
+    Ok(format!("a directory in the way of the file ended the run in {:.1?} with status 1 and \"cannot write to disk\", with two peers ready to serve", took))
 }

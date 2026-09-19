@@ -512,7 +512,10 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         services.shutdown();
         Ok(summary)
     } else {
-        let reason = format!("incomplete: {} piece(s) never downloaded ({} peer(s) dialed) -- rerun the same command to resume", report.remaining, report.dialed);
+        let reason = match &report.aborted {
+            Some(why) => format!("cannot write to disk: {} -- {} piece(s) not downloaded; fix that and rerun the same command to resume", why, report.remaining),
+            None => format!("incomplete: {} piece(s) never downloaded ({} peer(s) dialed) -- rerun the same command to resume", report.remaining, report.dialed),
+        };
         session.announce_stopped();
         services.shutdown();
         // If we're here because the user quit, don't flash a failure

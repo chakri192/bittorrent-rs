@@ -57,6 +57,10 @@ pub struct Report {
     pub elapsed: Duration,
     /// Bytes fetched by this run (resumed pieces don't count).
     pub bytes_this_run: u64,
+    /// Why the run was ended early and not by finishing, the timeout or a
+    /// stop: the disk could not be written to. No peer can help with that,
+    /// so retrying would only spin.
+    pub aborted: Option<String>,
 }
 
 /// A running download: the workers fetching pieces, the dial queue, the
@@ -122,9 +126,15 @@ impl<'a> Session<'a> {
         self.run_start = Instant::now();
         self.workers.spawn_peers(&mut self.pool, Instant::now());
         self.publish();
+        let mut aborted = None;
 
         loop {
             if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Some(why) = self.workers.disk_failure() {
+                sink.log(format!("cannot write to disk: {}", why));
+                aborted = Some(why);
                 break;
             }
             if let Some(timeout) = self.timeout {
@@ -173,7 +183,7 @@ impl<'a> Session<'a> {
         // last progress event -- describe a download that was not quite done.
         self.publish();
 
-        Report { complete: self.queue.is_empty(), remaining: self.queue.len(), dialed: self.pool.dialed(), elapsed: self.run_start.elapsed(), bytes_this_run: self.progress.bytes_this_run() }
+        Report { complete: self.queue.is_empty(), remaining: self.queue.len(), dialed: self.pool.dialed(), elapsed: self.run_start.elapsed(), bytes_this_run: self.progress.bytes_this_run(), aborted }
     }
 
     /// Tells the pool how each peer worker that has ended ended, so it can
@@ -480,6 +490,36 @@ mod tests {
             assert!(sink.lines.lock().unwrap().iter().any(|l| l.starts_with(&format!("piece {} verified (", piece))), "piece {} was reported", piece);
         }
         assert!(sink.snapshots.lock().unwrap().iter().any(|snap| snap.status == "downloading"), "and the dashboard saw it downloading");
+    }
+
+    #[test]
+    fn a_run_whose_disk_cannot_be_written_ends_at_once_saying_so_instead_of_spinning() {
+        let dir = tmp_dir("disk-failure");
+        // A directory where the file must go: opening it for writing fails.
+        std::fs::create_dir_all(dir.join("f.bin")).unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        // Safety net: without the abort this would wait out the timeout.
+        let mut s = session(&sink, &services, &dir, &[fake_peer(true), fake_peer(true)], Some(Duration::from_secs(20)));
+
+        let report = s.run(&AtomicBool::new(false));
+
+        assert!(!report.complete);
+        let why = report.aborted.expect("the run was aborted for the disk, not left to time out");
+        assert!(!why.is_empty());
+        assert!(report.elapsed < Duration::from_secs(10), "at once, not after {:?}", report.elapsed);
+        assert!(sink.logged("cannot write to disk"), "the log says so");
+        assert_eq!(report.remaining, PIECES, "nothing was written");
+    }
+
+    #[test]
+    fn a_run_that_ends_any_other_way_is_not_marked_aborted() {
+        let dir = tmp_dir("not-aborted");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let mut s = session(&sink, &services, &dir, &[fake_peer(true)], None);
+
+        assert!(s.run(&AtomicBool::new(false)).aborted.is_none());
     }
 
     #[test]
