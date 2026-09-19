@@ -899,6 +899,13 @@ fn spawn_recording_peer(listener: TcpListener, info_hash: [u8; 20], pieces: Vec<
                 served += 1;
             }
         }
+        // Hangs up as a peer that closes properly does: FIN after what was sent, then the requests it did not read
+        // are read and dropped. Closing with them unread makes Linux send a reset, which discards what the client
+        // has been sent and not yet read: the blocks served just before would be lost, not delivered and then cut off.
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let mut sink = [0u8; 4096];
+        while std::io::Read::read(&mut stream, &mut sink).is_ok_and(|n| n > 0) {}
     })
 }
 
