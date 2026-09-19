@@ -9,7 +9,7 @@ Every layer is written here — the bencode parser, the peer wire protocol, trac
 <p>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-1c1c1e?style=flat-square&logo=rust&logoColor=DEA584" />
   <img alt="Size" src="https://img.shields.io/badge/~10k-lines-1c1c1e?style=flat-square" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-470%20passing-1c1c1e?style=flat-square" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-486%20passing-1c1c1e?style=flat-square" />
   <img alt="BEPs" src="https://img.shields.io/badge/BEP-3%20·%205%20·%209%2F10%20·%2011%20·%2015%20·%2019%20·%2027-1c1c1e?style=flat-square" />
   <img alt="Fuzzed" src="https://img.shields.io/badge/parsers-fuzzed-1c1c1e?style=flat-square" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-1c1c1e?style=flat-square" />
@@ -83,6 +83,7 @@ Defaults may be placed in `~/.config/bittorrent-rs.toml`. Every key is optional,
 | `--port PORT` | TCP listen and UDP DHT port. Defaults to 6881 |
 | `--only SUB` · `--files 1,3` · `--list` | File selection within a multi-file torrent |
 | `--seed` | Continue seeding after completion until interrupted |
+| `--recheck` | Verify every piece against the files on disk instead of trusting the resume file. This also happens by itself when files exist but no resume file does, so a finished download can be re-verified and seeded, and files from elsewhere adopted |
 | `--no-dht` · `--no-portmap` · `--no-webseed` | Disable individual discovery mechanisms |
 | `--retry-delay SECS` | First wait before redialing a peer that failed; later retries wait 3× and 9× as long. Defaults to 15 |
 | `--quiet` · `--no-tui` | Suppress output · force the plain text interface |
@@ -134,9 +135,9 @@ cargo test
 cargo run --bin e2e_harness      # loopback scenarios: public, private, magnet, hostile torrent, resume, --only, dropped peer, retry, ban, --timeout, --seed
 ```
 
-470 tests (468 unit, 1 doctest, 1 integration), all passing, all confined to loopback.
+486 tests (484 unit, 1 doctest, 1 integration), all passing, all confined to loopback.
 
-Coverage spans parsing, the KRPC codec verified against BEP 5's published byte strings, DHT lookup and announce over a scripted transport, workers driven against mock peers, the seeder against a mock leecher, and web-seed range arithmetic. An end-to-end harness runs the real binary against a synthetic tracker and peer on `127.0.0.1` and compares output byte for byte. Its scenarios cover a public torrent, a hostile one whose paths would write outside the download directory (it must be refused with nothing written), a private one (no DHT, no PEX), a client killed mid-download that must resume and fetch only the pieces it lacks, `--only` on one file of three (only the pieces that file touches may be requested), a peer that hangs up halfway through a piece while another supplies the rest, and `--timeout` against a peer that goes silent (the client must stop, exit non-zero, report the download incomplete and keep its resume file), `--seed` (the client announces started and completed, stays up, and serves every piece back to a leecher on the port it announced), a magnet link (a peer found through the tracker serves the metadata, which the client verifies before downloading), the only peer dropping the first connection (the client must dial it again and finish), and a peer that sends corrupt data beside an honest one (the download must be correct and the liar dialed exactly once). Every parser that reads untrusted bytes also runs through a deterministic mutation fuzzer inside `cargo test` (bit flips, every truncation, extreme lengths, splices), which must never panic and must round-trip whatever it accepts; three `cargo-fuzz` targets do the same open-ended on a nightly toolchain.
+Coverage spans parsing, the KRPC codec verified against BEP 5's published byte strings, DHT lookup and announce over a scripted transport, workers driven against mock peers, the seeder against a mock leecher, and web-seed range arithmetic. An end-to-end harness runs the real binary against a synthetic tracker and peer on `127.0.0.1` and compares output byte for byte. Its scenarios cover a public torrent, a hostile one whose paths would write outside the download directory (it must be refused with nothing written), a private one (no DHT, no PEX), a client killed mid-download that must resume and fetch only the pieces it lacks, `--only` on one file of three (only the pieces that file touches may be requested), a peer that hangs up halfway through a piece while another supplies the rest, and `--timeout` against a peer that goes silent (the client must stop, exit non-zero, report the download incomplete and keep its resume file), `--seed` (the client announces started and completed, stays up, and serves every piece back to a leecher on the port it announced), a magnet link (a peer found through the tracker serves the metadata, which the client verifies before downloading), the only peer dropping the first connection (the client must dial it again and finish), a peer that sends corrupt data beside an honest one (the download must be correct and the liar dialed exactly once), a finished download run again (verified in place, nothing fetched), and one with a single damaged piece (exactly that piece fetched). Every parser that reads untrusted bytes also runs through a deterministic mutation fuzzer inside `cargo test` (bit flips, every truncation, extreme lengths, splices), which must never panic and must round-trip whatever it accepts; three `cargo-fuzz` targets do the same open-ended on a nightly toolchain.
 
 ## Security
 

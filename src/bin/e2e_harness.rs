@@ -71,6 +71,12 @@ enum Kind {
     /// A peer that sends corrupt data beside an honest one: the download
     /// must be correct and the liar must be banned, not retried.
     BanCorruptPeer,
+    /// A finished download run again: everything on disk verifies, so
+    /// nothing may be fetched.
+    RerunAfterComplete,
+    /// A finished download with one damaged piece: exactly that piece must
+    /// be fetched again.
+    RepairCorruptedFile,
 }
 
 struct Scenario {
@@ -90,6 +96,8 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "hostile-torrent", kind: Kind::HostileTorrent },
     Scenario { name: "reconnect-after-drop", kind: Kind::ReconnectAfterDrop },
     Scenario { name: "ban-corrupt-peer", kind: Kind::BanCorruptPeer },
+    Scenario { name: "rerun-after-complete", kind: Kind::RerunAfterComplete },
+    Scenario { name: "repair-corrupted-file", kind: Kind::RepairCorruptedFile },
 ];
 
 fn main() {
@@ -106,6 +114,8 @@ fn main() {
             Kind::HostileTorrent => run_hostile_torrent(scenario.name),
             Kind::ReconnectAfterDrop => run_reconnect_after_drop(scenario.name),
             Kind::BanCorruptPeer => run_ban_corrupt_peer(scenario.name),
+            Kind::RerunAfterComplete => run_rerun(scenario.name, None),
+            Kind::RepairCorruptedFile => run_rerun(scenario.name, Some(3)),
         };
         match outcome {
             Ok(summary) => println!("PASS [{}]: {}", scenario.name, summary),
@@ -1179,4 +1189,66 @@ fn run_ban_corrupt_peer(name: &str) -> Result<String, String> {
         return Err("client log does not say the corrupt peer was banned".to_string());
     }
     Ok("the corrupt peer was banned after one bad piece and never redialed; the honest peer supplied a byte-identical file".to_string())
+}
+
+/// Downloads the torrent, then runs the client again over the finished
+/// files. The first run deletes its resume file on completion, so the
+/// second has only the data on disk to go on. With `damage_piece`, one byte
+/// of that piece is flipped in between.
+fn run_rerun(name: &str, damage_piece: Option<usize>) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let dir = scratch_dir(name);
+    let out_dir = dir.join("out");
+
+    // First run: an ordinary complete download.
+    let swarm1 = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let torrent1 = dir.join("run1.torrent");
+    fs::write(&torrent1, fx.torrent_bytes(swarm1.tracker_addr)).expect("write torrent file");
+    let mut child = client_command(&torrent1, &out_dir, &dir.join("run1.log"), 1).arg("--no-dht").stdout(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    if !wait_or_kill(&mut child, RUN_LIMIT)?.success() {
+        return Err("run 1 did not complete".to_string());
+    }
+    check_downloaded(&fx, &out_dir).map_err(|e| format!("run 1: {}", e))?;
+    if progress_file_path(&out_dir, &fx.info_hash).exists() {
+        return Err("run 1 left its resume file behind".to_string());
+    }
+
+    if let Some(piece) = damage_piece {
+        let path = out_dir.join("e2e.bin");
+        let mut bytes = fs::read(&path).map_err(|e| e.to_string())?;
+        bytes[piece * fx.piece_len + 7] ^= 0xFF;
+        fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    }
+
+    // Second run, against a fresh swarm that would serve every piece.
+    let swarm2 = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let torrent2 = dir.join("run2.torrent");
+    let log2 = dir.join("run2.log");
+    fs::write(&torrent2, fx.torrent_bytes(swarm2.tracker_addr)).expect("write torrent file");
+    let mut child = client_command(&torrent2, &out_dir, &log2, 1).arg("--no-dht").stdout(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("run 2 exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir).map_err(|e| format!("run 2: {}", e))?;
+
+    let requested = requested_set(&swarm2.logs[0]);
+    let expected: BTreeSet<u32> = damage_piece.map(|p| p as u32).into_iter().collect();
+    if requested != expected {
+        return Err(format!("run 2 asked the peer for pieces {:?}; expected {:?}", requested, expected));
+    }
+    let log = fs::read_to_string(&log2).map_err(|e| format!("reading client log {:?}: {}", log2, e))?;
+    let checked = format!("checking the files on disk against the torrent ({} pieces)", fx.piece_count);
+    if !log.contains(&checked) {
+        return Err(format!("run 2's log lacks {:?}", checked));
+    }
+    let good = fx.piece_count - expected.len();
+    if good > 0 && !log.contains(&format!("resuming: {} piece(s) already verified on disk", good)) {
+        return Err(format!("run 2's log does not report {} pieces resumed", good));
+    }
+
+    Ok(match damage_piece {
+        None => format!("the finished download was verified in place ({} pieces) and nothing was fetched", fx.piece_count),
+        Some(p) => format!("one damaged piece ({}) was found among {} and only it was fetched; the file matches", p, fx.piece_count),
+    })
 }

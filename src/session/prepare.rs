@@ -2,7 +2,7 @@
 //! the file selection, resuming from disk, the listener and port mapping,
 //! the first tracker announce, and the workers.
 
-use crate::downloader::{build_file_spans, load_and_verify, progress_file_path, rewrite_compact, ResumeWriter, WorkQueue, WorkerConfig};
+use crate::downloader::{any_data_on_disk, build_file_spans, load_and_verify, progress_file_path, rewrite_compact, scan_all, ResumeWriter, WorkQueue, WorkerConfig};
 use crate::seeder::{self, HaveMap};
 use crate::session::peer_pool::RetryPolicy;
 use crate::session::{Announcer, DownloadPlan, Log, Outstanding, PeerPool, Progress, ProgressSink, Services, Session, Setup, Workers};
@@ -56,6 +56,11 @@ pub struct Options {
     pub no_webseed: bool,
     /// Give up after this long (`--timeout`).
     pub timeout: Option<Duration>,
+    /// Check every piece against the files on disk instead of trusting the
+    /// resume file (`--recheck`). This happens by itself when there is data
+    /// on disk but no resume file, such as after a completed download or
+    /// files copied in from elsewhere.
+    pub recheck: bool,
     /// The first delay before retrying a peer that failed; later retries
     /// wait longer (see [`RetryPolicy`]).
     pub retry_delay: Duration,
@@ -148,11 +153,27 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     let base_dir = if torrent.multi_file { options.out_dir.join(&torrent.name) } else { options.out_dir.clone() };
     let spans = Arc::new(build_file_spans(&base_dir, &torrent.files));
 
-    // Resume: re-verify any pieces a previous run claimed complete against
-    // their actual current bytes on disk before trusting them.
+    // Resume: work out which pieces are already on disk. Normally that is
+    // the pieces a previous run recorded as complete, each re-verified
+    // against its actual bytes before it is trusted. With no resume file
+    // but data present (a finished download, whose resume file is deleted,
+    // or files from elsewhere) or on request, every piece is checked.
     fs::create_dir_all(&options.out_dir).map_err(|e| format!("creating output directory {}: {}", options.out_dir.display(), e))?;
     let progress_path = progress_file_path(&options.out_dir, &torrent.info_hash);
-    let confirmed_resumed = load_and_verify(&progress_path, &spans, torrent);
+    let full_scan = options.recheck || (!progress_path.exists() && any_data_on_disk(&spans));
+    let confirmed_resumed = if full_scan {
+        sink.log(format!("checking the files on disk against the torrent ({} pieces)", total_pieces));
+        let mut next_report = 10;
+        scan_all(&spans, torrent, |done, total| {
+            // Big torrents take a while to hash; small ones do not need a running commentary.
+            if total >= 20 && done * 100 / total >= next_report {
+                sink.log(format!("checked {}% of the pieces", next_report));
+                next_report += 10;
+            }
+        })
+    } else {
+        load_and_verify(&progress_path, &spans, torrent)
+    };
     if !confirmed_resumed.is_empty() {
         sink.log(format!("resuming: {} piece(s) already verified on disk", confirmed_resumed.len()));
         rewrite_compact(&progress_path, &confirmed_resumed).map_err(|e| format!("writing resume file: {}", e))?;
@@ -293,6 +314,7 @@ mod tests {
             no_portmap: true, // nothing here may touch the LAN gateway
             no_webseed: false,
             timeout: None,
+            recheck: false,
             retry_delay: Duration::from_secs(15),
             pipeline_depth: 5,
             connect_timeout: Duration::from_secs(1),
@@ -501,5 +523,108 @@ mod tests {
         let (prepared, _) = run_prepare(&one_file, &[true], vec![dead_addr()], &options(&dir), &mut services);
 
         assert_eq!(prepared.unwrap().info.base_dir, dir.join("Album"));
+    }
+
+    // ---- adopting data that is already on disk --------------------------
+
+    /// The whole torrent's data, written where the download would put it.
+    fn write_all_data(dir: &std::path::Path) {
+        fs::create_dir_all(dir.join("t")).unwrap();
+        fs::write(dir.join("t/a"), &data()[..300]).unwrap();
+        fs::write(dir.join("t/b"), &data()[300..]).unwrap();
+    }
+
+    #[test]
+    fn a_finished_download_run_again_is_verified_not_fetched_again() {
+        // The resume file is deleted on completion, so the second run has
+        // nothing to trust; it used to fetch every piece a second time.
+        let dir = tmp_dir("adopt");
+        write_all_data(&dir);
+        let mut services = Services::new();
+
+        let (prepared, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        let prepared = prepared.unwrap();
+
+        assert_eq!(prepared.queue.len(), 0, "every piece checks out, so there is nothing to fetch");
+        assert_eq!(prepared.progress.verified(), 3);
+        assert_eq!(prepared.progress.bytes_done(), 600);
+        assert!(log.logged("checking the files on disk against the torrent (3 pieces)"));
+        assert!(log.logged("resuming: 3 piece(s) already verified on disk"));
+        assert_eq!(sidecar(&dir).lines().count(), 3, "and the resume file is rebuilt from what was found");
+    }
+
+    #[test]
+    fn a_corrupted_piece_in_existing_data_is_found_and_only_it_is_fetched() {
+        let dir = tmp_dir("adopt-corrupt");
+        write_all_data(&dir);
+        // Piece 2 is the last 88 bytes, all in file b: damage one of them.
+        let mut b = fs::read(dir.join("t/b")).unwrap();
+        b[250] ^= 0xFF;
+        fs::write(dir.join("t/b"), b).unwrap();
+        let mut services = Services::new();
+
+        let (prepared, _) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        let prepared = prepared.unwrap();
+
+        assert_eq!(prepared.queue.len(), 1);
+        assert_eq!(prepared.progress.verified(), 2);
+        assert_eq!(prepared.progress.bytes_done(), 512);
+    }
+
+    #[test]
+    fn with_a_resume_file_only_its_claims_are_checked_unless_a_recheck_is_asked_for() {
+        let dir = tmp_dir("recheck");
+        write_all_data(&dir);
+        fs::write(progress_file_path(&dir, &torrent().info_hash), "0\n").unwrap(); // claims only piece 0
+
+        let mut services = Services::new();
+        let (trusting, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        assert_eq!(trusting.unwrap().progress.verified(), 1, "the other two are valid on disk but nobody said so");
+        assert!(!log.logged("checking the files on disk"), "no full scan: a resume file exists");
+
+        let mut recheck = options(&dir);
+        recheck.recheck = true;
+        let mut services = Services::new();
+        let (scanning, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &recheck, &mut services);
+        assert_eq!(scanning.unwrap().progress.verified(), 3, "--recheck finds them");
+        assert!(log.logged("checking the files on disk"));
+    }
+
+    #[test]
+    fn an_empty_output_directory_is_not_scanned_at_all() {
+        let dir = tmp_dir("no-scan");
+        let mut services = Services::new();
+        let (prepared, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        assert_eq!(prepared.unwrap().queue.len(), 3);
+        assert!(!log.logged("checking the files on disk"), "nothing to check");
+    }
+
+    #[test]
+    fn a_long_scan_reports_every_ten_percent_and_a_short_one_stays_quiet() {
+        // 40 pieces of 16 bytes: long enough to be worth a running commentary.
+        let content: Vec<u8> = (0..640).map(|i| (i as u8).wrapping_mul(3)).collect();
+        let mut bytes = b"d4:infod6:lengthi640e4:name1:f12:piece lengthi16e6:pieces800:".to_vec();
+        for chunk in content.chunks(16) {
+            bytes.extend_from_slice(&Sha1::digest(chunk));
+        }
+        bytes.extend_from_slice(b"ee");
+        let long = parse_torrent_file(&bytes).unwrap();
+        let dir = tmp_dir("progress-long");
+        fs::write(dir.join("f"), &content).unwrap();
+        let mut services = Services::new();
+
+        let (prepared, log) = run_prepare(&long, &[true], vec![dead_addr()], &options(&dir), &mut services);
+
+        assert_eq!(prepared.unwrap().progress.verified(), 40);
+        let reports: Vec<String> = log.lines.lock().unwrap().iter().filter(|l| l.starts_with("checked ")).cloned().collect();
+        assert_eq!(reports.len(), 10, "{:?}", reports);
+        assert_eq!((reports.first().map(String::as_str), reports.last().map(String::as_str)), (Some("checked 10% of the pieces"), Some("checked 100% of the pieces")));
+
+        // The 3-piece torrent used elsewhere in these tests says nothing.
+        let dir = tmp_dir("progress-short");
+        write_all_data(&dir);
+        let mut services = Services::new();
+        let (_, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        assert!(!log.logged("checked "));
     }
 }
