@@ -328,6 +328,12 @@ pub struct SeederHandle {
 }
 
 impl SeederHandle {
+    /// The limit this torrent's uploads are held to, for tests to see whose it is.
+    #[cfg(test)]
+    pub(crate) fn up_limit(&self) -> Option<Arc<crate::ratelimit::RateLimiter>> {
+        self.torrent.up_limit.clone()
+    }
+
     /// Stops serving this torrent: peers already connected are let go within a
     /// read timeout, and new ones asking for it are refused.
     pub fn stop(&mut self) {

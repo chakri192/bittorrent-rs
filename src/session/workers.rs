@@ -57,6 +57,12 @@ pub struct Workers {
 }
 
 impl Workers {
+    /// The limit the downloads are held to, for tests to see whose it is.
+    #[cfg(test)]
+    pub(crate) fn down_limit(&self) -> Option<Arc<crate::ratelimit::RateLimiter>> {
+        self.config.down_limit.clone()
+    }
+
     /// A worker set that will keep at most `max_peers` peer connections
     /// going. Nothing runs until [`spawn_peers`](Self::spawn_peers) or
     /// [`start_web_seeds`](Self::start_web_seeds).

@@ -162,6 +162,10 @@ enum Kind {
     StoppedAnnounceIsBounded,
     /// A second signal during that wait exits at once with status 130.
     SecondSignalForcesExit,
+    /// The multi-torrent daemon: two torrents downloaded and then seeded on one
+    /// port, told to it over its control socket; one removed while the other
+    /// carries on; and, after a restart, what was left remembered.
+    Daemon,
 }
 
 struct Scenario {
@@ -209,6 +213,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "seed-time-ends-seeding", kind: Kind::SeedTime },
     Scenario { name: "stopped-announce-is-bounded", kind: Kind::StoppedAnnounceIsBounded },
     Scenario { name: "second-signal-forces-exit", kind: Kind::SecondSignalForcesExit },
+    Scenario { name: "daemon-two-torrents", kind: Kind::Daemon },
 ];
 
 fn main() {
@@ -259,6 +264,7 @@ fn main() {
             Kind::SeedTime => run_seed_time(scenario.name),
             Kind::StoppedAnnounceIsBounded => run_stopped_announce_is_bounded(scenario.name),
             Kind::SecondSignalForcesExit => run_second_signal_forces_exit(scenario.name),
+            Kind::Daemon => run_daemon(scenario.name),
         };
         match outcome {
             Ok(summary) => println!("PASS [{}]: {}", scenario.name, summary),
@@ -3311,4 +3317,179 @@ fn run_encryption(name: &str) -> Result<String, String> {
     }
 
     Ok("require encrypted a download from an MSE peer; prefer fell back to plain for a plain-only peer; require refused it; an encrypted leecher was served by the client, and a require-client turned a plain one away".to_string())
+}
+
+// ---- the daemon ------------------------------------------------------
+
+/// A running `daemon run`, killed if the scenario leaves it. What it prints is kept.
+struct RunningDaemon {
+    child: KillOnDrop,
+    port: u16,
+    stdout: Arc<Mutex<Vec<String>>>,
+}
+
+fn daemon_bin() -> PathBuf {
+    std::env::current_exe().expect("current exe").parent().expect("exe dir").join("daemon")
+}
+
+/// Starts the daemon on loopback-only settings, with state in `state_dir`, and waits until it says which port it listens on.
+fn start_daemon(state_dir: &Path, socket: &Path) -> Result<RunningDaemon, String> {
+    let mut child = Command::new(daemon_bin())
+        .arg("run")
+        .args(["--state-dir"])
+        .arg(state_dir)
+        .arg("--socket")
+        .arg(socket)
+        // Nothing here may leave loopback: no DHT, no local discovery, no port mapping on the LAN's router.
+        .args(["--port", "0", "--no-dht", "--no-lsd", "--no-portmap", "--no-ipv6"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the daemon: {}", e))?;
+    let out = child.stdout.take().ok_or("no stdout")?;
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    // Read for as long as the daemon runs: a closed pipe would kill it the next time it printed.
+    let lines = Arc::clone(&stdout);
+    thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            lines.lock().unwrap().push(line);
+        }
+    });
+    let mut daemon = RunningDaemon { child: KillOnDrop(child), port: 0, stdout };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let running = daemon.stdout.lock().unwrap().iter().find_map(|l| l.strip_prefix("daemon running: port ")?.split(',').next()?.parse::<u16>().ok());
+        if let Some(port) = running {
+            daemon.port = port;
+            return Ok(daemon);
+        }
+        if let Some(status) = daemon.child.0.try_wait().map_err(|e| e.to_string())? {
+            return Err(format!("the daemon exited ({:?}) before it was running: {:?}", status.code(), daemon.stdout.lock().unwrap()));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("the daemon was not running after 20 s: {:?}", daemon.stdout.lock().unwrap()));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// `daemon <args> --socket <socket> --json`: its stdout, or its stderr if it failed.
+fn daemon_ctl(socket: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(daemon_bin()).args(args).arg("--socket").arg(socket).arg("--json").output().map_err(|e| format!("running the daemon's client: {}", e))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// The daemon's torrents, as `(info hash, state)`.
+fn daemon_list(socket: &Path) -> Result<Vec<(String, String)>, String> {
+    let lines = json_lines(&daemon_ctl(socket, &["list"])?)?;
+    Ok(lines.iter().map(|l| (l["torrent"].as_str().unwrap_or("?").to_string(), l["state"].as_str().unwrap_or("?").to_string())).collect())
+}
+
+fn wait_for_state(socket: &Path, hash: &str, wanted: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let states = daemon_list(socket)?;
+        if states.iter().any(|(h, s)| h == hash && s == wanted) {
+            return Ok(());
+        }
+        if states.iter().any(|(h, s)| h == hash && s == "failed") {
+            return Err(format!("{} failed: {}", hash, daemon_ctl(socket, &["status", hash]).unwrap_or_default()));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("{} was not {} after 30 s: {:?}", hash, wanted, states));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn hex(hash: &[u8; 20]) -> String {
+    hash.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn run_daemon(name: &str) -> Result<String, String> {
+    let fx1 = Fixture::new(false);
+    let fx2 = Fixture::build("second.bin", &[("second.bin", pattern(5000, 7))], 256, false);
+    let (swarm1, swarm2) = (spawn_swarm(&fx1, vec![Behavior::Serve]), spawn_swarm(&fx2, vec![Behavior::Serve]));
+    let dir = scratch_dir(name);
+    let (state_dir, out_dir) = (dir.join("state"), dir.join("out"));
+    let socket = state_dir.join("d.sock");
+    let (torrent1, torrent2) = (dir.join("e2e.torrent"), dir.join("second.torrent"));
+    fs::write(&torrent1, fx1.torrent_bytes(swarm1.tracker_addr)).expect("write torrent file");
+    fs::write(&torrent2, fx2.torrent_bytes(swarm2.tracker_addr)).expect("write torrent file");
+    let (id1, id2) = (hex(&fx1.info_hash), hex(&fx2.info_hash));
+
+    // 1. Two torrents, told to the daemon, downloaded at the same time and then seeded.
+    let daemon = start_daemon(&state_dir, &socket)?;
+    for torrent in [&torrent1, &torrent2] {
+        daemon_ctl(&socket, &["add", &torrent.to_string_lossy(), "--out", &out_dir.to_string_lossy()])?;
+    }
+    wait_for_state(&socket, &id1, "seeding")?;
+    wait_for_state(&socket, &id2, "seeding")?;
+    check_downloaded(&fx1, &out_dir)?;
+    check_downloaded(&fx2, &out_dir)?;
+
+    // 2. Both announced the one port the daemon listens on, and both are served on it.
+    for (swarm, what) in [(&swarm1, "first"), (&swarm2, "second")] {
+        let started = swarm.announces.lock().unwrap().first().cloned().ok_or_else(|| format!("the {} tracker heard nothing", what))?;
+        let port = announce_param(&started, "port").ok_or_else(|| format!("no port in {}", started))?;
+        if port != daemon.port.to_string() {
+            return Err(format!("the {} torrent announced port {}, not the daemon's {}", what, port, daemon.port));
+        }
+    }
+    leech_everything(&fx1, daemon.port)?;
+    leech_everything(&fx2, daemon.port)?;
+
+    // 3. What the daemon says of one.
+    let status = json_lines(&daemon_ctl(&socket, &["status", &id2[..8]])?)?;
+    let log = status.first().and_then(|l| l["log"].as_str().map(str::to_string)).unwrap_or_default();
+    if !log.contains("download complete") || status[0]["name"].as_str() != Some("second.bin") || status[0]["progress"].as_f64() != Some(1.0) {
+        return Err(format!("status of the second torrent: {:?}", status));
+    }
+    let again = daemon_ctl(&socket, &["add", &torrent1.to_string_lossy(), "--out", &out_dir.to_string_lossy()]).err().ok_or("adding a torrent twice was accepted")?;
+    if !again.contains("already added") {
+        return Err(format!("adding a torrent twice said: {}", again));
+    }
+
+    // 4. One removed: it is told to its tracker, refused on the port, and its files stay; the other carries on.
+    daemon_ctl(&socket, &["remove", &id1])?;
+    let left = daemon_list(&socket)?;
+    if left.len() != 1 || left[0].0 != id2 {
+        return Err(format!("after removing the first torrent the list is {:?}", left));
+    }
+    check_stopped_last(&swarm1, fx1.data.len(), 0)?;
+    if leech_everything(&fx1, daemon.port).is_ok() {
+        return Err("the removed torrent was still served on the port".to_string());
+    }
+    leech_everything(&fx2, daemon.port)?;
+    check_downloaded(&fx1, &out_dir).map_err(|e| format!("removing a torrent must leave its files: {}", e))?;
+
+    // 5. `stop` ends the daemon, promptly and cleanly, and takes the socket file with it.
+    daemon_ctl(&socket, &["stop"])?;
+    let mut child = daemon.child;
+    let status = wait_or_kill(&mut child.0, Duration::from_secs(20))?;
+    if !status.success() {
+        return Err(format!("the daemon exited with {:?}", status.code()));
+    }
+    if socket.exists() {
+        return Err("the socket file was left behind".to_string());
+    }
+
+    // 6. Started again on the same state directory, it has the torrent that was left, and not the one removed.
+    let daemon = start_daemon(&state_dir, &socket)?;
+    let restored = daemon_list(&socket)?;
+    if restored.len() != 1 || restored[0].0 != id2 {
+        return Err(format!("the restarted daemon lists {:?}", restored));
+    }
+    wait_for_state(&socket, &id2, "seeding")?;
+    leech_everything(&fx2, daemon.port)?;
+    daemon_ctl(&socket, &["stop"])?;
+    let mut child = daemon.child;
+    wait_or_kill(&mut child.0, Duration::from_secs(20))?;
+
+    Ok(format!("two torrents downloaded and seeded on the one port {}, both announcing it and both served on it; one removed (told to its tracker, files kept, refused on the port) while the other carried on; and after stop and a restart only the other was there, seeding again", daemon.port))
 }

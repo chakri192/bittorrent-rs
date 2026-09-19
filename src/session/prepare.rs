@@ -217,8 +217,10 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     for &idx in &confirmed_resumed {
         have.set(idx);
     }
+    // On a shared network the limits are the network's, over every torrent together; its
+    // listener holds the uploads to its own, so only the download limit is chosen here.
     let up_limit = options.max_up.map(|rate| Arc::new(RateLimiter::new(rate)));
-    let down_limit = options.max_down.map(|rate| Arc::new(RateLimiter::new(rate)));
+    let down_limit = services.network().map_or_else(|| options.max_down.map(|rate| Arc::new(RateLimiter::new(rate))), |network| network.down_limit());
     // The info dictionary is offered to peers that have only a magnet link
     // (BEP 9), but only if it re-encodes to what the hash was taken over.
     let info_bytes = crate::bencode::encode(&torrent.info);
@@ -231,7 +233,12 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     };
     let piece_lengths = (!torrent.v2_pieces.is_empty()).then(|| Arc::new(torrent.v2_pieces.iter().map(|p| p.length).collect::<Vec<u32>>()));
     let seeder_options = seeder::SeederOptions { metadata, encryption: options.encryption.unwrap_or(crate::peer::Encryption::Prefer), utp: services.utp(), piece_lengths, ipv6: allow_ipv6, ..Default::default() };
-    match seeder::start_with(options.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options) {
+    let started = match services.network() {
+        // Peers reach this torrent on the port everyone's share.
+        Some(network) => Ok(network.register(torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), seeder_options)),
+        None => seeder::start_with(options.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options),
+    };
+    match started {
         Ok(handle) => {
             sink.log(format!("listening for inbound peers on port {}{}", handle.port, if handle.ipv6 { " (IPv4 and IPv6)" } else { "" }));
             if let Some(utp) = services.utp() {
@@ -883,5 +890,48 @@ mod tests {
         let mut services = Services::new();
         let (_, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
         assert!(log.logged(&format!("listening for inbound peers on port {}", services.announce_port(0))) && !log.logged("(IPv4 and IPv6)"), "--no-ipv6 keeps it to IPv4");
+    }
+
+    #[test]
+    fn on_a_shared_network_a_torrent_is_served_on_the_networks_port_and_gets_no_listener_of_its_own() {
+        use crate::session::network::tests::{handshake, no_dht, quiet_network};
+        let dir = tmp_dir("shared");
+        let network = quiet_network(crate::session::NetworkConfig { max_up: Some(5000), max_down: Some(6000), ..no_dht() });
+        let mut services = Services::shared(Arc::clone(&network));
+        let t = torrent();
+
+        // (`options.port` is 0: a listener of its own would be on some other port.)
+        let (prepared, log) = run_prepare(&t, &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        let prepared = prepared.expect("prepared");
+
+        assert_eq!(prepared.info.announce_port, network.port, "trackers are told the shared port");
+        assert_eq!(network.torrent_count(), 1);
+        assert_eq!(handshake(network.port, t.info_hash), Some(t.info_hash), "peers reach it there");
+        assert!(log.logged(&format!("listening for inbound peers on port {}", network.port)));
+        assert!(services.uploaded_counter().is_some());
+        drop(services);
+        assert_eq!(network.torrent_count(), 0, "and it is off the port once its services are gone");
+        network.shutdown();
+    }
+
+    #[test]
+    fn on_a_shared_network_the_limits_are_the_networks_and_not_the_options() {
+        use crate::session::network::tests::{no_dht, quiet_network};
+        let dir = tmp_dir("shared-limits");
+        let network = quiet_network(crate::session::NetworkConfig { max_up: Some(5000), max_down: Some(6000), ..no_dht() });
+        let mut services = Services::shared(Arc::clone(&network));
+        let mut opts = options(&dir);
+        (opts.max_up, opts.max_down) = (Some(1), Some(2));
+        let (prepared, _) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &opts, &mut services);
+        let prepared = prepared.expect("prepared");
+        assert_eq!(services.seeder_up_limit().map(|l| l.bytes_per_sec()), Some(5000));
+        assert!(Arc::ptr_eq(&prepared.workers.down_limit().unwrap(), &network.down_limit().unwrap()), "the same limiter, so that the torrents share the rate");
+
+        // Alone, the options' are what there is.
+        let mut alone = Services::new();
+        let (prepared, _) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &opts, &mut alone);
+        assert_eq!(prepared.unwrap().workers.down_limit().map(|l| l.bytes_per_sec()), Some(2));
+        assert_eq!(alone.seeder_up_limit().map(|l| l.bytes_per_sec()), Some(1));
+        network.shutdown();
     }
 }

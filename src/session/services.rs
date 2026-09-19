@@ -7,13 +7,18 @@ use crate::dht::{self, DhtService, SharedTransport};
 use crate::lsd::{LsdConfig, LsdService};
 use crate::portmap::{self, PortMap};
 use crate::seeder::SeederHandle;
+use crate::session::network::SharedNetwork;
 use crate::utp::socket::Foreign;
 use crate::utp::UtpSocket;
-use std::net::UdpSocket;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Owns the DHT service, local discovery, the seeder and the port mapping.
+///
+/// With [`Services::shared`] the listener, the DHT node, the uTP socket and the port mapping
+/// are not its own but a [`SharedNetwork`]'s, which serves other torrents too; what it owns
+/// then is this torrent's place on them, and stopping it takes the torrent off them and leaves
+/// them running.
 ///
 /// Dropping it stops all three, so a session that bails out early (no
 /// peers, a bad torrent) cannot leave a port mapping on the user's router
@@ -33,11 +38,25 @@ pub struct Services {
     /// thread, and `0` until the seeder's listener is up (the DHT starts
     /// first, since a magnet link may need it before anything else).
     dht_announce_port: Arc<AtomicU16>,
+    /// What is shared with other torrents, if this is one of several.
+    network: Option<Arc<SharedNetwork>>,
 }
 
 impl Services {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Services for one torrent among several, on `network`'s ports and sockets.
+    pub fn shared(network: Arc<SharedNetwork>) -> Self {
+        let mut services = Self::default();
+        services.network = Some(network);
+        services
+    }
+
+    /// The network this torrent shares with others, if it does.
+    pub fn network(&self) -> Option<&Arc<SharedNetwork>> {
+        self.network.as_ref()
     }
 
     /// Starts the DHT node on UDP `port` for `info_hash`. Failure to bind
@@ -47,6 +66,13 @@ impl Services {
     /// names the routers to start from as `host:port`; empty means the public
     /// ones.
     pub fn start_dht(&mut self, port: u16, info_hash: [u8; 20], ipv6: bool, bootstrap: Vec<String>, log: impl Fn(String)) {
+        // On a shared network the node is already running (or is not wanted); this torrent is given to it.
+        if let Some(network) = &self.network {
+            if let Some(node) = network.dht() {
+                self.dht = Some(node.add_torrent(info_hash, Arc::clone(&self.dht_announce_port)));
+            }
+            return;
+        }
         let bootstrap = if bootstrap.is_empty() { dht::DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect() } else { bootstrap };
         // With a uTP socket, the DHT uses its port, as peers expect one port to do both.
         let started = match self.shared_dht_transport() {
@@ -68,12 +94,13 @@ impl Services {
     /// Opens the UDP port for uTP connections (BEP 29), `port` if it is free.
     /// Failure is not fatal: `log` says so and connections are made over TCP.
     pub fn start_utp(&mut self, port: u16, log: impl Fn(String)) {
-        let bound = UdpSocket::bind(("0.0.0.0", port)).or_else(|_| UdpSocket::bind(("0.0.0.0", 0)));
-        let (tx, rx) = std::sync::mpsc::channel();
-        match bound.and_then(|socket| UtpSocket::with_socket(socket, Some(tx))) {
-            Ok(socket) => {
+        if self.network.is_some() {
+            return; // the network's
+        }
+        match super::network::open_utp(port) {
+            Ok((socket, rx)) => {
                 log(format!("uTP running on UDP port {}", socket.local_addr().map(|a| a.port()).unwrap_or(0)));
-                self.utp = Some(Arc::new(socket));
+                self.utp = Some(socket);
                 self.utp_foreign = Some(rx);
             }
             Err(e) => log(format!("uTP disabled (couldn't bind UDP socket): {}", e)),
@@ -91,7 +118,7 @@ impl Services {
 
     /// The uTP socket, if one is running.
     pub fn utp(&self) -> Option<Arc<UtpSocket>> {
-        self.utp.clone()
+        self.utp.clone().or_else(|| self.network.as_ref().and_then(|n| n.utp()))
     }
 
     /// Starts announcing the torrent on the local network (BEP 14) and
@@ -142,6 +169,12 @@ impl Services {
         self.seeder.as_ref().map(|s| s.port).unwrap_or(fallback)
     }
 
+    /// The limit the seeder's uploads are held to, for tests to see whose it is.
+    #[cfg(test)]
+    pub(crate) fn seeder_up_limit(&self) -> Option<Arc<crate::ratelimit::RateLimiter>> {
+        self.seeder.as_ref().and_then(|s| s.up_limit())
+    }
+
     /// Bytes uploaded so far, as a counter that stays readable after the
     /// seeder is stopped. `None` without a seeder.
     pub fn uploaded_counter(&self) -> Option<Arc<AtomicU64>> {
@@ -152,6 +185,9 @@ impl Services {
     /// port (UPnP/NAT-PMP), best effort and off-thread. Does nothing
     /// without a seeder: with nothing listening there is nothing to forward.
     pub fn start_portmap(&mut self, log: impl Fn(String) + Send + 'static) {
+        if self.network.is_some() {
+            return; // mapped once, for all the torrents, when the network started
+        }
         let Some(seeder) = &self.seeder else { return };
         let tcp = seeder.port;
         let udp = self.dht.as_ref().map(|d| d.port).or_else(|| self.utp.as_ref().and_then(|u| u.local_addr().ok()).map(|a| a.port())).unwrap_or(tcp);
@@ -190,7 +226,7 @@ impl Drop for Services {
 mod tests {
     use super::*;
     use crate::seeder::{self, HaveMap};
-    use std::net::TcpStream;
+    use std::net::{TcpStream, UdpSocket};
 
     /// A real seeder on an ephemeral loopback-reachable port, serving nothing.
     fn idle_seeder() -> SeederHandle {
@@ -323,5 +359,85 @@ mod tests {
         let (_, shared_port) = s.shared_dht_transport().expect("the DHT can have it");
         assert_eq!(shared_port, port, "the same port, so one number serves TCP peers' uTP and the DHT");
         assert!(s.shared_dht_transport().is_none(), "but only one DHT can");
+    }
+
+    use crate::session::network::tests::{handshake, no_dht, quiet_network};
+    use crate::session::network::NetworkConfig;
+
+    fn on_network(network: &Arc<SharedNetwork>, info_hash: [u8; 20]) -> Services {
+        let mut services = Services::shared(Arc::clone(network));
+        let handle = network.register(info_hash, [7; 20], Arc::new(Vec::new()), 16384, 0, Arc::new(HaveMap::new(0)), Default::default());
+        services.attach_seeder(handle);
+        services
+    }
+
+    #[test]
+    fn a_torrent_stopping_takes_it_off_the_shared_port_and_leaves_the_port_open_for_the_others() {
+        let network = quiet_network(no_dht());
+        let (a, b) = ([0xAA; 20], [0xBB; 20]);
+        let (mut first, second) = (on_network(&network, a), on_network(&network, b));
+        assert_eq!(first.announce_port(0), network.port, "each announces the shared port");
+        assert_eq!(second.announce_port(0), network.port);
+
+        first.shutdown();
+
+        assert_eq!(handshake(network.port, a), None);
+        assert_eq!(handshake(network.port, b), Some(b), "the port stayed open");
+        drop(second);
+        assert_eq!(network.torrent_count(), 0, "and dropping the last takes it off too");
+        assert!(std::net::TcpStream::connect(("127.0.0.1", network.port)).is_ok(), "though the listener is the network's, and still listens");
+        network.shutdown();
+    }
+
+    #[test]
+    fn shared_services_give_their_torrent_to_the_networks_dht_node_and_leave_it_running() {
+        let network = quiet_network(NetworkConfig { dht: true, dht_bootstrap: vec!["127.0.0.1:9".to_string()], ..no_dht() });
+        let node_port = network.dht().unwrap().port;
+        let (mut first, mut second) = (Services::shared(Arc::clone(&network)), Services::shared(Arc::clone(&network)));
+        first.start_dht(0, [1; 20], false, Vec::new(), |_| {});
+        second.start_dht(0, [2; 20], false, Vec::new(), |_| {});
+        assert_eq!((first.dht().map(|d| d.port), second.dht().map(|d| d.port)), (Some(node_port), Some(node_port)), "both are on the one node");
+
+        first.shutdown();
+
+        assert!(UdpSocket::bind(("0.0.0.0", node_port)).is_err(), "the node is still there, holding its port");
+        second.stop_dht();
+        assert!(UdpSocket::bind(("0.0.0.0", node_port)).is_err(), "and still, with no torrent on it");
+        network.shutdown();
+    }
+
+    #[test]
+    fn shared_services_start_no_dht_when_the_network_has_none() {
+        let network = quiet_network(no_dht());
+        let mut services = Services::shared(Arc::clone(&network));
+        services.start_dht(0, [1; 20], false, Vec::new(), |_| {});
+        assert!(services.dht().is_none(), "nor open a socket of their own for one");
+        network.shutdown();
+    }
+
+    #[test]
+    fn shared_services_use_the_networks_utp_socket_and_do_not_open_or_close_one() {
+        let network = quiet_network(NetworkConfig { transport: crate::peer::TransportMode::Both, ..no_dht() });
+        let mut services = Services::shared(Arc::clone(&network));
+        services.start_utp(0, |_| panic!("no socket of its own to log about"));
+        let socket = services.utp().expect("the network's");
+        assert!(Arc::ptr_eq(&socket, &network.utp().unwrap()));
+        let port = socket.local_addr().unwrap().port();
+
+        services.shutdown();
+
+        assert!(network.utp().unwrap().is_running(), "the socket is still running for the other torrents");
+        assert!(UdpSocket::bind(("0.0.0.0", port)).is_err(), "and open");
+        network.shutdown();
+        assert!(!socket.is_running(), "until the network ends it");
+    }
+
+    #[test]
+    fn shared_services_leave_port_mapping_to_the_network() {
+        let network = quiet_network(no_dht());
+        let mut services = on_network(&network, [1; 20]);
+        services.start_portmap(|_| panic!("a torrent maps no ports of its own"));
+        assert!(services.portmap.is_none());
+        network.shutdown();
     }
 }

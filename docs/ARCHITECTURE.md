@@ -51,6 +51,7 @@ behind locks.
 | seeder accept, one per inbound peer, and one for the choking rounds | `seeder` | `SeederHandle::stop` |
 | DHT, one for IPv4 and one for IPv6 (BEP 32) | `dht::service` | `Services::shutdown` |
 | local discovery | `lsd` | `Services::shutdown` |
+| the daemon: one per torrent, one control accept and one per client | `daemon::job`, `daemon::control` | `Manager::remove` / `shutdown`, `Server::stop` |
 | uTP | `utp::socket` (one thread for every connection) | `Services::shutdown` |
 
 **Shared state**, all small: the `WorkQueue` (pieces still to fetch, how
@@ -128,6 +129,38 @@ torrent for a piece's length and how to verify it.
 
 Piece data reaches disk only after its hash has matched. Everything before
 that is untrusted bytes in a buffer.
+
+## The daemon
+
+`download` is one torrent. The daemon (`daemon/`, `bin/daemon.rs`) is the same
+session run for many, and the work was in deciding what a torrent owns and what
+they share.
+
+**Shared, in `session::network::SharedNetwork`**, made once: the TCP listener
+(`seeder::Listener`, which serves any number of torrents on its one port: it looks up the info hash of each peer's handshake in a registry, and for an encrypted connection tries each registered hash against what the peer sent); a DHT node per address family (`dht::DhtNode`, which
+looks up and announces a set of torrents added and removed while it runs, each
+with its own schedule, announce port and peer channel); the uTP socket the DHT
+shares; the port mapping; and the two `RateLimiter`s. **Owned by each torrent**:
+its `Services` (built with `Services::shared`, so that starting the DHT, the
+seeder and the uTP socket means taking a place on the network's rather than
+opening one), its local-discovery instance, its `WorkQueue`, workers, announcer
+and resume file. Stopping a torrent takes its place off the shared things and
+leaves them running; `prepare` is the same function for both, choosing on
+whether its `Services` has a network.
+
+A **`Job`** is `download`'s orchestration on a thread of its own, with a sink
+that keeps the latest snapshot and log lines for `status`, and a stop flag in
+place of the terminal; being told to stop is never reported as a failure. The
+**`Manager`** holds the jobs in the order they were added, refuses a torrent it
+has, and remembers them in the state directory (`daemon/state.rs`: one flat JSON
+object to a line, written whole-file-atomically; the daemon keeps its own copy of
+each `.torrent`, and a magnet link becomes one once its metadata arrives).
+The **control socket** (`daemon/control.rs`) is a Unix socket, mode 0600, with
+one JSON object to a line each way, using the same small JSON reader and writer
+as `--json`; requests are handled by a pure function of the manager, so the
+protocol is tested without a socket and the socket without a network.
+
+Removing a torrent deletes nothing but the daemon's own copy of its `.torrent`.
 
 ## Rules that hold everywhere
 

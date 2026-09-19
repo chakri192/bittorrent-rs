@@ -17,6 +17,7 @@
 
 use bittorrent_rs::config::Config;
 use bittorrent_rs::magnet::parse_magnet_uri;
+use bittorrent_rs::session::env::{dht_bootstrap, lsd_config};
 use bittorrent_rs::session::{prepare, resolve_magnet, seed_limits, Ipv6Mode, MetadataConfig, Options, ProgressSink, SeedEnd, SeedLimits, Services};
 use bittorrent_rs::torrent;
 use bittorrent_rs::tracker::generate_peer_id;
@@ -404,18 +405,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// Where local service discovery listens and announces: BEP 14's multicast
-/// group, unless both `BITTORRENT_RS_LSD_LISTEN` and `BITTORRENT_RS_LSD_SEND_TO`
-/// name unicast addresses, which is how the end-to-end tests keep it on
-/// loopback.
-fn lsd_config() -> bittorrent_rs::lsd::LsdConfig {
-    let address = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<std::net::SocketAddr>().ok());
-    match (address("BITTORRENT_RS_LSD_LISTEN"), address("BITTORRENT_RS_LSD_SEND_TO")) {
-        (Some(listen), Some(send_to)) => bittorrent_rs::lsd::LsdConfig { listen, send_to, join: None, share_port: false, ..bittorrent_rs::lsd::LsdConfig::multicast() },
-        _ => bittorrent_rs::lsd::LsdConfig::multicast(),
-    }
-}
-
 /// Whether the DHT gets an IPv6 node (BEP 32): when peers over IPv6 are wanted,
 /// as `--ipv6` and `--no-ipv6` and a probe for a route decide.
 fn dht_ipv6(args: &Args) -> bool {
@@ -424,13 +413,6 @@ fn dht_ipv6(args: &Args) -> bool {
         bittorrent_rs::session::Ipv6Mode::Never => false,
         bittorrent_rs::session::Ipv6Mode::Auto => bittorrent_rs::session::has_ipv6_egress(),
     }
-}
-
-/// The DHT's routers to start from: the public ones, unless
-/// `BITTORRENT_RS_DHT_BOOTSTRAP` lists others (`host:port`, separated by
-/// commas), which is how the end-to-end tests keep it on loopback.
-fn dht_bootstrap() -> Vec<String> {
-    std::env::var("BITTORRENT_RS_DHT_BOOTSTRAP").map(|list| list.split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect()).unwrap_or_default()
 }
 
 /// The whole download, start to finish, publishing to `ui`. Returns a
@@ -666,23 +648,6 @@ mod tests {
         assert!(!parse(&off, &["x", "--lsd"]).unwrap().no_lsd, "the flag wins over the config");
         assert!(!parse(&cfg_from("lsd = true"), &["x"]).unwrap().no_lsd);
         assert!(!parse(&Config::default(), &["x", "--no-dht"]).unwrap().no_lsd, "and it is not the same switch as the DHT's");
-    }
-
-    #[test]
-    fn local_discovery_uses_the_multicast_group_unless_the_test_hooks_name_both_addresses() {
-        let group = bittorrent_rs::lsd::LsdConfig::multicast();
-        std::env::remove_var("BITTORRENT_RS_LSD_LISTEN");
-        std::env::remove_var("BITTORRENT_RS_LSD_SEND_TO");
-        assert_eq!(lsd_config().send_to, group.send_to);
-        std::env::set_var("BITTORRENT_RS_LSD_LISTEN", "127.0.0.1:4001");
-        assert_eq!(lsd_config().send_to, group.send_to, "one of the two is not enough");
-        std::env::set_var("BITTORRENT_RS_LSD_SEND_TO", "127.0.0.1:4002");
-        let hooked = lsd_config();
-        assert_eq!((hooked.listen.port(), hooked.send_to.port(), hooked.join, hooked.share_port), (4001, 4002, None, false));
-        std::env::set_var("BITTORRENT_RS_LSD_SEND_TO", "not an address");
-        assert_eq!(lsd_config().send_to, group.send_to, "an unusable one is ignored, not obeyed");
-        std::env::remove_var("BITTORRENT_RS_LSD_LISTEN");
-        std::env::remove_var("BITTORRENT_RS_LSD_SEND_TO");
     }
 
     #[test]

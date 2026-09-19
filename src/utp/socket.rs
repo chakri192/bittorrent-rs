@@ -282,6 +282,11 @@ impl UtpSocket {
 }
 
 impl UtpSocket {
+    /// Whether the socket is still doing its work (until [`shutdown`](Self::shutdown)).
+    pub fn is_running(&self) -> bool {
+        !self.shared.stop.load(Ordering::SeqCst)
+    }
+
     /// Ends every connection and stops the thread. A socket shared between
     /// owners is stopped by whichever of them is last to act; the socket
     /// itself is closed when the last of them lets go. Safe to call twice.

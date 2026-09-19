@@ -10,6 +10,7 @@ pub mod bytes;
 pub mod choker;
 pub mod config;
 pub mod create;
+pub mod daemon;
 pub mod dht;
 pub mod downloader;
 pub mod json;
