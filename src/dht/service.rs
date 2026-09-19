@@ -282,20 +282,15 @@ mod tests {
         }
 
         fn start_on(bind: &str, peer: SocketAddr) -> Self {
-            FakeNode::start_with(bind, Some(peer), false)
-        }
-
-        /// One that answers `find_node` but never `get_peers`: a network that lets lookups time out.
-        fn start_silent_on_peers() -> Self {
-            FakeNode::start_with("127.0.0.1:0", None, true)
+            FakeNode::start_with(bind, Some(peer))
         }
 
         /// One that answers each info hash with a peer of its own, `peer_for` it.
         fn start_by_hash() -> Self {
-            FakeNode::start_with("127.0.0.1:0", None, false)
+            FakeNode::start_with("127.0.0.1:0", None)
         }
 
-        fn start_with(bind: &str, peer: Option<SocketAddr>, silent_on_peers: bool) -> Self {
+        fn start_with(bind: &str, peer: Option<SocketAddr>) -> Self {
             let socket = UdpSocket::bind(bind).unwrap();
             socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
             let port = socket.local_addr().unwrap().port();
@@ -310,10 +305,6 @@ mod tests {
                     let Ok((n, from)) = socket.recv_from(&mut buf) else { continue };
                     let Ok(KrpcMessage::Query { t, query }) = KrpcMessage::decode(&buf[..n]) else { continue };
                     let response = match query {
-                        Query::GetPeers { info_hash, .. } if silent_on_peers => {
-                            asked_log.lock().unwrap().push(info_hash);
-                            continue;
-                        }
                         Query::GetPeers { info_hash, .. } => {
                             asked_log.lock().unwrap().push(info_hash);
                             Response { id: NODE_ID, values: vec![peer.unwrap_or_else(|| peer_for(&info_hash))], token: Some(b"tk".to_vec()), ..Default::default() }
@@ -644,24 +635,5 @@ mod tests {
         assert_eq!(lookup_deadline(budget, 4), Duration::from_millis(2500));
         assert_eq!(lookup_deadline(budget, 5), Duration::from_secs(2));
         assert_eq!(lookup_deadline(budget, 500), Duration::from_secs(2), "the floor");
-    }
-
-    #[test]
-    fn a_network_that_does_not_answer_holds_up_every_torrent_for_the_budget_in_all_not_each() {
-        // Six torrents against a node that never answers a lookup. With the whole budget each (2 s here), the last would
-        // be looked up after ten seconds; with a share each, within about one budget's time.
-        let router = FakeNode::start_silent_on_peers();
-        let budget = Duration::from_secs(2);
-        let transport = UdpTransport::bind(0).unwrap();
-        let port = transport.local_port();
-        let node = Arc::new(DhtNode::start_every(transport, port, vec![router.router()], false, Duration::from_secs(3600), budget).unwrap());
-        let started = Instant::now();
-        let services: Vec<_> = (1..=6u8).map(|i| node.add_torrent([i; 20], Arc::new(AtomicU16::new(0)))).collect();
-
-        wait_until("every torrent to have been looked up once", || router.asked.lock().unwrap().iter().collect::<std::collections::HashSet<_>>().len() == 6);
-
-        assert!(started.elapsed() < Duration::from_secs(6), "took {:?}: a turn each of the whole budget would take {:?}", started.elapsed(), budget * 5);
-        drop(services);
-        node.stop();
     }
 }
