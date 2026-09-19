@@ -4,6 +4,7 @@
 
 use crate::downloader::{build_file_spans, load_and_verify, progress_file_path, rewrite_compact, ResumeWriter, WorkQueue, WorkerConfig};
 use crate::seeder::{self, HaveMap};
+use crate::session::peer_pool::RetryPolicy;
 use crate::session::{Announcer, DownloadPlan, Log, Outstanding, PeerPool, Progress, ProgressSink, Services, Session, Setup, Workers};
 use crate::torrent::TorrentFile;
 use crate::tracker_discovery::TransferTotals;
@@ -55,6 +56,9 @@ pub struct Options {
     pub no_webseed: bool,
     /// Give up after this long (`--timeout`).
     pub timeout: Option<Duration>,
+    /// The first delay before retrying a peer that failed; later retries
+    /// wait longer (see [`RetryPolicy`]).
+    pub retry_delay: Duration,
     /// Outstanding block requests per piece.
     pub pipeline_depth: usize,
     pub connect_timeout: Duration,
@@ -195,7 +199,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     } else {
         format!("IPv6 peers disabled ({})", if options.ipv6 == Ipv6Mode::Never { "--no-ipv6" } else { "no local IPv6 route" })
     });
-    let mut pool = PeerPool::new(allow_ipv6);
+    let mut pool = PeerPool::with_policy(allow_ipv6, RetryPolicy::with_base(options.retry_delay));
     pool.add(bootstrap_peers);
 
     // First real announce, now that the true size is known.
@@ -289,6 +293,7 @@ mod tests {
             no_portmap: true, // nothing here may touch the LAN gateway
             no_webseed: false,
             timeout: None,
+            retry_delay: Duration::from_secs(15),
             pipeline_depth: 5,
             connect_timeout: Duration::from_secs(1),
         }

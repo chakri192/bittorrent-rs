@@ -1,7 +1,8 @@
 //! The threads that fetch pieces: one per connected peer, one per web
 //! seed, all draining the same work queue.
 
-use crate::downloader::{run_worker, FileSpan, PexSender, PieceResult, WorkQueue, WorkerConfig};
+use crate::downloader::{run_worker, FileSpan, PexSender, PieceResult, WorkQueue, WorkerConfig, WorkerError};
+use crate::session::peer_pool::Outcome;
 use crate::session::PeerPool;
 use crate::webseed::run_web_worker;
 use std::net::SocketAddr;
@@ -9,11 +10,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Where the workers' progress and failure messages go. Shared by every
 /// worker thread, hence the `Arc`.
 pub type Log = Arc<dyn Fn(String) + Send + Sync>;
+
+/// How a worker's run against one peer ended, in the pool's terms.
+pub fn classify(result: &Result<(), WorkerError>) -> Outcome {
+    match result {
+        Ok(()) => Outcome::Finished,
+        Err(WorkerError::PieceHashMismatch) => Outcome::BadData,
+        Err(WorkerError::Connection { stage: "connect_and_handshake", .. }) => Outcome::Unreachable,
+        // Our disk failed; the peer did nothing wrong.
+        Err(WorkerError::Connection { stage: "write_piece_to_disk", .. }) => Outcome::Local,
+        Err(WorkerError::Connection { .. }) => Outcome::Dropped,
+    }
+}
 
 /// The running download workers and the channels they report on.
 pub struct Workers {
@@ -31,6 +44,9 @@ pub struct Workers {
     /// what it hears.
     pex_tx: Option<PexSender>,
     pex_rx: Receiver<Vec<SocketAddr>>,
+    /// How each peer worker's run ended, for the pool to act on.
+    outcomes_tx: Sender<(SocketAddr, Outcome)>,
+    outcomes_rx: Receiver<(SocketAddr, Outcome)>,
     peers: Vec<JoinHandle<()>>,
     web_seeds: Vec<JoinHandle<()>>,
     web_stop: Arc<AtomicBool>,
@@ -43,7 +59,8 @@ impl Workers {
     pub fn new(queue: Arc<WorkQueue>, spans: Arc<Vec<FileSpan>>, config: Arc<WorkerConfig>, piece_length: u64, max_peers: usize, private: bool, log: Log) -> Self {
         let (results_tx, results_rx) = mpsc::channel();
         let (pex_tx, pex_rx) = mpsc::channel();
-        Workers { queue, spans, config, piece_length, max_peers, log, results_tx, results_rx, pex_tx: (!private).then_some(pex_tx), pex_rx, peers: Vec::new(), web_seeds: Vec::new(), web_stop: Arc::new(AtomicBool::new(false)) }
+        let (outcomes_tx, outcomes_rx) = mpsc::channel();
+        Workers { queue, spans, config, piece_length, max_peers, log, results_tx, results_rx, pex_tx: (!private).then_some(pex_tx), pex_rx, outcomes_tx, outcomes_rx, peers: Vec::new(), web_seeds: Vec::new(), web_stop: Arc::new(AtomicBool::new(false)) }
     }
 
     /// Starts one worker per BEP 19 web seed, each dialing nobody: they
@@ -60,18 +77,22 @@ impl Workers {
         }
     }
 
-    /// Dials peers from `pool` until `max_peers` are connected or there is
+    /// Dials peers from `pool` (as of `now`, which decides whether a
+    /// waiting retry is due) until `max_peers` are connected or there is
     /// nothing left to dial or fetch.
-    pub fn spawn_peers(&mut self, pool: &mut PeerPool) {
+    pub fn spawn_peers(&mut self, pool: &mut PeerPool, now: Instant) {
         while self.peers.len() < self.max_peers && !self.queue.is_empty() {
-            let Some(addr) = pool.next_to_dial() else { break };
+            let Some(addr) = pool.next_to_dial(now) else { break };
             let (queue, spans, config) = (Arc::clone(&self.queue), Arc::clone(&self.spans), Arc::clone(&self.config));
             let (tx, pex_tx, log) = (self.results_tx.clone(), self.pex_tx.clone(), Arc::clone(&self.log));
+            let outcomes = self.outcomes_tx.clone();
             let piece_length = self.piece_length;
             self.peers.push(thread::spawn(move || {
-                if let Err(e) = run_worker(addr, &config, &queue, &spans, piece_length, &tx, pex_tx.as_ref()) {
+                let result = run_worker(addr, &config, &queue, &spans, piece_length, &tx, pex_tx.as_ref());
+                if let Err(e) = &result {
                     log(format!("peer {} disconnected: {:?}", addr, e));
                 }
+                let _ = outcomes.send((addr, classify(&result)));
             }));
         }
     }
@@ -98,6 +119,11 @@ impl Workers {
     /// The next verified-and-written piece, waiting up to `timeout`.
     pub fn recv_result(&self, timeout: Duration) -> Result<PieceResult, RecvTimeoutError> {
         self.results_rx.recv_timeout(timeout)
+    }
+
+    /// How each peer worker that has ended since the last call ended.
+    pub fn take_outcomes(&self) -> Vec<(SocketAddr, Outcome)> {
+        self.outcomes_rx.try_iter().collect()
     }
 
     /// Batches of peer addresses learned through PEX since the last call.
@@ -154,7 +180,7 @@ mod tests {
         Workers::new(queue, Arc::new(Vec::new()), config, 16, max_peers, private, log)
     }
 
-    fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !cond() {
             assert!(Instant::now() < deadline, "timed out waiting for {}", what);
@@ -169,7 +195,7 @@ mod tests {
         let mut pool = PeerPool::new(true);
         pool.add((0..5).map(|_| dead_addr()));
 
-        w.spawn_peers(&mut pool);
+        w.spawn_peers(&mut pool, Instant::now());
 
         assert_eq!(w.active_peers(), 2);
         assert_eq!(pool.dialed(), 2, "only the two dialed addresses left the pool");
@@ -183,7 +209,7 @@ mod tests {
         let mut pool = PeerPool::new(true);
         pool.add([dead_addr()]);
 
-        w.spawn_peers(&mut pool);
+        w.spawn_peers(&mut pool, Instant::now());
 
         assert_eq!(w.active_peers(), 0);
         assert_eq!(pool.dialed(), 0);
@@ -196,7 +222,7 @@ mod tests {
         let mut pool = PeerPool::new(true);
         let addr = dead_addr();
         pool.add([addr]);
-        w.spawn_peers(&mut pool);
+        w.spawn_peers(&mut pool, Instant::now());
         assert_eq!(w.active_peers(), 1);
 
         wait_until("the worker to give up", || w.peers.iter().all(|h| h.is_finished()));
@@ -261,5 +287,39 @@ mod tests {
 
         let lines = lines.lock().unwrap();
         assert!(lines.iter().any(|l| l.contains("disabled after")), "got {:?}", *lines);
+    }
+
+    fn connection_error(stage: &'static str) -> WorkerError {
+        WorkerError::Connection { stage, error: crate::peer::ConnectionError::InfoHashMismatch }
+    }
+
+    #[test]
+    fn a_workers_end_is_classified_for_the_pool() {
+        assert_eq!(classify(&Ok(())), Outcome::Finished);
+        assert_eq!(classify(&Err(WorkerError::PieceHashMismatch)), Outcome::BadData, "a corrupt piece is the peer's doing");
+        assert_eq!(classify(&Err(connection_error("connect_and_handshake"))), Outcome::Unreachable);
+        assert_eq!(classify(&Err(connection_error("write_piece_to_disk"))), Outcome::Local, "our disk, not the peer");
+        for stage in ["wait_for_unchoke", "read_message_during_piece_download", "peer_never_unchoked", "peer_has_no_needed_pieces", "send_request"] {
+            assert_eq!(classify(&Err(connection_error(stage))), Outcome::Dropped, "{}", stage);
+        }
+    }
+
+    #[test]
+    fn a_worker_reports_how_it_ended_to_the_coordinator() {
+        let (log, _) = recording_log();
+        let mut w = workers(queue_with(1), 1, false, log);
+        let mut pool = PeerPool::new(true);
+        let addr = dead_addr();
+        pool.add([addr]);
+
+        w.spawn_peers(&mut pool, Instant::now());
+        let mut outcomes = Vec::new();
+        wait_until("the worker to report", || {
+            outcomes.extend(w.take_outcomes());
+            !outcomes.is_empty()
+        });
+
+        assert_eq!(outcomes, vec![(addr, Outcome::Unreachable)]);
+        assert!(w.take_outcomes().is_empty(), "each outcome is delivered once");
     }
 }

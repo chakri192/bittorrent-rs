@@ -2,6 +2,7 @@
 //! that can follow it.
 
 use crate::downloader::WorkQueue;
+use crate::session::peer_pool::Decision;
 use crate::session::{Announcer, PeerPool, ProgressSink, Progress, RateSampler, Services, Workers};
 use crate::tracker_discovery::TransferTotals;
 use crate::ui::Snapshot;
@@ -113,7 +114,7 @@ impl<'a> Session<'a> {
     pub fn run(&mut self, stop: &AtomicBool) -> Report {
         let sink = self.sink;
         self.run_start = Instant::now();
-        self.workers.spawn_peers(&mut self.pool);
+        self.workers.spawn_peers(&mut self.pool, Instant::now());
         self.publish();
 
         loop {
@@ -138,8 +139,9 @@ impl<'a> Session<'a> {
             }
 
             self.workers.reap();
+            self.settle_peers();
             self.poll_discovery();
-            self.workers.spawn_peers(&mut self.pool);
+            self.workers.spawn_peers(&mut self.pool, Instant::now());
 
             if !self.endgame_announced && self.queue.in_endgame() {
                 self.endgame_announced = true;
@@ -151,7 +153,7 @@ impl<'a> Session<'a> {
             if !self.reannounce_if_due() {
                 continue;
             }
-            self.workers.spawn_peers(&mut self.pool);
+            self.workers.spawn_peers(&mut self.pool, Instant::now());
             if self.round_was_fruitless_and_final() {
                 break;
             }
@@ -162,6 +164,20 @@ impl<'a> Session<'a> {
         }
 
         Report { complete: self.queue.is_empty(), remaining: self.queue.len(), dialed: self.pool.dialed(), elapsed: self.run_start.elapsed(), bytes_this_run: self.progress.bytes_this_run() }
+    }
+
+    /// Tells the pool how each peer worker that has ended ended, so it can
+    /// schedule a retry or a ban, and says what it decided about the ones
+    /// that matter. (The worker's own log line already says why it ended.)
+    fn settle_peers(&mut self) {
+        let now = Instant::now();
+        for (addr, outcome) in self.workers.take_outcomes() {
+            match self.pool.record_outcome(addr, outcome, now) {
+                Decision::Banned => self.sink.log(format!("peer {} banned: it sent a piece that failed verification", addr)),
+                Decision::GiveUp => self.sink.log(format!("peer {}: giving up on it after repeated failures", addr)),
+                Decision::RetryIn(_) | Decision::NoRetry => {}
+            }
+        }
     }
 
     /// Feeds the dial queue from the passive discovery sources: peer
@@ -380,6 +396,16 @@ mod tests {
     /// As [`session`], with the announce floor lowered, so the paths that
     /// wait on it (a starved swarm) run in milliseconds.
     fn session_with_floor<'a>(sink: &'a Arc<RecordingSink>, services: &'a Services, dir: &Path, peers: &[SocketAddr], timeout: Option<Duration>, floor: Duration) -> Session<'a> {
+        session_with_retries(sink, services, dir, peers, timeout, floor, Duration::from_secs(15))
+    }
+
+    /// As [`session_with_floor`], with the first retry delay chosen too.
+    fn session_with_retries<'a>(sink: &'a Arc<RecordingSink>, services: &'a Services, dir: &Path, peers: &[SocketAddr], timeout: Option<Duration>, floor: Duration, retry_base: Duration) -> Session<'a> {
+        session_with_policy(sink, services, dir, peers, timeout, floor, crate::session::peer_pool::RetryPolicy::with_base(retry_base))
+    }
+
+    /// As [`session_with_floor`], with the whole retry policy chosen.
+    fn session_with_policy<'a>(sink: &'a Arc<RecordingSink>, services: &'a Services, dir: &Path, peers: &[SocketAddr], timeout: Option<Duration>, floor: Duration, policy: crate::session::peer_pool::RetryPolicy) -> Session<'a> {
         let data = data();
         let work = data.chunks(PIECE_LEN).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32 }).collect();
         let queue = Arc::new(WorkQueue::new(work, PIECES));
@@ -391,7 +417,7 @@ mod tests {
         };
         let workers = Workers::new(Arc::clone(&queue), spans, config, PIECE_LEN as u64, 4, false, log);
         let progress = Progress::new(Arc::new(HaveMap::new(PIECES)), ResumeWriter::create(&progress_file_path(dir, &INFO_HASH)).unwrap(), PIECES, 0, 0);
-        let mut pool = PeerPool::new(true);
+        let mut pool = PeerPool::with_policy(true, policy);
         pool.add(peers.iter().copied());
         Session::new(Setup {
             sink: &**sink,
@@ -475,7 +501,7 @@ mod tests {
         // seed: nothing will ever be found. No stop request, so the way out
         // is the swarm being declared dead; the timeout is only a net so a
         // regression there fails this test instead of hanging it.
-        let mut s = session_with_floor(&sink, &services, &dir, &[dead_addr()], Some(Duration::from_secs(15)), Duration::from_millis(1));
+        let mut s = session_with_policy(&sink, &services, &dir, &[dead_addr()], Some(Duration::from_secs(15)), Duration::from_millis(1), crate::session::peer_pool::RetryPolicy::none());
 
         let report = s.run(&AtomicBool::new(false));
 
@@ -496,7 +522,7 @@ mod tests {
         // A peer that connects, unchokes and never answers. Its worker gives
         // up when its 1s read timeout expires; until then the swarm is not
         // dead, however many announce rounds come and go.
-        let mut s = session_with_floor(&sink, &services, &dir, &[fake_peer(false)], Some(Duration::from_secs(15)), Duration::from_millis(1)); // the timeout is only a net
+        let mut s = session_with_policy(&sink, &services, &dir, &[fake_peer(false)], Some(Duration::from_secs(15)), Duration::from_millis(1), crate::session::peer_pool::RetryPolicy::none()); // the timeout is only a net
 
         let report = s.run(&AtomicBool::new(false));
 
@@ -555,7 +581,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let services = Services::new();
         let mut s = session(&sink, &services, &dir, &[fake_peer(false)], None);
-        s.workers.spawn_peers(&mut s.pool);
+        s.workers.spawn_peers(&mut s.pool, Instant::now());
         assert_eq!(s.workers.active_peers(), 1);
         s.fruitless_rounds = MAX_FRUITLESS_ROUNDS - 1;
 
@@ -661,5 +687,132 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let services = Services::new();
         assert_eq!(session(&sink, &services, &dir, &[], None).uploaded_bytes(), 0);
+    }
+
+    // ---- peers that fail --------------------------------------------------
+
+    #[derive(Clone, Copy)]
+    enum Flaw {
+        /// Hangs up on the first connection's first request, serves later ones.
+        DropsOnce,
+        /// Hangs up on every connection's first request.
+        AlwaysDrops,
+        /// Serves every block corrupted.
+        Corrupt,
+    }
+
+    /// A peer with the given flaw that accepts any number of connections.
+    /// Returns its address and how many connections it has accepted.
+    fn flawed_peer(flaw: Flaw) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&connections);
+        let data = data();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let nth = count.fetch_add(1, Ordering::SeqCst) + 1;
+                let data = data.clone();
+                thread::spawn(move || {
+                    let mut hs = [0u8; 68];
+                    if stream.read_exact(&mut hs).is_err() || stream.write_all(&Handshake::new(INFO_HASH, [9; 20], false).to_bytes()).is_err() {
+                        return;
+                    }
+                    let mut bits = vec![0u8; PIECES.div_ceil(8)];
+                    for i in 0..PIECES {
+                        bits[i / 8] |= 1 << (7 - i % 8);
+                    }
+                    if Message::Bitfield(bits).write_to(&mut stream).is_err() || Message::Unchoke.write_to(&mut stream).is_err() {
+                        return;
+                    }
+                    while let Ok(msg) = Message::read_from(&mut stream) {
+                        let Message::Request { index, begin, length } = msg else { continue };
+                        if matches!(flaw, Flaw::AlwaysDrops) || (matches!(flaw, Flaw::DropsOnce) && nth == 1) {
+                            return; // hang up
+                        }
+                        let start = index as usize * PIECE_LEN;
+                        let mut block = data[start..start + PIECE_LEN][begin as usize..(begin + length) as usize].to_vec();
+                        if matches!(flaw, Flaw::Corrupt) {
+                            block.iter_mut().for_each(|b| *b ^= 0xFF);
+                        }
+                        if (Message::Piece { index, begin, block }).write_to(&mut stream).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, connections)
+    }
+
+    const SAFETY: Duration = Duration::from_secs(20); // only a net: a regression fails instead of hanging
+
+    #[test]
+    fn a_peer_that_drops_us_once_is_dialed_again_and_the_download_finishes() {
+        // The pool used to dial each address exactly once, so one dropped
+        // connection to the only peer ended the download.
+        let dir = tmp_dir("dropsonce");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let (peer, connections) = flawed_peer(Flaw::DropsOnce);
+        let mut s = session_with_retries(&sink, &services, &dir, &[peer], Some(SAFETY), crate::session::announce::MIN_REANNOUNCE, Duration::from_millis(100));
+
+        let report = s.run(&AtomicBool::new(false));
+
+        assert!(report.complete, "it should finish on the second connection: {:?}", sink.lines.lock().unwrap());
+        assert_eq!(connections.load(Ordering::SeqCst), 2, "one connection dropped, one retried");
+        assert_eq!(std::fs::read(dir.join("f.bin")).unwrap(), data());
+        assert_eq!(report.dialed, 1, "one distinct peer");
+    }
+
+    #[test]
+    fn a_peer_that_always_hangs_up_is_retried_a_bounded_number_of_times_then_given_up() {
+        let dir = tmp_dir("alwaysdrops");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let (peer, connections) = flawed_peer(Flaw::AlwaysDrops);
+        // Retry delays of 20, 60 and 180 ms: the first connection and three retries.
+        let mut s = session_with_retries(&sink, &services, &dir, &[peer], Some(SAFETY), Duration::from_millis(1), Duration::from_millis(20));
+
+        let report = s.run(&AtomicBool::new(false));
+
+        assert!(!report.complete);
+        assert_eq!(connections.load(Ordering::SeqCst), 4, "the first attempt and three retries, no more");
+        assert!(sink.logged(&format!("peer {}: giving up on it after repeated failures", peer)));
+        assert!(!sink.logged("--timeout"), "it ended because the peer was given up on, not by the safety timeout");
+    }
+
+    #[test]
+    fn a_peer_that_sends_corrupt_data_is_banned_and_never_dialed_again() {
+        let dir = tmp_dir("corrupt");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let (peer, connections) = flawed_peer(Flaw::Corrupt);
+        let mut s = session_with_retries(&sink, &services, &dir, &[peer], Some(SAFETY), Duration::from_millis(1), Duration::from_millis(20));
+
+        let report = s.run(&AtomicBool::new(false));
+
+        assert!(!report.complete, "the only peer is a liar");
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "banned after its first bad piece, however short the retry delay");
+        assert!(sink.logged(&format!("peer {} banned: it sent a piece that failed verification", peer)));
+        assert!(s.pool.is_banned(&peer));
+        assert_eq!(std::fs::metadata(dir.join("f.bin")).map(|m| m.len()).unwrap_or(0), 0, "nothing corrupt was written");
+    }
+
+    #[test]
+    fn a_liar_is_banned_while_an_honest_peer_finishes_the_download() {
+        let dir = tmp_dir("liarandhonest");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let (liar, liar_connections) = flawed_peer(Flaw::Corrupt);
+        let honest = fake_peer(true);
+        let mut s = session_with_retries(&sink, &services, &dir, &[liar, honest], Some(SAFETY), crate::session::announce::MIN_REANNOUNCE, Duration::from_millis(20));
+
+        let report = s.run(&AtomicBool::new(false));
+
+        assert!(report.complete);
+        assert_eq!(std::fs::read(dir.join("f.bin")).unwrap(), data(), "every byte is the honest peer's");
+        assert_eq!(liar_connections.load(Ordering::SeqCst), 1);
     }
 }

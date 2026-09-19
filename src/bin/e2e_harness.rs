@@ -65,6 +65,12 @@ enum Kind {
     /// A torrent whose file paths would write outside the download
     /// directory: the client must refuse it and write nothing.
     HostileTorrent,
+    /// The only peer hangs up on the first connection: the client must
+    /// dial it again and finish.
+    ReconnectAfterDrop,
+    /// A peer that sends corrupt data beside an honest one: the download
+    /// must be correct and the liar must be banned, not retried.
+    BanCorruptPeer,
 }
 
 struct Scenario {
@@ -82,6 +88,8 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "seed-after-download", kind: Kind::SeedAfterDownload },
     Scenario { name: "magnet-download", kind: Kind::MagnetDownload },
     Scenario { name: "hostile-torrent", kind: Kind::HostileTorrent },
+    Scenario { name: "reconnect-after-drop", kind: Kind::ReconnectAfterDrop },
+    Scenario { name: "ban-corrupt-peer", kind: Kind::BanCorruptPeer },
 ];
 
 fn main() {
@@ -96,6 +104,8 @@ fn main() {
             Kind::SeedAfterDownload => run_seed_after_download(scenario.name),
             Kind::MagnetDownload => run_magnet_download(scenario.name),
             Kind::HostileTorrent => run_hostile_torrent(scenario.name),
+            Kind::ReconnectAfterDrop => run_reconnect_after_drop(scenario.name),
+            Kind::BanCorruptPeer => run_ban_corrupt_peer(scenario.name),
         };
         match outcome {
             Ok(summary) => println!("PASS [{}]: {}", scenario.name, summary),
@@ -227,6 +237,8 @@ struct PeerLog {
     dropped_piece: Option<u32>,
     /// ut_metadata pieces (BEP 9) the peer sent to a client that asked.
     metadata_pieces_served: usize,
+    /// Connections the peer has accepted and handshaken.
+    connections: usize,
 }
 
 /// A latch one fake peer can open for another to wait on, to force an
@@ -271,6 +283,12 @@ enum Behavior {
     DropMidPiece { after_pieces: usize, dropped: Arc<Gate> },
     /// Serves normally, but keeps the client choked until `gate` opens.
     ChokedUntil(Arc<Gate>),
+    /// Serves normally, but only unchokes the client after this long.
+    UnchokeAfter(Duration),
+    /// Hangs up on the first connection's first request, then serves.
+    DropFirstConnection,
+    /// Sends every block corrupted, so no piece ever verifies.
+    Corrupt,
 }
 
 struct Swarm {
@@ -385,8 +403,16 @@ fn serve_connection(mut stream: TcpStream, cx: &PeerContext, behavior: &Behavior
     if Message::Bitfield(bits).write_to(&mut stream).is_err() {
         return;
     }
+    let nth_connection = {
+        let mut log = log.lock().unwrap();
+        log.connections += 1;
+        log.connections
+    };
     if let Behavior::ChokedUntil(gate) = behavior {
         gate.wait(GATE_LIMIT);
+    }
+    if let Behavior::UnchokeAfter(delay) = behavior {
+        thread::sleep(*delay);
     }
     if Message::Unchoke.write_to(&mut stream).is_err() {
         return;
@@ -430,7 +456,13 @@ fn serve_connection(mut stream: TcpStream, cx: &PeerContext, behavior: &Behavior
                     }
                     return; // the stream closes with the piece half-sent
                 }
-                let block = cx.data[piece_start..piece_end][begin as usize..(begin + length) as usize].to_vec();
+                if matches!(behavior, Behavior::DropFirstConnection) && nth_connection == 1 {
+                    return; // hang up on the request
+                }
+                let mut block = cx.data[piece_start..piece_end][begin as usize..(begin + length) as usize].to_vec();
+                if matches!(behavior, Behavior::Corrupt) {
+                    block.iter_mut().for_each(|b| *b ^= 0xFF);
+                }
                 if (Message::Piece { index, begin, block }).write_to(&mut stream).is_err() {
                     return;
                 }
@@ -1080,4 +1112,71 @@ fn run_hostile_torrent(name: &str) -> Result<String, String> {
     }
 
     Ok("parent-traversal and absolute paths were refused with status 1 before any network use, and nothing was written outside".to_string())
+}
+
+/// The only peer hangs up on the first connection. The client used to dial
+/// each address once, so that ended the download; it must now wait out a
+/// short delay, dial again, and finish.
+fn run_reconnect_after_drop(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::DropFirstConnection]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .args(["--retry-delay", "1"])
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("download binary exited with {:?}; it should have reconnected and finished", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+
+    let connections = swarm.logs[0].lock().unwrap().connections;
+    if connections != 2 {
+        return Err(format!("the peer saw {} connections; expected the dropped one and one retry", connections));
+    }
+    let log = fs::read_to_string(&log_path).map_err(|e| format!("reading client log {:?}: {}", log_path, e))?;
+    if !log.contains("disconnected") {
+        return Err("client log does not mention the dropped connection".to_string());
+    }
+    Ok("the only peer dropped the first connection; the client dialed it again and the file matches".to_string())
+}
+
+/// A peer that sends corrupt data, beside an honest one that is slow to
+/// unchoke. The download must be correct, and the liar dialed exactly once:
+/// the honest peer's delay makes the run longer than the retry delay, so a
+/// client that merely retried it would show up as a second connection.
+fn run_ban_corrupt_peer(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Corrupt, Behavior::UnchokeAfter(Duration::from_millis(2500))]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let mut child = client_command(&torrent, &out_dir, &log_path, 2)
+        .arg("--no-dht")
+        .args(["--retry-delay", "1"])
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("download binary exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+
+    let liar_connections = swarm.logs[0].lock().unwrap().connections;
+    if liar_connections != 1 {
+        return Err(format!("the corrupt peer was dialed {} times; a peer that sends bad data must be banned after the first", liar_connections));
+    }
+    let log = fs::read_to_string(&log_path).map_err(|e| format!("reading client log {:?}: {}", log_path, e))?;
+    if !log.contains("banned: it sent a piece that failed verification") {
+        return Err("client log does not say the corrupt peer was banned".to_string());
+    }
+    Ok("the corrupt peer was banned after one bad piece and never redialed; the honest peer supplied a byte-identical file".to_string())
 }
