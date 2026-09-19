@@ -6,6 +6,7 @@ use crate::dht::DhtService;
 use crate::magnet::MagnetLink;
 use crate::magnet_fetch::fetch_metadata_from_peer;
 use crate::session::ProgressSink;
+use crate::sync::lock;
 use crate::torrent::{self, TorrentFile};
 use crate::tracker::Event;
 use crate::tracker_discovery::{announce_to_all, build_request, TransferTotals};
@@ -73,7 +74,7 @@ pub fn fetch_metadata(info_hash: [u8; 20], our_peer_id: [u8; 20], initial_peers:
     let mut known: HashSet<SocketAddr> = HashSet::new();
     let untried: Arc<Mutex<VecDeque<SocketAddr>>> = Arc::new(Mutex::new(VecDeque::new()));
     {
-        let mut q = untried.lock().unwrap();
+        let mut q = lock(&untried);
         for p in initial_peers {
             if known.insert(p) {
                 q.push_back(p);
@@ -97,7 +98,7 @@ pub fn fetch_metadata(info_hash: [u8; 20], our_peer_id: [u8; 20], initial_peers:
         let connect_timeout = config.connect_timeout;
         workers.push(thread::spawn(move || {
             while !pool_stop.load(Ordering::SeqCst) {
-                let Some(peer) = untried.lock().unwrap().pop_front() else {
+                let Some(peer) = lock(&untried).pop_front() else {
                     thread::sleep(Duration::from_millis(200));
                     continue;
                 };
@@ -109,7 +110,7 @@ pub fn fetch_metadata(info_hash: [u8; 20], our_peer_id: [u8; 20], initial_peers:
                         }
                         return;
                     }
-                    Err(e) => *last_err.lock().unwrap() = e.to_string(),
+                    Err(e) => *lock(&last_err) = e.to_string(),
                 }
             }
         }));
@@ -123,7 +124,7 @@ pub fn fetch_metadata(info_hash: [u8; 20], our_peer_id: [u8; 20], initial_peers:
             break None; // user quit
         }
         if let Some(dht) = dht {
-            let mut q = untried.lock().unwrap();
+            let mut q = lock(&untried);
             for batch in dht.peers_rx.try_iter() {
                 for p in batch {
                     if known.insert(p) {
@@ -167,7 +168,7 @@ pub fn fetch_metadata(info_hash: [u8; 20], our_peer_id: [u8; 20], initial_peers:
         }
         None => {
             let n = attempts.load(Ordering::Relaxed);
-            let last = last_err.lock().unwrap().clone();
+            let last = lock(&last_err).clone();
             Err(if stop.load(Ordering::SeqCst) {
                 "stopped before metadata could be resolved".to_string()
             } else if Instant::now() >= deadline {

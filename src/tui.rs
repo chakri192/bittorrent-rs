@@ -12,6 +12,7 @@
 //! bounded in-memory ring the dashboard tails; the summary numbers live in
 //! a `Snapshot`.
 
+use crate::sync::lock;
 use crate::ui::{format_bytes, format_duration, format_rate, Logger, Snapshot};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -68,15 +69,13 @@ impl Ui {
     }
 
     pub fn set_title(&self, title: impl Into<String>) {
-        if let Ok(mut s) = self.state.lock() {
-            s.title = title.into();
-        }
+        let mut s = lock(&self.state);
+        s.title = title.into();
     }
 
     pub fn set_log_path(&self, path: Option<String>) {
-        if let Ok(mut s) = self.state.lock() {
-            s.log_path = path;
-        }
+        let mut s = lock(&self.state);
+        s.log_path = path;
     }
 
     /// Appends one activity line: to the on-screen ring (bounded) and, if
@@ -84,46 +83,41 @@ impl Ui {
     pub fn log(&self, msg: impl AsRef<str>) {
         let msg = msg.as_ref();
         self.log.line(msg);
-        if let Ok(mut s) = self.state.lock() {
-            s.logs.push_back(msg.to_string());
-            while s.logs.len() > LOG_RING_CAP {
-                s.logs.pop_front();
-            }
+        let mut s = lock(&self.state);
+        s.logs.push_back(msg.to_string());
+        while s.logs.len() > LOG_RING_CAP {
+            s.logs.pop_front();
         }
     }
 
     /// Replaces the summary numbers shown in the stat panes.
     pub fn set_snapshot(&self, snap: Snapshot) {
-        if let Ok(mut s) = self.state.lock() {
-            s.snap = snap;
-        }
+        let mut s = lock(&self.state);
+        s.snap = snap;
     }
 
     /// Updates the per-piece completion map (cheap `Vec<bool>` snapshot).
     pub fn set_pieces(&self, pieces: Vec<bool>) {
-        if let Ok(mut s) = self.state.lock() {
-            s.pieces = pieces;
-        }
+        let mut s = lock(&self.state);
+        s.pieces = pieces;
     }
 
     /// Records one throughput sample for the sparklines.
     pub fn push_rates(&self, down: u64, up: u64) {
-        if let Ok(mut s) = self.state.lock() {
-            s.down_hist.push_back(down);
-            s.up_hist.push_back(up);
-            while s.down_hist.len() > RATE_HISTORY_CAP {
-                s.down_hist.pop_front();
-            }
-            while s.up_hist.len() > RATE_HISTORY_CAP {
-                s.up_hist.pop_front();
-            }
+        let mut s = lock(&self.state);
+        s.down_hist.push_back(down);
+        s.up_hist.push_back(up);
+        while s.down_hist.len() > RATE_HISTORY_CAP {
+            s.down_hist.pop_front();
+        }
+        while s.up_hist.len() > RATE_HISTORY_CAP {
+            s.up_hist.pop_front();
         }
     }
 
     pub fn finish(&self, result: Result<String, String>) {
-        if let Ok(mut s) = self.state.lock() {
-            s.finished = Some(result);
-        }
+        let mut s = lock(&self.state);
+        s.finished = Some(result);
     }
 }
 
@@ -160,7 +154,7 @@ pub fn run(state: &Arc<Mutex<AppState>>, stop: &AtomicBool) -> bool {
         frame = frame.wrapping_add(1);
         // Clone a lightweight view under the lock, then render lock-free.
         let view = {
-            let s = state.lock().unwrap();
+            let s = lock(state);
             View {
                 title: s.title.clone(),
                 out_path: s.out_path.clone(),
@@ -476,7 +470,7 @@ pub fn run_plain(state: &Arc<Mutex<AppState>>, stop: &AtomicBool) -> bool {
     let mut last = Instant::now() - Duration::from_secs(10);
     loop {
         let (snap, finished, title) = {
-            let s = state.lock().unwrap();
+            let s = lock(state);
             (s.snap.clone(), s.finished.clone(), s.title.clone())
         };
         // The caller prints the final summary once, on the normal screen,
@@ -516,7 +510,7 @@ pub fn run_plain(state: &Arc<Mutex<AppState>>, stop: &AtomicBool) -> bool {
 /// interactive quit path here).
 pub fn run_silent(state: &Arc<Mutex<AppState>>, stop: &AtomicBool) -> bool {
     loop {
-        if state.lock().unwrap().finished.is_some() || stop.load(Ordering::SeqCst) {
+        if lock(state).finished.is_some() || stop.load(Ordering::SeqCst) {
             return false;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -567,5 +561,25 @@ mod tests {
         ui.finish(Ok("all done".to_string()));
         let s = ui.shared();
         assert!(matches!(s.lock().unwrap().finished, Some(Ok(ref m)) if m == "all done"));
+    }
+
+    #[test]
+    fn a_poisoned_display_still_learns_that_the_download_finished() {
+        // If finish() were skipped, plain mode would wait for a `finished`
+        // that never arrives.
+        let ui = Ui::new("t", "out", Logger::disabled());
+        let shared = ui.shared();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shared.lock().unwrap();
+            panic!("a thread died holding the dashboard's lock");
+        }));
+        assert!(shared.is_poisoned(), "the setup must really poison it");
+
+        ui.log("still logging");
+        ui.finish(Ok("done".to_string()));
+
+        let state = lock(&shared);
+        assert!(matches!(state.finished, Some(Ok(ref m)) if m == "done"));
+        assert_eq!(state.logs.back().map(String::as_str), Some("still logging"));
     }
 }

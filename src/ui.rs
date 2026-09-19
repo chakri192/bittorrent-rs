@@ -6,6 +6,7 @@
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
+use crate::sync::lock;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -72,10 +73,9 @@ impl Logger {
     /// errors are swallowed: logging must never take down a download.
     pub fn line(&self, msg: &str) {
         if let Some(file) = &self.inner {
-            if let Ok(mut f) = file.lock() {
-                let _ = writeln!(f, "[+{:>8.2}s] {}", self.start.elapsed().as_secs_f64(), msg);
-                let _ = f.flush();
-            }
+            let mut f = lock(file);
+            let _ = writeln!(f, "[+{:>8.2}s] {}", self.start.elapsed().as_secs_f64(), msg);
+            let _ = f.flush();
         }
     }
 }

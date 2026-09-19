@@ -17,6 +17,7 @@ use crate::peer::state::PeerState;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use crate::sync;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -51,23 +52,21 @@ impl HaveMap {
     }
 
     pub fn set(&self, index: u32) {
-        if let Ok(mut bits) = self.bits.write() {
-            if let Some(b) = bits.get_mut(index as usize) {
-                *b = true;
-            }
+        if let Some(b) = sync::write(&self.bits).get_mut(index as usize) {
+            *b = true;
         }
     }
 
     pub fn get(&self, index: u32) -> bool {
-        self.bits.read().map(|bits| bits.get(index as usize).copied().unwrap_or(false)).unwrap_or(false)
+        sync::read(&self.bits).get(index as usize).copied().unwrap_or(false)
     }
 
     pub fn snapshot(&self) -> Vec<bool> {
-        self.bits.read().map(|b| b.clone()).unwrap_or_default()
+        sync::read(&self.bits).clone()
     }
 
     pub fn count(&self) -> usize {
-        self.bits.read().map(|b| b.iter().filter(|&&x| x).count()).unwrap_or(0)
+        sync::read(&self.bits).iter().filter(|&&x| x).count()
     }
 }
 
@@ -422,5 +421,22 @@ mod tests {
         assert!(!have.get(99));
         assert_eq!(have.count(), 2);
         assert_eq!(have.snapshot(), vec![false, true, false, true]);
+    }
+
+    #[test]
+    fn a_thread_panicking_with_the_have_map_locked_does_not_freeze_it() {
+        let have = HaveMap::new(4);
+        have.set(1);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = have.bits.write().unwrap();
+            panic!("a worker died holding the have-map's write lock");
+        }));
+        assert!(have.bits.is_poisoned(), "the setup must really poison it");
+
+        // A piece verified after the panic must still be advertised to peers.
+        have.set(2);
+        assert!(have.get(1) && have.get(2) && !have.get(0));
+        assert_eq!(have.count(), 2);
+        assert_eq!(have.snapshot(), vec![false, true, true, false]);
     }
 }

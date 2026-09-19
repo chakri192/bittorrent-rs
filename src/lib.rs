@@ -14,5 +14,6 @@ pub mod torrent;
 pub mod tracker;
 pub mod tracker_discovery;
 pub mod tui;
+pub mod sync;
 pub mod ui;
 pub mod webseed;

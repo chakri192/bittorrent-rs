@@ -21,6 +21,7 @@
 
 use crate::downloader::piece_assembler::PieceWork;
 use std::collections::{HashMap, HashSet};
+use crate::sync::lock;
 use std::sync::Mutex;
 
 struct Inner {
@@ -64,8 +65,8 @@ impl WorkQueue {
     /// Workers that can't service the piece they popped (peer doesn't
     /// have it, download failed) call `push_back` to return it.
     pub fn pop(&self) -> Option<PieceWork> {
-        let mut inner = self.inner.lock().unwrap();
-        let availability = self.availability.lock().unwrap();
+        let mut inner = lock(&self.inner);
+        let availability = lock(&self.availability);
         let rarity = |w: &PieceWork| availability.get(w.index as usize).copied().unwrap_or(0);
 
         if !inner.pending.is_empty() {
@@ -89,7 +90,7 @@ impl WorkQueue {
     /// piece, that's fine: it effectively continues as an endgame
     /// duplicate, and whichever copy verifies first retires the piece.
     pub fn push_back(&self, work: PieceWork) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock(&self.inner);
         if inner.done.contains(&work.index) {
             return;
         }
@@ -103,7 +104,7 @@ impl WorkQueue {
     /// Returns `true` if this call was the first to mark it done (callers
     /// use this to avoid double-counting duplicate endgame completions).
     pub fn mark_done(&self, index: u32) -> bool {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock(&self.inner);
         let newly_done = inner.done.insert(index);
         inner.claimed.remove(&index);
         inner.pending.retain(|w| w.index != index);
@@ -114,24 +115,24 @@ impl WorkQueue {
     /// worker. Endgame workers poll this mid-download to abandon pieces
     /// that completed elsewhere instead of wasting the peer's bandwidth.
     pub fn is_done(&self, index: u32) -> bool {
-        self.inner.lock().unwrap().done.contains(&index)
+        lock(&self.inner).done.contains(&index)
     }
 
     /// True once every piece is done (nothing pending, nothing claimed).
     pub fn is_empty(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock(&self.inner);
         inner.pending.is_empty() && inner.claimed.is_empty()
     }
 
     /// Pieces not yet done (pending + claimed).
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock(&self.inner);
         inner.pending.len() + inner.claimed.len()
     }
 
     /// True while `pop` is handing out duplicates of claimed pieces.
     pub fn in_endgame(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock(&self.inner);
         inner.pending.is_empty() && !inner.claimed.is_empty()
     }
 
@@ -139,10 +140,9 @@ impl WorkQueue {
     /// indices (a malformed or lying peer) are silently ignored rather
     /// than panicking -- this is untrusted network input.
     pub fn note_have(&self, piece_index: u32) {
-        if let Ok(mut availability) = self.availability.lock() {
-            if let Some(count) = availability.get_mut(piece_index as usize) {
-                *count += 1;
-            }
+        let mut availability = lock(&self.availability);
+        if let Some(count) = availability.get_mut(piece_index as usize) {
+            *count += 1;
         }
     }
 
@@ -335,5 +335,33 @@ mod tests {
         }
         let availability = q.availability.lock().unwrap();
         assert!(availability.iter().all(|&c| c == 2), "every piece should show availability 2, got {:?}", availability);
+    }
+
+    /// A worker thread that panics while holding the queue's lock.
+    fn poison(queue: &WorkQueue) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _inner = queue.inner.lock().unwrap();
+            let _availability = queue.availability.lock().unwrap();
+            panic!("a worker died holding the queue's locks");
+        }));
+        assert!(queue.inner.is_poisoned() && queue.availability.is_poisoned(), "the setup must really poison both");
+    }
+
+    #[test]
+    fn a_worker_panicking_with_the_queue_locked_does_not_take_the_queue_down() {
+        let q = WorkQueue::new((0..3).map(|i| PieceWork { index: i, hash: [0; 20], length: 16 }).collect(), 3);
+        let claimed = q.pop().expect("a piece to claim");
+        poison(&q);
+
+        // Every operation the other workers rely on still works, and still
+        // remembers what happened before the panic.
+        q.note_have(1);
+        assert_eq!(q.len(), 3, "nothing was lost: 2 pending and the claimed one");
+        q.push_back(claimed.clone());
+        assert!(q.mark_done(claimed.index));
+        assert!(q.is_done(claimed.index));
+        assert!(q.pop().is_some());
+        assert!(!q.is_empty());
+        assert!(!q.in_endgame());
     }
 }
