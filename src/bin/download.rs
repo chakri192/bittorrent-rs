@@ -70,6 +70,8 @@ struct Args {
     save_torrent: Option<PathBuf>,
     /// Write status as JSON lines on stdout instead of a dashboard.
     json: bool,
+    /// Check the files on disk against the torrent and exit, touching no network.
+    verify: bool,
     /// Bytes per second limits on download and upload, if set.
     max_down: Option<u64>,
     max_up: Option<u64>,
@@ -141,6 +143,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
     let mut prefer: Vec<String> = Vec::new();
     let mut save_torrent = None;
     let mut json = false;
+    let mut verify = false;
     let mut max_down = None;
     let mut max_up = None;
     let mut verbosity = Verbosity::Normal;
@@ -185,6 +188,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
             "--sequential" => sequential = true,
             "--prefer" => prefer.push(argv.next().ok_or("--prefer requires a path substring")?),
             "--json" => json = true,
+            "--verify" => verify = true,
             "--save-torrent" => save_torrent = Some(PathBuf::from(argv.next().ok_or("--save-torrent requires a file name")?)),
             "--max-down" => {
                 let v = argv.next().ok_or("--max-down requires a rate such as 500K or 2M")?;
@@ -266,6 +270,12 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
         }
     }
 
+    if verify && list {
+        return Err("--verify and --list are mutually exclusive".to_string());
+    }
+    if verify && source.starts_with("magnet:?") {
+        return Err("--verify needs a .torrent file: a magnet link has no file list until its metadata has been fetched from the network".to_string());
+    }
     if json && verbosity == Verbosity::Quiet {
         return Err("--json and --quiet are mutually exclusive".to_string());
     }
@@ -278,11 +288,11 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
         seed = true;
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, sequential, prefer, save_torrent, json, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
+    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, sequential, prefer, save_torrent, json, verify, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--verify] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -328,7 +338,7 @@ fn main() -> ExitCode {
 
     // `--list` is a quick print-and-exit; never spin up the dashboard for it.
     let json = args.json;
-    let interactive = !quiet && !json && !args.no_tui && !args.list && std::io::stdout().is_terminal();
+    let interactive = !quiet && !json && !args.no_tui && !args.list && !args.verify && std::io::stdout().is_terminal();
     let stop = Arc::new(AtomicBool::new(false));
     // Ctrl-C and `kill` wind the client down like the dashboard's `q`, even
     // with no terminal: the port mapping is removed, not left on the router.
@@ -414,7 +424,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| finish_err(ui, format!("parsing {}: {}", args.source, e)))?;
         // A `.torrent` already carries the file list, so `--list` needs no
         // network at all.
-        if !args.no_dht && !args.list && !torrent.private {
+        if !args.no_dht && !args.list && !args.verify && !torrent.private {
             services.start_dht(args.port, torrent.info_hash, |m| ui.log(m));
         }
         (torrent, Vec::new())
@@ -446,6 +456,10 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
             ui.finish(Ok(listing.clone()));
         }
         return Ok(listing);
+    }
+    if args.verify {
+        services.shutdown();
+        return verify_files(&torrent, &mask, &args, ui, stop);
     }
     let options = Options {
         out_dir: args.out_dir.clone(),
@@ -527,6 +541,36 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     }
 }
 
+/// `--verify`: hash what is on disk against the torrent, telling the
+/// dashboard as it goes, and say which files are whole. `Err` when anything
+/// wanted is missing or damaged, so the exit status says so.
+fn verify_files(torrent: &torrent::TorrentFile, mask: &[bool], args: &Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String> {
+    use bittorrent_rs::ui::Snapshot;
+    let base_dir = if torrent.multi_file { args.out_dir.join(&torrent.name) } else { args.out_dir.clone() };
+    let (_, wanted_bytes) = bittorrent_rs::selection::selected_pieces(&torrent.files, torrent.piece_length as u64, mask);
+    ui.log(format!("verifying {} against {}", torrent.name, base_dir.display()));
+    let mut last_shown = 0;
+    let report = bittorrent_rs::session::verify::verify(torrent, mask, &base_dir, |checked, of| {
+        // Not on every piece: a large torrent has hundreds of thousands.
+        if checked == of || checked >= last_shown + 64 {
+            last_shown = checked;
+            ui.set_snapshot(Snapshot { total_length: wanted_bytes, total_pieces: of, verified: checked, status: "verifying", ..Default::default() });
+        }
+        !stop.load(Ordering::SeqCst)
+    });
+    let Some(report) = report else {
+        // Interrupted: main prints the "stopped" line.
+        return Err("verification was stopped".to_string());
+    };
+    let summary = report.describe(&torrent.name, false);
+    if report.is_whole() {
+        ui.finish(Ok(summary.clone()));
+        Ok(summary)
+    } else {
+        Err(finish_err(ui, summary))
+    }
+}
+
 /// Convenience: record a fatal reason on the dashboard and return it so
 /// the `?` operator can bubble it up as the orchestration's `Err`.
 fn finish_err(ui: &Ui, reason: String) -> String {
@@ -552,6 +596,14 @@ mod tests {
         assert!(parse(&Config::default(), &["x"]).unwrap().prefer.is_empty());
         assert_eq!(parse(&Config::default(), &["x", "--prefer", ".nfo", "--prefer", "ep1"]).unwrap().prefer, vec![".nfo".to_string(), "ep1".to_string()]);
         assert!(parse(&Config::default(), &["x", "--prefer"]).err().unwrap().contains("requires"));
+    }
+
+    #[test]
+    fn verify_is_off_unless_asked_for_and_cannot_be_combined_with_list() {
+        assert!(!parse(&Config::default(), &["x"]).unwrap().verify);
+        assert!(parse(&Config::default(), &["x", "--verify"]).unwrap().verify);
+        assert!(parse(&Config::default(), &["x", "--verify", "--list"]).err().unwrap().contains("mutually exclusive"));
+        assert!(parse(&Config::default(), &["magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", "--verify"]).err().unwrap().contains(".torrent file"));
     }
 
     #[test]

@@ -90,6 +90,9 @@ enum Kind {
     /// A torrent's empty files exist after the download, though no piece
     /// contains a byte of them; with `--only`, only the selected ones do.
     EmptyFiles,
+    /// `--verify` checks files on disk against the torrent with no network,
+    /// and its exit status says whether they are whole.
+    Verify,
     /// A finished client serves its info dictionary to a peer that asks for
     /// it (BEP 9) and says it is a seed (BEP 21).
     ServeMetadata,
@@ -153,6 +156,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "sigint-while-seeding", kind: Kind::SigintWhileSeeding },
     Scenario { name: "sigterm-mid-download", kind: Kind::SigtermMidDownload },
     Scenario { name: "empty-files", kind: Kind::EmptyFiles },
+    Scenario { name: "verify", kind: Kind::Verify },
     Scenario { name: "serve-metadata", kind: Kind::ServeMetadata },
     Scenario { name: "magnet-peer-hint", kind: Kind::MagnetPeerHint },
     Scenario { name: "tracker-redirect", kind: Kind::TrackerRedirect },
@@ -195,6 +199,7 @@ fn main() {
             Kind::SigintWhileSeeding => run_sigint_while_seeding(scenario.name),
             Kind::SigtermMidDownload => run_sigterm_mid_download(scenario.name),
             Kind::EmptyFiles => run_empty_files(scenario.name),
+            Kind::Verify => run_verify(scenario.name),
             Kind::ServeMetadata => run_serve_metadata(scenario.name),
             Kind::MagnetPeerHint => run_magnet_peer_hint(scenario.name),
             Kind::TrackerRedirect => run_tracker_redirect(scenario.name),
@@ -2326,4 +2331,74 @@ fn run_serve_metadata(name: &str) -> Result<String, String> {
         other => return Err(format!("expected the info dict as piece 0, got {:?}", other)),
     }
     Ok(format!("a peer holding only the info hash got the {}-byte info dictionary from the seeding client, byte for byte, and was told it is a seed", fx.info_bytes.len()))
+}
+
+/// `--verify` on files written by the harness itself: whole ones pass with
+/// status 0; a damaged, a truncated and a missing file each fail with
+/// status 1 and are named; and no tracker or peer is contacted.
+fn run_verify(name: &str) -> Result<String, String> {
+    let files = [(vec!["a.bin"], pattern(1500, 1)), (vec!["sub", "b.bin"], pattern(2200, 2)), (vec!["z.bin"], pattern(900, 3))];
+    let fx = Fixture::build_paths("pack", &files, 1024, false, true);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir) = (dir.join("e2e.torrent"), dir.join("out"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let write_all = || -> Result<(), String> {
+        for (relative, content) in &fx.files {
+            let path = out_dir.join(relative);
+            fs::create_dir_all(path.parent().ok_or("no parent")?).map_err(|e| e.to_string())?;
+            fs::write(&path, content).map_err(|e| format!("writing {:?}: {}", path, e))?;
+        }
+        Ok(())
+    };
+    let run = |extra: &[&str]| client_command(&torrent, &out_dir, &dir.join("client.log"), 1).arg("--no-dht").arg("--verify").args(extra).output().map_err(|e| format!("running the client: {}", e));
+
+    // 1. Everything there and right.
+    write_all()?;
+    let whole = run(&[])?;
+    let text = String::from_utf8_lossy(&whole.stdout).to_string();
+    if !whole.status.success() || !text.contains("5 of 5 piece(s) verified") || !text.contains("3 of 3 file(s) whole") {
+        return Err(format!("intact files should verify with status 0; exit {:?}, stdout {:?}, stderr {:?}", whole.status.code(), text.trim(), String::from_utf8_lossy(&whole.stderr).trim()));
+    }
+
+    // 2. One byte wrong in the middle file.
+    let b_path = out_dir.join("pack/sub/b.bin");
+    let mut b = fs::read(&b_path).map_err(|e| e.to_string())?;
+    b[1500] ^= 0xFF;
+    fs::write(&b_path, b).map_err(|e| e.to_string())?;
+    let damaged = run(&[])?;
+    let stderr = String::from_utf8_lossy(&damaged.stderr).to_string();
+    if damaged.status.code() != Some(1) || !stderr.contains("[damaged] sub/b.bin") || stderr.contains("a.bin") || stderr.contains("z.bin") {
+        return Err(format!("a damaged file should be named and nothing else, with status 1; exit {:?}, stderr {:?}", damaged.status.code(), stderr.trim()));
+    }
+
+    // 3. A file missing and one truncated.
+    write_all()?;
+    fs::remove_file(out_dir.join("pack/a.bin")).map_err(|e| e.to_string())?;
+    fs::write(out_dir.join("pack/z.bin"), &fx.files[2].1[..100]).map_err(|e| e.to_string())?;
+    let broken = run(&[])?;
+    let stderr = String::from_utf8_lossy(&broken.stderr).to_string();
+    if broken.status.code() != Some(1) || !stderr.contains("[missing] a.bin") || !stderr.contains("[damaged] z.bin") {
+        return Err(format!("expected a.bin missing and z.bin damaged with status 1; exit {:?}, stderr {:?}", broken.status.code(), stderr.trim()));
+    }
+
+    // 4. With --only, what is not wanted is not checked. a.bin is damaged in
+    // its first piece, which z.bin (the last piece) has nothing to do with.
+    write_all()?;
+    let a_path = out_dir.join("pack/a.bin");
+    let mut a = fs::read(&a_path).map_err(|e| e.to_string())?;
+    a[10] ^= 0xFF;
+    fs::write(&a_path, a).map_err(|e| e.to_string())?;
+    if run(&[])?.status.success() {
+        return Err("a.bin is damaged, so checking everything should fail".to_string());
+    }
+    let only = run(&["--only", "z.bin"])?;
+    if !only.status.success() {
+        return Err(format!("--only z.bin should not care about a.bin; exit {:?}, stderr {:?}", only.status.code(), String::from_utf8_lossy(&only.stderr).trim()));
+    }
+
+    if !swarm.announces.lock().unwrap().is_empty() || !swarm.logs[0].lock().unwrap().requested.is_empty() {
+        return Err("--verify touched the network".to_string());
+    }
+    Ok("intact files pass with status 0; a wrong byte, a truncated file and a missing one each fail with status 1 and are named; --only ignores the rest; no tracker or peer was contacted".to_string())
 }
