@@ -35,6 +35,8 @@ const IDLE: Duration = Duration::from_secs(30);
 /// How many clients may be connected at once. A person and a few scripts need a handful; the rest
 /// is refused, so that a runaway one cannot fill the daemon with threads.
 const MAX_CONNECTIONS: usize = 32;
+/// What a Unix socket's path must be shorter than (`sun_path` is 104 bytes on macOS and the BSDs, 108 on Linux).
+const SOCKET_PATH_LIMIT: usize = 104;
 /// How many lines of a torrent's log a `status` includes.
 const STATUS_LOG_LINES: usize = 10;
 
@@ -293,8 +295,13 @@ fn bind_private(path: &Path) -> io::Result<UnixListener> {
         _ => Path::new("."),
     };
     let staging = parent.join(format!(".bt-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::SeqCst)));
-    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
     let inside = staging.join("s");
+    // (Rather than the system's "path must be shorter than SUN_LEN", which does not say what to do.)
+    let longest = inside.as_os_str().len().max(path.as_os_str().len());
+    if longest >= SOCKET_PATH_LIMIT {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("the socket path is too long for a Unix socket ({} bytes counting the directory it is made in first; under {} are allowed): use a shorter --socket", longest, SOCKET_PATH_LIMIT)));
+    }
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
     let made = UnixListener::bind(&inside).and_then(|listener| {
         std::fs::set_permissions(&inside, std::fs::Permissions::from_mode(0o600))?;
         std::fs::rename(&inside, path)?;
@@ -602,6 +609,17 @@ mod tests {
         }
         drop(held);
         server.stop();
+        manager.shutdown();
+        network.shutdown();
+    }
+
+    #[test]
+    fn a_socket_path_that_is_too_long_is_refused_saying_what_to_do() {
+        let (manager, network) = manager();
+        let long = std::env::temp_dir().join("x".repeat(100)).join("d.sock");
+        let error = Server::start(&long, Arc::clone(&manager), Arc::new(AtomicBool::new(false))).err().expect("refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("shorter --socket"), "{}", error);
         manager.shutdown();
         network.shutdown();
     }
