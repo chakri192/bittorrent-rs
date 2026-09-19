@@ -449,20 +449,25 @@ pub fn start_with(
     Ok(handle)
 }
 
+/// Makes a connection just accepted ready to be served on a thread of its own.
+fn prepare_accepted(stream: std::net::TcpStream) -> Option<std::net::TcpStream> {
+    // The listener is non-blocking so that it can notice a stop,
+    // and where an accepted socket inherits that (macOS, the
+    // BSDs) each read on it would fail at once when nothing has
+    // arrived yet: a peer whose handshake came after the accept
+    // would be dropped. The serving thread wants to block, with
+    // its own read timeout.
+    stream.set_nonblocking(false).ok()?;
+    crate::peer::transport::tune_peer_socket(&stream);
+    Some(stream)
+}
+
 /// Takes connections on `listener` (non-blocking) until it stops, each served on a thread of its own.
 fn accept_loop(listener: TcpListener, registry: Arc<Registry>) {
     while registry.running.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _addr)) => {
-                // The listener is non-blocking so that it can notice a stop,
-                // and where an accepted socket inherits that (macOS, the
-                // BSDs) each read on it would fail at once when nothing has
-                // arrived yet: a peer whose handshake came after the accept
-                // would be dropped. The serving thread wants to block, with
-                // its own read timeout.
-                if stream.set_nonblocking(false).is_err() {
-                    continue;
-                }
+                let Some(stream) = prepare_accepted(stream) else { continue };
                 let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
                 admit(&registry, Box::new(stream), peer_ip);
             }
@@ -2161,6 +2166,27 @@ mod tests {
         stream.read_exact(&mut buf).unwrap();
         assert_eq!(Handshake::from_bytes(&buf).unwrap().info_hash, info_hash, "and the handshake is what came through it");
         handle.stop();
+    }
+
+    #[test]
+    fn an_accepted_connection_is_blocking_and_sends_small_messages_at_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let accepted = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(_) => thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        let stream = prepare_accepted(accepted).unwrap();
+        assert!(stream.nodelay().unwrap());
+        // Blocking: a read with nothing to read waits out its timeout instead of failing at once.
+        stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let started = Instant::now();
+        let mut byte = [0u8; 1];
+        let error = (&stream).read(&mut byte).unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(90), "{:?} after {:?}", error, started.elapsed());
     }
 
     #[test]

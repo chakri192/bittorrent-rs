@@ -66,7 +66,17 @@ impl Transport {
 }
 
 fn open_tcp(addr: SocketAddr, timeout: Duration) -> Result<TcpStream, ConnectionError> {
-    Ok(TcpStream::connect_timeout(&addr, timeout)?)
+    let stream = TcpStream::connect_timeout(&addr, timeout)?;
+    tune_peer_socket(&stream);
+    Ok(stream)
+}
+
+/// Sets a peer connection up for what is sent over it: many small messages (a request, a `have`, a choke),
+/// each of which a peer is waiting for. With Nagle's algorithm left on, the second of two back-to-back small
+/// writes waits for the first to be acknowledged, and a peer that delays its acknowledgements (Linux does, by
+/// up to 40 ms) makes a request pipeline stall a round trip at a time. Failing to set it only costs speed.
+pub fn tune_peer_socket(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
 }
 
 #[cfg(test)]
@@ -133,6 +143,17 @@ mod tests {
             watcher.set_nonblocking(true).unwrap();
             assert!(watcher.accept().is_err(), "nothing came to TCP");
         }
+    }
+
+    #[test]
+    fn a_tcp_peer_connection_sends_small_messages_at_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = open_tcp(listener.local_addr().unwrap(), Duration::from_secs(5)).unwrap();
+        assert!(stream.nodelay().unwrap(), "Nagle's algorithm is off");
+        let plain = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        assert!(!plain.nodelay().unwrap(), "(as a socket is otherwise)");
+        tune_peer_socket(&plain);
+        assert!(plain.nodelay().unwrap());
     }
 
     #[test]
