@@ -479,7 +479,7 @@ mod tests {
         /// `files` in torrent order, as (path components, content).
         fn new(name: &str, files: &[(Vec<&str>, Vec<u8>)], piece_length: u64) -> Rig {
             let data: Vec<u8> = files.iter().flat_map(|(_, c)| c.iter().copied()).collect();
-            let work = data.chunks(piece_length as usize).enumerate().map(|(i, chunk)| PieceWork { index: i as u32, hash: sha1_of(chunk), length: chunk.len() as u32 }).collect::<Vec<_>>();
+            let work = data.chunks(piece_length as usize).enumerate().map(|(i, chunk)| PieceWork { index: i as u32, hash: sha1_of(chunk), length: chunk.len() as u32, merkle: None }).collect::<Vec<_>>();
             let piece_count = work.len();
             let dir = tmp_dir(name);
             let listed: Vec<(Vec<String>, i64)> = files.iter().map(|(path, c)| (path.iter().map(|p| p.to_string()).collect(), c.len() as i64)).collect();

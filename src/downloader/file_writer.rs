@@ -33,6 +33,22 @@ pub fn build_file_spans(base_dir: &Path, files: &[(Vec<String>, i64)]) -> Vec<Fi
     spans
 }
 
+/// [`build_file_spans`] for a BitTorrent v2 torrent (BEP 52), in which each
+/// file begins on a piece boundary of the torrent's flat byte space and the
+/// space between the end of one file and the next piece boundary belongs to no
+/// file. A piece never spans two files, so the gaps are never read or written.
+pub fn build_file_spans_aligned(base_dir: &Path, files: &[(Vec<String>, i64)], piece_length: u64) -> Vec<FileSpan> {
+    let mut spans = Vec::with_capacity(files.len());
+    let mut cursor: u64 = 0;
+    for (path_parts, length) in files {
+        let path = path_parts.iter().fold(base_dir.to_path_buf(), |p, part| p.join(part));
+        let len = *length as u64;
+        spans.push(FileSpan { path, start: cursor, end: cursor + len });
+        cursor = (cursor + len).next_multiple_of(piece_length.max(1));
+    }
+    spans
+}
+
 /// The file that holds byte `offset` of the torrent, if any. Spans are in
 /// order and contiguous, so this is a binary search: a torrent of tens of
 /// thousands of files would otherwise cost a scan of all of them for every
@@ -353,5 +369,34 @@ mod tests {
         let spans = build_file_spans(&dir, &[(vec!["d".to_string(), "x".to_string()], 0i64)]);
 
         assert!(create_empty_files(&spans, |_| true).is_err());
+    }
+
+    #[test]
+    fn aligned_spans_start_every_file_on_a_piece_boundary_and_leave_the_gaps_to_nobody() {
+        let files = vec![(vec!["a".to_string()], 100i64), (vec!["empty".to_string()], 0), (vec!["b".to_string()], 256), (vec!["c".to_string()], 1)];
+        let spans = build_file_spans_aligned(Path::new("/base"), &files, 256);
+        assert_eq!(spans.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>(), vec![(0, 100), (256, 256), (256, 512), (512, 513)], "each file begins where the piece after the last one's end begins");
+        assert!(span_at(&spans, 100).is_none() && span_at(&spans, 255).is_none(), "the gap holds no file");
+        assert_eq!(span_at(&spans, 256).unwrap().path, Path::new("/base/b"));
+        assert_eq!(span_at(&spans, 512).unwrap().path, Path::new("/base/c"));
+        // Unaligned, the same files would run into one another.
+        let plain = build_file_spans(Path::new("/base"), &files);
+        assert_eq!(plain[2].start, 100);
+    }
+
+    #[test]
+    fn a_v2_piece_is_written_and_read_back_at_its_place_in_the_aligned_space() {
+        let dir = std::env::temp_dir().join(format!("bittorrent-rs-aligned-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let files = vec![(vec!["a".to_string()], 300i64), (vec!["b".to_string()], 100)];
+        let spans = build_file_spans_aligned(&dir, &files, 256);
+        // a: pieces 0 (256 bytes) and 1 (44); b: piece 2 (100).
+        write_piece(&spans, 0, 256, &[1u8; 256]).unwrap();
+        write_piece(&spans, 1, 256, &[2u8; 44]).unwrap();
+        write_piece(&spans, 2, 256, &[3u8; 100]).unwrap();
+        assert_eq!(fs::read(dir.join("a")).unwrap().len(), 300);
+        assert_eq!(fs::read(dir.join("b")).unwrap(), vec![3u8; 100], "b begins with its own first byte, not at 44 into the padding");
+        assert_eq!(read_at_global_offset(&spans, 512, 100).unwrap(), vec![3u8; 100]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

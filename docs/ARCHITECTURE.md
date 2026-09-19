@@ -118,6 +118,14 @@ the time, and each connection is a `PeerStream`, so the workers and the seeder
 neither know nor care. Datagrams that are not uTP go to the DHT, which is how
 the two share a port.
 
+**v2 torrents** (`v2.rs`) fit the same machinery by giving each piece its own
+length and its own check. A v2 piece belongs to one file, so a file's last
+piece is short and the flat byte space has gaps where files are aligned to piece
+boundaries (`file_spans`); `PieceWork` carries a merkle root and tree width
+beside the SHA-1 slot, and `PieceWork::matches` picks the check. Everything
+downstream (queue, workers, seeder, resume) is unchanged apart from asking the
+torrent for a piece's length and how to verify it.
+
 Piece data reaches disk only after its hash has matched. Everything before
 that is untrusted bytes in a buffer.
 
@@ -172,4 +180,4 @@ trackers are asked concurrently rather than by BEP 12 tier; a piece
 interrupted part-way is handed to the next peer within a run but not saved
 across runs; one piece is downloaded at a time per connection, so a request
 pipeline drains at each piece boundary; no BEP 32, uTP and local discovery are IPv4 only (and uTP is
-unproven against other clients), and BEP 52 (v2) is only partly there: v2 torrents can be made, listed and verified (`v2.rs`, the per-file merkle trees), but a v2-only one cannot be downloaded or seeded.
+unproven against other clients), and BEP 52 (v2) needs the piece layers in the .torrent (no hash-request messages), so a v2 torrent without them, or a v2-only magnet link, cannot be downloaded.

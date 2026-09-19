@@ -455,8 +455,8 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     } else {
         let bytes = fs::read(&args.source).map_err(|e| finish_err(ui, format!("reading {}: {}", args.source, e)))?;
         let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| finish_err(ui, format!("parsing {}: {}", args.source, e)))?;
-        if torrent.is_v2_only() && !args.list && !args.verify {
-            return Err(finish_err(ui, "this torrent is BitTorrent v2 only (BEP 52): it can be listed (--list) and verified (--verify), but not yet downloaded. A hybrid torrent, which also carries v1 hashes, can be".to_string()));
+        if torrent.is_v2_only() && !torrent.v2_ready() && !args.list && !args.verify {
+            return Err(finish_err(ui, bittorrent_rs::session::prepare::NO_PIECE_LAYERS.to_string()));
         }
         // A `.torrent` already carries the file list, so `--list` needs no
         // network at all.
@@ -589,7 +589,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
 fn verify_files(torrent: &torrent::TorrentFile, mask: &[bool], args: &Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String> {
     use bittorrent_rs::ui::Snapshot;
     let base_dir = if torrent.multi_file { args.out_dir.join(&torrent.name) } else { args.out_dir.clone() };
-    let (_, wanted_bytes) = bittorrent_rs::selection::selected_pieces(&torrent.files, torrent.piece_length as u64, mask);
+    let (_, wanted_bytes) = bittorrent_rs::selection::selected_pieces_of(torrent, mask);
     ui.log(format!("verifying {} against {}", torrent.name, base_dir.display()));
     let mut last_shown = 0;
     let report = bittorrent_rs::session::verify::verify(torrent, mask, &base_dir, |checked, of| {

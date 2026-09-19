@@ -311,7 +311,7 @@ mod tests {
     use std::thread;
 
     fn work(index: u32) -> PieceWork {
-        PieceWork { index, hash: [0; 20], length: 100 }
+        PieceWork { index, hash: [0; 20], length: 100, merkle: None }
     }
 
     #[test]
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn a_worker_panicking_with_the_queue_locked_does_not_take_the_queue_down() {
-        let q = WorkQueue::new((0..3).map(|i| PieceWork { index: i, hash: [0; 20], length: 16 }).collect(), 3);
+        let q = WorkQueue::new((0..3).map(|i| PieceWork { index: i, hash: [0; 20], length: 16, merkle: None }).collect(), 3);
         let claimed = q.pop().expect("a piece to claim");
         poison(&q);
 
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn a_bitfield_longer_than_the_torrent_counts_only_real_pieces() {
-        let q = WorkQueue::new((0..3).map(|i| PieceWork { index: i, hash: [0; 20], length: 16 }).collect(), 3);
+        let q = WorkQueue::new((0..3).map(|i| PieceWork { index: i, hash: [0; 20], length: 16, merkle: None }).collect(), 3);
         assert_eq!(q.total_pieces(), 3);
         q.note_bitfield(&vec![true; 1_000_000]); // far more entries than pieces
         assert_eq!(q.total_pieces(), 3, "nothing grew");
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn a_short_bitfield_counts_the_pieces_it_covers() {
-        let q = WorkQueue::new((0..4).map(|i| PieceWork { index: i, hash: [0; 20], length: 16 }).collect(), 4);
+        let q = WorkQueue::new((0..4).map(|i| PieceWork { index: i, hash: [0; 20], length: 16, merkle: None }).collect(), 4);
         q.note_bitfield(&[true, false]); // piece 0 only
         // Pieces 1, 2, 3 have no holder, so all of them come out before 0.
         let order: Vec<u32> = std::iter::from_fn(|| q.pop()).take(4).map(|w| w.index).collect();
@@ -655,7 +655,7 @@ mod tests {
     // ---- partly downloaded pieces ----
 
     fn partial_of(index: u32, blocks: u32, length: u32) -> PartialPiece {
-        let mut a = crate::downloader::piece_assembler::PieceAssembler::new(PieceWork { index, hash: [0; 20], length });
+        let mut a = crate::downloader::piece_assembler::PieceAssembler::new(PieceWork { index, hash: [0; 20], length, merkle: None });
         for n in 0..blocks {
             let begin = n * crate::downloader::piece_assembler::BLOCK_SIZE;
             let len = (length - begin).min(crate::downloader::piece_assembler::BLOCK_SIZE) as usize;

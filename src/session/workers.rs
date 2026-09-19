@@ -197,7 +197,7 @@ mod tests {
     use std::time::Instant;
 
     fn queue_with(pieces: usize) -> Arc<WorkQueue> {
-        let work = (0..pieces).map(|i| PieceWork { index: i as u32, hash: [0; 20], length: 16 }).collect();
+        let work = (0..pieces).map(|i| PieceWork { index: i as u32, hash: [0; 20], length: 16, merkle: None }).collect();
         Arc::new(WorkQueue::new(work, pieces))
     }
 
@@ -366,7 +366,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bittorrent-rs-workers-disk-failure-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("file.bin")).unwrap(); // a directory where the file goes
-        let work = content.chunks(1024).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32 }).collect();
+        let work = content.chunks(1024).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32, merkle: None }).collect();
         let queue = Arc::new(WorkQueue::new(work, 3));
         let files = vec![(vec!["file.bin".to_string()], 3000i64)];
         let spans = Arc::new(build_file_spans(&dir, &files));

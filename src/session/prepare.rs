@@ -2,7 +2,7 @@
 //! the file selection, resuming from disk, the listener and port mapping,
 //! the first tracker announce, and the workers.
 
-use crate::downloader::{any_data_on_disk, build_file_spans, create_empty_files, load_and_verify, progress_file_path, rewrite_compact, scan_all, Order, ResumeWriter, WorkQueue, WorkerConfig};
+use crate::downloader::{any_data_on_disk, create_empty_files, load_and_verify, progress_file_path, rewrite_compact, scan_all, Order, ResumeWriter, WorkQueue, WorkerConfig};
 use crate::ratelimit::RateLimiter;
 use crate::seeder::{self, HaveMap};
 use crate::session::peer_pool::RetryPolicy;
@@ -41,6 +41,9 @@ pub fn has_ipv6_egress() -> bool {
         Err(_) => false,
     }
 }
+
+/// Why a BitTorrent v2 torrent that carries no piece layers is not downloaded.
+pub const NO_PIECE_LAYERS: &str = "this torrent is BitTorrent v2 only (BEP 52) and does not carry its piece layers, which are what its pieces are checked against; fetching them from peers is not implemented. It can be listed (--list) and verified (--verify)";
 
 /// How a session is set up. Everything the command line decides, and the
 /// two protocol constants the workers need.
@@ -157,6 +160,9 @@ fn shared_log(sink: &Arc<dyn ProgressSink>) -> Log {
 /// Fails, with a reason for the user, if the output directory or resume
 /// file cannot be used, or if there is nowhere at all to get peers from.
 pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<SocketAddr>, our_peer_id: [u8; 20], options: &Options, services: &mut Services, sink: &Arc<dyn ProgressSink>) -> Result<Prepared, String> {
+    if torrent.is_v2_only() && !torrent.v2_ready() {
+        return Err(NO_PIECE_LAYERS.to_string());
+    }
     let total_pieces = torrent.pieces.len();
     let total_length = torrent.total_length();
     let piece_length = torrent.piece_length as u64;
@@ -174,7 +180,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // A multi-file torrent's name is the directory its files go under,
     // however many files it lists (one is legal and common).
     let base_dir = if torrent.multi_file { options.out_dir.join(&torrent.name) } else { options.out_dir.clone() };
-    let spans = Arc::new(build_file_spans(&base_dir, &torrent.files));
+    let spans = Arc::new(torrent.file_spans(&base_dir));
     // Empty files are in no piece, so nothing would ever create them.
     create_empty_files(&spans, |file| mask.get(file).copied().unwrap_or(false)).map_err(|e| format!("creating an empty file under {}: {}", base_dir.display(), e))?;
 
@@ -217,7 +223,8 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // (BEP 9), but only if it re-encodes to what the hash was taken over.
     let info_bytes = crate::bencode::encode(&torrent.info);
     let metadata = (Sha1::digest(&info_bytes).as_slice() == torrent.info_hash).then(|| Arc::new(info_bytes));
-    let seeder_options = seeder::SeederOptions { metadata, encryption: options.encryption.unwrap_or(crate::peer::Encryption::Prefer), utp: services.utp(), ..Default::default() };
+    let piece_lengths = (!torrent.v2_pieces.is_empty()).then(|| Arc::new(torrent.v2_pieces.iter().map(|p| p.length).collect::<Vec<u32>>()));
+    let seeder_options = seeder::SeederOptions { metadata, encryption: options.encryption.unwrap_or(crate::peer::Encryption::Prefer), utp: services.utp(), piece_lengths, ..Default::default() };
     match seeder::start_with(options.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options) {
         Ok(handle) => {
             sink.log(format!("listening for inbound peers on port {}", handle.port));
@@ -254,7 +261,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // *unwanted* pieces from a prior full run stay advertised for seeding
     // via `have` above, but don't count toward this run's goal.)
     let Outstanding { work, pieces_done, bytes_done: bytes_already_done } = plan.outstanding(torrent, &confirmed_resumed);
-    let preferred = if options.prefer.iter().any(|&p| p) { crate::selection::selected_pieces(&torrent.files, torrent.piece_length as u64, &options.prefer).0 } else { Default::default() };
+    let preferred = if options.prefer.iter().any(|&p| p) { crate::selection::selected_pieces_of(torrent, &options.prefer).0 } else { Default::default() };
     let queue = Arc::new(WorkQueue::new(work, total_pieces).with_order(if options.sequential { Order::Sequential } else { Order::RarestFirst }).with_preferred(preferred));
 
     let allow_ipv6 = match options.ipv6 {
@@ -278,7 +285,8 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // BEP 19 web seeds (from the torrent's url-list). These can carry the
     // whole download even with zero peers, so their presence keeps the run
     // alive.
-    let web_seeds: Vec<String> = if options.no_webseed { Vec::new() } else { torrent.url_list.clone() };
+    // Web seeds serve v1 pieces, which a v2-only torrent has none of.
+    let web_seeds: Vec<String> = if options.no_webseed || torrent.is_v2_only() { Vec::new() } else { torrent.url_list.clone() };
 
     if pool.known_count() == 0 && services.dht().is_none() && services.lsd().is_none() && web_seeds.is_empty() {
         return Err("no peers found from any tracker (and DHT, local discovery + web seeds unavailable)".to_string());
@@ -632,6 +640,52 @@ mod tests {
         let mut services = Services::new();
         let (_, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
         assert!(!log.logged("uTP is not running"), "and says nothing when TCP was asked for");
+    }
+
+    /// A v2-only torrent of two files, made by the creator (piece length 16 KiB), with its layers or without.
+    fn v2_torrent(with_layers: bool) -> TorrentFile {
+        // A directory for each, since tests run side by side.
+        let dir = tmp_dir(if with_layers { "v2-source-with" } else { "v2-source-without" });
+        fs::create_dir_all(dir.join("t")).unwrap();
+        fs::write(dir.join("t/a.bin"), vec![1u8; 40_000]).unwrap();
+        fs::write(dir.join("t/empty"), b"").unwrap();
+        fs::write(dir.join("t/b.bin"), vec![2u8; 100]).unwrap();
+        let made = crate::create::create(&dir.join("t"), &crate::create::CreateOptions { piece_length: Some(16384), v2: true, web_seeds: vec![format!("http://{}/", dead_addr())], ..Default::default() }, |_, _| {}).unwrap();
+        let mut bytes = made.bytes;
+        if !with_layers {
+            let mut top = crate::bencode::decode(&bytes).unwrap();
+            if let crate::bencode::Bencode::Dict(entries) = &mut top {
+                entries.remove(b"piece layers".as_slice());
+            }
+            bytes = crate::bencode::encode(&top);
+        }
+        parse_torrent_file(&bytes).unwrap()
+    }
+
+    #[test]
+    fn a_v2_torrent_is_prepared_over_its_aligned_layout() {
+        let dir = tmp_dir("v2-prepare");
+        let t = v2_torrent(true);
+        let mut services = Services::new();
+
+        let (prepared, log) = run_prepare(&t, &[true, true, true], vec![dead_addr()], &options(&dir), &mut services);
+        let prepared = prepared.expect("a v2 torrent with its layers can be downloaded");
+
+        assert_eq!(prepared.goal_pieces, 4, "a.bin's three pieces and b.bin's one");
+        assert_eq!(prepared.queue.len(), 4);
+        assert_eq!(prepared.display_total, 40_100);
+        assert!(dir.join("t/empty").exists(), "the empty file is made, as for any torrent");
+        assert!(t.url_list.len() == 1 && !log.logged("web seed:"), "the torrent names a web seed, but a v2 torrent has no v1 pieces for it to serve");
+    }
+
+    #[test]
+    fn a_v2_torrent_without_its_layers_is_not_prepared_and_the_reason_is_given() {
+        let dir = tmp_dir("v2-prepare-bare");
+        let t = v2_torrent(false);
+        assert!(t.is_v2_only() && !t.v2_ready());
+        let mut services = Services::new();
+        let (result, _) = run_prepare(&t, &[true, true, true], vec![dead_addr()], &options(&dir), &mut services);
+        assert_eq!(result.err().as_deref(), Some(NO_PIECE_LAYERS));
     }
 
     #[test]

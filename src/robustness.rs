@@ -186,7 +186,11 @@ fn torrent_parsing_survives_hostile_input_and_only_yields_safe_torrents() {
         if t.is_v2_only() {
             // BitTorrent v2: no v1 hashes; the layers add up, and the files are the tree's.
             let meta = t.v2.as_ref().unwrap();
-            assert!(t.pieces.is_empty() && crate::v2::valid_piece_length(t.piece_length));
+            assert!(t.pieces.len() == t.v2_pieces.len() && crate::v2::valid_piece_length(t.piece_length));
+            assert_eq!(build_work_queue(&t).len(), t.v2_pieces.len());
+            if t.v2_ready() {
+                assert_eq!(t.v2_pieces.iter().map(|p| p.length as u64).sum::<u64>(), t.total_length(), "the pieces cover the files exactly");
+            }
             assert!(crate::v2::validate_layers(&meta.files, &meta.layers, t.piece_length).is_ok());
             assert_eq!(meta.files.len(), t.files.len());
             assert_eq!(meta.short_hash(), t.info_hash);
@@ -290,7 +294,7 @@ fn piece_assembly_survives_blocks_at_hostile_offsets_and_sizes() {
     let mut rng = Rng::new(21);
     for _ in 0..500 {
         let length = 1 + rng.below(70_000) as u32;
-        let mut assembler = PieceAssembler::new(PieceWork { index: 0, hash: [0; 20], length });
+        let mut assembler = PieceAssembler::new(PieceWork { index: 0, hash: [0; 20], length, merkle: None });
         for _ in 0..40 {
             // Offsets and lengths a lying peer might use, including ones
             // that overflow when added.

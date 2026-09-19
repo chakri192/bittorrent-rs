@@ -128,6 +128,23 @@ pub fn selected_pieces(files: &Files, piece_length: u64, mask: &[bool]) -> (Hash
     (pieces, bytes)
 }
 
+/// [`selected_pieces`] for a torrent: for a v2 one, whose pieces each belong to
+/// one file, that is the pieces of the selected files.
+pub fn selected_pieces_of(torrent: &crate::torrent::TorrentFile, mask: &[bool]) -> (HashSet<u32>, u64) {
+    if torrent.v2_pieces.is_empty() {
+        return selected_pieces(&torrent.files, torrent.piece_length as u64, mask);
+    }
+    let mut pieces = HashSet::new();
+    let mut bytes = 0u64;
+    for (index, piece) in torrent.v2_pieces.iter().enumerate() {
+        if mask.get(piece.file).copied().unwrap_or(false) {
+            pieces.insert(index as u32);
+            bytes += piece.length as u64;
+        }
+    }
+    (pieces, bytes)
+}
+
 /// Renders the file table for `--list`, marking selected files.
 pub fn format_list(name: &str, files: &Files, mask: &[bool]) -> String {
     let selected = mask.iter().filter(|&&b| b).count();
@@ -295,5 +312,30 @@ mod tests {
         let mut got: Vec<u32> = pieces.into_iter().collect();
         got.sort_unstable();
         assert_eq!(got, vec![3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn a_v2_torrents_selected_pieces_are_those_of_the_selected_files_and_nothing_between() {
+        use crate::create::{create, CreateOptions};
+        let dir = std::env::temp_dir().join(format!("bittorrent-rs-select-v2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("t")).unwrap();
+        std::fs::write(dir.join("t/a"), vec![1u8; 20_000]).unwrap(); // two pieces (16384 + 3616)
+        std::fs::write(dir.join("t/b"), vec![2u8; 100]).unwrap(); // one
+        std::fs::write(dir.join("t/c"), vec![3u8; 16_384 * 2]).unwrap(); // two
+        let made = create(&dir.join("t"), &CreateOptions { piece_length: Some(16_384), v2: true, ..Default::default() }, |_, _| {}).unwrap();
+        let torrent = crate::torrent::parse_torrent_file(&made.bytes).unwrap();
+
+        let (pieces, bytes) = selected_pieces_of(&torrent, &[false, true, true]);
+        let mut sorted: Vec<u32> = pieces.into_iter().collect();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![2, 3, 4], "b is piece 2 and c is 3 and 4, though a's last piece is short and b begins on a boundary");
+        assert_eq!(bytes, 100 + 32_768);
+        let (all, all_bytes) = selected_pieces_of(&torrent, &[true, true, true]);
+        assert_eq!((all.len(), all_bytes), (5, 20_000 + 100 + 32_768));
+        // A v1 torrent is worked out as before.
+        let v1 = crate::torrent::parse_torrent_file(b"d4:infod6:lengthi40000e4:name1:a12:piece lengthi16384e6:pieces60:000000000000000000001111111111111111111122222222222222222222ee").unwrap();
+        assert_eq!(selected_pieces_of(&v1, &[true]).0.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

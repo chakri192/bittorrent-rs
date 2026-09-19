@@ -107,6 +107,52 @@ pub fn piece_hash(data: &[u8], piece_length: usize) -> Hash {
     merkle_root(&block_hashes(data), piece_length / BLOCK, [0u8; 32])
 }
 
+/// Whether `data` is a piece whose tree, `width` leaves wide, has root `root`.
+pub fn merkle_matches(data: &[u8], width: usize, root: &Hash) -> bool {
+    if !width.is_power_of_two() || data.len() > width.saturating_mul(BLOCK) {
+        return false;
+    }
+    merkle_root(&block_hashes(data), width, [0u8; 32]) == *root
+}
+
+/// One piece of a v2-only torrent. Pieces never span files: each file's
+/// tree is cut into pieces of its own, so a file's last piece is short.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2Piece {
+    /// The file it is part of (an index into the torrent's files).
+    pub file: usize,
+    /// Where in that file it begins.
+    pub offset: u64,
+    pub length: u32,
+    /// What it must come to, from the file's piece layer (or the file's root
+    /// if the file fits in one piece).
+    pub root: Hash,
+    /// Leaves in the tree it is hashed over: a piece's worth, except in a file
+    /// smaller than a piece, where the tree is only as wide as the file needs.
+    pub width: u32,
+}
+
+/// Every piece of the files, in order, with what each must hash to. `None`
+/// if a file longer than a piece has no piece layer: without it there is
+/// nothing to check that file's pieces against.
+pub fn plan_pieces(files: &[V2File], layers: &BTreeMap<Hash, Vec<Hash>>, piece_length: u64) -> Option<Vec<V2Piece>> {
+    let mut pieces = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        let Some(root) = file.root else { continue };
+        if file.length <= piece_length {
+            let blocks = file.length.div_ceil(BLOCK as u64) as usize;
+            pieces.push(V2Piece { file: index, offset: 0, length: file.length as u32, root, width: blocks.next_power_of_two() as u32 });
+            continue;
+        }
+        let layer = layers.get(&root)?;
+        for (n, hash) in layer.iter().enumerate() {
+            let offset = n as u64 * piece_length;
+            pieces.push(V2Piece { file: index, offset, length: (file.length - offset).min(piece_length) as u32, root: *hash, width: (piece_length / BLOCK as u64) as u32 });
+        }
+    }
+    Some(pieces)
+}
+
 /// What a file's tree comes to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHashes {
@@ -540,5 +586,57 @@ mod tests {
         assert_eq!(parse_layers(Some(&tree(&format!("d32:{}5:xxxxxe", key)))), Err(V2Error::BadLayer), "hashes that do not come in 32s");
         assert_eq!(parse_layers(Some(&tree(&format!("d32:{}i5ee", key)))), Err(V2Error::BadLayer), "not a string");
         assert_eq!(parse_layers(Some(&tree(&format!("d32:{}64:{}e", key, "h".repeat(64))))).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_pieces_of_a_torrent_come_out_file_by_file_with_short_last_pieces_and_the_widths_that_check_them() {
+        let (torrent, info) = demo();
+        let files = parse_file_tree(info.get("file tree").unwrap()).unwrap();
+        let layers = parse_layers(torrent.get("piece layers")).unwrap();
+        let pieces = plan_pieces(&files, &layers, 32768).expect("every long file has its layer");
+        // a.bin 100000 (4 pieces), empty (none), b.txt 20000 (one, of two blocks), c.bin 70000 (3 pieces).
+        let plan: Vec<(usize, u64, u32, u32)> = pieces.iter().map(|p| (p.file, p.offset, p.length, p.width)).collect();
+        assert_eq!(plan, vec![(0, 0, 32768, 2), (0, 32768, 32768, 2), (0, 65536, 32768, 2), (0, 98304, 1696, 2), (2, 0, 20000, 2), (3, 0, 32768, 2), (3, 32768, 32768, 2), (3, 65536, 4464, 2)]);
+        // The bytes of every piece check against what the plan says, and no other bytes do.
+        let a = data(100_000, 7);
+        for piece in pieces.iter().filter(|p| p.file == 0) {
+            let bytes = &a[piece.offset as usize..piece.offset as usize + piece.length as usize];
+            assert!(merkle_matches(bytes, piece.width as usize, &piece.root), "piece at {}", piece.offset);
+            let mut wrong = bytes.to_vec();
+            wrong[0] ^= 1;
+            assert!(!merkle_matches(&wrong, piece.width as usize, &piece.root));
+        }
+        let b = data(20_000, 8);
+        assert!(merkle_matches(&b, pieces[4].width as usize, &pieces[4].root), "the small file's only piece, hashed as its own short tree");
+    }
+
+    #[test]
+    fn a_torrent_without_the_layer_of_a_long_file_cannot_be_planned() {
+        let (torrent, info) = demo();
+        let files = parse_file_tree(info.get("file tree").unwrap()).unwrap();
+        let mut layers = parse_layers(torrent.get("piece layers")).unwrap();
+        let a = files.iter().find(|f| f.path == ["a.bin"]).unwrap();
+        layers.remove(&a.root.unwrap());
+        assert!(plan_pieces(&files, &layers, 32768).is_none(), "nothing to check a.bin's pieces against");
+        let short_only: Vec<V2File> = files.iter().filter(|f| f.length <= 32768).cloned().collect();
+        assert!(plan_pieces(&short_only, &BTreeMap::new(), 32768).is_some(), "small files need no layer: their root is their piece's hash");
+    }
+
+    #[test]
+    fn a_piece_with_too_many_bytes_for_its_tree_or_the_wrong_width_does_not_match() {
+        let bytes = data(3 * BLOCK, 1);
+        let root4 = merkle_root(&block_hashes(&bytes), 4, [0u8; 32]);
+        assert!(merkle_matches(&bytes, 4, &root4));
+        assert!(!merkle_matches(&bytes, 8, &root4), "another width is another tree");
+        assert!(!merkle_matches(&bytes, 3, &root4), "and a width that is not a power of two is no tree");
+        assert!(!merkle_matches(&data(5 * BLOCK, 1), 4, &root4), "more blocks than the tree has leaves");
+    }
+
+    #[test]
+    fn a_small_files_piece_is_as_wide_as_the_file_needs_not_as_wide_as_a_piece() {
+        // 20000 bytes is two blocks; the pieces of this torrent are sixteen blocks wide.
+        let file = V2File { path: vec!["f".to_string()], length: 20_000, root: Some([7u8; 32]) };
+        let pieces = plan_pieces(&[file], &BTreeMap::new(), 16 * BLOCK as u64).unwrap();
+        assert_eq!(pieces, vec![V2Piece { file: 0, offset: 0, length: 20_000, root: [7u8; 32], width: 2 }]);
     }
 }

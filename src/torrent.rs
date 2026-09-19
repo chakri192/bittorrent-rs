@@ -30,6 +30,9 @@ pub struct TorrentFile {
     /// torrent. For a torrent that is v2 only, `pieces` is empty and
     /// `info_hash` is the first 20 bytes of the SHA-256 one.
     pub v2: Option<crate::v2::V2Meta>,
+    /// For a v2-only torrent whose piece layers are all present: its pieces,
+    /// with what each must hash to. Empty otherwise.
+    pub v2_pieces: Vec<crate::v2::V2Piece>,
 }
 
 #[derive(Debug)]
@@ -327,6 +330,7 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
         url_list,
         private,
         v2,
+        v2_pieces: Vec::new(),
     })
 }
 
@@ -366,7 +370,12 @@ fn build_v2_only_torrent(info: Bencode, tree: &Bencode, raw_info: &[u8], announc
     let multi_file = !(meta.files.len() == 1 && meta.files[0].path == [name.clone()]);
     let private = info.get("private").and_then(Bencode::as_int).is_some_and(|v| v != 0);
     let info_hash = meta.short_hash();
-    Ok(TorrentFile { announce, announce_list, info, info_hash, piece_length, pieces: Vec::new(), name, files, multi_file, url_list, private, v2: Some(meta) })
+    // With the layers, every piece has something to be checked against and can be
+    // fetched like a v1 piece (`pieces` then holds the first 20 bytes of each
+    // expected hash, so that the counts everything works from are right).
+    let v2_pieces = crate::v2::plan_pieces(&meta.files, &meta.layers, piece_length as u64).unwrap_or_default();
+    let pieces = v2_pieces.iter().map(|p| <[u8; 20]>::try_from(&p.root[..20]).unwrap_or([0; 20])).collect();
+    Ok(TorrentFile { announce, announce_list, info, info_hash, piece_length, pieces, name, files, multi_file, url_list, private, v2: Some(meta), v2_pieces })
 }
 
 pub fn info_hash_hex(hash: &[u8; 20]) -> String {
@@ -389,7 +398,24 @@ impl TorrentFile {
     /// Whether the torrent is BitTorrent v2 only (BEP 52), with no v1 piece
     /// hashes: it can be read, listed and verified, but not yet downloaded.
     pub fn is_v2_only(&self) -> bool {
-        self.v2.is_some() && self.pieces.is_empty()
+        self.v2.is_some() && self.info.get("pieces").is_none()
+    }
+
+    /// Whether a v2-only torrent has what it takes to be downloaded: every piece
+    /// has a hash to be checked against (the `.torrent` carried the piece layers).
+    pub fn v2_ready(&self) -> bool {
+        self.is_v2_only() && (!self.v2_pieces.is_empty() || self.total_length() == 0)
+    }
+
+    /// Where each file lies in the torrent's flat byte space, under `base_dir`.
+    /// In a v2 torrent every file begins on a piece boundary, so the gaps
+    /// between files hold no piece.
+    pub fn file_spans(&self, base_dir: &std::path::Path) -> Vec<crate::downloader::file_writer::FileSpan> {
+        if self.is_v2_only() {
+            crate::downloader::file_writer::build_file_spans_aligned(base_dir, &self.files, self.piece_length as u64)
+        } else {
+            crate::downloader::file_writer::build_file_spans(base_dir, &self.files)
+        }
     }
 
     /// Sum of every file's length -- the total number of bytes the torrent
@@ -402,6 +428,10 @@ impl TorrentFile {
     /// except the last, which is whatever remains
     /// (`total_length - piece_length * (num_pieces - 1)`).
     pub fn piece_len(&self, index: usize) -> u64 {
+        // A v2 piece is part of one file, so a file's last piece is short.
+        if !self.v2_pieces.is_empty() {
+            return self.v2_pieces.get(index).map_or(0, |p| p.length as u64);
+        }
         let num_pieces = self.pieces.len() as u64;
         let last_index = num_pieces.saturating_sub(1);
         if index as u64 == last_index {
@@ -791,7 +821,11 @@ mod tests {
         assert!(t.is_v2_only());
         assert_eq!((t.name.as_str(), t.piece_length, t.multi_file), ("f.bin", 16384, false), "one file named as the torrent is: a single-file torrent");
         assert_eq!(t.files, vec![(vec!["f.bin".to_string()], 40_000)]);
-        assert!(t.pieces.is_empty(), "there are no v1 hashes");
+        assert!(t.info.get("pieces").is_none(), "there are no v1 hashes");
+        assert!(t.v2_ready());
+        assert_eq!(t.v2_pieces.iter().map(|p| (p.file, p.offset, p.length)).collect::<Vec<_>>(), vec![(0, 0, 16384), (0, 16384, 16384), (0, 32768, 7232)], "three pieces, the last short");
+        assert_eq!(t.pieces.len(), 3, "so the counts everything works from are right");
+        assert_eq!(t.piece_len(2), 7232);
         assert_eq!(hex(&t.v2.as_ref().unwrap().info_hash), V2_ONLY_SHA256);
         assert_eq!(hex(&t.info_hash), &V2_ONLY_SHA256[..40], "what the handshake, trackers and the DHT know it by");
         assert_eq!(hex(&t.v2.as_ref().unwrap().files[0].root.unwrap()), V2_ROOT);

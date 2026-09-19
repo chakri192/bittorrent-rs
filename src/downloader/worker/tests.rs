@@ -97,8 +97,8 @@ fn run_worker_downloads_all_pieces_from_mock_peer_and_writes_to_disk() {
     let mock = spawn_mock_peer(listener, info_hash, vec![piece0.clone(), piece1.clone()], Duration::ZERO);
 
     let work = vec![
-        PieceWork { index: 0, hash: sha1_of(&piece0), length: 16384 },
-        PieceWork { index: 1, hash: sha1_of(&piece1), length: 16384 },
+        PieceWork { index: 0, hash: sha1_of(&piece0), length: 16384, merkle: None },
+        PieceWork { index: 1, hash: sha1_of(&piece1), length: 16384, merkle: None },
     ];
     let queue = Arc::new(WorkQueue::new(work, 2));
 
@@ -140,7 +140,7 @@ fn run_worker_survives_a_peer_that_unchokes_slower_than_the_read_timeout() {
     let addr = listener.local_addr().unwrap();
     let mock = spawn_mock_peer(listener, info_hash, vec![piece0.clone()], Duration::from_millis(350));
 
-    let work = vec![PieceWork { index: 0, hash: sha1_of(&piece0), length: 16384 }];
+    let work = vec![PieceWork { index: 0, hash: sha1_of(&piece0), length: 16384, merkle: None }];
     let queue = Arc::new(WorkQueue::new(work, 1));
     let dir = tmp_dir("slow-unchoke");
     let files = vec![(vec!["out.bin".to_string()], 16384i64)];
@@ -174,7 +174,7 @@ fn run_worker_gives_up_on_a_peer_that_never_unchokes() {
         thread::sleep(Duration::from_secs(3));
     });
 
-    let work = vec![PieceWork { index: 0, hash: [0; 20], length: 100 }];
+    let work = vec![PieceWork { index: 0, hash: [0; 20], length: 100, merkle: None }];
     let queue = Arc::new(WorkQueue::new(work, 1));
     let dir = tmp_dir("never-unchokes");
     let files = vec![(vec!["out.bin".to_string()], 100i64)];
@@ -210,7 +210,7 @@ fn run_worker_gives_up_on_peer_with_no_needed_pieces_instead_of_hanging() {
         thread::sleep(Duration::from_secs(8));
     });
 
-    let work = vec![PieceWork { index: 0, hash: [0; 20], length: 100 }];
+    let work = vec![PieceWork { index: 0, hash: [0; 20], length: 100, merkle: None }];
     let queue = Arc::new(WorkQueue::new(work, 1));
     let dir = tmp_dir("no-needed-pieces");
     let files = vec![(vec!["out.bin".to_string()], 100i64)];
@@ -239,7 +239,7 @@ fn run_worker_requeues_piece_on_hash_mismatch_and_stops() {
 
     // Deliberately wrong hash -- the mock peer serves real data, but
     // the assembler should refuse to hand it back as verified.
-    let work = vec![PieceWork { index: 0, hash: [0u8; 20], length: 16384 }];
+    let work = vec![PieceWork { index: 0, hash: [0u8; 20], length: 16384, merkle: None }];
     let queue = Arc::new(WorkQueue::new(work, 1));
 
     let dir = tmp_dir("hash-mismatch");
@@ -313,7 +313,7 @@ fn worker_reports_pex_peers_from_a_pex_sending_peer() {
         }
     });
 
-    let work = vec![PieceWork { index: 0, hash: sha1_of(&piece0), length: 16384 }];
+    let work = vec![PieceWork { index: 0, hash: sha1_of(&piece0), length: 16384, merkle: None }];
     let queue = Arc::new(WorkQueue::new(work, 1));
     let dir = tmp_dir("pex");
     let files = vec![(vec!["out.bin".to_string()], 16384i64)];
@@ -339,7 +339,7 @@ fn a_download_limit_slows_the_worker_but_not_what_it_downloads() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let mock = spawn_mock_peer(listener, info_hash, vec![piece0.clone(), piece1.clone()], Duration::ZERO);
-    let work = vec![PieceWork { index: 0, hash: sha1_of(&piece0), length: 16384 }, PieceWork { index: 1, hash: sha1_of(&piece1), length: 16384 }];
+    let work = vec![PieceWork { index: 0, hash: sha1_of(&piece0), length: 16384, merkle: None }, PieceWork { index: 1, hash: sha1_of(&piece1), length: 16384, merkle: None }];
     let queue = Arc::new(WorkQueue::new(work, 2));
     let dir = tmp_dir("limited");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 32768i64)]));
@@ -451,7 +451,7 @@ fn a_worker_waiting_on_a_silent_peer_stops_when_interrupted() {
         let _ = release_rx.recv_timeout(Duration::from_secs(20));
     });
 
-    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: [0; 20], length: 16384 }], 1));
+    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: [0; 20], length: 16384, merkle: None }], 1));
     let dir = tmp_dir("interrupted");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 16384i64)]));
     let (tx, _rx) = mpsc::channel();
@@ -545,7 +545,7 @@ fn download_from_laggy_peer(name: &str, piece_count: usize, piece_len: usize, la
     let max_outstanding = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let peer = spawn_laggy_peer(listener, info_hash, pieces.clone(), latency, reqq, Arc::clone(&max_outstanding));
 
-    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: piece_len as u32 }).collect();
+    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: piece_len as u32, merkle: None }).collect();
     let queue = Arc::new(WorkQueue::new(work, piece_count));
     let dir = tmp_dir(name);
     let total = (piece_count * piece_len) as i64;
@@ -641,7 +641,7 @@ fn a_peer_with_only_common_pieces_is_given_those_even_while_a_rarer_one_is_still
     // The peer has pieces 1 and 2, and hangs up after serving them.
     let peer = spawn_partial_peer(listener, info_hash, pieces.clone(), vec![1, 2], 2);
 
-    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: 16384 }).collect();
+    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: 16384, merkle: None }).collect();
     let queue = Arc::new(WorkQueue::new(work, 3));
     // Piece 0 is the rarest by a distance: the swarm has been seen with 1 and 2 twice.
     for piece in [1, 2, 1, 2] {
@@ -672,7 +672,7 @@ fn a_sequential_queue_is_downloaded_in_order_and_a_rarest_first_one_is_not() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let mock = spawn_mock_peer(listener, info_hash, pieces.clone(), Duration::ZERO);
-        let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: 16384 }).collect();
+        let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: 16384, merkle: None }).collect();
         let queue = Arc::new(WorkQueue::new(work, 4).with_order(order));
         queue.note_have(0);
         queue.note_have(1);
@@ -765,7 +765,7 @@ fn download_through_a_choke(name: &str, serve_before_choke: usize, choked_for: D
     let addr = listener.local_addr().unwrap();
     let peer = spawn_choking_peer(listener, info_hash, pieces.clone(), serve_before_choke, Some(choked_for));
 
-    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32 }).collect();
+    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32, merkle: None }).collect();
     let queue = Arc::new(WorkQueue::new(work, 2));
     let dir = tmp_dir(name);
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 8 * 16384)]));
@@ -806,7 +806,7 @@ fn a_peer_that_chokes_and_never_unchokes_is_given_up_on_and_the_piece_goes_back(
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let _peer = spawn_choking_peer(listener, info_hash, pieces.clone(), 1, None);
-    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: sha1_of(&pieces[0]), length: 4 * 16384 }], 1));
+    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: sha1_of(&pieces[0]), length: 4 * 16384, merkle: None }], 1));
     let dir = tmp_dir("choked-for-good");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 4 * 16384)]));
     let (tx, _rx) = mpsc::channel();
@@ -834,7 +834,7 @@ fn stopping_does_not_wait_for_a_worker_held_back_by_the_download_limit() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let _mock = spawn_mock_peer(listener, info_hash, vec![piece.clone()], Duration::ZERO);
-    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: sha1_of(&piece), length: 16384 }], 1));
+    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: sha1_of(&piece), length: 16384, merkle: None }], 1));
     let dir = tmp_dir("limit-interrupt");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 16384)]));
     let (tx, _rx) = mpsc::channel();
@@ -915,7 +915,7 @@ struct HandOver {
 fn hand_a_piece_over(name: &str, first_serves: usize, first_fault: Fault, second_fault: Fault) -> HandOver {
     let piece: Vec<u8> = (0..4 * 16384).map(|b| (b as u8).wrapping_mul(13).wrapping_add(1)).collect();
     let info_hash = [0x68; 20];
-    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: sha1_of(&piece), length: piece.len() as u32 }], 1));
+    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: sha1_of(&piece), length: piece.len() as u32, merkle: None }], 1));
     let dir = tmp_dir(name);
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], piece.len() as i64)]));
     let (tx, rx) = mpsc::channel();
@@ -994,7 +994,7 @@ fn a_worker_is_listed_while_it_runs_with_its_bytes_and_removed_when_it_ends() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let peer = spawn_laggy_peer(listener, info_hash, pieces.clone(), Duration::from_millis(150), None, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
-    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32 }).collect();
+    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32, merkle: None }).collect();
     let queue = Arc::new(WorkQueue::new(work, 2));
     let dir = tmp_dir("peer-table");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 128 * 1024)]));
@@ -1032,7 +1032,7 @@ fn a_worker_whose_peer_has_us_choked_is_listed_as_choked() {
     let addr = listener.local_addr().unwrap();
     // Chokes after one block for good; the worker waits (up to its patience) in that state.
     let _peer = spawn_choking_peer(listener, info_hash, vec![piece.clone()], 1, None);
-    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: sha1_of(&piece), length: piece.len() as u32 }], 1));
+    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: sha1_of(&piece), length: piece.len() as u32, merkle: None }], 1));
     let dir = tmp_dir("peer-table-choked");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], piece.len() as i64)]));
     let (tx, _rx) = mpsc::channel();
@@ -1065,7 +1065,7 @@ fn a_worker_with_nothing_to_fetch_from_its_peer_is_listed_as_idle() {
     let addr = listener.local_addr().unwrap();
     // The peer has only piece 1, and stays connected once it has served it (never hangs up).
     let _peer = spawn_partial_peer(listener, info_hash, pieces.clone(), vec![1], usize::MAX);
-    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32 }).collect();
+    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32, merkle: None }).collect();
     let queue = Arc::new(WorkQueue::new(work, 2));
     let dir = tmp_dir("peer-table-idle");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 32768)]));
@@ -1102,7 +1102,7 @@ fn download_with_encryption(name: &str, peer_takes: crate::peer::Encryption, wor
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let mock = spawn_mock_peer_with(listener, info_hash, pieces.clone(), Duration::ZERO, peer_takes);
-    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32 }).collect();
+    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32, merkle: None }).collect();
     let queue = Arc::new(WorkQueue::new(work, 2));
     let dir = tmp_dir(name);
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 32768)]));
@@ -1139,7 +1139,7 @@ fn a_worker_that_prefers_encryption_downloads_from_a_peer_that_only_speaks_plain
         let mock = spawn_mock_peer_with(listener, info_hash, vec![vec![0x44u8; 16384]], Duration::ZERO, crate::peer::Encryption::Off);
         mock.join().unwrap();
     });
-    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: sha1_of(&pieces[0]), length: 16384 }], 1));
+    let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash: sha1_of(&pieces[0]), length: 16384, merkle: None }], 1));
     let dir = tmp_dir("mse-fallback");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 16384)]));
     let (tx, rx) = mpsc::channel();
@@ -1197,7 +1197,7 @@ where
 
 /// A worker for a torrent of `pieces` (one file, pieces of `piece_length`) against `addr`, with short timeouts.
 fn run_fast_worker(name: &str, addr: std::net::SocketAddr, info_hash: [u8; 20], pieces: &[Vec<u8>], piece_length: u32, pipeline_depth: usize) -> (Result<(), WorkerError>, Arc<WorkQueue>, Vec<crate::downloader::queue::PieceResult>) {
-    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32 }).collect();
+    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32, merkle: None }).collect();
     let queue = Arc::new(WorkQueue::new(work, pieces.len()));
     let total: usize = pieces.iter().map(Vec::len).sum();
     let dir = tmp_dir(name);
@@ -1430,7 +1430,7 @@ fn download_over_utp(name: &str, mode: crate::peer::TransportMode, encryption: c
     });
 
     let client = Arc::new(UtpSocket::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).unwrap());
-    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32 }).collect();
+    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32, merkle: None }).collect();
     let queue = Arc::new(WorkQueue::new(work, 2));
     let dir = tmp_dir(name);
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 32768)]));
@@ -1482,4 +1482,63 @@ fn a_tcp_only_worker_cannot_reach_a_peer_that_only_speaks_utp() {
     let (result, results, _) = download_over_utp("utp-worker-tcp", crate::peer::TransportMode::Tcp, crate::peer::Encryption::Off);
     assert!(matches!(result, Err(WorkerError::Connection { stage: "connect_and_handshake", .. })), "{:?}", result);
     assert!(results.is_empty());
+}
+
+#[test]
+fn a_worker_downloads_the_pieces_of_a_v2_torrent_and_checks_each_by_its_merkle_tree() {
+    // Two files of 20000 and 100 bytes in 16 KiB pieces: three pieces, two of them short.
+    let piece_length = 16384usize;
+    let a: Vec<u8> = (0..20_000u32).map(|i| (i * 5) as u8).collect();
+    let b = vec![0x42u8; 100];
+    let pieces = vec![a[..piece_length].to_vec(), a[piece_length..].to_vec(), b.clone()];
+    let info_hash = [0x73; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = spawn_mock_peer(listener, info_hash, pieces.clone(), Duration::ZERO);
+
+    let work: Vec<PieceWork> = pieces
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let width = (p.len().div_ceil(16384)).next_power_of_two() as u32;
+            let root = crate::v2::merkle_root(&crate::v2::block_hashes(p), width as usize, [0u8; 32]);
+            PieceWork { index: i as u32, hash: <[u8; 20]>::try_from(&root[..20]).unwrap(), length: p.len() as u32, merkle: Some(crate::downloader::piece_assembler::Merkle { root, width }) }
+        })
+        .collect();
+    let queue = Arc::new(WorkQueue::new(work, 3));
+    let dir = tmp_dir("v2-worker");
+    let files = vec![(vec!["a".to_string()], 20_000i64), (vec!["b".to_string()], 100)];
+    let spans = Arc::new(crate::downloader::file_writer::build_file_spans_aligned(&dir, &files, piece_length as u64));
+    let (tx, rx) = mpsc::channel();
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default() };
+
+    run_worker(addr, &config, &queue, &spans, piece_length as u64, &tx, None).unwrap();
+    mock.join().unwrap();
+
+    assert_eq!(rx.try_iter().count(), 3);
+    assert_eq!(fs::read(dir.join("a")).unwrap(), a);
+    assert_eq!(fs::read(dir.join("b")).unwrap(), b, "b begins on a piece boundary of its own");
+}
+
+#[test]
+fn a_v2_piece_that_does_not_come_to_its_root_is_refused_like_a_v1_one_that_fails_its_hash() {
+    let info_hash = [0x74; 20];
+    let piece = vec![0x11u8; 16384];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = spawn_mock_peer(listener, info_hash, vec![piece.clone()], Duration::ZERO);
+    let wrong_root = crate::v2::merkle_root(&crate::v2::block_hashes(&[0x99u8; 16384]), 1, [0u8; 32]);
+    let work = vec![PieceWork { index: 0, hash: [0; 20], length: 16384, merkle: Some(crate::downloader::piece_assembler::Merkle { root: wrong_root, width: 1 }) }];
+    let queue = Arc::new(WorkQueue::new(work, 1));
+    let dir = tmp_dir("v2-worker-bad");
+    let spans = Arc::new(build_file_spans(&dir, &[(vec!["f".to_string()], 16384)]));
+    let (tx, rx) = mpsc::channel();
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default() };
+
+    let result = run_worker(addr, &config, &queue, &spans, 16384, &tx, None);
+
+    assert!(matches!(result, Err(WorkerError::PieceHashMismatch)), "{:?}", result);
+    assert_eq!(rx.try_iter().count(), 0);
+    assert!(!dir.join("f").exists(), "nothing unverified reached the disk");
+    let _ = mock.join();
 }

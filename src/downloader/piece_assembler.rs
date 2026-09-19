@@ -7,11 +7,37 @@ use sha1::{Digest, Sha1};
 
 pub const BLOCK_SIZE: u32 = 16 * 1024;
 
+/// How a piece of a BitTorrent v2 torrent (BEP 52) is checked: the SHA-256
+/// merkle root its blocks must come to, in a tree `width` leaves wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Merkle {
+    pub root: [u8; 32],
+    pub width: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PieceWork {
     pub index: u32,
+    /// What the piece hashes to under SHA-1 (v1). For a v2 piece, the first 20
+    /// bytes of `merkle.root`, which stands for it where only a name is needed.
     pub hash: [u8; 20],
     pub length: u32,
+    /// Set for a piece of a v2 torrent, which is checked against this
+    /// instead of `hash`.
+    pub merkle: Option<Merkle>,
+}
+
+impl PieceWork {
+    /// Whether `data` is this piece.
+    pub fn matches(&self, data: &[u8]) -> bool {
+        match self.merkle {
+            Some(merkle) => crate::v2::merkle_matches(data, merkle.width as usize, &merkle.root),
+            None => {
+                let actual: [u8; 20] = Sha1::digest(data).into();
+                actual == self.hash
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -196,10 +222,7 @@ impl PieceAssembler {
         if !self.is_complete() {
             return Err(AssemblerError::AlreadyComplete); // reuse variant: "not done" is the same "don't trust this yet" signal
         }
-        let mut hasher = Sha1::new();
-        hasher.update(&self.buf);
-        let actual: [u8; 20] = hasher.finalize().into();
-        if actual != self.work.hash {
+        if !self.work.matches(&self.buf) {
             return Err(AssemblerError::HashMismatch);
         }
         Ok(self.buf)
@@ -219,7 +242,7 @@ mod tests {
     #[test]
     fn single_block_piece_full_flow() {
         let data = vec![0xABu8; 100];
-        let work = PieceWork { index: 0, hash: hash_of(&data), length: 100 };
+        let work = PieceWork { index: 0, hash: hash_of(&data), length: 100, merkle: None };
         let mut asm = PieceAssembler::new(work);
 
         let reqs = asm.next_requests(5);
@@ -235,7 +258,7 @@ mod tests {
     fn multi_block_piece_pipelines_requests() {
         let length = BLOCK_SIZE * 3 + 100; // 3 full blocks + 1 short block
         let data = vec![0x11u8; length as usize];
-        let work = PieceWork { index: 2, hash: hash_of(&data), length };
+        let work = PieceWork { index: 2, hash: hash_of(&data), length, merkle: None };
         let mut asm = PieceAssembler::new(work);
 
         let reqs = asm.next_requests(2);
@@ -256,7 +279,7 @@ mod tests {
     fn out_of_order_blocks_are_accepted() {
         let length = BLOCK_SIZE * 2;
         let data = vec![0x22u8; length as usize];
-        let work = PieceWork { index: 0, hash: hash_of(&data), length };
+        let work = PieceWork { index: 0, hash: hash_of(&data), length, merkle: None };
         let mut asm = PieceAssembler::new(work);
         asm.next_requests(2);
 
@@ -270,7 +293,7 @@ mod tests {
 
     #[test]
     fn rejects_block_extending_past_piece_length() {
-        let work = PieceWork { index: 0, hash: [0; 20], length: 100 };
+        let work = PieceWork { index: 0, hash: [0; 20], length: 100, merkle: None };
         let mut asm = PieceAssembler::new(work);
         let err = asm.record_block(90, &[0u8; 50]).unwrap_err();
         assert!(matches!(err, AssemblerError::BlockOutOfRange { .. }));
@@ -278,7 +301,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_size_block() {
-        let work = PieceWork { index: 0, hash: [0; 20], length: BLOCK_SIZE * 2 };
+        let work = PieceWork { index: 0, hash: [0; 20], length: BLOCK_SIZE * 2, merkle: None };
         let mut asm = PieceAssembler::new(work);
         let err = asm.record_block(0, &[0u8; 10]).unwrap_err(); // should be BLOCK_SIZE
         assert!(matches!(err, AssemblerError::UnexpectedBlockSize { .. }));
@@ -287,7 +310,7 @@ mod tests {
     #[test]
     fn finish_fails_on_hash_mismatch() {
         let data = vec![0x33u8; 50];
-        let work = PieceWork { index: 0, hash: [0; 20], length: 50 }; // wrong hash on purpose
+        let work = PieceWork { index: 0, hash: [0; 20], length: 50, merkle: None }; // wrong hash on purpose
         let mut asm = PieceAssembler::new(work);
         asm.record_block(0, &data).unwrap();
         assert!(matches!(asm.finish(), Err(AssemblerError::HashMismatch)));
@@ -296,7 +319,7 @@ mod tests {
     #[test]
     fn missing_block_count_tracks_progress() {
         let length = BLOCK_SIZE * 4;
-        let work = PieceWork { index: 0, hash: [0; 20], length };
+        let work = PieceWork { index: 0, hash: [0; 20], length, merkle: None };
         let mut asm = PieceAssembler::new(work);
         assert_eq!(asm.missing_block_count(), 4);
         asm.record_block(0, &vec![0u8; BLOCK_SIZE as usize]).unwrap();
@@ -305,7 +328,7 @@ mod tests {
 
     #[test]
     fn double_request_never_hands_out_same_block_twice() {
-        let work = PieceWork { index: 0, hash: [0; 20], length: BLOCK_SIZE };
+        let work = PieceWork { index: 0, hash: [0; 20], length: BLOCK_SIZE, merkle: None };
         let mut asm = PieceAssembler::new(work);
         assert_eq!(asm.next_requests(10).len(), 1);
         assert_eq!(asm.next_requests(10).len(), 0);
@@ -314,7 +337,7 @@ mod tests {
     #[test]
     fn requests_never_include_a_block_that_has_already_arrived() {
         let data = vec![7u8; (BLOCK_SIZE * 3) as usize];
-        let mut a = PieceAssembler::new(PieceWork { index: 0, hash: hash_of(&data), length: data.len() as u32 });
+        let mut a = PieceAssembler::new(PieceWork { index: 0, hash: hash_of(&data), length: data.len() as u32, merkle: None });
         a.record_block(BLOCK_SIZE, &data[..BLOCK_SIZE as usize]).unwrap(); // the middle block, unasked
 
         let requests = a.next_requests(10);
@@ -325,7 +348,7 @@ mod tests {
     #[test]
     fn forgetting_requests_makes_the_missing_blocks_come_round_again_and_only_those() {
         let data: Vec<u8> = (0..(BLOCK_SIZE * 4) as usize).map(|i| i as u8).collect();
-        let mut a = PieceAssembler::new(PieceWork { index: 9, hash: hash_of(&data), length: data.len() as u32 });
+        let mut a = PieceAssembler::new(PieceWork { index: 9, hash: hash_of(&data), length: data.len() as u32, merkle: None });
         assert_eq!(a.next_requests(4).len(), 4, "everything requested");
         assert!(a.next_requests(4).is_empty(), "and nothing left to request");
         a.record_block(0, &data[..BLOCK_SIZE as usize]).unwrap();
@@ -342,7 +365,7 @@ mod tests {
 
     fn four_block_piece() -> (Vec<u8>, PieceWork) {
         let data: Vec<u8> = (0..(BLOCK_SIZE * 4) as usize).map(|i| (i as u8).wrapping_mul(7)).collect();
-        let work = PieceWork { index: 3, hash: hash_of(&data), length: data.len() as u32 };
+        let work = PieceWork { index: 3, hash: hash_of(&data), length: data.len() as u32, merkle: None };
         (data, work)
     }
 
@@ -378,7 +401,7 @@ mod tests {
     #[test]
     fn a_partial_that_does_not_fit_the_piece_is_ignored() {
         let (data, work) = four_block_piece();
-        let mut other = PieceAssembler::new(PieceWork { index: 3, hash: [0; 20], length: BLOCK_SIZE * 2 });
+        let mut other = PieceAssembler::new(PieceWork { index: 3, hash: [0; 20], length: BLOCK_SIZE * 2, merkle: None });
         other.record_block(0, block(&data, 0)).unwrap();
         let partial = other.into_partial().unwrap();
 
@@ -403,7 +426,7 @@ mod tests {
 
     fn four_blocks() -> PieceAssembler {
         let length = BLOCK_SIZE * 4;
-        PieceAssembler::new(PieceWork { index: 6, hash: [0; 20], length })
+        PieceAssembler::new(PieceWork { index: 6, hash: [0; 20], length, merkle: None })
     }
 
     #[test]
@@ -445,5 +468,35 @@ mod tests {
         asm.forget_requests();
         let asked = asm.next_requests(10);
         assert_eq!(asked.len(), 4, "every missing block once, the refused one not twice: {:?}", asked);
+    }
+
+    #[test]
+    fn a_v2_piece_is_verified_by_its_merkle_tree_not_by_sha1() {
+        // Two blocks and a bit of a four-block piece, as the last piece of a file is.
+        let data: Vec<u8> = (0..BLOCK_SIZE * 2 + 100).map(|i| (i * 7) as u8).collect();
+        let root = crate::v2::merkle_root(&crate::v2::block_hashes(&data), 4, [0u8; 32]);
+        let work = PieceWork { index: 3, hash: [0u8; 20], length: data.len() as u32, merkle: Some(Merkle { root, width: 4 }) };
+        let mut asm = PieceAssembler::new(work.clone());
+        for (index, begin, length) in asm.next_requests(10) {
+            assert_eq!(index, 3);
+            asm.record_block(begin, &data[begin as usize..(begin + length) as usize]).unwrap();
+        }
+        assert_eq!(asm.finish().unwrap(), data, "verified though `hash` (the SHA-1 slot) is not the SHA-1 of anything");
+
+        let mut wrong = data.clone();
+        wrong[5] ^= 1;
+        let mut asm = PieceAssembler::new(work);
+        for (_, begin, length) in asm.next_requests(10) {
+            asm.record_block(begin, &wrong[begin as usize..(begin + length) as usize]).unwrap();
+        }
+        assert_eq!(asm.finish().unwrap_err(), AssemblerError::HashMismatch);
+    }
+
+    #[test]
+    fn without_a_merkle_check_a_piece_is_still_checked_by_sha1() {
+        let data = vec![9u8; 500];
+        let good = PieceWork { index: 0, hash: hash_of(&data), length: 500, merkle: None };
+        assert!(good.matches(&data));
+        assert!(!good.matches(&[8u8; 500]));
     }
 }

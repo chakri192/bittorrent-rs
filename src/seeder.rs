@@ -132,12 +132,17 @@ struct SeederShared {
     /// The info dictionary, for peers that ask for it.
     metadata: Option<Arc<Vec<u8>>>,
     encryption: crate::peer::Encryption,
+    piece_lengths: Option<Arc<Vec<u32>>>,
 }
 
 impl SeederShared {
     /// Actual byte length of `piece_index` (the final piece is usually
     /// shorter than `piece_length`).
     fn piece_len(&self, piece_index: u32) -> u64 {
+        // In a v2 torrent every file's last piece is short.
+        if let Some(lengths) = &self.piece_lengths {
+            return lengths.get(piece_index as usize).map_or(0, |&length| u64::from(length));
+        }
         let start = piece_index as u64 * self.piece_length;
         self.piece_length.min(self.total_length.saturating_sub(start))
     }
@@ -182,13 +187,16 @@ pub struct SeederOptions {
     pub metadata: Option<Arc<Vec<u8>>>,
     /// A uTP socket to take connections on as well as TCP ones (BEP 29).
     pub utp: Option<Arc<crate::utp::UtpSocket>>,
+    /// The length of every piece, where they are not all `piece_length` but for
+    /// the last (a v2 torrent, whose pieces never span files).
+    pub piece_lengths: Option<Arc<Vec<u32>>>,
 }
 
 impl Default for SeederOptions {
     fn default() -> Self {
         // Both are accepted by default: a peer that offers encryption is
         // taken up on it, and one that does not is served all the same.
-        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL, encryption: crate::peer::Encryption::Prefer, metadata: None, utp: None }
+        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL, encryption: crate::peer::Encryption::Prefer, metadata: None, utp: None, piece_lengths: None }
     }
 }
 
@@ -242,6 +250,7 @@ pub fn start_with(
         choker: Arc::new(Choker::new(options.unchoke_slots)),
         metadata: options.metadata.clone(),
         encryption: options.encryption,
+        piece_lengths: options.piece_lengths.clone(),
     });
 
     // The rounds: who is served changes here, and each connection notices
@@ -1438,5 +1447,49 @@ mod tests {
         }
         assert!(got.iter().all(|m| !matches!(m, Message::RejectRequest { .. } | Message::Piece { .. })), "BEP 3: ignored, not rejected: {:?}", got);
         seed.stop();
+    }
+
+    #[test]
+    fn a_v2_seeder_knows_each_pieces_own_length_and_serves_it_from_the_aligned_layout() {
+        use crate::downloader::file_writer::build_file_spans_aligned;
+        let dir = tmp_dir("v2-seed");
+        // a: 300 bytes in pieces of 256 (256 + 44), b: 100 bytes (one piece).
+        let files = vec![(vec!["a".to_string()], 300i64), (vec!["b".to_string()], 100)];
+        let spans = Arc::new(build_file_spans_aligned(&dir, &files, 256));
+        let pieces = [vec![0x11u8; 256], vec![0x22u8; 44], vec![0x33u8; 100]];
+        for (i, p) in pieces.iter().enumerate() {
+            write_piece(&spans, i as u32, 256, p).unwrap();
+        }
+        let have = Arc::new(HaveMap::new(3));
+        (0..3).for_each(|i| have.set(i));
+        let info_hash = [0x68; 20];
+        let options = SeederOptions { piece_lengths: Some(Arc::new(vec![256, 44, 100])), ..Default::default() };
+        let mut seeder = start_with(0, info_hash, [0x20; 20], spans, 256, 400, have, None, options).unwrap();
+
+        let (mut stream, bitfield) = leech_connect(seeder.port, info_hash);
+        assert_eq!(&bitfield[..3], &[true, true, true]);
+        Message::Interested.write_to(&mut stream).unwrap();
+        loop {
+            if matches!(Message::read_from(&mut stream).unwrap(), Message::Unchoke) {
+                break;
+            }
+        }
+        for (index, expected) in pieces.iter().enumerate() {
+            Message::Request { index: index as u32, begin: 0, length: expected.len() as u32 }.write_to(&mut stream).unwrap();
+            let block = loop {
+                if let Message::Piece { index: i, block, .. } = Message::read_from(&mut stream).unwrap() {
+                    if i as usize == index {
+                        break block;
+                    }
+                }
+            };
+            assert_eq!(&block, expected, "piece {}", index);
+        }
+        // Past the end of a short piece is not served, though the arithmetic of a
+        // uniform piece length would have allowed it.
+        Message::Request { index: 1, begin: 0, length: 100 }.write_to(&mut stream).unwrap();
+        stream.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+        assert!(Message::read_from(&mut stream).is_err(), "nothing comes back for a request longer than the piece is");
+        seeder.stop();
     }
 }

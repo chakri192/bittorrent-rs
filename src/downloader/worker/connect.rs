@@ -105,7 +105,7 @@ mod tests {
     }
 
     fn queue(pieces: usize) -> WorkQueue {
-        WorkQueue::new((0..pieces).map(|i| PieceWork { index: i as u32, hash: [0; 20], length: 16 }).collect(), pieces)
+        WorkQueue::new((0..pieces).map(|i| PieceWork { index: i as u32, hash: [0; 20], length: 16, merkle: None }).collect(), pieces)
     }
 
     /// A peer that completes the handshake (advertising BEP 10 support or

@@ -456,7 +456,7 @@ mod tests {
     /// As [`session_with_floor`], with the whole retry policy chosen.
     fn session_with_policy<'a>(sink: &'a Arc<RecordingSink>, services: &'a Services, dir: &Path, peers: &[SocketAddr], timeout: Option<Duration>, floor: Duration, policy: crate::session::peer_pool::RetryPolicy) -> Session<'a> {
         let data = data();
-        let work = data.chunks(PIECE_LEN).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32 }).collect();
+        let work = data.chunks(PIECE_LEN).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32, merkle: None }).collect();
         let queue = Arc::new(WorkQueue::new(work, PIECES));
         let spans = Arc::new(build_file_spans(dir, &[(vec!["f.bin".to_string()], data.len() as i64)]));
         let config = Arc::new(WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(1), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default() });

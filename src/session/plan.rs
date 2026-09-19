@@ -34,7 +34,7 @@ impl DownloadPlan {
     /// `mask[i]` says whether file `i` is selected.
     pub fn new(torrent: &TorrentFile, mask: &[bool]) -> Self {
         let selective = !selection::selects_everything(mask);
-        let (selected, selected_bytes) = selection::selected_pieces(&torrent.files, torrent.piece_length as u64, mask);
+        let (selected, selected_bytes) = selection::selected_pieces_of(torrent, mask);
         DownloadPlan {
             selective,
             display_total: if selective { selected_bytes } else { torrent.total_length() },

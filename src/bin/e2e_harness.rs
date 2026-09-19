@@ -109,8 +109,13 @@ enum Kind {
     /// BitTorrent v2 (BEP 52): `create_torrent --v2` makes the torrent an
     /// independently written builder makes (same info hash), the client
     /// lists it, `--verify` passes intact files and names a damaged one, and
-    /// a download is refused with a message saying why.
+    /// a download of a copy without its piece layers is refused, saying why.
     V2Torrents,
+    /// BitTorrent v2 (BEP 52) downloads: a v2-only torrent (built by hand,
+    /// with piece layers and multi-block pieces) is downloaded from a fake
+    /// peer byte for byte, and the client as a seeder serves it to a
+    /// leecher, each verified by the merkle trees.
+    V2Download,
     /// uTP (BEP 29): a peer reachable only over uTP is downloaded from with
     /// `--transport both` and `--transport utp` and is out of reach for
     /// `tcp`; and as a seeder the client serves a leecher that comes in over
@@ -185,6 +190,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "tracker-redirect", kind: Kind::TrackerRedirect },
     Scenario { name: "encryption", kind: Kind::Encryption },
     Scenario { name: "v2-torrents", kind: Kind::V2Torrents },
+    Scenario { name: "v2-download", kind: Kind::V2Download },
     Scenario { name: "utp", kind: Kind::Utp },
     Scenario { name: "local-discovery", kind: Kind::LocalDiscovery },
     Scenario { name: "fast-extension", kind: Kind::FastExtension },
@@ -233,6 +239,7 @@ fn main() {
             Kind::TrackerRedirect => run_tracker_redirect(scenario.name),
             Kind::Encryption => run_encryption(scenario.name),
             Kind::V2Torrents => run_v2_torrents(scenario.name),
+            Kind::V2Download => run_v2_download(scenario.name),
             Kind::Utp => run_utp(scenario.name),
             Kind::LocalDiscovery => run_local_discovery(scenario.name),
             Kind::FastExtension => run_fast_extension(scenario.name),
@@ -273,6 +280,10 @@ struct Fixture {
     piece_count: usize,
     info_bytes: Vec<u8>,
     info_hash: [u8; 20],
+    /// For a v2 torrent: the bytes of every piece, in piece order (a piece never spans files).
+    v2_pieces: Option<Vec<Vec<u8>>>,
+    /// For a v2 torrent: the `piece layers` entry of the .torrent file, bencoded, key and all.
+    torrent_extra: Vec<u8>,
 }
 
 /// `len` bytes that differ from `salt` to `salt` and don't repeat within a
@@ -338,7 +349,7 @@ impl Fixture {
             .iter()
             .map(|(path, content)| (if single { path.join("/") } else { format!("{}/{}", name, path.join("/")) }, content.clone()))
             .collect();
-        Fixture { files, piece_count: pieces_concat.len() / 20, data, piece_len, info_bytes: v, info_hash }
+        Fixture { files, piece_count: pieces_concat.len() / 20, data, piece_len, info_bytes: v, info_hash, v2_pieces: None, torrent_extra: Vec::new() }
     }
 
     /// A magnet link for this torrent naming the tracker at `tracker_addr`.
@@ -357,8 +368,103 @@ impl Fixture {
         v.extend_from_slice(format!("8:announce{}:{}", announce_url.len(), announce_url).as_bytes());
         v.extend_from_slice(b"4:info");
         v.extend_from_slice(&self.info_bytes);
+        v.extend_from_slice(&self.torrent_extra);
         v.extend_from_slice(b"e");
         v
+    }
+
+    /// A BitTorrent v2 torrent (BEP 52) of `files`, built by hand: the only
+    /// thing taken from the library is the SHA-256 primitive. Its pieces are
+    /// cut file by file, and its info hash is the first 20 bytes of the
+    /// SHA-256 of the info dictionary. `name/` prefixes the files' paths in the
+    /// output directory unless there is a single file named `name`.
+    fn build_v2(name: &str, files: &[(Vec<&str>, Vec<u8>)], piece_len: usize) -> Self {
+        use bittorrent_rs::sha256::sha256;
+        const BLOCK: usize = 16384;
+        fn root(leaves: &[[u8; 32]], width: usize, pad: [u8; 32]) -> [u8; 32] {
+            let mut level = leaves.to_vec();
+            level.resize(width, pad);
+            while level.len() > 1 {
+                level = level.chunks(2).map(|pair| sha256(&[pair[0].as_slice(), pair[1].as_slice()].concat())).collect();
+            }
+            level[0]
+        }
+        fn bstr(bytes: &[u8]) -> Vec<u8> {
+            let mut out = format!("{}:", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out
+        }
+        enum Node {
+            Dir(std::collections::BTreeMap<String, Node>),
+            File(usize, Option<[u8; 32]>),
+        }
+        fn encode(node: &Node) -> Vec<u8> {
+            match node {
+                Node::File(length, root) => {
+                    let mut out = format!("d0:d6:lengthi{}e", length).into_bytes();
+                    if let Some(root) = root {
+                        out.extend_from_slice(b"11:pieces root");
+                        out.extend_from_slice(&bstr(root));
+                    }
+                    out.extend_from_slice(b"ee");
+                    out
+                }
+                Node::Dir(entries) => {
+                    let mut out = b"d".to_vec();
+                    for (name, child) in entries {
+                        out.extend_from_slice(&bstr(name.as_bytes()));
+                        out.extend_from_slice(&encode(child));
+                    }
+                    out.push(b'e');
+                    out
+                }
+            }
+        }
+        let blocks_per_piece = piece_len / BLOCK;
+        let mut zero_piece = [0u8; 32];
+        for _ in 0..blocks_per_piece.trailing_zeros() {
+            zero_piece = sha256(&[zero_piece.as_slice(), zero_piece.as_slice()].concat());
+        }
+
+        let mut tree = std::collections::BTreeMap::new();
+        let mut layers: std::collections::BTreeMap<[u8; 32], Vec<u8>> = std::collections::BTreeMap::new();
+        let mut pieces = Vec::new();
+        for (path, content) in files {
+            let file_root = if content.is_empty() {
+                None
+            } else if content.len() <= piece_len {
+                let leaves: Vec<[u8; 32]> = content.chunks(BLOCK).map(sha256).collect();
+                pieces.push(content.clone());
+                Some(root(&leaves, leaves.len().next_power_of_two(), [0; 32]))
+            } else {
+                let layer: Vec<[u8; 32]> = content.chunks(piece_len).map(|piece| root(&piece.chunks(BLOCK).map(sha256).collect::<Vec<_>>(), blocks_per_piece, [0; 32])).collect();
+                pieces.extend(content.chunks(piece_len).map(<[u8]>::to_vec));
+                let file_root = root(&layer, layer.len().next_power_of_two(), zero_piece);
+                layers.insert(file_root, layer.concat());
+                Some(file_root)
+            };
+            let mut node = &mut tree;
+            for part in &path[..path.len() - 1] {
+                let Node::Dir(next) = node.entry(part.to_string()).or_insert_with(|| Node::Dir(Default::default())) else { unreachable!("a file and a directory of one name") };
+                node = next;
+            }
+            node.insert(path[path.len() - 1].to_string(), Node::File(content.len(), file_root));
+        }
+        let mut info = b"d9:file tree".to_vec();
+        info.extend_from_slice(&encode(&Node::Dir(tree)));
+        info.extend_from_slice(format!("12:meta versioni2e4:name{}:{}12:piece lengthi{}ee", name.len(), name, piece_len).as_bytes());
+        let mut info_hash = [0u8; 20];
+        info_hash.copy_from_slice(&sha256(&info)[..20]);
+
+        let mut extra = b"12:piece layersd".to_vec();
+        for (file_root, layer) in &layers {
+            extra.extend_from_slice(&bstr(file_root));
+            extra.extend_from_slice(&bstr(layer));
+        }
+        extra.push(b'e');
+        let single = files.len() == 1 && files[0].0 == [name];
+        let out_files = files.iter().map(|(path, content)| (if single { path.join("/") } else { format!("{}/{}", name, path.join("/")) }, content.clone())).collect();
+        Fixture { files: out_files, data: files.iter().flat_map(|(_, c)| c.iter().copied()).collect(), piece_len, piece_count: pieces.len(), info_bytes: info, info_hash, v2_pieces: Some(pieces), torrent_extra: extra }
     }
 }
 
@@ -490,6 +596,8 @@ struct PeerContext {
     info_hash: [u8; 20],
     piece_len: usize,
     piece_count: usize,
+    /// Every piece's bytes, where they are not simply `data` cut into `piece_len`s (a v2 torrent).
+    pieces: Option<Arc<Vec<Vec<u8>>>>,
 }
 
 /// Starts a fake tracker (answers every announce with the full peer list,
@@ -514,7 +622,7 @@ fn spawn_swarm_full(fx: &Fixture, behaviors: Vec<Behavior>, mode: TrackerMode, e
         peer_addrs.push(listener.local_addr().unwrap());
         let log = Arc::new(Mutex::new(PeerLog::default()));
         logs.push(Arc::clone(&log));
-        let cx = PeerContext { encryption, data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count };
+        let cx = PeerContext { encryption, data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count, pieces: fx.v2_pieces.clone().map(Arc::new) };
         thread::spawn(move || run_fake_peer(listener, cx, behavior, log));
     }
 
@@ -587,7 +695,7 @@ fn spawn_utp_swarm(fx: &Fixture, behaviors: Vec<Behavior>) -> (Swarm, Vec<Arc<bi
         peer_addrs.push(SocketAddr::from(([127, 0, 0, 1], port)));
         let log = Arc::new(Mutex::new(PeerLog::default()));
         logs.push(Arc::clone(&log));
-        let cx = Arc::new(PeerContext { encryption: bittorrent_rs::peer::Encryption::Off, data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count });
+        let cx = Arc::new(PeerContext { encryption: bittorrent_rs::peer::Encryption::Off, data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count, pieces: fx.v2_pieces.clone().map(Arc::new) });
         let behavior = Arc::new(behavior);
         let accepting = Arc::clone(&socket);
         thread::spawn(move || {
@@ -692,6 +800,13 @@ fn serve_stream(stream: Box<dyn bittorrent_rs::peer::PeerStream>, over_utp: bool
             Ok(Message::Request { index, begin, length }) => {
                 let piece_start = index as usize * cx.piece_len;
                 let piece_end = (piece_start + cx.piece_len).min(cx.data.len());
+                let piece_bytes: &[u8] = match &cx.pieces {
+                    Some(pieces) => match pieces.get(index as usize) {
+                        Some(bytes) => bytes,
+                        None => continue,
+                    },
+                    None => &cx.data[piece_start.min(piece_end)..piece_end],
+                };
                 if let (Behavior::Fast(allowed), true) = (behavior, choking) {
                     if !allowed.contains(&index) {
                         let mut log = log.lock().unwrap();
@@ -723,7 +838,7 @@ fn serve_stream(stream: Box<dyn bittorrent_rs::peer::PeerStream>, over_utp: bool
                     // The piece counts as served once its last block is
                     // sent -- recorded *before* the send, so it is never
                     // behind what the client can have received.
-                    if log.dropped_piece != Some(index) && (begin + length) as usize == piece_end - piece_start {
+                    if log.dropped_piece != Some(index) && (begin + length) as usize == piece_bytes.len() {
                         log.served.insert(index);
                     }
                     log.dropped_piece == Some(index)
@@ -737,7 +852,8 @@ fn serve_stream(stream: Box<dyn bittorrent_rs::peer::PeerStream>, over_utp: bool
                 if matches!(behavior, Behavior::DropFirstConnection) && nth_connection == 1 {
                     return; // hang up on the request
                 }
-                let mut block = cx.data[piece_start..piece_end][begin as usize..(begin + length) as usize].to_vec();
+                let Some(slice) = piece_bytes.get(begin as usize..(begin + length) as usize) else { continue };
+                let mut block = slice.to_vec();
                 if matches!(behavior, Behavior::Corrupt) {
                     block.iter_mut().for_each(|b| *b ^= 0xFF);
                 }
@@ -2482,81 +2598,10 @@ fn run_serve_metadata(name: &str) -> Result<String, String> {
 /// against the standard's vectors), and `create_torrent --v2` must come to the
 /// same hash.
 fn run_v2_torrents(name: &str) -> Result<String, String> {
-    use bittorrent_rs::sha256::sha256;
     const BLOCK: usize = 16384;
-    const PIECE: usize = 16384;
-
-    // The merkle root of `leaves` padded to `width` with `pad`.
-    fn root(leaves: &[[u8; 32]], width: usize, pad: [u8; 32]) -> [u8; 32] {
-        let mut level = leaves.to_vec();
-        level.resize(width, pad);
-        while level.len() > 1 {
-            level = level.chunks(2).map(|pair| sha256(&[pair[0].as_slice(), pair[1].as_slice()].concat())).collect();
-        }
-        level[0]
-    }
-    // (pieces root, piece layer) of a file's bytes at a piece length of one block.
-    fn file_tree_entry(content: &[u8]) -> (Option<[u8; 32]>, Vec<[u8; 32]>) {
-        if content.is_empty() {
-            return (None, Vec::new());
-        }
-        let leaves: Vec<[u8; 32]> = content.chunks(BLOCK).map(sha256).collect();
-        if content.len() <= PIECE {
-            return (Some(root(&leaves, leaves.len().next_power_of_two(), [0; 32])), Vec::new());
-        }
-        // A piece is one block here, so the piece layer is the leaves and the padding is zero.
-        (Some(root(&leaves, leaves.len().next_power_of_two(), [0; 32])), leaves)
-    }
-    fn bstr(bytes: &[u8]) -> Vec<u8> {
-        let mut out = format!("{}:", bytes.len()).into_bytes();
-        out.extend_from_slice(bytes);
-        out
-    }
-    enum Node {
-        Dir(std::collections::BTreeMap<String, Node>),
-        File(usize, Option<[u8; 32]>),
-    }
-    fn encode(node: &Node) -> Vec<u8> {
-        match node {
-            Node::File(length, root) => {
-                let mut leaf = format!("d6:lengthi{}e", length).into_bytes();
-                if let Some(root) = root {
-                    leaf.extend_from_slice(b"11:pieces root");
-                    leaf.extend_from_slice(&bstr(root));
-                }
-                leaf.push(b'e');
-                let mut out = b"d0:".to_vec();
-                out.extend_from_slice(&leaf);
-                out.push(b'e');
-                out
-            }
-            Node::Dir(entries) => {
-                let mut out = b"d".to_vec();
-                for (name, child) in entries {
-                    out.extend_from_slice(&bstr(name.as_bytes()));
-                    out.extend_from_slice(&encode(child));
-                }
-                out.push(b'e');
-                out
-            }
-        }
-    }
-
     let files: Vec<(Vec<&str>, Vec<u8>)> = vec![(vec!["a.bin"], pattern(40_000, 1)), (vec!["sub", "b.bin"], pattern(5000, 2)), (vec!["z.bin"], pattern(2 * BLOCK, 3)), (vec!["empty"], Vec::new())];
-    let mut tree = std::collections::BTreeMap::new();
-    for (path, content) in &files {
-        let (file_root, _) = file_tree_entry(content);
-        let mut node = &mut tree;
-        for part in &path[..path.len() - 1] {
-            let Node::Dir(next) = node.entry(part.to_string()).or_insert_with(|| Node::Dir(Default::default())) else { return Err("a file and a directory of one name".to_string()) };
-            node = next;
-        }
-        node.insert(path[path.len() - 1].to_string(), Node::File(content.len(), file_root));
-    }
-    let mut info = b"d9:file tree".to_vec();
-    info.extend_from_slice(&encode(&Node::Dir(tree)));
-    info.extend_from_slice(format!("12:meta versioni2e4:name4:pack12:piece lengthi{}ee", PIECE).as_bytes());
-    let expected_hash = sha256(&info);
+    let fx = Fixture::build_v2("pack", &files, BLOCK);
+    let (info, expected_hash) = (fx.info_bytes.clone(), fx.info_hash);
 
     // The tree of directories on disk.
     let dir = scratch_dir(name);
@@ -2575,8 +2620,8 @@ fn run_v2_torrents(name: &str) -> Result<String, String> {
     }
     let bytes = fs::read(&torrent_path).map_err(|e| e.to_string())?;
     let parsed = bittorrent_rs::torrent::parse_torrent_file(&bytes).map_err(|e| format!("the client cannot read what create_torrent --v2 wrote: {}", e))?;
-    if !parsed.is_v2_only() || parsed.info_hash[..] != expected_hash[..20] {
-        return Err(format!("info hash {} differs from the independently built {}", bittorrent_rs::torrent::info_hash_hex(&parsed.info_hash), expected_hash[..20].iter().map(|b| format!("{:02x}", b)).collect::<String>()));
+    if !parsed.is_v2_only() || parsed.info_hash != expected_hash {
+        return Err(format!("info hash {} differs from the independently built {}", bittorrent_rs::torrent::info_hash_hex(&parsed.info_hash), bittorrent_rs::torrent::info_hash_hex(&expected_hash)));
     }
     // The info dictionary is byte for byte what the harness wrote.
     let (start, end) = (bytes.windows(info.len()).position(|w| w == info.as_slice()), info.len());
@@ -2614,13 +2659,118 @@ fn run_v2_torrents(name: &str) -> Result<String, String> {
         return Err(format!("a damaged file should be named, and only its bad piece not counted; exit {:?}, stderr {:?}", damaged.status.code(), stderr.trim()));
     }
 
-    // A download is refused, and says why.
-    let refused = run(&["--timeout", "5"])?;
-    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
-    if refused.status.success() || !stderr.contains("BitTorrent v2") {
-        return Err(format!("downloading a v2-only torrent should be refused, saying so; exit {:?}, stderr {:?}", refused.status.code(), stderr.trim()));
+    // Without its piece layers there is nothing to check the pieces against, and a download is refused, saying so.
+    let mut top = bittorrent_rs::bencode::decode(&bytes).map_err(|e| e.to_string())?;
+    if let bittorrent_rs::bencode::Bencode::Dict(entries) = &mut top {
+        entries.remove(b"piece layers".as_slice());
     }
-    Ok(format!("create_torrent --v2 made the independently built info hash ({}), --list named the files, --verify passed intact ones and caught a wrong byte to the piece, and a download was refused with a reason", &bittorrent_rs::torrent::info_hash_hex(&parsed.info_hash)[..8]))
+    let bare = dir.join("bare.torrent");
+    fs::write(&bare, bittorrent_rs::bencode::encode(&top)).map_err(|e| e.to_string())?;
+    let refused = client_command(&bare, &dir.join("out2"), &dir.join("client2.log"), 1).args(["--no-dht", "--timeout", "5"]).output().map_err(|e| format!("running the client: {}", e))?;
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    if refused.status.success() || !stderr.contains("piece layers") {
+        return Err(format!("a v2-only torrent without piece layers should be refused, saying why; exit {:?}, stderr {:?}", refused.status.code(), stderr.trim()));
+    }
+    Ok(format!("create_torrent --v2 made the independently built info hash ({}), --list named the files, --verify passed intact ones and caught a wrong byte to the piece, and a copy without its piece layers was refused for a download, with the reason", &bittorrent_rs::torrent::info_hash_hex(&parsed.info_hash)[..8]))
+}
+
+/// A v2-only torrent is downloaded. The fake peer serves pieces by the v2
+/// layout (a file's last piece is short, and no piece spans two files), the
+/// client checks each against the merkle trees of the torrent's piece layers,
+/// and writes each file whole. Then, as a seeder, it serves those pieces back
+/// to a leecher, which verifies them itself with the harness's own trees.
+fn run_v2_download(name: &str) -> Result<String, String> {
+    const PIECE: usize = 32768; // two blocks
+    let files: Vec<(Vec<&str>, Vec<u8>)> = vec![(vec!["a.bin"], pattern(100_000, 1)), (vec!["sub", "b.bin"], pattern(20_000, 2)), (vec!["sub", "deep", "c.bin"], pattern(2 * PIECE, 3)), (vec!["empty"], Vec::new()), (vec!["z.bin"], pattern(70_001, 4))];
+    let fx = Fixture::build_v2("pack", &files, PIECE);
+    // a.bin 4 pieces, b.bin 1 (of two blocks, short of a piece), c.bin 2, z.bin 3.
+    if fx.piece_count != 4 + 1 + 2 + 3 {
+        return Err(format!("the fixture has {} pieces, not 10", fx.piece_count));
+    }
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("v2.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let child = client_command(&torrent, &out_dir, &log_path, 1).args(["--no-dht", "--seed", "--port", "0"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, "seeding pack on port", Duration::from_secs(30), &mut client.0)?;
+    check_downloaded(&fx, &out_dir)?;
+    let seen = swarm.logs[0].lock().unwrap();
+    let wanted: BTreeSet<u32> = (0..fx.piece_count as u32).collect();
+    if seen.requested.iter().copied().collect::<BTreeSet<_>>() != wanted {
+        return Err(format!("the client should ask for each of the {} pieces; it asked for {:?}", fx.piece_count, seen.requested));
+    }
+    drop(seen);
+    if fs::metadata(out_dir.join("pack/empty")).map_err(|e| format!("the empty file: {}", e))?.len() != 0 {
+        return Err("the empty file has content".to_string());
+    }
+
+    // As a seeder: a leecher asks for every piece over TCP and checks it against the layout.
+    let port: u16 = swarm.announces.lock().unwrap().first().and_then(|line| announce_param(line, "port")).and_then(|p| p.parse().ok()).ok_or("no port in the client's first announce")?;
+    let pieces = fx.v2_pieces.clone().ok_or("a v2 fixture has its pieces")?;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connecting to the seeding client: {}", e))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    stream.write_all(&Handshake::new(fx.info_hash, [0x71; 20], false).to_bytes()).map_err(|e| e.to_string())?;
+    let mut hs = [0u8; 68];
+    stream.read_exact(&mut hs).map_err(|e| format!("reading the handshake: {}", e))?;
+    if Handshake::from_bytes(&hs).map_err(|e| format!("{:?}", e))?.info_hash != fx.info_hash {
+        return Err("the seeding client answered with another info hash".to_string());
+    }
+    let wire = |what: &str, e: bittorrent_rs::peer::message::WireError| format!("{}: {:?}", what, e);
+    let bitfield = loop {
+        match Message::read_from(&mut stream).map_err(|e| wire("waiting for the bitfield", e))? {
+            Message::Bitfield(bits) => break bits,
+            _ => continue,
+        }
+    };
+    let advertised = (0..pieces.len()).filter(|i| bitfield.get(i / 8).is_some_and(|byte| byte & (1 << (7 - i % 8)) != 0)).count();
+    if advertised != pieces.len() {
+        return Err(format!("the seeding client advertised {} of {} pieces", advertised, pieces.len()));
+    }
+    Message::Interested.write_to(&mut stream).map_err(|e| wire("sending interested", e))?;
+    loop {
+        if matches!(Message::read_from(&mut stream).map_err(|e| wire("waiting for the unchoke", e))?, Message::Unchoke) {
+            break;
+        }
+    }
+    for (index, piece) in pieces.iter().enumerate() {
+        let mut got = Vec::new();
+        while got.len() < piece.len() {
+            let begin = got.len() as u32;
+            let length = (piece.len() - got.len()).min(16384) as u32;
+            Message::Request { index: index as u32, begin, length }.write_to(&mut stream).map_err(|e| wire("requesting", e))?;
+            loop {
+                match Message::read_from(&mut stream).map_err(|e| wire(&format!("waiting for piece {}", index), e))? {
+                    Message::Piece { index: i, begin: b, block } if i as usize == index && b == begin => {
+                        got.extend_from_slice(&block);
+                        break;
+                    }
+                    Message::RejectRequest { .. } => return Err(format!("the seeding client refused a block of piece {}", index)),
+                    _ => continue,
+                }
+            }
+        }
+        if got != *piece {
+            return Err(format!("piece {} served by the seeding client differs from the layout's ({} bytes against {})", index, got.len(), piece.len()));
+        }
+    }
+    // A request for more than a short piece holds is ignored (not served out of the padding, and
+    // not a reason to drop the connection): the next, proper, request is still answered.
+    let short = pieces.iter().position(|p| p.len() < PIECE / 2).ok_or("no short piece in the fixture")?;
+    Message::Request { index: short as u32, begin: 0, length: 16384 }.write_to(&mut stream).map_err(|e| wire("requesting past the end", e))?;
+    Message::Request { index: 0, begin: 0, length: 16384 }.write_to(&mut stream).map_err(|e| wire("requesting after that", e))?;
+    let first = loop {
+        match Message::read_from(&mut stream).map_err(|e| wire("waiting for an answer after the over-long request", e))? {
+            Message::Piece { index, begin, block } => break (index, begin, block.len()),
+            _ => continue,
+        }
+    };
+    if first != (0, 0, 16384) {
+        return Err(format!("the first answer should be to the proper request (piece 0), not to the over-long one; it was {:?}", first));
+    }
+
+    Ok(format!("a v2-only torrent of 5 files (one empty) and {} pieces was downloaded byte for byte from a peer serving the v2 layout, and the seeding client served every piece back", fx.piece_count))
 }
 
 /// uTP (BEP 29). The fake peers can be reached only over uTP: their TCP port

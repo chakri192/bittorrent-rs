@@ -44,6 +44,10 @@ pub fn piece_is_on_disk(spans: &[FileSpan], torrent: &TorrentFile, index: u32) -
     let Ok(data) = read_piece_bytes(spans, index, torrent.piece_length as u64, piece_len) else {
         return false; // file missing or shorter than expected -- not actually there
     };
+    // A v2 piece is checked by its merkle tree; a v1 one by SHA-1.
+    if let Some(piece) = torrent.v2_pieces.get(index as usize) {
+        return crate::v2::merkle_matches(&data, piece.width as usize, &piece.root);
+    }
     let hash: [u8; 20] = Sha1::digest(&data).into();
     hash == torrent.pieces[index as usize]
 }
@@ -384,5 +388,50 @@ mod tests {
 
         stdfs::write(&spans[0].path, b"x").unwrap();
         assert!(any_data_on_disk(&spans));
+    }
+
+    /// A v2-only torrent of two files (20000 and 100 bytes) in 16 KiB pieces, and the directory
+    /// holding the files it was made from.
+    fn v2_torrent(name: &str) -> (TorrentFile, std::path::PathBuf, Vec<Vec<u8>>) {
+        use crate::create::{create, CreateOptions};
+        let dir = tmp_dir(name);
+        let root = dir.join("t");
+        stdfs::create_dir_all(&root).unwrap();
+        let (a, b) = ((0..20_000u32).map(|i| (i * 3) as u8).collect::<Vec<u8>>(), vec![7u8; 100]);
+        stdfs::write(root.join("a"), &a).unwrap();
+        stdfs::write(root.join("b"), &b).unwrap();
+        let made = create(&root, &CreateOptions { piece_length: Some(16384), v2: true, ..Default::default() }, |_, _| {}).unwrap();
+        let torrent = parse_torrent_file(&made.bytes).unwrap();
+        (torrent, root, vec![a[..16384].to_vec(), a[16384..].to_vec(), b])
+    }
+
+    #[test]
+    fn v2_pieces_are_confirmed_on_disk_by_their_merkle_trees() {
+        let (torrent, root, pieces) = v2_torrent("resume-v2");
+        let spans = torrent.file_spans(&root);
+        assert!(torrent.v2_ready() && torrent.pieces.len() == 3);
+        assert_eq!(scan_all(&spans, &torrent, |_, _| {}), HashSet::from([0, 1, 2]), "every piece of what was made verifies, the short ones too");
+
+        // One byte wrong in piece 1 (the short last piece of a): only that one falls out.
+        let mut a = stdfs::read(root.join("a")).unwrap();
+        a[17_000] ^= 1;
+        stdfs::write(root.join("a"), a).unwrap();
+        assert_eq!(scan_all(&spans, &torrent, |_, _| {}), HashSet::from([0, 2]));
+        assert!(!piece_is_on_disk(&spans, &torrent, 99), "a piece the torrent does not have");
+        // And a resume file's claims are checked, not believed.
+        let progress = progress_file_path(&root, &torrent.info_hash);
+        stdfs::write(&progress, "0\n1\n2\n").unwrap();
+        assert_eq!(load_and_verify(&progress, &spans, &torrent), HashSet::from([0, 2]));
+        let _ = pieces;
+    }
+
+    #[test]
+    fn a_v2_piece_that_is_not_all_there_is_not_confirmed() {
+        let (torrent, root, _) = v2_torrent("resume-v2-short");
+        let spans = torrent.file_spans(&root);
+        let b = stdfs::read(root.join("b")).unwrap();
+        stdfs::write(root.join("b"), &b[..50]).unwrap();
+        stdfs::remove_file(root.join("a")).unwrap();
+        assert!(scan_all(&spans, &torrent, |_, _| {}).is_empty());
     }
 }
