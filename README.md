@@ -9,7 +9,7 @@ Every layer is written here — the bencode parser, the peer wire protocol, trac
 <p>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-1c1c1e?style=flat-square&logo=rust&logoColor=DEA584" />
   <img alt="Size" src="https://img.shields.io/badge/~10k-lines-1c1c1e?style=flat-square" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-381%20passing-1c1c1e?style=flat-square" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-450%20passing-1c1c1e?style=flat-square" />
   <img alt="BEPs" src="https://img.shields.io/badge/BEP-3%20·%205%20·%209%2F10%20·%2011%20·%2015%20·%2019%20·%2027-1c1c1e?style=flat-square" />
   <img alt="Fuzzed" src="https://img.shields.io/badge/parsers-fuzzed-1c1c1e?style=flat-square" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-1c1c1e?style=flat-square" />
@@ -133,9 +133,26 @@ cargo test
 cargo run --bin e2e_harness      # loopback scenarios: public, private, magnet, resume, --only, dropped peer, --timeout, --seed
 ```
 
-381 tests (380 unit, 1 doctest), all passing, all confined to loopback.
+450 tests (449 unit, 1 doctest), all passing, all confined to loopback.
 
-Coverage spans parsing, the KRPC codec verified against BEP 5's published byte strings, DHT lookup and announce over a scripted transport, workers driven against mock peers, the seeder against a mock leecher, and web-seed range arithmetic. An end-to-end harness runs the real binary against a synthetic tracker and peer on `127.0.0.1` and compares output byte for byte. Its scenarios cover a public torrent, a private one (no DHT, no PEX), a client killed mid-download that must resume and fetch only the pieces it lacks, `--only` on one file of three (only the pieces that file touches may be requested), a peer that hangs up halfway through a piece while another supplies the rest, and `--timeout` against a peer that goes silent (the client must stop, exit non-zero, report the download incomplete and keep its resume file), `--seed` (the client announces started and completed, stays up, and serves every piece back to a leecher on the port it announced), and a magnet link (a peer found through the tracker serves the metadata, which the client verifies before downloading). Three `cargo-fuzz` targets exercise the parsers handling untrusted input.
+Coverage spans parsing, the KRPC codec verified against BEP 5's published byte strings, DHT lookup and announce over a scripted transport, workers driven against mock peers, the seeder against a mock leecher, and web-seed range arithmetic. An end-to-end harness runs the real binary against a synthetic tracker and peer on `127.0.0.1` and compares output byte for byte. Its scenarios cover a public torrent, a hostile one whose paths would write outside the download directory (it must be refused with nothing written), a private one (no DHT, no PEX), a client killed mid-download that must resume and fetch only the pieces it lacks, `--only` on one file of three (only the pieces that file touches may be requested), a peer that hangs up halfway through a piece while another supplies the rest, and `--timeout` against a peer that goes silent (the client must stop, exit non-zero, report the download incomplete and keep its resume file), `--seed` (the client announces started and completed, stays up, and serves every piece back to a leecher on the port it announced), and a magnet link (a peer found through the tracker serves the metadata, which the client verifies before downloading). Every parser that reads untrusted bytes also runs through a deterministic mutation fuzzer inside `cargo test` (bit flips, every truncation, extreme lengths, splices), which must never panic and must round-trip whatever it accepts; three `cargo-fuzz` targets do the same open-ended on a nightly toolchain.
+
+## Security
+
+The client treats everything from the network, and every `.torrent` or magnet link, as hostile. What it defends against, each with a test that fails when the defence is removed:
+
+| Attack | Defence |
+|---|---|
+| A torrent naming `../../.ssh/authorized_keys`, or an absolute path, to write outside the download directory | The name and every path component must be exactly one ordinary path component; the torrent is refused before any network use |
+| Deeply nested bencode (`llll…`) overflowing the stack in a peer's handshake, a tracker reply or a DHT datagram | Nesting is limited to 100 levels |
+| A peer advertising a huge `metadata_size` to make magnet resolution allocate without bound | Accepted only between 1 byte and 16 MiB |
+| A `have` for piece 4294967295 (or an oversized bitfield) growing per-peer state to 4 GiB | Tracked only up to the torrent's real piece count |
+| A tracker streaming an endless HTTP response, or sending a chunk size that overflows | Responses capped at 4 MiB; chunk arithmetic checked |
+| A `.torrent` whose piece count, lengths or piece length do not add up | Cross-checked when parsed; piece length capped at 128 MiB |
+| One announcing many info-hashes to grow the DHT node's memory | At most 1000 remembered |
+| A panic in one thread poisoning shared state for all of them | Locks recover the data rather than propagate the panic |
+
+`unwrap()` and `expect()` are linted against in non-test code, so a new way to panic on network input has to be argued for.
 
 ## Limitations
 
