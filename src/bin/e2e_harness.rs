@@ -106,6 +106,11 @@ enum Kind {
     /// peer will, a plain one where it will not (unless required), and
     /// incoming connections are taken either way (unless required).
     Encryption,
+    /// BitTorrent v2 (BEP 52): `create_torrent --v2` makes the torrent an
+    /// independently written builder makes (same info hash), the client
+    /// lists it, `--verify` passes intact files and names a damaged one, and
+    /// a download is refused with a message saying why.
+    V2Torrents,
     /// uTP (BEP 29): a peer reachable only over uTP is downloaded from with
     /// `--transport both` and `--transport utp` and is out of reach for
     /// `tcp`; and as a seeder the client serves a leecher that comes in over
@@ -179,6 +184,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "magnet-peer-hint", kind: Kind::MagnetPeerHint },
     Scenario { name: "tracker-redirect", kind: Kind::TrackerRedirect },
     Scenario { name: "encryption", kind: Kind::Encryption },
+    Scenario { name: "v2-torrents", kind: Kind::V2Torrents },
     Scenario { name: "utp", kind: Kind::Utp },
     Scenario { name: "local-discovery", kind: Kind::LocalDiscovery },
     Scenario { name: "fast-extension", kind: Kind::FastExtension },
@@ -226,6 +232,7 @@ fn main() {
             Kind::MagnetPeerHint => run_magnet_peer_hint(scenario.name),
             Kind::TrackerRedirect => run_tracker_redirect(scenario.name),
             Kind::Encryption => run_encryption(scenario.name),
+            Kind::V2Torrents => run_v2_torrents(scenario.name),
             Kind::Utp => run_utp(scenario.name),
             Kind::LocalDiscovery => run_local_discovery(scenario.name),
             Kind::FastExtension => run_fast_extension(scenario.name),
@@ -2467,6 +2474,153 @@ fn run_serve_metadata(name: &str) -> Result<String, String> {
         other => return Err(format!("expected the info dict as piece 0, got {:?}", other)),
     }
     Ok(format!("a peer holding only the info hash got the {}-byte info dictionary from the seeding client, byte for byte, and was told it is a seed", fx.info_bytes.len()))
+}
+
+/// BitTorrent v2 (BEP 52), made and read back by things that do not share
+/// the merkle code: the harness builds the torrent's info dictionary and hash
+/// itself (only the SHA-256 primitive is the library's, and that is checked
+/// against the standard's vectors), and `create_torrent --v2` must come to the
+/// same hash.
+fn run_v2_torrents(name: &str) -> Result<String, String> {
+    use bittorrent_rs::sha256::sha256;
+    const BLOCK: usize = 16384;
+    const PIECE: usize = 16384;
+
+    // The merkle root of `leaves` padded to `width` with `pad`.
+    fn root(leaves: &[[u8; 32]], width: usize, pad: [u8; 32]) -> [u8; 32] {
+        let mut level = leaves.to_vec();
+        level.resize(width, pad);
+        while level.len() > 1 {
+            level = level.chunks(2).map(|pair| sha256(&[pair[0].as_slice(), pair[1].as_slice()].concat())).collect();
+        }
+        level[0]
+    }
+    // (pieces root, piece layer) of a file's bytes at a piece length of one block.
+    fn file_tree_entry(content: &[u8]) -> (Option<[u8; 32]>, Vec<[u8; 32]>) {
+        if content.is_empty() {
+            return (None, Vec::new());
+        }
+        let leaves: Vec<[u8; 32]> = content.chunks(BLOCK).map(sha256).collect();
+        if content.len() <= PIECE {
+            return (Some(root(&leaves, leaves.len().next_power_of_two(), [0; 32])), Vec::new());
+        }
+        // A piece is one block here, so the piece layer is the leaves and the padding is zero.
+        (Some(root(&leaves, leaves.len().next_power_of_two(), [0; 32])), leaves)
+    }
+    fn bstr(bytes: &[u8]) -> Vec<u8> {
+        let mut out = format!("{}:", bytes.len()).into_bytes();
+        out.extend_from_slice(bytes);
+        out
+    }
+    enum Node {
+        Dir(std::collections::BTreeMap<String, Node>),
+        File(usize, Option<[u8; 32]>),
+    }
+    fn encode(node: &Node) -> Vec<u8> {
+        match node {
+            Node::File(length, root) => {
+                let mut leaf = format!("d6:lengthi{}e", length).into_bytes();
+                if let Some(root) = root {
+                    leaf.extend_from_slice(b"11:pieces root");
+                    leaf.extend_from_slice(&bstr(root));
+                }
+                leaf.push(b'e');
+                let mut out = b"d0:".to_vec();
+                out.extend_from_slice(&leaf);
+                out.push(b'e');
+                out
+            }
+            Node::Dir(entries) => {
+                let mut out = b"d".to_vec();
+                for (name, child) in entries {
+                    out.extend_from_slice(&bstr(name.as_bytes()));
+                    out.extend_from_slice(&encode(child));
+                }
+                out.push(b'e');
+                out
+            }
+        }
+    }
+
+    let files: Vec<(Vec<&str>, Vec<u8>)> = vec![(vec!["a.bin"], pattern(40_000, 1)), (vec!["sub", "b.bin"], pattern(5000, 2)), (vec!["z.bin"], pattern(2 * BLOCK, 3)), (vec!["empty"], Vec::new())];
+    let mut tree = std::collections::BTreeMap::new();
+    for (path, content) in &files {
+        let (file_root, _) = file_tree_entry(content);
+        let mut node = &mut tree;
+        for part in &path[..path.len() - 1] {
+            let Node::Dir(next) = node.entry(part.to_string()).or_insert_with(|| Node::Dir(Default::default())) else { return Err("a file and a directory of one name".to_string()) };
+            node = next;
+        }
+        node.insert(path[path.len() - 1].to_string(), Node::File(content.len(), file_root));
+    }
+    let mut info = b"d9:file tree".to_vec();
+    info.extend_from_slice(&encode(&Node::Dir(tree)));
+    info.extend_from_slice(format!("12:meta versioni2e4:name4:pack12:piece lengthi{}ee", PIECE).as_bytes());
+    let expected_hash = sha256(&info);
+
+    // The tree of directories on disk.
+    let dir = scratch_dir(name);
+    let source = dir.join("src/pack");
+    for (path, content) in &files {
+        let full = path.iter().fold(source.clone(), |acc, part| acc.join(part));
+        fs::create_dir_all(full.parent().ok_or("no parent")?).map_err(|e| e.to_string())?;
+        fs::write(&full, content).map_err(|e| e.to_string())?;
+    }
+
+    let torrent_path = dir.join("v2.torrent");
+    let create_bin = std::env::current_exe().map_err(|e| e.to_string())?.parent().ok_or("no exe dir")?.join("create_torrent");
+    let made = Command::new(&create_bin).arg(&source).arg("--out").arg(&torrent_path).args(["--v2", "--piece-length", "16K", "--no-date", "--quiet"]).output().map_err(|e| e.to_string())?;
+    if !made.status.success() {
+        return Err(format!("create_torrent --v2 failed: {}", String::from_utf8_lossy(&made.stderr).trim()));
+    }
+    let bytes = fs::read(&torrent_path).map_err(|e| e.to_string())?;
+    let parsed = bittorrent_rs::torrent::parse_torrent_file(&bytes).map_err(|e| format!("the client cannot read what create_torrent --v2 wrote: {}", e))?;
+    if !parsed.is_v2_only() || parsed.info_hash[..] != expected_hash[..20] {
+        return Err(format!("info hash {} differs from the independently built {}", bittorrent_rs::torrent::info_hash_hex(&parsed.info_hash), expected_hash[..20].iter().map(|b| format!("{:02x}", b)).collect::<String>()));
+    }
+    // The info dictionary is byte for byte what the harness wrote.
+    let (start, end) = (bytes.windows(info.len()).position(|w| w == info.as_slice()), info.len());
+    if start.is_none() {
+        return Err(format!("the torrent does not contain the info dictionary the harness built ({} bytes)", end));
+    }
+
+    // --list names the files, with the empty one.
+    let run = |extra: &[&str]| client_command(&torrent_path, &dir.join("out"), &dir.join("client.log"), 1).arg("--no-dht").args(extra).output().map_err(|e| format!("running the client: {}", e));
+    let listed = run(&["--list"])?;
+    let listing = String::from_utf8_lossy(&listed.stdout).to_string();
+    if !listed.status.success() || !["a.bin", "sub/b.bin", "z.bin", "empty"].iter().all(|f| listing.contains(f)) {
+        return Err(format!("--list should name every file; exit {:?}, stdout {:?}", listed.status.code(), listing.trim()));
+    }
+
+    // --verify: intact, then one byte wrong in the middle of a.bin.
+    let out_dir = dir.join("out");
+    for (path, content) in &files {
+        let full = path.iter().fold(out_dir.join("pack"), |acc, part| acc.join(part));
+        fs::create_dir_all(full.parent().ok_or("no parent")?).map_err(|e| e.to_string())?;
+        fs::write(&full, content).map_err(|e| e.to_string())?;
+    }
+    let whole = run(&["--verify"])?;
+    let text = String::from_utf8_lossy(&whole.stdout).to_string();
+    if !whole.status.success() || !text.contains("6 of 6 piece(s) verified") || !text.contains("4 of 4 file(s) whole") {
+        return Err(format!("intact files should verify; exit {:?}, stdout {:?}, stderr {:?}", whole.status.code(), text.trim(), String::from_utf8_lossy(&whole.stderr).trim()));
+    }
+    let a_path = out_dir.join("pack/a.bin");
+    let mut a = fs::read(&a_path).map_err(|e| e.to_string())?;
+    a[20_000] ^= 0xFF;
+    fs::write(&a_path, a).map_err(|e| e.to_string())?;
+    let damaged = run(&["--verify"])?;
+    let stderr = String::from_utf8_lossy(&damaged.stderr).to_string();
+    if damaged.status.code() != Some(1) || !stderr.contains("[damaged] a.bin") || stderr.contains("b.bin") || stderr.contains("z.bin") || !stderr.contains("5 of 6 piece(s) verified") {
+        return Err(format!("a damaged file should be named, and only its bad piece not counted; exit {:?}, stderr {:?}", damaged.status.code(), stderr.trim()));
+    }
+
+    // A download is refused, and says why.
+    let refused = run(&["--timeout", "5"])?;
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    if refused.status.success() || !stderr.contains("BitTorrent v2") {
+        return Err(format!("downloading a v2-only torrent should be refused, saying so; exit {:?}, stderr {:?}", refused.status.code(), stderr.trim()));
+    }
+    Ok(format!("create_torrent --v2 made the independently built info hash ({}), --list named the files, --verify passed intact ones and caught a wrong byte to the piece, and a download was refused with a reason", &bittorrent_rs::torrent::info_hash_hex(&parsed.info_hash)[..8]))
 }
 
 /// uTP (BEP 29). The fake peers can be reached only over uTP: their TCP port

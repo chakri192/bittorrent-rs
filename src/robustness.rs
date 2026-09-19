@@ -32,6 +32,10 @@ fn v4(s: &str) -> SocketAddrV4 {
 // ---- seeds -----------------------------------------------------------
 
 fn torrent_seeds() -> Vec<Vec<u8>> {
+    let unhex = |text: &str| -> Vec<u8> { (0..text.len() / 2).map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap()).collect() };
+    // BitTorrent v2 (BEP 52): v2 only, and hybrid, built by a separate script.
+    let v2_only = unhex("64383a616e6e6f756e636531383a687474703a2f2f742e6578616d706c652f61343a696e666f64393a66696c65207472656564353a662e62696e64303a64363a6c656e6774686934303030306531313a70696563657320726f6f7433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68265656531323a6d6574612076657273696f6e693265343a6e616d65353a662e62696e31323a7069656365206c656e677468693136333834656531323a7069656365206c61796572736433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68239363acfa57d60545ac82e09b63df067e2396f9377bac5311c3b159e50a61a2275876be25b78513a631bd38a5cc26875de9b787f1250a16ec6ad92f880fb37bfe5fa62eebf7c92de9855ef3886236a4378a7054258749ace85d10875991b9f13a6abab6565");
+    let hybrid = unhex("64343a696e666f64393a66696c65207472656564353a662e62696e64303a64363a6c656e6774686934303030306531313a70696563657320726f6f7433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa682656565363a6c656e6774686934303030306531323a6d6574612076657273696f6e693265343a6e616d65353a662e62696e31323a7069656365206c656e67746869313633383465363a70696563657336303a6ab462cc165379d368dc9206fc25f8546e894131fd1d4adde2a16bf56c84129d6902e8d056d38311218898aa5c30e0ed9d2e1f9451b673dda2498a366531323a7069656365206c61796572736433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68239363acfa57d60545ac82e09b63df067e2396f9377bac5311c3b159e50a61a2275876be25b78513a631bd38a5cc26875de9b787f1250a16ec6ad92f880fb37bfe5fa62eebf7c92de9855ef3886236a4378a7054258749ace85d10875991b9f13a6abab6565");
     let hashes = |n: usize| vec![0xAB; n * 20];
     let single = {
         let mut v = b"d8:announce20:http://tracker.test/13:announce-listll20:http://tracker.test/ee4:infod6:lengthi40000e4:name8:file.bin12:piece lengthi16384e6:pieces60:".to_vec();
@@ -54,7 +58,7 @@ fn torrent_seeds() -> Vec<Vec<u8>> {
         v.extend_from_slice(b"ee");
         v
     };
-    vec![single, multi, hostile("dir", ".."), hostile("dir", "/etc/passwd"), hostile("..", "ok"), hostile("a/b", "ok"), hostile("dir", "a\\b")]
+    vec![single, multi, v2_only, hybrid, hostile("dir", ".."), hostile("dir", "/etc/passwd"), hostile("..", "ok"), hostile("a/b", "ok"), hostile("dir", "a\\b")]
 }
 
 fn bencode_seeds() -> Vec<Vec<u8>> {
@@ -179,6 +183,16 @@ fn torrent_parsing_survives_hostile_input_and_only_yields_safe_torrents() {
 
         // The piece arithmetic downstream is consistent for anything accepted.
         assert!(t.piece_length > 0 && t.piece_length <= crate::torrent::MAX_PIECE_LENGTH);
+        if t.is_v2_only() {
+            // BitTorrent v2: no v1 hashes; the layers add up, and the files are the tree's.
+            let meta = t.v2.as_ref().unwrap();
+            assert!(t.pieces.is_empty() && crate::v2::valid_piece_length(t.piece_length));
+            assert!(crate::v2::validate_layers(&meta.files, &meta.layers, t.piece_length).is_ok());
+            assert_eq!(meta.files.len(), t.files.len());
+            assert_eq!(meta.short_hash(), t.info_hash);
+            let _ = t.tracker_urls();
+            return;
+        }
         let total = t.total_length();
         assert_eq!(t.pieces.len() as u64, total.div_ceil(t.piece_length as u64), "piece count matches the length");
         if t.pieces.len() <= 100_000 {

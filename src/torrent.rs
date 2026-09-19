@@ -26,6 +26,10 @@ pub struct TorrentFile {
     /// BEP 27 `private` flag. A private torrent's peers must come only
     /// from its tracker: no DHT, no PEX, no local discovery.
     pub private: bool,
+    /// The BitTorrent v2 side of the metadata (BEP 52), for a v2 or hybrid
+    /// torrent. For a torrent that is v2 only, `pieces` is empty and
+    /// `info_hash` is the first 20 bytes of the SHA-256 one.
+    pub v2: Option<crate::v2::V2Meta>,
 }
 
 #[derive(Debug)]
@@ -44,6 +48,10 @@ pub enum TorrentError {
     PieceCountMismatch { pieces: usize, expected: u64 },
     /// A length beyond what is sane to handle (or that overflows).
     TooLarge(&'static str),
+    /// The BitTorrent v2 part of the metadata (BEP 52) is malformed.
+    V2(crate::v2::V2Error),
+    /// A `meta version` this client does not know.
+    UnsupportedVersion(i64),
 }
 
 impl From<DecodeError> for TorrentError {
@@ -65,6 +73,8 @@ impl std::fmt::Display for TorrentError {
             TorrentError::UnsafePath(p) => write!(f, "unsafe path in torrent ({:?}): it could write outside the download directory", p),
             TorrentError::PieceCountMismatch { pieces, expected } => write!(f, "torrent lists {} piece hashes but its length needs {}", pieces, expected),
             TorrentError::TooLarge(what) => write!(f, "'{}' is unreasonably large", what),
+            TorrentError::V2(e) => write!(f, "BitTorrent v2 metadata: {}", e),
+            TorrentError::UnsupportedVersion(v) => write!(f, "meta version {} is not supported", v),
         }
     }
 }
@@ -169,7 +179,7 @@ pub fn parse_torrent_file(data: &[u8]) -> Result<TorrentFile, TorrentError> {
         _ => Vec::new(),
     };
 
-    build_torrent_from_info(info, raw_info, announce, announce_list, url_list)
+    build_torrent_from_info(info, raw_info, announce, announce_list, url_list, dict.get(b"piece layers".as_slice()))
 }
 
 /// Builds a `TorrentFile` from a magnet link's assembled+verified info
@@ -194,14 +204,26 @@ pub fn from_info_dict_bytes(raw_info: &[u8], expected_info_hash: [u8; 20], annou
     // Magnet metadata (BEP 9) transfers only the info dict, which never
     // contains `url-list`; web seeds, if any, would arrive via the magnet
     // `ws=` param (not currently parsed).
-    build_torrent_from_info(info, raw_info, announce, announce_list, Vec::new())
+    build_torrent_from_info(info, raw_info, announce, announce_list, Vec::new(), None)
 }
 
 /// Shared construction logic: given a parsed info dict value and the raw
 /// bytes it was decoded from (for the InfoHash), builds the rest of
 /// `TorrentFile`'s fields identically regardless of whether the info dict
 /// came from a `.torrent` file or a magnet metadata exchange.
-fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<String>, announce_list: Vec<Vec<String>>, url_list: Vec<String>) -> Result<TorrentFile, TorrentError> {
+fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<String>, announce_list: Vec<Vec<String>>, url_list: Vec<String>, layers: Option<&Bencode>) -> Result<TorrentFile, TorrentError> {
+    // BitTorrent v2 (BEP 52): a torrent with a file tree and no v1 piece hashes
+    // is v2 only; one with both is a hybrid, which this reads as v1.
+    let version = info.get("meta version").and_then(Bencode::as_int);
+    if let Some(version) = version.filter(|&v| v != 2) {
+        return Err(TorrentError::UnsupportedVersion(version));
+    }
+    let file_tree = info.get("file tree").filter(|_| version == Some(2));
+    if let (Some(tree), None) = (file_tree, info.get("pieces")) {
+        return build_v2_only_torrent(info.clone(), tree, raw_info, announce, announce_list, url_list, layers);
+    }
+    let v2 = file_tree.and_then(|tree| v2_meta(&info, tree, raw_info, layers).ok());
+
     let mut hasher = Sha1::new();
     hasher.update(raw_info);
     let info_hash: [u8; 20] = hasher.finalize().into();
@@ -304,7 +326,47 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
         multi_file,
         url_list,
         private,
+        v2,
     })
+}
+
+/// The v2 metadata of an info dictionary: its files, the layers the
+/// `.torrent` carries, and the SHA-256 of the dictionary. The layers are
+/// checked against the files.
+fn v2_meta(info: &Bencode, tree: &Bencode, raw_info: &[u8], layers: Option<&Bencode>) -> Result<crate::v2::V2Meta, TorrentError> {
+    let files = crate::v2::parse_file_tree(tree).map_err(TorrentError::V2)?;
+    let layers = crate::v2::parse_layers(layers).map_err(TorrentError::V2)?;
+    let piece_length = info.get("piece length").and_then(Bencode::as_int).ok_or(TorrentError::MissingKey("piece length"))?;
+    crate::v2::validate_layers(&files, &layers, piece_length).map_err(TorrentError::V2)?;
+    Ok(crate::v2::V2Meta { files, layers, info_hash: crate::sha256::sha256(raw_info) })
+}
+
+/// A torrent that is BitTorrent v2 only. It has no piece hashes of the v1
+/// kind, so `pieces` is empty; what a piece must hash to is in the layers.
+fn build_v2_only_torrent(info: Bencode, tree: &Bencode, raw_info: &[u8], announce: Option<String>, announce_list: Vec<Vec<String>>, url_list: Vec<String>, layers: Option<&Bencode>) -> Result<TorrentFile, TorrentError> {
+    let piece_length = info.get("piece length").and_then(Bencode::as_int).ok_or(TorrentError::MissingKey("piece length"))?;
+    if !crate::v2::valid_piece_length(piece_length) {
+        return Err(TorrentError::V2(crate::v2::V2Error::BadPieceLength));
+    }
+    if piece_length > MAX_PIECE_LENGTH {
+        return Err(TorrentError::TooLarge("piece length"));
+    }
+    let name = info.get("name").and_then(Bencode::as_str).ok_or(TorrentError::MissingKey("name"))?.to_string();
+    if !is_safe_component(&name) {
+        return Err(TorrentError::UnsafePath(name));
+    }
+    let meta = v2_meta(&info, tree, raw_info, layers)?;
+    let mut files = Vec::with_capacity(meta.files.len());
+    let mut total = 0u64;
+    for file in &meta.files {
+        total = total.checked_add(file.length).ok_or(TorrentError::TooLarge("total length"))?;
+        files.push((file.path.clone(), i64::try_from(file.length).map_err(|_| TorrentError::TooLarge("length"))?));
+    }
+    // A single file is a tree of one entry named as the torrent is.
+    let multi_file = !(meta.files.len() == 1 && meta.files[0].path == [name.clone()]);
+    let private = info.get("private").and_then(Bencode::as_int).is_some_and(|v| v != 0);
+    let info_hash = meta.short_hash();
+    Ok(TorrentFile { announce, announce_list, info, info_hash, piece_length, pieces: Vec::new(), name, files, multi_file, url_list, private, v2: Some(meta) })
 }
 
 pub fn info_hash_hex(hash: &[u8; 20]) -> String {
@@ -322,6 +384,12 @@ impl TorrentFile {
         urls.sort();
         urls.dedup();
         urls
+    }
+
+    /// Whether the torrent is BitTorrent v2 only (BEP 52), with no v1 piece
+    /// hashes: it can be read, listed and verified, but not yet downloaded.
+    pub fn is_v2_only(&self) -> bool {
+        self.v2.is_some() && self.pieces.is_empty()
     }
 
     /// Sum of every file's length -- the total number of bytes the torrent
@@ -695,5 +763,103 @@ mod tests {
             parse_torrent_file(&multi(b"dir", one, 16384, 1)).unwrap().multi_file,
             "a `files` list with a single entry is still the multi-file form, and its name is a directory"
         );
+    }
+
+    // ---- BitTorrent v2 (BEP 52) ----
+    // The torrents below were built by a Python script that shares nothing with this code.
+
+    fn unhex(text: &str) -> Vec<u8> {
+        (0..text.len() / 2).map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    const V2_ONLY: &str = "64383a616e6e6f756e636531383a687474703a2f2f742e6578616d706c652f61343a696e666f64393a66696c65207472656564353a662e62696e64303a64363a6c656e6774686934303030306531313a70696563657320726f6f7433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68265656531323a6d6574612076657273696f6e693265343a6e616d65353a662e62696e31323a7069656365206c656e677468693136333834656531323a7069656365206c61796572736433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68239363acfa57d60545ac82e09b63df067e2396f9377bac5311c3b159e50a61a2275876be25b78513a631bd38a5cc26875de9b787f1250a16ec6ad92f880fb37bfe5fa62eebf7c92de9855ef3886236a4378a7054258749ace85d10875991b9f13a6abab6565";
+    const V2_ONLY_SHA256: &str = "73ec1349d7abba4a6808971cc642ddc3ed620191741baf40cb10f26bdcfbc1f7";
+    const V2_ROOT: &str = "b01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa682";
+    const HYBRID: &str = "64343a696e666f64393a66696c65207472656564353a662e62696e64303a64363a6c656e6774686934303030306531313a70696563657320726f6f7433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa682656565363a6c656e6774686934303030306531323a6d6574612076657273696f6e693265343a6e616d65353a662e62696e31323a7069656365206c656e67746869313633383465363a70696563657336303a6ab462cc165379d368dc9206fc25f8546e894131fd1d4adde2a16bf56c84129d6902e8d056d38311218898aa5c30e0ed9d2e1f9451b673dda2498a366531323a7069656365206c61796572736433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68239363acfa57d60545ac82e09b63df067e2396f9377bac5311c3b159e50a61a2275876be25b78513a631bd38a5cc26875de9b787f1250a16ec6ad92f880fb37bfe5fa62eebf7c92de9855ef3886236a4378a7054258749ace85d10875991b9f13a6abab6565";
+    const HYBRID_SHA1: &str = "f7ad704f94c56d10621e59ff6e562e0cacb0f7f4";
+    const HYBRID_SHA256: &str = "9d3ff85840fcbf09db7a59d6246a7d35118f4c5b732c40a506a06e5f5d343d70";
+    const V2_TAMPERED_LAYER: &str = "64343a696e666f64393a66696c65207472656564353a662e62696e64303a64363a6c656e6774686934303030306531313a70696563657320726f6f7433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68265656531323a6d6574612076657273696f6e693265343a6e616d65353a662e62696e31323a7069656365206c656e677468693136333834656531323a7069656365206c61796572736433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68239363acea57d60545ac82e09b63df067e2396f9377bac5311c3b159e50a61a2275876be25b78513a631bd38a5cc26875de9b787f1250a16ec6ad92f880fb37bfe5fa62eebf7c92de9855ef3886236a4378a7054258749ace85d10875991b9f13a6abab6565";
+    const META_VERSION_3: &str = "64343a696e666f64393a66696c65207472656564353a662e62696e64303a64363a6c656e6774686934303030306531313a70696563657320726f6f7433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68265656531323a6d6574612076657273696f6e693365343a6e616d65353a662e62696e31323a7069656365206c656e677468693136333834656565";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    #[test]
+    fn a_v2_only_torrent_is_read_with_its_files_and_the_short_form_of_its_sha256_hash() {
+        let t = parse_torrent_file(&unhex(V2_ONLY)).unwrap();
+        assert!(t.is_v2_only());
+        assert_eq!((t.name.as_str(), t.piece_length, t.multi_file), ("f.bin", 16384, false), "one file named as the torrent is: a single-file torrent");
+        assert_eq!(t.files, vec![(vec!["f.bin".to_string()], 40_000)]);
+        assert!(t.pieces.is_empty(), "there are no v1 hashes");
+        assert_eq!(hex(&t.v2.as_ref().unwrap().info_hash), V2_ONLY_SHA256);
+        assert_eq!(hex(&t.info_hash), &V2_ONLY_SHA256[..40], "what the handshake, trackers and the DHT know it by");
+        assert_eq!(hex(&t.v2.as_ref().unwrap().files[0].root.unwrap()), V2_ROOT);
+        assert_eq!(t.announce.as_deref(), Some("http://t.example/a"));
+        assert_eq!(t.total_length(), 40_000);
+    }
+
+    #[test]
+    fn a_hybrid_torrent_is_read_as_v1_and_also_carries_its_v2_side() {
+        let t = parse_torrent_file(&unhex(HYBRID)).unwrap();
+        assert!(!t.is_v2_only());
+        assert_eq!(hex(&t.info_hash), HYBRID_SHA1, "the v1 hash, as before");
+        assert_eq!(t.pieces.len(), 3);
+        let v2 = t.v2.as_ref().expect("and the v2 side");
+        assert_eq!(hex(&v2.info_hash), HYBRID_SHA256, "over the same info dictionary, with SHA-256");
+        assert_eq!(hex(&v2.files[0].root.unwrap()), V2_ROOT);
+    }
+
+    #[test]
+    fn a_v1_torrent_has_no_v2_side() {
+        let t = parse_torrent_file(b"d4:infod6:lengthi10e4:name1:a12:piece lengthi16384e6:pieces20:00000000000000000000ee").unwrap();
+        assert!(t.v2.is_none() && !t.is_v2_only());
+    }
+
+    #[test]
+    fn a_v2_torrent_whose_layer_does_not_add_up_to_the_root_is_refused() {
+        let err = parse_torrent_file(&unhex(V2_TAMPERED_LAYER)).unwrap_err();
+        assert!(matches!(err, TorrentError::V2(crate::v2::V2Error::BadLayer)), "{:?}", err);
+    }
+
+    #[test]
+    fn a_meta_version_this_client_does_not_know_is_refused_not_misread() {
+        let err = parse_torrent_file(&unhex(META_VERSION_3)).unwrap_err();
+        assert!(matches!(err, TorrentError::UnsupportedVersion(3)), "{:?}", err);
+    }
+
+    #[test]
+    fn a_v2_torrent_without_its_layers_is_still_read_they_can_come_from_peers() {
+        // The same torrent with the piece layers removed from the outer dictionary.
+        let mut top = crate::bencode::decode(&unhex(V2_ONLY)).unwrap();
+        if let Bencode::Dict(entries) = &mut top {
+            entries.remove(b"piece layers".as_slice());
+        }
+        let bytes = crate::bencode::encode(&top);
+        let t = parse_torrent_file(&bytes).unwrap();
+        assert!(t.is_v2_only() && t.v2.as_ref().unwrap().layers.is_empty());
+        assert_eq!(hex(&t.v2.as_ref().unwrap().info_hash), V2_ONLY_SHA256, "the info dictionary was not touched, so neither is its hash");
+    }
+
+    #[test]
+    fn a_v2_torrent_with_an_unsafe_name_or_path_is_refused() {
+        let mut top = crate::bencode::decode(&unhex(V2_ONLY)).unwrap();
+        if let Bencode::Dict(entries) = &mut top {
+            if let Some(Bencode::Dict(info)) = entries.get_mut(b"info".as_slice()) {
+                info.insert(b"name".to_vec(), Bencode::Bytes(b"..".to_vec()));
+            }
+        }
+        assert!(matches!(parse_torrent_file(&crate::bencode::encode(&top)).unwrap_err(), TorrentError::UnsafePath(_)));
+    }
+
+    #[test]
+    fn a_v2_torrent_needs_a_valid_piece_length() {
+        let mut top = crate::bencode::decode(&unhex(V2_ONLY)).unwrap();
+        if let Bencode::Dict(entries) = &mut top {
+            if let Some(Bencode::Dict(info)) = entries.get_mut(b"info".as_slice()) {
+                info.insert(b"piece length".to_vec(), Bencode::Int(20_000));
+            }
+        }
+        assert!(matches!(parse_torrent_file(&crate::bencode::encode(&top)).unwrap_err(), TorrentError::V2(crate::v2::V2Error::BadPieceLength)));
     }
 }

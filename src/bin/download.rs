@@ -455,6 +455,9 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     } else {
         let bytes = fs::read(&args.source).map_err(|e| finish_err(ui, format!("reading {}: {}", args.source, e)))?;
         let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| finish_err(ui, format!("parsing {}: {}", args.source, e)))?;
+        if torrent.is_v2_only() && !args.list && !args.verify {
+            return Err(finish_err(ui, "this torrent is BitTorrent v2 only (BEP 52): it can be listed (--list) and verified (--verify), but not yet downloaded. A hybrid torrent, which also carries v1 hashes, can be".to_string()));
+        }
         // A `.torrent` already carries the file list, so `--list` needs no
         // network at all.
         if args.transport.wants_utp() && !args.list && !args.verify {

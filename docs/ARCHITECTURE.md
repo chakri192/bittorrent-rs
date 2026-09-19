@@ -172,4 +172,4 @@ trackers are asked concurrently rather than by BEP 12 tier; a piece
 interrupted part-way is handed to the next peer within a run but not saved
 across runs; one piece is downloaded at a time per connection, so a request
 pipeline drains at each piece boundary; no BEP 32, uTP and local discovery are IPv4 only (and uTP is
-unproven against other clients), and there are no BEP 52 (v2) torrents.
+unproven against other clients), and BEP 52 (v2) is only partly there: v2 torrents can be made, listed and verified (`v2.rs`, the per-file merkle trees), but a v2-only one cannot be downloaded or seeded.
