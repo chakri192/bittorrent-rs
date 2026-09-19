@@ -117,6 +117,8 @@ Files are listed in path order, so the result is reproducible. Symbolic links ar
 
 ## Architecture
 
+This section is the short version; [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) covers the threads, the life of a download, the rules that hold everywhere and how the tests are layered.
+
 ```
   .torrent ─┐
   magnet ───┴─ metadata (BEP 9/10) ─▶ TorrentFile
