@@ -6,7 +6,7 @@ pub mod worker;
 
 pub use file_writer::{build_file_spans, read_at_global_offset, read_block, write_at_global_offset, write_piece, FileSpan};
 pub use piece_assembler::{AssemblerError, PieceAssembler, PieceWork, BLOCK_SIZE};
-pub use queue::{PieceResult, WorkQueue};
+pub use queue::{Order, PieceResult, Take, WorkQueue};
 pub use resume::{any_data_on_disk, load_and_verify, progress_file_path, rewrite_compact, scan_all, ResumeWriter};
 pub use worker::{run_worker, Interrupt, PexSender, WorkerConfig, WorkerError};
 

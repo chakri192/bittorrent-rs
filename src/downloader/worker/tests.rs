@@ -4,6 +4,7 @@
 use super::*;
 use crate::downloader::file_writer::build_file_spans;
 use crate::downloader::piece_assembler::PieceWork;
+use crate::downloader::Order;
 use crate::peer::handshake::Handshake;
 use crate::peer::message::Message as WireMessage;
 use sha1::{Digest, Sha1};
@@ -644,4 +645,31 @@ fn a_peer_with_only_common_pieces_is_given_those_even_while_a_rarer_one_is_still
     assert!(matches!(result, Err(WorkerError::Connection { stage: "wait_for_relevant_have", .. })), "then it waited for something more from the peer, and the hang-up ended it: {:?}", result);
     assert_eq!(queue.len(), 1, "piece 0 is untouched, for a peer that has it");
     assert!(!queue.in_endgame(), "and was never claimed");
+}
+
+#[test]
+fn a_sequential_queue_is_downloaded_in_order_and_a_rarest_first_one_is_not() {
+    // Pieces 2 and 3 are the rare ones: the swarm has been seen with 0 and 1.
+    let download_order = |name: &str, order: Order| -> Vec<u32> {
+        let pieces: Vec<Vec<u8>> = (0..4u8).map(|i| vec![0xD0 + i; 16384]).collect();
+        let info_hash = [0x64; 20];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = spawn_mock_peer(listener, info_hash, pieces.clone(), Duration::ZERO);
+        let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: 16384 }).collect();
+        let queue = Arc::new(WorkQueue::new(work, 4).with_order(order));
+        queue.note_have(0);
+        queue.note_have(1);
+        let dir = tmp_dir(name);
+        let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 4 * 16384)]));
+        let (tx, rx) = mpsc::channel();
+        let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default() };
+
+        run_worker(addr, &config, &queue, &spans, 16384, &tx, None).unwrap();
+        mock.join().unwrap();
+        rx.try_iter().map(|r| r.index).collect()
+    };
+
+    assert_eq!(download_order("order-sequential", Order::Sequential), vec![0, 1, 2, 3]);
+    assert_eq!(download_order("order-rarest", Order::RarestFirst), vec![2, 3, 0, 1], "the same swarm, fetched rare pieces first");
 }

@@ -2,7 +2,7 @@
 //! the file selection, resuming from disk, the listener and port mapping,
 //! the first tracker announce, and the workers.
 
-use crate::downloader::{any_data_on_disk, build_file_spans, load_and_verify, progress_file_path, rewrite_compact, scan_all, ResumeWriter, WorkQueue, WorkerConfig};
+use crate::downloader::{any_data_on_disk, build_file_spans, load_and_verify, progress_file_path, rewrite_compact, scan_all, Order, ResumeWriter, WorkQueue, WorkerConfig};
 use crate::ratelimit::RateLimiter;
 use crate::seeder::{self, HaveMap};
 use crate::session::peer_pool::RetryPolicy;
@@ -68,6 +68,8 @@ pub struct Options {
     /// on disk but no resume file, such as after a completed download or
     /// files copied in from elsewhere.
     pub recheck: bool,
+    /// Fetch pieces in order instead of rarest first (`--sequential`).
+    pub sequential: bool,
     /// The first delay before retrying a peer that failed; later retries
     /// wait longer (see [`RetryPolicy`]).
     pub retry_delay: Duration,
@@ -217,7 +219,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // *unwanted* pieces from a prior full run stay advertised for seeding
     // via `have` above, but don't count toward this run's goal.)
     let Outstanding { work, pieces_done, bytes_done: bytes_already_done } = plan.outstanding(torrent, &confirmed_resumed);
-    let queue = Arc::new(WorkQueue::new(work, total_pieces));
+    let queue = Arc::new(WorkQueue::new(work, total_pieces).with_order(if options.sequential { Order::Sequential } else { Order::RarestFirst }));
 
     let allow_ipv6 = match options.ipv6 {
         Ipv6Mode::Always => true,
@@ -326,6 +328,7 @@ mod tests {
             max_down: None,
             max_up: None,
             recheck: false,
+            sequential: false,
             retry_delay: Duration::from_secs(15),
             pipeline_depth: 5,
             connect_timeout: Duration::from_secs(1),
@@ -637,5 +640,27 @@ mod tests {
         let mut services = Services::new();
         let (_, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
         assert!(!log.logged("checked "));
+    }
+
+    #[test]
+    fn the_queue_is_rarest_first_unless_sequential_is_asked_for() {
+        let dir = tmp_dir("sequential");
+        let first_taken = |sequential: bool| {
+            let mut opts = options(&dir);
+            opts.sequential = sequential;
+            let mut services = Services::new();
+            let (prepared, _) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &opts, &mut services);
+            let prepared = prepared.unwrap();
+            // The swarm has been seen with pieces 0 and 1 but not 2.
+            prepared.queue.note_have(0);
+            prepared.queue.note_have(1);
+            match prepared.queue.take_for(|_| true) {
+                crate::downloader::Take::Piece(work) => work.index,
+                other => panic!("expected a piece, got {:?}", other),
+            }
+        };
+
+        assert_eq!(first_taken(false), 2, "rarest first: the piece nobody has been seen with");
+        assert_eq!(first_taken(true), 0, "--sequential: the lowest index");
     }
 }

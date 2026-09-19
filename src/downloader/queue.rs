@@ -24,6 +24,20 @@ use std::collections::{HashMap, HashSet};
 use crate::sync::lock;
 use std::sync::Mutex;
 
+/// Which pending piece comes out first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Order {
+    /// The piece fewest peers have (`--sequential` off). Keeps pieces from
+    /// becoming unavailable, and gets the most out of a swarm.
+    #[default]
+    RarestFirst,
+    /// The lowest index, whatever its rarity (`--sequential`), so a file
+    /// can be played or inspected while it downloads. Costs the swarm
+    /// health rarest-first buys: pieces only one peer has are fetched
+    /// only when their turn comes.
+    Sequential,
+}
+
 /// What [`WorkQueue::take_for`] found for a peer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Take {
@@ -56,6 +70,7 @@ pub struct WorkQueue {
     /// than it might currently be is a reasonable simplification for a
     /// downloader that doesn't track per-peer liveness at this layer.
     availability: Mutex<Vec<u32>>,
+    order: Order,
 }
 
 impl WorkQueue {
@@ -66,7 +81,14 @@ impl WorkQueue {
         WorkQueue {
             inner: Mutex::new(Inner { pending: pieces, claimed: HashMap::new(), done: HashSet::new() }),
             availability: Mutex::new(vec![0u32; total_pieces]),
+            order: Order::default(),
         }
+    }
+
+    /// Chooses which pending piece comes out first (rarest by default).
+    pub fn with_order(mut self, order: Order) -> Self {
+        self.order = order;
+        self
     }
 
     /// Pops the rarest pending piece (ties broken arbitrarily) and marks
@@ -99,10 +121,16 @@ impl WorkQueue {
     pub fn take_for(&self, has: impl Fn(u32) -> bool) -> Take {
         let mut inner = lock(&self.inner);
         let availability = lock(&self.availability);
-        let rarity = |w: &PieceWork| availability.get(w.index as usize).copied().unwrap_or(0);
+        // Lower comes first. The index breaks ties, so the choice is
+        // deterministic rather than an accident of the list's order.
+        let order = self.order;
+        let rank = |w: &PieceWork| match order {
+            Order::RarestFirst => (availability.get(w.index as usize).copied().unwrap_or(0), w.index),
+            Order::Sequential => (0, w.index),
+        };
 
-        let rarest_offered = inner.pending.iter().enumerate().filter(|(_, w)| has(w.index)).min_by_key(|(_, w)| rarity(w)).map(|(i, _)| i);
-        if let Some(index) = rarest_offered {
+        let first_offered = inner.pending.iter().enumerate().filter(|(_, w)| has(w.index)).min_by_key(|(_, w)| rank(w)).map(|(i, _)| i);
+        if let Some(index) = first_offered {
             // swap_remove is O(1) (vs. a true rarest-first-preserving
             // remove being O(n) regardless of representation) -- fine
             // since there is no ordering promise among equal-rarity
@@ -118,7 +146,7 @@ impl WorkQueue {
         // claimed ones would have every partial peer in the swarm
         // downloading the same few pieces.
         if inner.pending.is_empty() {
-            if let Some(work) = inner.claimed.values().filter(|w| has(w.index)).min_by_key(|w| rarity(w)).cloned() {
+            if let Some(work) = inner.claimed.values().filter(|w| has(w.index)).min_by_key(|w| rank(w)).cloned() {
                 return Take::Piece(work);
             }
         }
@@ -522,5 +550,46 @@ mod tests {
         q.mark_done(0);
         q.mark_done(1);
         assert!(q.pop().is_none());
+    }
+
+    // ---- order ----
+
+    #[test]
+    fn sequential_gives_the_lowest_index_however_rare_the_others_are() {
+        let q = WorkQueue::new(vec![work(2), work(0), work(1)], 3).with_order(Order::Sequential);
+        // Piece 2 is the rarest and piece 0 the commonest.
+        q.note_have(0);
+        q.note_have(0);
+        q.note_have(1);
+
+        let order: Vec<u32> = std::iter::from_fn(|| piece_index(q.take_for(|_| true))).take(3).collect();
+
+        assert_eq!(order, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn sequential_takes_the_lowest_index_the_peer_has() {
+        let q = WorkQueue::new(vec![work(0), work(1), work(2)], 3).with_order(Order::Sequential);
+        assert_eq!(piece_index(q.take_for(has(&[1, 2]))), Some(1), "piece 0 is not on offer");
+        assert_eq!(piece_index(q.take_for(has(&[0, 1, 2]))), Some(0));
+    }
+
+    #[test]
+    fn sequential_duplicates_the_lowest_claimed_piece_in_endgame() {
+        let q = WorkQueue::new(vec![work(0), work(1), work(2)], 3).with_order(Order::Sequential);
+        for _ in 0..3 {
+            q.pop();
+        }
+        assert_eq!(q.take_for(|_| true), Take::Piece(work(0)));
+    }
+
+    #[test]
+    fn rarest_first_is_the_default_and_ties_go_to_the_lowest_index() {
+        let q = WorkQueue::new(vec![work(2), work(0), work(1), work(3)], 4);
+        q.note_have(0);
+        q.note_have(1);
+        // 2 and 3 are equally rare, and rarer than 0 and 1.
+        let order: Vec<u32> = std::iter::from_fn(|| piece_index(q.take_for(|_| true))).take(4).collect();
+        assert_eq!(order, vec![2, 3, 0, 1], "rarity first, then index, however the list was arranged");
     }
 }
