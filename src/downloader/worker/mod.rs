@@ -13,6 +13,7 @@
 mod connect;
 mod messages;
 mod piece;
+mod peer_stats;
 mod pipeline;
 #[cfg(test)]
 mod tests;
@@ -23,7 +24,8 @@ use crate::ratelimit::RateLimiter;
 use crate::peer::{ConnectionError, WireError};
 use connect::establish;
 use messages::{absorb, is_read_timeout};
-use piece::download_one_piece;
+use piece::{download_one_piece, Meter};
+pub use peer_stats::{Activity, PeerRegistry, PeerRow, PeerStat};
 use pipeline::Throughput;
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::mpsc::Sender;
@@ -48,6 +50,8 @@ pub struct WorkerConfig {
     pub down_limit: Option<Arc<RateLimiter>>,
     /// Lets the coordinator cut short workers blocked on the network.
     pub interrupt: Interrupt,
+    /// What each connected peer is doing, for the dashboard.
+    pub peers: PeerRegistry,
 }
 
 /// A way to end workers that are blocked reading from a peer.
@@ -157,8 +161,12 @@ pub fn run_worker(
     results_tx: &Sender<PieceResult>,
     pex_tx: Option<&PexSender>,
 ) -> Result<(), WorkerError> {
+    // Listed on the dashboard for as long as the connection lasts.
+    let entry = config.peers.enter(peer_addr, std::time::Instant::now());
+    let stat = &entry.stat;
     // The registration is held to the end of the run: dropping it is what lets the connection close.
     let (mut stream, mut state, _registration) = establish(peer_addr, config, queue, pex_tx)?;
+    stat.set(Activity::Downloading);
 
     let mut irrelevant_cycles = 0u32;
     // How fast this peer delivers, which sets how many requests to queue.
@@ -170,14 +178,16 @@ pub fn run_worker(
             Take::Piece(work) => work,
             Take::Done => break,
             Take::NothingForThisPeer => {
+                stat.set(Activity::Idle);
                 wait_for_a_piece_it_has(&mut stream, &mut state, queue, pex_tx, &mut irrelevant_cycles)?;
                 continue;
             }
         };
         irrelevant_cycles = 0;
+        stat.set(Activity::Downloading);
         let piece_index = work.index;
 
-        match download_one_piece(&mut stream, &mut state, queue, work.clone(), config, &mut throughput, pex_tx) {
+        match download_one_piece(&mut stream, &mut state, queue, work.clone(), config, Meter { throughput: &mut throughput, stat }, pex_tx) {
             Ok(Some(data)) => {
                 if let Err(e) = write_piece(spans, piece_index, piece_length, &data) {
                     // Disk failure isn't the peer's fault; requeue and bail

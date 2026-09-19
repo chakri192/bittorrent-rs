@@ -8,7 +8,7 @@ pub use file_writer::{build_file_spans, create_empty_files, read_at_global_offse
 pub use piece_assembler::{AssemblerError, PartialPiece, PieceAssembler, PieceWork, BLOCK_SIZE};
 pub use queue::{Order, PieceResult, Take, WorkQueue};
 pub use resume::{any_data_on_disk, load_and_verify, progress_file_path, rewrite_compact, scan_all, ResumeWriter};
-pub use worker::{run_worker, Interrupt, PexSender, WorkerConfig, WorkerError};
+pub use worker::{run_worker, Activity, Interrupt, PeerRegistry, PeerRow, PexSender, WorkerConfig, WorkerError};
 
 use crate::torrent::TorrentFile;
 

@@ -269,8 +269,82 @@ fn render(f: &mut Frame, view: &View) {
     render_throughput(f, lower[0], view);
     render_swarm(f, lower[1], view);
 
-    render_log(f, rows[3], view);
+    // The peer table sits beside the activity log when there is room for both.
+    if rows[3].width >= PEER_PANEL_WIDTH + MIN_LOG_WIDTH {
+        let bottom = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Min(MIN_LOG_WIDTH), Constraint::Length(PEER_PANEL_WIDTH)]).split(rows[3]);
+        render_log(f, bottom[0], view);
+        render_peers(f, bottom[1], view);
+    } else {
+        render_log(f, rows[3], view);
+    }
     render_footer(f, rows[4], view);
+}
+
+/// The peer table's width, borders included: an IPv4 address and port, a
+/// state, a rate and a total, each in its column.
+const PEER_PANEL_WIDTH: u16 = 54;
+/// The narrowest the activity log is squeezed to make room for it.
+const MIN_LOG_WIDTH: u16 = 50;
+const ADDR_COL: usize = 21;
+const STATE_COL: usize = 11;
+const RATE_COL: usize = 9;
+const TOTAL_COL: usize = 8;
+
+/// `text` cut to `width` characters, with an ellipsis if it was longer.
+fn fit(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        text.to_string()
+    } else {
+        let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
+        cut.push('\u{2026}');
+        cut
+    }
+}
+
+fn activity_color(activity: &str) -> Color {
+    match activity {
+        "downloading" => Color::Green,
+        "choked" => Color::Yellow,
+        "connecting" => Color::Cyan,
+        _ => Color::DarkGray,
+    }
+}
+
+/// The peer table as lines of at most `height`: a header, then the peers
+/// (already fastest first), with a count of those that did not fit.
+fn peer_table_lines(peers: &[crate::downloader::PeerRow], height: usize) -> Vec<Line<'static>> {
+    if peers.is_empty() {
+        return vec![Line::from(Span::styled("no peers connected yet", Style::default().fg(Color::DarkGray)))];
+    }
+    let header = Style::default().fg(TITLE);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{:<ADDR_COL$} ", "ADDRESS"), header),
+        Span::styled(format!("{:<STATE_COL$} ", "STATE"), header),
+        Span::styled(format!("{:>RATE_COL$} ", "RATE"), header),
+        Span::styled(format!("{:>TOTAL_COL$}", "TOTAL"), header),
+    ])];
+    let room = height.saturating_sub(1);
+    let shown = if peers.len() > room { room.saturating_sub(1) } else { peers.len() };
+    for peer in peers.iter().take(shown) {
+        let rate = if peer.rate >= 1.0 { format_rate(peer.rate) } else { "-".to_string() };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<ADDR_COL$} ", fit(&peer.addr, ADDR_COL)), Style::default().fg(Color::White)),
+            Span::styled(format!("{:<STATE_COL$} ", peer.activity), Style::default().fg(activity_color(peer.activity))),
+            Span::styled(format!("{:>RATE_COL$} ", fit(&rate, RATE_COL)), Style::default().fg(Color::Gray)),
+            Span::styled(format!("{:>TOTAL_COL$}", fit(&format_bytes(peer.bytes), TOTAL_COL)), Style::default().fg(Color::Gray)),
+        ]));
+    }
+    if shown < peers.len() && room > 0 {
+        lines.push(Line::from(Span::styled(format!("+ {} more", peers.len() - shown), Style::default().fg(Color::DarkGray))));
+    }
+    lines
+}
+
+fn render_peers(f: &mut Frame, area: Rect, view: &View) {
+    let block = panel(&format!("peers ({})", view.snap.peers.len()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(peer_table_lines(&view.snap.peers, inner.height as usize)), inner);
 }
 
 /// Braille spinner frames for the "live" indicator in the header.
@@ -857,5 +931,120 @@ mod tests {
         ui.finish(Ok("done".to_string()));
         // Returns normally instead of panicking, as `println!` would.
         assert!(!run_json_to(&ui.shared(), &AtomicBool::new(false), &mut Broken, Duration::from_millis(10)));
+    }
+
+    // ---- the peer table ----
+
+    use crate::downloader::PeerRow;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn peer(addr: &str, activity: &'static str, rate: f64, bytes: u64) -> PeerRow {
+        PeerRow { addr: addr.to_string(), activity, rate, bytes }
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn view_with(peers: Vec<PeerRow>) -> View {
+        View {
+            title: "Some Torrent".to_string(),
+            out_path: "/out".to_string(),
+            log_path: None,
+            snap: Snapshot { total_length: 1000, total_pieces: 4, active_peers: peers.len(), status: "downloading", peers, ..Default::default() },
+            down_hist: VecDeque::new(),
+            up_hist: VecDeque::new(),
+            logs: vec!["torrent: Some Torrent".to_string()],
+            pieces: vec![false; 4],
+            finished: None,
+            frame: 0,
+        }
+    }
+
+    /// The whole dashboard drawn on a terminal of the given size, as text.
+    fn screen(view: &View, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render(f, view)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height).map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn the_table_lists_each_peer_with_its_state_rate_and_total() {
+        let lines = peer_table_lines(&[peer("203.0.113.7:51413", "downloading", 1_500_000.0, 45_000_000), peer("198.51.100.2:6881", "choked", 0.0, 0)], 10);
+
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert_eq!(lines.len(), 3, "a header and two peers");
+        assert!(text[0].starts_with("ADDRESS") && text[0].contains("STATE") && text[0].contains("RATE") && text[0].contains("TOTAL"), "{:?}", text[0]);
+        assert!(text[1].starts_with("203.0.113.7:51413 ") && text[1].contains("downloading") && text[1].contains("1.4 MiB/s") && text[1].contains("42.9 MiB"), "{:?}", text[1]);
+        assert!(text[2].contains("198.51.100.2:6881") && text[2].contains("choked") && text[2].contains(" -"), "a peer moving nothing shows a dash: {:?}", text[2]);
+    }
+
+    #[test]
+    fn every_row_has_the_same_width_so_the_columns_line_up() {
+        let lines = peer_table_lines(&[peer("1.2.3.4:5", "idle", 5.0, 1), peer("255.255.255.255:65535", "downloading", 999_999_999.0, 99_999_999_999)], 10);
+        let widths: Vec<usize> = lines.iter().map(|l| line_text(l).chars().count()).collect();
+        assert!(widths.iter().all(|&w| w == widths[0]), "{:?}", widths);
+        assert!(widths[0] <= (PEER_PANEL_WIDTH - 2) as usize, "and they fit the panel: {}", widths[0]);
+    }
+
+    #[test]
+    fn a_long_ipv6_address_is_cut_with_an_ellipsis_not_allowed_to_push_the_columns() {
+        let long = "[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:51413";
+        let lines = peer_table_lines(&[peer(long, "idle", 0.0, 0)], 5);
+        let row = line_text(&lines[1]);
+        assert!(row.starts_with("[2001:0db8:85a3:0000\u{2026} "), "{:?}", row);
+        assert_eq!(row.chars().count(), line_text(&lines[0]).chars().count());
+    }
+
+    #[test]
+    fn what_does_not_fit_is_counted_not_drawn() {
+        let peers: Vec<PeerRow> = (0..10).map(|i| peer(&format!("10.0.0.{}:1", i), "idle", 0.0, 0)).collect();
+
+        let lines = peer_table_lines(&peers, 5); // a header and four lines: three peers and the count
+
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(text.len(), 5);
+        assert!(text[3].contains("10.0.0.2:1"));
+        assert_eq!(text[4], "+ 7 more");
+        assert_eq!(peer_table_lines(&peers, 11).len(), 11, "with room for all ten, all ten");
+        assert_eq!(peer_table_lines(&peers, 1).len(), 1, "with room only for the header, just that");
+        assert_eq!(peer_table_lines(&peers, 0).len(), 1, "and never a panic on no room at all");
+    }
+
+    #[test]
+    fn with_no_peers_the_panel_says_so() {
+        assert_eq!(line_text(&peer_table_lines(&[], 5)[0]), "no peers connected yet");
+    }
+
+    #[test]
+    fn a_wide_terminal_shows_the_peer_panel_beside_the_log() {
+        let view = view_with(vec![peer("203.0.113.7:51413", "downloading", 2_000_000.0, 1024), peer("198.51.100.2:6881", "choked", 0.0, 0)]);
+
+        let drawn = screen(&view, 130, 40);
+
+        assert!(drawn.contains("peers (2)"), "the panel is titled with the count");
+        assert!(drawn.contains("203.0.113.7:51413") && drawn.contains("downloading") && drawn.contains("198.51.100.2:6881") && drawn.contains("choked"));
+        assert!(drawn.contains("activity"), "and the log is still there");
+    }
+
+    #[test]
+    fn a_narrow_terminal_leaves_the_peer_panel_out_and_keeps_the_log() {
+        let view = view_with(vec![peer("203.0.113.7:51413", "downloading", 2_000_000.0, 1024)]);
+
+        let drawn = screen(&view, 90, 40);
+
+        assert!(!drawn.contains("203.0.113.7:51413"), "no room for it beside the log");
+        assert!(drawn.contains("activity"));
+    }
+
+    #[test]
+    fn the_dashboard_survives_a_tiny_terminal_with_peers_to_show() {
+        let view = view_with((0..30).map(|i| peer(&format!("10.0.0.{}:6881", i), "downloading", 1e6, 1e6 as u64)).collect());
+        for (w, h) in [(1, 1), (10, 5), (54, 3), (104, 12), (200, 60)] {
+            let _ = screen(&view, w, h); // must not panic
+        }
     }
 }

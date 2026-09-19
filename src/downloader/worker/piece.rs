@@ -2,6 +2,7 @@
 //! assembling the blocks, and verifying the result.
 
 use super::connect::MAX_UNCHOKE_WAIT_TIMEOUTS;
+use super::peer_stats::{Activity, PeerStat};
 use super::pipeline::{depth_for, Throughput};
 use super::{absorb, is_read_timeout, PexSender, WorkerConfig, WorkerError};
 use crate::downloader::piece_assembler::{PieceAssembler, PieceWork};
@@ -28,14 +29,14 @@ pub(super) fn download_one_piece(
     queue: &WorkQueue,
     work: PieceWork,
     config: &WorkerConfig,
-    throughput: &mut Throughput,
+    meter: Meter,
     pex_tx: Option<&PexSender>,
 ) -> Result<Option<Vec<u8>>, WorkerError> {
     let (assembler, resumed) = match queue.take_partial(work.index) {
         Some(partial) => (PieceAssembler::resume(work.clone(), partial), true),
         None => (PieceAssembler::new(work.clone()), false),
     };
-    let mut link = Link { stream, state, queue, config, throughput, pex_tx };
+    let mut link = Link { stream, state, queue, config, meter, pex_tx };
     match attempt(&mut link, assembler)? {
         Attempt::Verified(data) => Ok(Some(data)),
         Attempt::Abandoned => Ok(None),
@@ -48,13 +49,20 @@ pub(super) fn download_one_piece(
     }
 }
 
+/// What is measured about a peer as its pieces arrive: how fast, which
+/// sizes its request queue, and what the dashboard shows.
+pub(super) struct Meter<'a> {
+    pub throughput: &'a mut Throughput,
+    pub stat: &'a PeerStat,
+}
+
 /// The connection and the shared things a piece download works with.
 struct Link<'a> {
     stream: &'a mut std::net::TcpStream,
     state: &'a mut PeerState,
     queue: &'a WorkQueue,
     config: &'a WorkerConfig,
-    throughput: &'a mut Throughput,
+    meter: Meter<'a>,
     pex_tx: Option<&'a PexSender>,
 }
 
@@ -93,7 +101,7 @@ enum Fetched {
 
 /// Requests and receives blocks until `assembler` has them all.
 fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler) -> Result<Fetched, WorkerError> {
-    let Link { stream, state, queue, config, throughput, pex_tx } = link;
+    let Link { stream, state, queue, config, meter, pex_tx } = link;
     let piece_index = assembler.piece_index();
     let mut blocks_received = 0u32;
     // Outstanding (begin, length) requests -- what we'd need to Cancel
@@ -121,9 +129,11 @@ fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler) -> Result<Fetch
             // is requested while choked.
             in_flight.clear();
             assembler.forget_requests();
+            meter.stat.set(Activity::Choked);
         } else {
             choked_timeouts = 0;
-            let depth = depth_for(throughput.rate(Instant::now()), config.pipeline_depth, state.peer_request_limit);
+            meter.stat.set(Activity::Downloading);
+            let depth = depth_for(meter.throughput.rate(Instant::now()), config.pipeline_depth, state.peer_request_limit);
             while in_flight.len() < depth {
                 let reqs = assembler.next_requests(depth - in_flight.len());
                 if reqs.is_empty() {
@@ -164,7 +174,8 @@ fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler) -> Result<Fetch
                 let _ = assembler.record_block(*begin, block);
                 in_flight.retain(|&(b, _)| b != *begin);
                 blocks_received += 1;
-                throughput.record(Instant::now(), block.len());
+                meter.throughput.record(Instant::now(), block.len());
+                meter.stat.add_bytes(block.len());
                 // Reading slowly is backpressure: the peer's window fills.
                 if let Some(limiter) = config.down_limit.as_deref() {
                     // Not past the point where the client is stopping.

@@ -294,6 +294,7 @@ impl<'a> Session<'a> {
             eta_secs,
             elapsed_secs: self.run_start.elapsed().as_secs(),
             status,
+            peers: self.workers.peer_rows(Instant::now()),
         });
     }
 
@@ -451,7 +452,7 @@ mod tests {
         let work = data.chunks(PIECE_LEN).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32 }).collect();
         let queue = Arc::new(WorkQueue::new(work, PIECES));
         let spans = Arc::new(build_file_spans(dir, &[(vec!["f.bin".to_string()], data.len() as i64)]));
-        let config = Arc::new(WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(1), down_limit: None, interrupt: Default::default() });
+        let config = Arc::new(WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(1), down_limit: None, interrupt: Default::default(), peers: Default::default() });
         let log: Log = {
             let sink = Arc::clone(sink);
             Arc::new(move |m| sink.log(m))
@@ -520,6 +521,23 @@ mod tests {
         let mut s = session(&sink, &services, &dir, &[fake_peer(true)], None);
 
         assert!(s.run(&AtomicBool::new(false)).aborted.is_none());
+    }
+
+    #[test]
+    fn a_connected_peer_is_listed_in_what_the_run_publishes() {
+        let dir = tmp_dir("peer-rows");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        // A peer that unchokes us and then never answers a request: the worker is on the table, downloading nothing.
+        let mut s = session(&sink, &services, &dir, &[fake_peer(false)], Some(Duration::from_millis(1200)));
+
+        s.run(&AtomicBool::new(false));
+
+        let listed: Vec<_> = sink.snapshots.lock().unwrap().iter().flat_map(|snap| snap.peers.clone()).collect();
+        assert!(!listed.is_empty(), "the peer was on the table in some snapshot");
+        assert!(listed.iter().any(|row| row.activity == "downloading"), "and, once it had unchoked us, as downloading: {:?}", listed);
+        assert!(listed.iter().all(|row| row.addr.starts_with("127.0.0.1:") && matches!(row.activity, "connecting" | "downloading") && row.bytes == 0), "{:?}", listed);
+        assert!(sink.last_snapshot().peers.is_empty(), "and gone once the run had stopped its workers");
     }
 
     #[test]

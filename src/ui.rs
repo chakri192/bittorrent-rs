@@ -106,6 +106,8 @@ pub struct Snapshot {
     pub elapsed_secs: u64,
     /// One-word phase: "connecting", "downloading", "waiting", ...
     pub status: &'static str,
+    /// The connected peers, fastest first, for the dashboard's peer table.
+    pub peers: Vec<crate::downloader::PeerRow>,
 }
 
 impl Snapshot {
