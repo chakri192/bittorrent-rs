@@ -137,6 +137,20 @@ impl WorkQueue {
     /// Workers that can't finish the piece they were given (the download
     /// failed) call `push_back` to return it.
     pub fn take_for(&self, has: impl Fn(u32) -> bool) -> Take {
+        self.take(has, true)
+    }
+
+    /// The next piece for a connection that is still busy with another, so that its requests can go on across the boundary:
+    /// as `take_for`, but only a piece nobody has taken, and never a duplicate of one being fetched (an endgame piece is
+    /// not looked ahead to), and never any if the queue is in endgame or has nothing this peer has.
+    pub fn take_pending_for(&self, has: impl Fn(u32) -> bool) -> Option<PieceWork> {
+        match self.take(has, false) {
+            Take::Piece(work) => Some(work),
+            Take::Done | Take::NothingForThisPeer => None,
+        }
+    }
+
+    fn take(&self, has: impl Fn(u32) -> bool, endgame_duplicates: bool) -> Take {
         let mut inner = lock(&self.inner);
         let availability = lock(&self.availability);
         // Lower comes first. The index breaks ties, so the choice is
@@ -167,7 +181,7 @@ impl WorkQueue {
         // pieces remain pending that this peer lacks, letting it duplicate
         // claimed ones would have every partial peer in the swarm
         // downloading the same few pieces.
-        if inner.pending.is_empty() {
+        if endgame_duplicates && inner.pending.is_empty() {
             if let Some(work) = inner.claimed.values().filter(|w| has(w.index)).min_by_key(|w| rank(w)).cloned() {
                 return Take::Piece(work);
             }
@@ -794,5 +808,20 @@ mod tests {
         assert!(!q.is_wanted(7), "a piece the queue does not have");
         q.mark_done(1);
         assert!(!q.is_wanted(1), "nor one that is done");
+    }
+
+    #[test]
+    fn a_piece_to_look_ahead_to_is_the_rarest_pending_one_this_peer_has_and_never_a_duplicate() {
+        let q = WorkQueue::new(vec![work(0), work(1), work(2)], 3);
+        q.note_bitfield(&[true, true, true]);
+        q.note_bitfield(&[true, false, true]);
+        // Piece 1 is the rare one (one peer has it, two have the others); a peer that has only 0 and 2 is offered the first of those.
+        assert_eq!(q.take_pending_for(|p| p != 1).map(|w| w.index), Some(0), "the index breaks the tie");
+        assert_eq!(q.take_pending_for(|p| p == 1).map(|w| w.index), Some(1));
+        assert!(q.take_pending_for(|p| p == 0).is_none(), "0 is taken already, and taking it again would be a duplicate");
+        assert_eq!(q.take_pending_for(|_| true).map(|w| w.index), Some(2), "what is left");
+        // Nothing pending, all claimed: endgame, where `take_for` hands out duplicates and this does not.
+        assert!(q.take_pending_for(|_| true).is_none());
+        assert!(matches!(q.take_for(|_| true), Take::Piece(_)), "which is what a worker that has run out of its own gets");
     }
 }

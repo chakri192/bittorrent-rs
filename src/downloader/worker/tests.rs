@@ -795,10 +795,10 @@ fn a_choke_at_any_point_is_waited_out_and_the_missing_blocks_are_asked_for_again
         assert!(result.is_ok(), "choked after {} blocks: {:?}", serve_before_choke, result);
         assert_eq!(got, vec![0, 1], "choked after {} blocks: both pieces arrived and verified", serve_before_choke);
         assert!(log.ignored_while_choked > 0, "choked after {} blocks: the peer discarded requests, so some had to be sent again", serve_before_choke);
-        // At most one piece's worth (4 blocks) were already on their way
-        // when the choke came; a client that kept asking while choked would
-        // send that many again on every quiet spell.
-        assert!(log.ignored_while_choked <= 4, "choked after {} blocks: {} requests reached a peer that had us choked", serve_before_choke, log.ignored_while_choked);
+        // What was already on its way when the choke came -- with the requests going on across piece boundaries, up to both
+        // pieces' worth (8 blocks) -- and no more: a client that kept asking while choked would send that many
+        // again on every quiet spell (three of them here).
+        assert!(log.ignored_while_choked <= 8, "choked after {} blocks: {} requests reached a peer that had us choked", serve_before_choke, log.ignored_while_choked);
     }
 }
 
@@ -1411,7 +1411,9 @@ fn a_peer_that_chokes_between_pieces_and_stays_silent_is_kept_alive_for_a_while_
     });
 
     let started = Instant::now();
-    let (result, queue, results) = run_fast_worker("choked-between-pieces", addr, info_hash, &pieces, 16384, 2);
+    // (A depth of one: with more, the second piece would be asked for before the choke came, as a pipeline that goes on
+    // across pieces does, and there would be no gap between the pieces to be choked in.)
+    let (result, queue, results) = run_fast_worker("choked-between-pieces", addr, info_hash, &pieces, 16384, 1);
 
     assert!(matches!(result, Err(WorkerError::Connection { stage: "peer_has_no_needed_pieces", .. })), "{:?}", result);
     assert!(started.elapsed() < Duration::from_secs(3), "it gave up after the short wait for an unchoke, not the long one for something to be offered: {:?}", started.elapsed());
@@ -1551,4 +1553,96 @@ fn a_v2_piece_that_does_not_come_to_its_root_is_refused_like_a_v1_one_that_fails
     assert_eq!(rx.try_iter().count(), 0);
     assert!(!dir.join("f").exists(), "nothing unverified reached the disk");
     let _ = mock.join();
+}
+
+
+// ---- requests that go on across pieces ----
+
+#[test]
+fn small_pieces_from_a_distant_peer_are_not_a_round_trip_each() {
+    const LATENCY: Duration = Duration::from_millis(30);
+    let (pieces, piece_len) = (16usize, 64 * 1024); // four blocks each
+    // Without the requests going on across pieces, every piece is a round trip on its own: all sixteen wait a latency.
+    let one_per_round_trip = LATENCY * pieces as u32;
+
+    // Room for four pieces at once (sixteen blocks): about four round trips for the sixteen, where each on its own is sixteen.
+    let (took, _, correct) = download_from_laggy_peer("across-pieces", pieces, piece_len, LATENCY, None, 16);
+
+    assert!(correct, "every byte arrived intact");
+    assert!(took < one_per_round_trip / 2, "took {:?}; a round trip a piece would take {:?}", took, one_per_round_trip);
+}
+
+/// Four pieces of four blocks from a peer that sends every block wrong, with room for all at once: the worker fails on
+/// the first, and the others, which it had asked for, go back too.
+#[test]
+fn a_piece_asked_for_ahead_goes_back_to_the_queue_when_the_one_before_it_fails() {
+    let pieces: Vec<Vec<u8>> = (0..4u8).map(|i| (0..4 * 16384).map(|b| (b as u8).wrapping_mul(7).wrapping_add(i)).collect()).collect();
+    let info_hash = [0x6A; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let peer = spawn_recording_peer(listener, info_hash, pieces.clone(), None, Fault::EveryBlockWrong, Arc::clone(&requests));
+    let work = pieces.iter().enumerate().map(|(i, p)| PieceWork { index: i as u32, hash: sha1_of(p), length: p.len() as u32, merkle: None }).collect();
+    let queue = Arc::new(WorkQueue::new(work, 4));
+    let dir = tmp_dir("ahead-released");
+    let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 16 * 16384)]));
+    let (tx, _rx) = mpsc::channel();
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 16, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default() };
+
+    let result = run_worker(addr, &config, &queue, &spans, 4 * 16384, &tx, None);
+    drop(config);
+    drop(peer);
+
+    assert!(matches!(result, Err(WorkerError::PieceHashMismatch)));
+    let asked: std::collections::BTreeSet<u32> = requests.lock().unwrap().iter().map(|&(piece, _)| piece).collect();
+    assert!(asked.len() >= 3, "the pieces after the first were asked for while it was still being fetched: {:?}", asked);
+    let mut pending: Vec<u32> = std::iter::from_fn(|| queue.take_pending_for(|_| true)).map(|w| w.index).collect();
+    pending.sort_unstable();
+    assert_eq!(pending, vec![0, 1, 2, 3], "all are waiting to be taken again, not left claimed by a worker that has gone");
+}
+
+/// A peer that has pieces 0 and 2 of three: the worker asks it for those and never for the one it lacks, ahead or not.
+#[test]
+fn only_a_piece_the_peer_has_is_asked_for_ahead() {
+    let pieces: Vec<Vec<u8>> = (0..3u8).map(|i| (0..2 * 16384).map(|b| (b as u8).wrapping_mul(5).wrapping_add(i)).collect()).collect();
+    let info_hash = [0x6B; 20];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = pieces.clone();
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&asked);
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut hs_buf = [0u8; 68];
+        stream.read_exact(&mut hs_buf).unwrap();
+        std::io::Write::write_all(&mut stream, &Handshake::new(info_hash, [0x99; 20], false).to_bytes()).unwrap();
+        WireMessage::Bitfield(vec![0b1010_0000]).write_to(&mut stream).unwrap();
+        WireMessage::Unchoke.write_to(&mut stream).unwrap();
+        while let Ok(msg) = WireMessage::read_from(&mut stream) {
+            if let WireMessage::Request { index, begin, length } = msg {
+                log.lock().unwrap().push(index);
+                serve(&mut stream, &served, (index, begin, length));
+            }
+        }
+    });
+    let (result, queue, results) = run_fast_worker("ahead-has", addr, info_hash, &pieces, 2 * 16384, 8);
+    drop(peer);
+
+    let mut got: Vec<u32> = results.iter().map(|r| r.index).collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![0, 2], "the two it has arrived");
+    assert!(!asked.lock().unwrap().contains(&1), "and the one it lacks was never asked for: {:?}", asked.lock().unwrap());
+    assert!(result.is_err(), "the worker then has nothing to get here and leaves: {:?}", result);
+    assert_eq!(queue.len(), 1);
+}
+
+#[test]
+fn one_connection_looks_ahead_only_so_many_pieces() {
+    // One-block pieces, so that a block in flight is a piece in flight, and room in the queue for far more than are allowed.
+    let (_, most_waiting, correct) = download_from_laggy_peer("lookahead-bound", 32, 16384, Duration::from_millis(20), None, 64);
+    assert!(correct);
+    // (The piece being fetched and eight more: written out, so that changing the limit means changing this on purpose.)
+    assert!(most_waiting <= 9, "{} blocks of different pieces were waiting at the peer at once", most_waiting);
+    assert!(most_waiting > 4, "and it did look ahead: {}", most_waiting);
 }

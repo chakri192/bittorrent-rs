@@ -24,10 +24,11 @@ use crate::ratelimit::RateLimiter;
 use crate::peer::{ConnectionError, Message, WireError};
 use connect::establish;
 use messages::{absorb, is_read_timeout};
-use piece::{download_one_piece, Downloaded, Meter};
+use piece::{download_one_piece, Downloaded, Lookahead, Meter};
 pub use peer_stats::{Activity, PeerRegistry, PeerRow, PeerStat};
 use pipeline::Throughput;
 use crate::peer::{Closer, PeerStream};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::mpsc::Sender;
 use crate::sync::lock;
@@ -179,29 +180,36 @@ pub fn run_worker(
     // Pieces this peer keeps refusing to send (BEP 6): not asked for again on this connection.
     let mut refused: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
+    // The piece taken while the last one was being fetched, so that the requests went on across the boundary.
+    let mut ahead: VecDeque<Lookahead> = VecDeque::new();
+
     loop {
-        // The rarest piece *this peer has* and will send now: one it lacks is
-        // no use to it, nor is one it will not send while it has us choked.
-        let work = match queue.take_for(|piece| state.peer_has_pieces.get(piece as usize).copied().unwrap_or(false) && state.may_request(piece) && !refused.contains(&piece)) {
-            Take::Piece(work) => work,
-            Take::Done => break,
-            Take::NothingForThisPeer => {
-                stat.set(Activity::Idle);
-                wait_for_a_piece_it_has(&mut stream, &mut state, queue, pex_tx, &mut irrelevant_cycles)?;
-                continue;
-            }
+        // The piece already looked ahead to, if there is one; else the rarest piece *this peer has* and will send now: one
+        // it lacks is no use to it, nor is one it will not send while it has us choked.
+        let (work, started) = match ahead.pop_front() {
+            Some(next) => (next.work.clone(), Some(next)),
+            None => match queue.take_for(|piece| state.peer_has_pieces.get(piece as usize).copied().unwrap_or(false) && state.may_request(piece) && !refused.contains(&piece)) {
+                Take::Piece(work) => (work, None),
+                Take::Done => break,
+                Take::NothingForThisPeer => {
+                    stat.set(Activity::Idle);
+                    wait_for_a_piece_it_has(&mut stream, &mut state, queue, pex_tx, &mut irrelevant_cycles)?;
+                    continue;
+                }
+            },
         };
         irrelevant_cycles = 0;
         stat.set(Activity::Downloading);
         let piece_index = work.index;
 
-        match download_one_piece(&mut stream, &mut state, queue, work.clone(), config, Meter { throughput: &mut throughput, stat }, pex_tx) {
+        match download_one_piece(&mut stream, &mut state, queue, work.clone(), started, &refused, &mut ahead, config, Meter { throughput: &mut throughput, stat }, pex_tx) {
             Ok(Downloaded::Verified(data)) => {
                 if let Err(e) = write_piece(spans, piece_index, piece_length, &data) {
                     // Disk failure isn't the peer's fault; requeue and bail
                     // out of this worker entirely rather than risk more
                     // writes to a broken filesystem.
                     queue.push_back(work);
+                    release_all(&mut ahead, queue);
                     return Err(WorkerError::Connection { stage: "write_piece_to_disk", error: ConnectionError::Io(e) });
                 }
                 // First completion wins (endgame duplicates lose the race
@@ -215,6 +223,7 @@ pub fn run_worker(
                 // Not this peer's to give: let someone else have the piece.
                 queue.push_back(work);
                 refused.insert(piece_index);
+                release_all(&mut ahead, queue);
             }
             Ok(Downloaded::Abandoned) => {
                 // Endgame: another worker finished this piece while we
@@ -225,11 +234,19 @@ pub fn run_worker(
                 // peer a chance rather than trusting this connection
                 // further.
                 queue.push_back(work);
+                release_all(&mut ahead, queue);
                 return Err(e);
             }
         }
     }
     Ok(())
+}
+
+/// Gives back every piece that was taken ahead of time, for the connection has no more use for them.
+fn release_all(ahead: &mut VecDeque<Lookahead>, queue: &WorkQueue) {
+    for next in ahead.drain(..) {
+        next.release(queue);
+    }
 }
 
 /// Pieces remain, but this peer has none of them. Rather than

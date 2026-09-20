@@ -548,7 +548,10 @@ mod tests {
         for piece in 0..PIECES {
             assert!(sink.lines.lock().unwrap().iter().any(|l| l.starts_with(&format!("piece {} verified (", piece))), "piece {} was reported", piece);
         }
-        assert!(sink.snapshots.lock().unwrap().iter().any(|snap| snap.status == "downloading"), "and the dashboard saw it downloading");
+        // (Whether a snapshot in between said "downloading" depends on how fast the pieces arrive: with the requests going on across
+        // pieces, all four here can be in before the loop has published anything but the end.)
+        let last = sink.last_snapshot();
+        assert_eq!((last.status, last.verified, last.done_bytes), ("complete", PIECES, data().len() as u64), "and the dashboard's last word is that it is done");
     }
 
     /// A partial piece: the one block of piece `index` (the pieces here are one block long), received.

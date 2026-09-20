@@ -871,7 +871,14 @@ fn serve_stream(stream: Box<dyn bittorrent_rs::peer::PeerStream>, over_utp: bool
                 };
                 if hang_up {
                     if let Behavior::DropMidPiece { dropped, .. } = behavior {
-                        dropped.open();
+                        // The other peer is let in a moment after this one has gone, not as it goes: the client hands back the
+                        // pieces it had taken from this connection, and what arrived of them, when it sees the connection
+                        // end, and a peer that came in before it had would be asked for a piece that is still someone's.
+                        let dropped = Arc::clone(dropped);
+                        thread::spawn(move || {
+                            thread::sleep(Duration::from_millis(300));
+                            dropped.open();
+                        });
                     }
                     return; // the stream closes with the piece half-sent
                 }
@@ -1214,7 +1221,7 @@ fn run_drop_mid_piece(name: &str) -> Result<String, String> {
     // the client kept it: the healthy peer is asked only for the second.
     let asked_for_dropped: Vec<u32> = healthy.lock().unwrap().requested_blocks.iter().filter(|&&(piece, _)| piece == dropped_piece).map(|&(_, begin)| begin).collect();
     if asked_for_dropped != [16384] {
-        return Err(format!("the healthy peer was asked for blocks {:?} of piece {}; the first block had already arrived, so only the block at 16384 was needed", asked_for_dropped, dropped_piece));
+        return Err(format!("the healthy peer was asked for blocks {:?} of piece {}; the first block had already arrived, so only the block at 16384 was needed [flaky saw {:?}; healthy saw {:?}]", asked_for_dropped, dropped_piece, flaky.lock().unwrap().requested_blocks, healthy.lock().unwrap().requested_blocks));
     }
 
     let log = fs::read_to_string(&log_path).map_err(|e| format!("reading client log {:?}: {}", log_path, e))?;
