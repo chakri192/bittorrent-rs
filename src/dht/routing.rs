@@ -13,7 +13,7 @@
 //!    answering a future query).
 
 use crate::dht::krpc::{CompactNode, NodeId};
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::time::Instant;
 
 pub const K: usize = 8;
@@ -70,7 +70,7 @@ impl RoutingTable {
 
     /// Records a node that just responded to (or validly queried) us.
     /// Re-inserting an existing id refreshes its address and timestamp.
-    pub fn insert(&mut self, id: NodeId, addr: SocketAddrV4) {
+    pub fn insert(&mut self, id: NodeId, addr: SocketAddr) {
         let Some(idx) = bucket_index(&self.self_id, &id) else {
             return; // our own id
         };
@@ -109,8 +109,8 @@ mod tests {
         id
     }
 
-    fn addr(port: u16) -> SocketAddrV4 {
-        SocketAddrV4::new([10, 0, 0, 1].into(), port)
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, 1], port))
     }
 
     #[test]
@@ -181,5 +181,19 @@ mod tests {
         let mut rt = RoutingTable::new(me);
         rt.insert(me, addr(1));
         assert!(rt.is_empty());
+    }
+
+    #[test]
+    fn ipv6_nodes_are_kept_like_any_other_and_found_by_distance() {
+        let mut rt = RoutingTable::new([0u8; 20]);
+        let a: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
+        let b: SocketAddr = "[2001:db8::2]:6881".parse().unwrap();
+        rt.insert(nid(0x10), a);
+        rt.insert(nid(0xF0), b);
+        let got = rt.closest(&nid(0x11), 2);
+        assert_eq!((got[0].addr, got[1].addr), (a, b));
+        rt.insert(nid(0x10), b); // the same id, from a new address
+        assert_eq!(rt.len(), 2);
+        assert_eq!(rt.closest(&nid(0x10), 1)[0].addr, b);
     }
 }

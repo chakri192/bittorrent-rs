@@ -13,6 +13,7 @@ use std::time::Duration;
 const PROTOCOL_ID: u64 = 0x0000_0417_2710_1980;
 const ACTION_CONNECT: u32 = 0;
 const ACTION_ANNOUNCE: u32 = 1;
+const ACTION_SCRAPE: u32 = 2;
 const ACTION_ERROR: u32 = 3;
 
 fn build_connect_request(transaction_id: u32) -> [u8; 16] {
@@ -131,9 +132,9 @@ fn send_with_retries(sock: &UdpSocket, packet: &[u8], max_retries: u32) -> Resul
     Err(TrackerError::Timeout)
 }
 
-/// Performs the full connect+announce exchange against `tracker_addr`
-/// (host:port, no scheme -- e.g. "tracker.example.com:6969").
-pub fn announce(tracker_addr: &str, req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
+/// A socket connected to the tracker at `tracker_addr` (host:port, no scheme -- e.g.
+/// "tracker.example.com:6969"), and the connection id that BEP 15's first round trip gives.
+fn connect(tracker_addr: &str) -> Result<(UdpSocket, u64), TrackerError> {
     let addr: SocketAddr = tracker_addr
         .to_socket_addrs()
         .map_err(|e| TrackerError::BadUrl(format!("{}: DNS resolution failed ({})", tracker_addr, e)))?
@@ -149,11 +150,54 @@ pub fn announce(tracker_addr: &str, req: &AnnounceRequest) -> Result<AnnounceRes
     // we use a smaller ceiling suitable for an interactive client.
     let connect_resp = send_with_retries(&sock, &connect_pkt, 4)?;
     let connection_id = parse_connect_response(&connect_resp, connect_txn)?;
+    Ok((sock, connection_id))
+}
+
+/// Performs the full connect+announce exchange against `tracker_addr`
+/// (host:port, no scheme -- e.g. "tracker.example.com:6969").
+pub fn announce(tracker_addr: &str, req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
+    let (sock, connection_id) = connect(tracker_addr)?;
 
     let announce_txn = generate_transaction_id();
     let announce_pkt = build_announce_request(connection_id, announce_txn, req);
     let announce_resp = send_with_retries(&sock, &announce_pkt, 4)?;
     parse_announce_response(&announce_resp, announce_txn)
+}
+
+/// The scrape request (BEP 15): the connection id, action 2, a transaction id and the info hash asked about.
+fn build_scrape_request(connection_id: u64, transaction_id: u32, info_hash: &[u8; 20]) -> [u8; 36] {
+    let mut pkt = [0u8; 36];
+    pkt[0..8].copy_from_slice(&connection_id.to_be_bytes());
+    pkt[8..12].copy_from_slice(&ACTION_SCRAPE.to_be_bytes());
+    pkt[12..16].copy_from_slice(&transaction_id.to_be_bytes());
+    pkt[16..36].copy_from_slice(info_hash);
+    pkt
+}
+
+/// The answer to a scrape of one torrent: seeders, completed downloads, leechers, each a 32-bit number.
+fn parse_scrape_response(resp: &[u8], expected_txn: u32) -> Result<super::scrape::ScrapeStats, TrackerError> {
+    if resp.len() < 8 {
+        return Err(TrackerError::MalformedResponse("scrape response too short"));
+    }
+    let action = field_u32(resp, 0)?;
+    if field_u32(resp, 4)? != expected_txn {
+        return Err(TrackerError::MalformedResponse("scrape response transaction_id mismatch"));
+    }
+    if action == ACTION_ERROR {
+        return Err(TrackerError::TrackerFailure(String::from_utf8_lossy(&resp[8..]).to_string()));
+    }
+    if action != ACTION_SCRAPE {
+        return Err(TrackerError::MalformedResponse("unexpected action in scrape response"));
+    }
+    Ok(super::scrape::ScrapeStats { complete: field_u32(resp, 8)?, downloaded: field_u32(resp, 12)?, incomplete: field_u32(resp, 16)? })
+}
+
+/// Asks the tracker at `tracker_addr` (host:port, no scheme) how many seeders, leechers and completed downloads it has for `info_hash`.
+pub fn scrape(tracker_addr: &str, info_hash: &[u8; 20]) -> Result<super::scrape::ScrapeStats, TrackerError> {
+    let (sock, connection_id) = connect(tracker_addr)?;
+    let txn = generate_transaction_id();
+    let response = send_with_retries(&sock, &build_scrape_request(connection_id, txn, info_hash), 4)?;
+    parse_scrape_response(&response, txn)
 }
 
 fn generate_transaction_id() -> u32 {
@@ -300,4 +344,61 @@ mod tests {
             }
         });
     }
+
+    #[test]
+    fn a_scrape_request_is_the_connection_id_action_two_a_transaction_id_and_the_hash() {
+        let pkt = build_scrape_request(0x0102030405060708, 9, &[0xAB; 20]);
+        assert_eq!(&pkt[0..8], &0x0102030405060708u64.to_be_bytes());
+        assert_eq!(u32::from_be_bytes(pkt[8..12].try_into().unwrap()), 2);
+        assert_eq!(u32::from_be_bytes(pkt[12..16].try_into().unwrap()), 9);
+        assert_eq!(&pkt[16..], &[0xAB; 20]);
+    }
+
+    fn scrape_reply(txn: u32, seeders: u32, completed: u32, leechers: u32) -> Vec<u8> {
+        let mut resp = Vec::new();
+        for n in [ACTION_SCRAPE, txn, seeders, completed, leechers] {
+            resp.extend_from_slice(&n.to_be_bytes());
+        }
+        resp
+    }
+
+    #[test]
+    fn a_scrape_reply_gives_seeders_completed_and_leechers_in_that_order() {
+        let stats = parse_scrape_response(&scrape_reply(5, 10, 200, 3), 5).unwrap();
+        assert_eq!((stats.complete, stats.downloaded, stats.incomplete), (10, 200, 3));
+        assert!(parse_scrape_response(&scrape_reply(5, 1, 2, 3), 6).is_err(), "the wrong transaction");
+        assert!(parse_scrape_response(&scrape_reply(5, 1, 2, 3)[..12], 5).is_err(), "too short for the counts");
+        let mut error = Vec::new();
+        error.extend_from_slice(&ACTION_ERROR.to_be_bytes());
+        error.extend_from_slice(&5u32.to_be_bytes());
+        error.extend_from_slice(b"unknown torrent");
+        assert!(matches!(parse_scrape_response(&error, 5), Err(TrackerError::TrackerFailure(m)) if m == "unknown torrent"));
+    }
+
+    #[test]
+    fn a_scrape_connects_first_and_then_asks() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            let (n, from) = server.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 16);
+            assert_eq!(u64::from_be_bytes(buf[0..8].try_into().unwrap()), PROTOCOL_ID);
+            let mut connected = Vec::new();
+            connected.extend_from_slice(&ACTION_CONNECT.to_be_bytes());
+            connected.extend_from_slice(&buf[12..16]);
+            connected.extend_from_slice(&0x1122334455667788u64.to_be_bytes());
+            server.send_to(&connected, from).unwrap();
+            let (n, from) = server.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 36);
+            assert_eq!(u64::from_be_bytes(buf[0..8].try_into().unwrap()), 0x1122334455667788, "the connection id it was given");
+            assert_eq!(&buf[16..36], &[0x77; 20]);
+            let txn = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+            server.send_to(&scrape_reply(txn, 4, 9, 2), from).unwrap();
+        });
+        let stats = scrape(&addr.to_string(), &[0x77; 20]).unwrap();
+        assert_eq!((stats.complete, stats.downloaded, stats.incomplete), (4, 9, 2));
+        thread.join().unwrap();
+    }
 }
+

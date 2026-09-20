@@ -52,6 +52,10 @@ pub struct CreateOptions {
     pub creation_date: Option<u64>,
     /// The torrent's name; by default that of the file or directory.
     pub name: Option<String>,
+    /// Make a BitTorrent v2 torrent (BEP 52): a file tree with a merkle root
+    /// per file and the piece layers, and no v1 piece hashes. Its info hash
+    /// is SHA-256, and `Created::info_hash` is the first 20 bytes of it.
+    pub v2: bool,
 }
 
 /// A torrent that has been made.
@@ -177,6 +181,9 @@ pub fn create(source: &Path, options: &CreateOptions, mut progress: impl FnMut(u
         return Err(CreateError::BadPieceLength(format!("a piece length of {} would need more than {} pieces for {} bytes; use a larger one", piece_length, MAX_PIECES, total_length)));
     }
 
+    if options.v2 {
+        return create_v2(&name, &entries, piece_length, options, &mut progress);
+    }
     let pieces = hash_pieces(&entries, piece_length, total_length, &mut progress)?;
     let piece_count = pieces.len() / 20;
 
@@ -208,9 +215,68 @@ pub fn create(source: &Path, options: &CreateOptions, mut progress: impl FnMut(u
     // BEP 12: a list of tiers, only worth writing when there is a choice.
     let announce_list = if all_trackers.len() > 1 { options.trackers.iter().filter(|tier| !tier.is_empty()).cloned().collect() } else { Vec::new() };
     let extras = Extras { comment: options.comment.as_deref(), created_by: options.created_by.as_deref(), creation_date: options.creation_date };
-    let bytes = top_level(info, all_trackers.first().map(|url| url.as_str()), &announce_list, &options.web_seeds, &extras);
+    let bytes = top_level(info, None, all_trackers.first().map(|url| url.as_str()), &announce_list, &options.web_seeds, &extras);
 
     Ok(Created { bytes, info_hash, name, total_length, piece_length, piece_count, file_count: entries.len() })
+}
+
+/// The v2 form of [`create`]: each file is hashed into a merkle tree of its
+/// own, and the torrent carries the file tree and the piece layers.
+fn create_v2(name: &str, entries: &[Entry], piece_length: u64, options: &CreateOptions, progress: &mut impl FnMut(u64, u64)) -> Result<Created, CreateError> {
+    use crate::v2::{hash_file, valid_piece_length};
+    if !valid_piece_length(piece_length as i64) {
+        return Err(CreateError::BadPieceLength(format!("a v2 piece length must be a power of two of at least 16 KiB: {}", piece_length)));
+    }
+    let total_length: u64 = entries.iter().map(|e| e.length).sum();
+    let mut tree: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+    let mut layers: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+    let (mut piece_count, mut done) = (0usize, 0u64);
+    for entry in entries {
+        let mut file = File::open(&entry.on_disk).map_err(|source| CreateError::Io { path: entry.on_disk.clone(), source })?;
+        let hashes = hash_file(&mut file, entry.length, piece_length as usize).map_err(|source| CreateError::Io { path: entry.on_disk.clone(), source })?;
+        // A file that has grown since it was measured is not the file that was hashed.
+        let mut extra = [0u8; 1];
+        if file.read(&mut extra).map_err(|source| CreateError::Io { path: entry.on_disk.clone(), source })? != 0 {
+            return Err(CreateError::ChangedWhileReading(entry.on_disk.clone()));
+        }
+        piece_count += entry.length.div_ceil(piece_length) as usize;
+        done += entry.length;
+        progress(done, total_length);
+
+        let mut leaf = BTreeMap::new();
+        leaf.insert(b"length".to_vec(), Bencode::Int(entry.length as i64));
+        if let Some(root) = hashes.root {
+            leaf.insert(b"pieces root".to_vec(), Bencode::Bytes(root.to_vec()));
+            if !hashes.layer.is_empty() {
+                layers.insert(root.to_vec(), Bencode::Bytes(hashes.layer.concat()));
+            }
+        }
+        let mut node = &mut tree;
+        for part in &entry.path {
+            let Bencode::Dict(next) = node.entry(part.as_bytes().to_vec()).or_insert_with(|| Bencode::Dict(BTreeMap::new())) else { unreachable!("only dictionaries are inserted") };
+            node = next;
+        }
+        node.insert(Vec::new(), Bencode::Dict(leaf));
+    }
+
+    let mut info = BTreeMap::new();
+    info.insert(b"file tree".to_vec(), Bencode::Dict(tree));
+    info.insert(b"meta version".to_vec(), Bencode::Int(2));
+    info.insert(b"name".to_vec(), text(name));
+    info.insert(b"piece length".to_vec(), Bencode::Int(piece_length as i64));
+    if options.private {
+        info.insert(b"private".to_vec(), Bencode::Int(1));
+    }
+    let info = Bencode::Dict(info);
+    let info_hash_v2 = crate::sha256::sha256(&bencode::encode(&info));
+    let mut info_hash = [0u8; 20];
+    info_hash.copy_from_slice(&info_hash_v2[..20]);
+
+    let all_trackers: Vec<&String> = options.trackers.iter().flatten().collect();
+    let announce_list = if all_trackers.len() > 1 { options.trackers.iter().filter(|tier| !tier.is_empty()).cloned().collect() } else { Vec::new() };
+    let extras = Extras { comment: options.comment.as_deref(), created_by: options.created_by.as_deref(), creation_date: options.creation_date };
+    let bytes = top_level(info, Some(Bencode::Dict(layers)), all_trackers.first().map(|url| url.as_str()), &announce_list, &options.web_seeds, &extras);
+    Ok(Created { bytes, info_hash, name: name.to_string(), total_length, piece_length, piece_count, file_count: entries.len() })
 }
 
 /// The optional descriptive fields of a torrent file.
@@ -222,7 +288,7 @@ struct Extras<'a> {
 
 /// The `.torrent` file around an info dictionary: where to announce, where
 /// else to fetch from, and who made it.
-fn top_level(info: Bencode, announce: Option<&str>, announce_list: &[Vec<String>], web_seeds: &[String], extras: &Extras) -> Vec<u8> {
+fn top_level(info: Bencode, piece_layers: Option<Bencode>, announce: Option<&str>, announce_list: &[Vec<String>], web_seeds: &[String], extras: &Extras) -> Vec<u8> {
     let mut top = BTreeMap::new();
     if let Some(url) = announce {
         top.insert(b"announce".to_vec(), text(url));
@@ -250,6 +316,9 @@ fn top_level(info: Bencode, announce: Option<&str>, announce_list: &[Vec<String>
         top.insert(b"creation date".to_vec(), Bencode::Int(date.min(i64::MAX as u64) as i64));
     }
     top.insert(b"info".to_vec(), info);
+    if let Some(layers) = piece_layers {
+        top.insert(b"piece layers".to_vec(), layers);
+    }
     bencode::encode(&Bencode::Dict(top))
 }
 
@@ -261,12 +330,20 @@ fn top_level(info: Bencode, announce: Option<&str>, announce_list: &[Vec<String>
 /// file whose info hash differs from the torrent's.
 pub fn torrent_file_bytes(torrent: &crate::torrent::TorrentFile) -> Result<Vec<u8>, CreateError> {
     let info_bytes = bencode::encode(&torrent.info);
+    let extras = Extras { comment: None, created_by: None, creation_date: None };
+    // A v2-only torrent is hashed with SHA-256, and carries its piece layers along.
+    if let (true, Some(meta)) = (torrent.is_v2_only(), &torrent.v2) {
+        if crate::sha256::sha256(&info_bytes) != meta.info_hash {
+            return Err(CreateError::Unreproducible);
+        }
+        let layers = meta.layers.iter().map(|(root, hashes)| (root.to_vec(), Bencode::Bytes(hashes.concat()))).collect();
+        return Ok(top_level(torrent.info.clone(), Some(Bencode::Dict(layers)), torrent.announce.as_deref(), &torrent.announce_list, &torrent.url_list, &extras));
+    }
     let rehashed: [u8; 20] = Sha1::digest(&info_bytes).into();
     if rehashed != torrent.info_hash {
         return Err(CreateError::Unreproducible);
     }
-    let extras = Extras { comment: None, created_by: None, creation_date: None };
-    Ok(top_level(torrent.info.clone(), torrent.announce.as_deref(), &torrent.announce_list, &torrent.url_list, &extras))
+    Ok(top_level(torrent.info.clone(), None, torrent.announce.as_deref(), &torrent.announce_list, &torrent.url_list, &extras))
 }
 
 /// Writes `torrent` to `path` as a `.torrent` file (see
@@ -824,5 +901,87 @@ mod tests {
         fs::create_dir_all(&as_dir).unwrap();
         assert!(save_torrent(&parsed, &as_dir).is_err());
         assert!(!dir.join("a-directory.part").exists(), "a failed rename does not leave the partial behind");
+    }
+
+    // ---- v2 ----
+
+    fn v2_opts(piece_length: u64) -> CreateOptions {
+        CreateOptions { piece_length: Some(piece_length), v2: true, ..Default::default() }
+    }
+
+    #[test]
+    fn a_v2_torrent_of_one_file_is_what_the_parser_reads_back_and_its_layers_check_out() {
+        let dir = tmp_dir("v2-one");
+        let content = bytes(100_000, 3);
+        write(&dir, "movie.bin", &content);
+        let (created, parsed) = make(&dir.join("movie.bin"), &v2_opts(32768));
+
+        assert!(parsed.is_v2_only() && !parsed.multi_file);
+        assert_eq!(parsed.files, vec![(vec!["movie.bin".to_string()], 100_000)]);
+        assert_eq!(created.info_hash, parsed.info_hash, "the short SHA-256 hash");
+        assert_eq!((created.piece_count, created.piece_length, created.file_count), (4, 32768, 1));
+        let meta = parsed.v2.unwrap();
+        let hashes = crate::v2::hash_file(&mut &content[..], 100_000, 32768).unwrap();
+        assert_eq!(meta.files[0].root, hashes.root);
+        assert_eq!(meta.layer_of(&meta.files[0]), Some(&hashes.layer), "the torrent carries the piece layer");
+        assert_eq!(created.info_hash[..], crate::sha256::sha256(&bencode::encode(&parsed.info))[..20]);
+    }
+
+    #[test]
+    fn a_v2_torrent_of_a_directory_has_a_file_tree_with_the_empty_file_and_no_v1_hashes() {
+        let dir = tmp_dir("v2-dir");
+        write(&dir, "pack/a.bin", &bytes(40_000, 1));
+        write(&dir, "pack/sub/b.bin", &bytes(1000, 2));
+        write(&dir, "pack/sub/deeper/c.bin", &bytes(70_000, 3));
+        write(&dir, "pack/empty", b"");
+        let (created, parsed) = make(&dir.join("pack"), &v2_opts(16384));
+
+        assert!(parsed.is_v2_only() && parsed.multi_file);
+        let listing: Vec<(String, i64)> = parsed.files.iter().map(|(p, l)| (p.join("/"), *l)).collect();
+        assert_eq!(listing, vec![("a.bin".to_string(), 40_000), ("empty".to_string(), 0), ("sub/b.bin".to_string(), 1000), ("sub/deeper/c.bin".to_string(), 70_000)], "in the order of the tree");
+        assert_eq!(created.file_count, 4);
+        assert_eq!(created.piece_count, 3 + 1 + 5, "a piece per 16 KiB of each file (3, 1, 5), and none for the empty one");
+        assert!(parsed.info.get("pieces").is_none(), "no v1 hashes");
+    }
+
+    #[test]
+    fn making_a_v2_torrent_twice_gives_the_same_bytes() {
+        let dir = tmp_dir("v2-repeat");
+        write(&dir, "d/x", &bytes(50_000, 5));
+        let options = CreateOptions { creation_date: Some(1_700_000_000), ..v2_opts(16384) };
+        assert_eq!(create(&dir.join("d"), &options, |_, _| {}).unwrap().bytes, create(&dir.join("d"), &options, |_, _| {}).unwrap().bytes);
+    }
+
+    #[test]
+    fn a_v2_torrent_needs_a_piece_length_of_at_least_16_kib_and_carries_the_private_flag() {
+        let dir = tmp_dir("v2-plen");
+        write(&dir, "f", &bytes(5000, 1));
+        let err = create(&dir.join("f"), &v2_opts(4096), |_, _| {}).unwrap_err();
+        assert!(matches!(err, CreateError::BadPieceLength(_)), "{}", err);
+        let (_, parsed) = make(&dir.join("f"), &CreateOptions { private: true, ..v2_opts(16384) });
+        assert!(parsed.private);
+        // Left to choose, it chooses one that is valid.
+        assert!(create(&dir.join("f"), &CreateOptions { v2: true, ..Default::default() }, |_, _| {}).is_ok());
+    }
+
+    #[test]
+    fn saving_a_v2_torrent_keeps_its_layers_and_its_hash() {
+        let dir = tmp_dir("v2-save");
+        write(&dir, "f.bin", &bytes(100_000, 9));
+        let (created, parsed) = make(&dir.join("f.bin"), &v2_opts(16384));
+        let saved = torrent_file_bytes(&parsed).unwrap();
+        let again = parse_torrent_file(&saved).unwrap();
+        assert_eq!(again.info_hash, created.info_hash);
+        assert_eq!(again.v2.as_ref().unwrap().layers, parsed.v2.as_ref().unwrap().layers, "the layers came along");
+        assert_eq!(saved, created.bytes, "byte for byte what was made");
+    }
+
+    #[test]
+    fn a_file_that_is_longer_than_it_was_measured_is_refused_not_hashed_short() {
+        let dir = tmp_dir("v2-grown");
+        write(&dir, "f", &bytes(3000, 1));
+        let entries = [Entry { path: vec!["f".to_string()], on_disk: dir.join("f"), length: 2000 }];
+        let err = create_v2("f", &entries, 16384, &v2_opts(16384), &mut |_, _| {}).unwrap_err();
+        assert!(matches!(err, CreateError::ChangedWhileReading(_)), "{}", err);
     }
 }

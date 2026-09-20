@@ -4,7 +4,7 @@
 use super::krpc::{KrpcMessage, Query, Response};
 use super::routing::K;
 use super::{Dht, Transport, RECV_TICK};
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -20,10 +20,10 @@ const MAX_STORED_INFOHASHES: usize = 1000;
 impl<T: Transport> Dht<T> {
     /// Handles one inbound datagram. Queries get answered on the spot;
     /// responses are returned to the caller for transaction correlation.
-    pub(super) fn handle_inbound(&mut self, data: &[u8], from: SocketAddr) -> Option<(Vec<u8>, Response, SocketAddrV4)> {
-        let SocketAddr::V4(from_v4) = from else {
-            return None; // BEP 32 (IPv6) out of scope
-        };
+    pub(super) fn handle_inbound(&mut self, data: &[u8], from: SocketAddr) -> Option<(Vec<u8>, Response, SocketAddr)> {
+        if !self.is_our_family(&from) {
+            return None; // not something this socket can have received; ignore it
+        }
         let msg = KrpcMessage::decode(data).ok()?; // garbage from strangers: drop silently
 
         match msg {
@@ -31,29 +31,29 @@ impl<T: Transport> Dht<T> {
                 self.tokens.rotate_if_due(Instant::now());
                 // A node that queries us is alive at that address --
                 // exactly the freshness signal the routing table wants.
-                self.table.insert(*query.sender_id(), from_v4);
+                self.table.insert(*query.sender_id(), from);
                 let reply = match &query {
                     Query::Ping { .. } => Response { id: self.node_id, ..Default::default() },
                     Query::FindNode { target, .. } => Response { id: self.node_id, nodes: self.table.closest(target, K), ..Default::default() },
                     Query::GetPeers { info_hash, .. } => {
-                        let token = Some(self.tokens.issue(from_v4.ip()));
+                        let token = Some(self.tokens.issue(&from.ip()));
                         match self.peer_store.get(info_hash) {
                             Some(peers) if !peers.is_empty() => Response { id: self.node_id, values: peers.clone(), token, ..Default::default() },
                             _ => Response { id: self.node_id, nodes: self.table.closest(info_hash, K), token, ..Default::default() },
                         }
                     }
                     Query::AnnouncePeer { info_hash, port, token, implied_port, .. } => {
-                        if !self.tokens.accepts(from_v4.ip(), token) {
+                        if !self.tokens.accepts(&from.ip(), token) {
                             let err = KrpcMessage::Error { t, code: 203, message: "bad token".to_string() };
                             let _ = self.transport.send_to(&err.encode(), from);
                             return None;
                         }
-                        let peer_port = if *implied_port { from_v4.port() } else { *port };
+                        let peer_port = if *implied_port { from.port() } else { *port };
                         // At capacity we still answer "ok" but only add peers to
                         // info-hashes we already hold.
                         if self.peer_store.contains_key(info_hash) || self.peer_store.len() < MAX_STORED_INFOHASHES {
                             let peers = self.peer_store.entry(*info_hash).or_default();
-                            let peer = SocketAddrV4::new(*from_v4.ip(), peer_port);
+                            let peer = SocketAddr::new(from.ip(), peer_port);
                             if !peers.contains(&peer) && peers.len() < MAX_STORED_PEERS_PER_HASH {
                                 peers.push(peer);
                             }
@@ -64,7 +64,7 @@ impl<T: Transport> Dht<T> {
                 let _ = self.transport.send_to(&KrpcMessage::Response { t, response: reply }.encode(), from);
                 None
             }
-            KrpcMessage::Response { t, response } => Some((t, response, from_v4)),
+            KrpcMessage::Response { t, response } => Some((t, response, from)),
             KrpcMessage::Error { .. } => None, // errors just mean that txid never resolves
         }
     }
@@ -77,8 +77,8 @@ impl<T: Transport> Dht<T> {
         while Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
             match self.transport.recv(RECV_TICK) {
                 Ok(Some((data, from))) => {
-                    if let Some((_t, response, from_v4)) = self.handle_inbound(&data, from) {
-                        self.table.insert(response.id, from_v4);
+                    if let Some((_t, response, from)) = self.handle_inbound(&data, from) {
+                        self.table.insert(response.id, from);
                     }
                 }
                 Ok(None) => {}
@@ -214,7 +214,7 @@ mod tests {
     }
 
     /// Sends `get_peers` from `asker` and returns the token in the reply.
-    fn harvest_token(dht: &mut Dht<&MockTransport>, transport: &MockTransport, asker: SocketAddrV4, info_hash: [u8; 20]) -> Vec<u8> {
+    fn harvest_token(dht: &mut Dht<&MockTransport>, transport: &MockTransport, asker: SocketAddr, info_hash: [u8; 20]) -> Vec<u8> {
         let stop = AtomicBool::new(false);
         let q = KrpcMessage::Query { t: b"g".to_vec(), query: Query::GetPeers { id: [0x02; 20], info_hash } };
         transport.push_inbound(q.encode(), asker);
@@ -227,7 +227,7 @@ mod tests {
 
     /// Sends `announce_peer` with `token` and reports whether it was
     /// accepted (a plain response) or refused (error 203).
-    fn announce_accepted(dht: &mut Dht<&MockTransport>, transport: &MockTransport, asker: SocketAddrV4, info_hash: [u8; 20], token: Vec<u8>) -> bool {
+    fn announce_accepted(dht: &mut Dht<&MockTransport>, transport: &MockTransport, asker: SocketAddr, info_hash: [u8; 20], token: Vec<u8>) -> bool {
         let stop = AtomicBool::new(false);
         let q = KrpcMessage::Query { t: b"a".to_vec(), query: Query::AnnouncePeer { id: [0x02; 20], info_hash, port: 9999, token, implied_port: false } };
         transport.push_inbound(q.encode(), asker);
@@ -274,8 +274,8 @@ mod tests {
     }
 
     /// Sends `bytes` to the node as if from `from`, and lets it answer.
-    fn deliver(dht: &mut Dht<&MockTransport>, from: SocketAddrV4, bytes: Vec<u8>) {
-        let _ = dht.handle_inbound(&bytes, std::net::SocketAddr::V4(from));
+    fn deliver(dht: &mut Dht<&MockTransport>, from: SocketAddr, bytes: Vec<u8>) {
+        let _ = dht.handle_inbound(&bytes, from);
     }
 
     #[test]
@@ -339,5 +339,82 @@ mod tests {
         let mut first = [0u8; 20];
         first[..4].copy_from_slice(&0u32.to_be_bytes());
         assert_eq!(dht.peer_store[&first].len(), 2, "an entry we already hold keeps accepting peers");
+    }
+
+    // ---- BEP 32: a node on IPv6 ----
+
+    fn v6(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn reply(transport: &MockTransport, to: SocketAddr) -> Response {
+        match KrpcMessage::decode(&transport.sent_to(to)[0]).unwrap() {
+            KrpcMessage::Response { response, .. } => response,
+            other => panic!("expected a response, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_ipv6_node_answers_a_ping_from_an_ipv6_address_and_remembers_it() {
+        let transport = MockTransport::new_v6();
+        let mut dht = Dht::new(&transport);
+        let asker = v6("[2001:db8::9]:6881");
+        deliver(&mut dht, asker, KrpcMessage::Query { t: b"xy".to_vec(), query: Query::Ping { id: [0x01; 20] } }.encode());
+
+        assert_eq!(reply(&transport, asker).id, *dht.node_id());
+        assert_eq!(dht.table_len(), 1);
+    }
+
+    #[test]
+    fn a_node_ignores_datagrams_from_the_other_family() {
+        for (transport, from) in [(MockTransport::new_v6(), v4("10.1.1.1:6881")), (MockTransport::new(), v6("[2001:db8::9]:6881"))] {
+            let mut dht = Dht::new(&transport);
+            deliver(&mut dht, from, KrpcMessage::Query { t: b"xy".to_vec(), query: Query::Ping { id: [0x01; 20] } }.encode());
+            assert!(transport.sent_to(from).is_empty(), "no answer");
+            assert_eq!(dht.table_len(), 0, "and nothing remembered");
+        }
+    }
+
+    #[test]
+    fn ipv6_announces_are_stored_with_the_senders_v6_address_and_served_as_18_byte_values() {
+        let transport = MockTransport::new_v6();
+        let mut dht = Dht::new(&transport);
+        let info_hash = [0x77; 20];
+        let asker = v6("[2001:db8::5]:7000");
+        let token = harvest_token(&mut dht, &transport, asker, info_hash);
+        assert!(announce_accepted(&mut dht, &transport, asker, info_hash, token));
+
+        let other = v6("[2001:db8::6]:7001");
+        deliver(&mut dht, other, KrpcMessage::Query { t: b"t3".to_vec(), query: Query::GetPeers { id: [0x03; 20], info_hash } }.encode());
+        assert_eq!(reply(&transport, other).values, vec![v6("[2001:db8::5]:9999")]);
+        // On the wire, that value is eighteen bytes.
+        let raw = transport.sent_to(other)[0].clone();
+        assert!(raw.windows(3).any(|w| w == b"18:"), "{:?}", String::from_utf8_lossy(&raw));
+    }
+
+    #[test]
+    fn ipv6_answers_to_find_node_are_in_nodes6_and_only_ipv6_nodes_are_in_them() {
+        let transport = MockTransport::new_v6();
+        let mut dht = Dht::new(&transport);
+        for (i, ip) in ["[2001:db8::a]:1", "[2001:db8::b]:2", "[2001:db8::c]:3"].iter().enumerate() {
+            dht.seed_node([0x10 + i as u8; 20], v6(ip));
+        }
+        dht.seed_node([0x20; 20], v4("10.0.0.9:9")); // of the other family, and so not kept
+        assert_eq!(dht.table_len(), 3);
+        let asker = v6("[2001:db8::99]:6881");
+        deliver(&mut dht, asker, KrpcMessage::Query { t: b"f".to_vec(), query: Query::FindNode { id: [0x05; 20], target: [0x10; 20] } }.encode());
+        let raw = transport.sent_to(asker)[0].clone();
+        assert!(String::from_utf8_lossy(&raw).contains("6:nodes6"), "{:?}", String::from_utf8_lossy(&raw));
+        let nodes = reply(&transport, asker).nodes;
+        assert_eq!(nodes.len(), 4, "the three seeded, and the asker, which the query itself taught it");
+        assert!(nodes.iter().all(|n| n.addr.is_ipv6()));
+    }
+
+    #[test]
+    fn a_token_from_one_family_is_no_good_from_another_address_of_the_other() {
+        let transport = MockTransport::new_v6();
+        let mut dht = Dht::new(&transport);
+        let token = harvest_token(&mut dht, &transport, v6("[2001:db8::5]:7000"), [0x77; 20]);
+        assert!(!announce_accepted(&mut dht, &transport, v6("[2001:db8::6]:7000"), [0x77; 20], token), "bound to the requester's IPv6 address");
     }
 }

@@ -68,3 +68,38 @@ path = "fuzz_targets/pex_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "lsd_announcement"
+path = "fuzz_targets/lsd_announcement.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "utp_packet"
+path = "fuzz_targets/utp_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_request"
+path = "fuzz_targets/control_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_entries"
+path = "fuzz_targets/state_entries.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "flat_json"
+path = "fuzz_targets/flat_json.rs"
+test = false
+doc = false
+bench = false

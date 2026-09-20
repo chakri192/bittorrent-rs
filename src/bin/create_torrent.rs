@@ -26,9 +26,10 @@ struct Args {
 }
 
 fn usage() -> String {
-    "usage: create_torrent <file | directory> [--out FILE] [--announce URL[,URL...]]... [--web-seed URL]... [--piece-length SIZE] [--private] [--comment TEXT] [--name NAME] [--no-date] [--force] [--quiet]\n\
+    "usage: create_torrent <file | directory> [--out FILE] [--announce URL[,URL...]]... [--web-seed URL]... [--piece-length SIZE] [--private] [--v2] [--comment TEXT] [--name NAME] [--no-date] [--force] [--quiet]\n\
      \n\
-     Each --announce is one tier of trackers (BEP 12): trackers within a tier are separated by commas, and tiers are tried in the order given."
+     Each --announce is one tier of trackers (BEP 12): trackers within a tier are separated by commas, and tiers are tried in the order given.\n\
+     --v2 makes a BitTorrent v2 torrent (BEP 52) with SHA-256 merkle trees instead of v1 piece hashes; the piece length is then at least 16K."
         .to_string()
 }
 
@@ -58,6 +59,7 @@ fn parse_args(argv: impl Iterator<Item = String>) -> Result<Args, String> {
                 args.options.piece_length = Some(parse_size(&v).map_err(|e| format!("--piece-length: {}", e))?);
             }
             "--private" => args.options.private = true,
+            "--v2" => args.options.v2 = true,
             "--comment" | "-c" => args.options.comment = Some(argv.next().ok_or("--comment requires some text")?),
             "--name" | "-n" => args.options.name = Some(argv.next().ok_or("--name requires a name")?),
             "--no-date" => no_date = true,
@@ -174,6 +176,12 @@ mod tests {
         assert!(args.options.private && args.force && args.quiet);
         assert_eq!(args.options.comment.as_deref(), Some("hi there"));
         assert_eq!(args.options.name.as_deref(), Some("release"));
+    }
+
+    #[test]
+    fn v2_is_a_flag_and_off_unless_given() {
+        assert!(!parse(&["d"]).unwrap().options.v2);
+        assert!(parse(&["d", "--v2"]).unwrap().options.v2);
     }
 
     #[test]

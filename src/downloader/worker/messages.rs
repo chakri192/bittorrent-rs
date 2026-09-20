@@ -1,10 +1,11 @@
 //! What a worker does with each message a peer sends it.
 
-use super::PexSender;
+use super::{PexSender, WorkerError};
 use crate::downloader::queue::WorkQueue;
 use crate::peer::extension::{ExtendedHandshake, OUR_UT_PEX_ID};
 use crate::peer::pex::parse_ut_pex;
-use crate::peer::{ConnectionError, Message, PeerState, WireError};
+use crate::peer::{ConnectionError, Message, PeerState, PeerStream, WireError};
+use crate::serving::Serving;
 
 /// A read timeout on a blocking socket surfaces as `WouldBlock` on Unix
 /// (`SO_RCVTIMEO` semantics) and `TimedOut` on Windows. Either way it
@@ -34,6 +35,12 @@ pub(super) fn absorb(msg: &Message, state: &mut PeerState, queue: &WorkQueue, pe
             scratch.apply_message(msg);
             queue.note_bitfield(&scratch.peer_has_pieces);
         }
+        // BEP 6: the same as a bitfield with every bit set.
+        Message::HaveAll => {
+            let mut scratch = PeerState::for_torrent(queue.total_pieces());
+            scratch.apply_message(msg);
+            queue.note_bitfield(&scratch.peer_has_pieces);
+        }
         Message::Have { piece_index } => queue.note_have(*piece_index),
         // The peer's extended handshake (BEP 10): the one thing the worker
         // takes from it is how many requests the peer will queue.
@@ -59,6 +66,26 @@ pub(super) fn absorb(msg: &Message, state: &mut PeerState, queue: &WorkQueue, pe
     state.apply_message(msg)
 }
 
+/// What a peer sent, taken by both halves of the connection: the upload side answers what is asked of it
+/// (a block, the info dictionary, hashes) and hears of the peer's interest, and then the download side
+/// applies it. Says whether it showed the peer to be doing something. A connection with nothing to serve
+/// only does the second.
+pub(super) fn take(msg: &Message, state: &mut PeerState, queue: &WorkQueue, pex_tx: Option<&PexSender>, serving: &mut Option<Serving>, stream: &mut dyn PeerStream) -> Result<bool, WorkerError> {
+    let asked = match serving {
+        Some(serving) => serving.handle(msg, stream).map_err(|e| WorkerError::Connection { stage: "serve_peer", error: ConnectionError::Io(e) })?,
+        None => false,
+    };
+    Ok(absorb(msg, state, queue, pex_tx) || asked)
+}
+
+/// What the upload side has to say between messages: the pieces verified since, and a change of who is unchoked.
+pub(super) fn keep_serving(serving: &mut Option<Serving>, stream: &mut dyn PeerStream) -> Result<(), WorkerError> {
+    match serving {
+        Some(serving) => serving.tick(stream).map_err(|e| WorkerError::Connection { stage: "serve_peer", error: ConnectionError::Io(e) }),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,7 +95,7 @@ mod tests {
     use std::sync::mpsc;
 
     fn queue(pieces: usize) -> WorkQueue {
-        WorkQueue::new((0..pieces).map(|i| PieceWork { index: i as u32, hash: [0; 20], length: 16 }).collect(), pieces)
+        WorkQueue::new((0..pieces).map(|i| PieceWork { index: i as u32, hash: [0; 20], length: 16, merkle: None }).collect(), pieces)
     }
 
     /// A ut_pex payload announcing the given compact peers.
@@ -104,6 +131,17 @@ mod tests {
         // first, so this fails if the bitfield is not fed to it.)
         let order = pop_order(&q);
         assert_eq!(order.iter().take(2).copied().collect::<std::collections::BTreeSet<_>>(), [1, 2].into(), "got {:?}", order);
+    }
+
+    #[test]
+    fn have_all_counts_every_piece_as_held_by_the_peer_like_a_full_bitfield() {
+        let q = queue(4);
+        let mut state = PeerState::for_torrent(4);
+        let active = absorb(&Message::HaveAll, &mut state, &q, None);
+
+        assert!(active);
+        assert_eq!(state.peer_has_pieces, vec![true; 4]);
+        assert_eq!(q.availability(), vec![1, 1, 1, 1]);
     }
 
     fn extended_handshake(body: &str) -> Message {

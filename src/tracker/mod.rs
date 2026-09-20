@@ -5,6 +5,7 @@
 
 pub mod http;
 pub mod https;
+pub mod scrape;
 pub mod udp;
 
 use std::fmt;
@@ -126,7 +127,7 @@ pub fn announce_http(url: &str, req: &AnnounceRequest) -> Result<AnnounceRespons
 }
 
 /// Refuses a redirect that would send a secure request over plain HTTP.
-fn check_redirect_allowed(from: &str, to: &str) -> Result<(), TrackerError> {
+pub(crate) fn check_redirect_allowed(from: &str, to: &str) -> Result<(), TrackerError> {
     if from.starts_with("https://") && to.starts_with("http://") {
         return Err(TrackerError::BadUrl(format!("refusing a redirect from https to http: {}", to)));
     }
@@ -137,7 +138,7 @@ fn check_redirect_allowed(from: &str, to: &str) -> Result<(), TrackerError> {
 /// requested: an absolute URL as it is, `//host/path` with the same scheme,
 /// `/path` on the same host, and `path` relative to the requested one's
 /// directory.
-fn resolve_redirect(base: &str, location: &str) -> Result<String, TrackerError> {
+pub(crate) fn resolve_redirect(base: &str, location: &str) -> Result<String, TrackerError> {
     let location = location.trim();
     if location.is_empty() {
         return Err(TrackerError::MalformedResponse("empty redirect location"));
@@ -247,7 +248,9 @@ pub fn parse_compact_peers(data: &[u8]) -> Result<Vec<SocketAddrV4>, TrackerErro
         return Err(TrackerError::MalformedResponse("compact peers length not a multiple of 6"));
     }
     Ok(data
-        .chunks_exact(6)
+        .as_chunks::<6>()
+        .0
+        .iter()
         .map(|c| {
             let ip = Ipv4Addr::new(c[0], c[1], c[2], c[3]);
             let port = u16::from_be_bytes([c[4], c[5]]);
@@ -271,7 +274,9 @@ pub fn parse_compact_peers_v6(data: &[u8]) -> Result<Vec<SocketAddr>, TrackerErr
         return Err(TrackerError::MalformedResponse("compact peers6 length not a multiple of 18"));
     }
     Ok(data
-        .chunks_exact(18)
+        .as_chunks::<18>()
+        .0
+        .iter()
         .map(|c| {
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&c[..16]);
@@ -494,4 +499,43 @@ mod tests {
         assert!(matches!(result, Err(TrackerError::HttpStatus(503))), "{:?}", result.err());
         assert_eq!(heads.lock().unwrap().len(), 1, "no retry, no redirect");
     }
+
+    // ---- scrape ----
+
+    fn scrape_reply(hash: &[u8; 20]) -> Vec<u8> {
+        let mut body = b"d5:filesd20:".to_vec();
+        body.extend_from_slice(hash);
+        body.extend_from_slice(b"d8:completei7e10:downloadedi50e10:incompletei3eeee");
+        let mut reply = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+        reply.extend_from_slice(&body);
+        reply
+    }
+
+    #[test]
+    fn a_scrape_asks_the_scrape_url_for_the_hash_and_reads_the_counts() {
+        let hash = [0x5A; 20];
+        let (port, heads) = serve(move |_| scrape_reply(&hash));
+        let stats = scrape::scrape(&format!("http://127.0.0.1:{}/announce?passkey=k", port), &hash).unwrap();
+        assert_eq!(stats, scrape::ScrapeStats { complete: 7, downloaded: 50, incomplete: 3 });
+        let heads = heads.lock().unwrap();
+        assert_eq!(heads.len(), 1);
+        assert!(heads[0].starts_with(&format!("GET /scrape?passkey=k&info_hash={} ", percent_encode_bytes(&hash))), "{:?}", heads[0]);
+    }
+
+    #[test]
+    fn a_scrape_follows_a_redirect_like_an_announce() {
+        let hash = [0x5B; 20];
+        let (port, heads) = serve(move |head| if head.starts_with("GET /scrape?") { b"HTTP/1.1 301 Moved\r\nLocation: /v2/scrape\r\nContent-Length: 0\r\n\r\n".to_vec() } else { scrape_reply(&hash) });
+        let stats = scrape::scrape(&format!("http://127.0.0.1:{}/announce", port), &hash).unwrap();
+        assert_eq!(stats.complete, 7);
+        assert!(heads.lock().unwrap()[1].starts_with("GET /v2/scrape?info_hash="));
+    }
+
+    #[test]
+    fn a_scrape_that_the_tracker_answers_with_a_failure_status_says_which() {
+        let (port, _) = serve(|_| b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec());
+        let result = scrape::scrape(&format!("http://127.0.0.1:{}/announce", port), &[1; 20]);
+        assert!(matches!(result, Err(TrackerError::HttpStatus(404))), "{:?}", result.err());
+    }
 }
+

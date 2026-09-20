@@ -5,7 +5,10 @@
 //! parts that had no reason to live in a binary move here one at a time.
 
 pub mod announce;
+pub mod env;
+pub mod layers;
 pub mod metadata;
+pub mod network;
 pub mod peer_pool;
 pub mod prepare;
 pub mod plan;
@@ -17,11 +20,12 @@ pub mod services;
 pub mod sink;
 pub mod verify;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 pub mod workers;
 
 pub use announce::{Announcer, NetworkTrackers, TrackerClient};
 pub use metadata::{fetch_metadata, resolve_magnet, Fetched, MetadataConfig};
+pub use network::{NetworkConfig, SharedNetwork};
 pub use peer_pool::PeerPool;
 pub use prepare::{has_ipv6_egress, prepare, Ipv6Mode, Options, Prepared, RunInfo};
 pub use plan::{DownloadPlan, Outstanding};

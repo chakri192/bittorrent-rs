@@ -3,7 +3,7 @@
 
 use super::random_node_id;
 use sha1::{Digest, Sha1};
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 /// How often the announce-token secret is replaced. BEP 5 leaves the
@@ -28,7 +28,7 @@ impl TokenSecrets {
     }
 
     /// The token to hand `ip` now.
-    pub(super) fn issue(&self, ip: &Ipv4Addr) -> Vec<u8> {
+    pub(super) fn issue(&self, ip: &IpAddr) -> Vec<u8> {
         token_for(&self.current, ip)
     }
 
@@ -45,17 +45,20 @@ impl TokenSecrets {
 
     /// Whether `token` is one we issued to `ip` under the current or the
     /// previous secret.
-    pub(super) fn accepts(&self, ip: &Ipv4Addr, token: &[u8]) -> bool {
+    pub(super) fn accepts(&self, ip: &IpAddr, token: &[u8]) -> bool {
         token_for(&self.current, ip) == token || self.previous.is_some_and(|prev| token_for(&prev, ip) == token)
     }
 }
 
 /// Announce token for `ip` under `secret`: the first 8 bytes of
 /// sha1(secret || ip). Opaque to the receiver (BEP 5), verifiable by us.
-fn token_for(secret: &[u8; 20], ip: &Ipv4Addr) -> Vec<u8> {
+fn token_for(secret: &[u8; 20], ip: &IpAddr) -> Vec<u8> {
     let mut h = Sha1::new();
     h.update(secret);
-    h.update(ip.octets());
+    match ip {
+        IpAddr::V4(ip) => h.update(ip.octets()),
+        IpAddr::V6(ip) => h.update(ip.octets()),
+    }
     h.finalize()[..8].to_vec()
 }
 

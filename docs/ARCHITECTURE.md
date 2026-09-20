@@ -19,13 +19,16 @@ someone about to change the code.
    └───┬───────────────┬───────────────────┬────────────────┬──────────┘
        │               │                   │                │
        ▼               ▼                   ▼                ▼
-  downloader/       tracker/ +          dht/             seeder.rs + choker.rs
-  one worker        tracker_discovery   Kademlia node    inbound peers, a few
-  thread per peer   HTTP·HTTPS·UDP      (BEP 5)          unchoked at a time,
-                    (redirects followed)                 serves the info dict
+  downloader/       tracker/ +          dht/             seeder.rs + serving.rs
+  one worker        tracker_discovery   Kademlia node    + choker.rs: inbound peers, a
+  thread per peer   HTTP·HTTPS·UDP      (BEP 5)          few unchoked at a time, the
+  (also serves      (redirects followed,                 info dict; hands a peer with
+  what it can)      scrape: BEP 48)                      pieces we lack to a worker
        │
        ▼
   peer/  handshake · wire messages · extensions (BEP 10) · PEX (BEP 11)
+         Fast Extension (BEP 6) · message stream encryption · PeerStream
+  utp/   packets · connection (a state machine on an injected clock) · socket
   bencode.rs · torrent.rs   the formats everything above reads
 ```
 
@@ -44,10 +47,13 @@ behind locks.
 |---|---|---|
 | main | reads the terminal, refreshes the dashboard | the run ends or the user quits |
 | orchestration | `session::run`, then seeding | it returns |
-| one per peer | `downloader::worker::run_worker` | queue empty, connection fails, or interrupted |
+| one per peer (dialed, or one that connected and had a piece we lack) | `downloader::worker::run_worker` / `run_adopted` | queue empty, connection fails, or interrupted |
 | one per web seed | `webseed::run_web_worker` | queue empty or told to stop |
-| seeder accept, one per inbound peer, and one for the choking rounds | `seeder` | `SeederHandle::stop` |
-| DHT | `dht::service` | `Services::shutdown` |
+| seeder accept, one per inbound peer and one per peer dialed while seeding (at most 10), and one for the choking rounds | `seeder` | `SeederHandle::stop` |
+| DHT, one for IPv4 and one for IPv6 (BEP 32) | `dht::service` | `Services::shutdown` |
+| local discovery | `lsd` | `Services::shutdown` |
+| the daemon: one per torrent, one control accept and one per client | `daemon::job`, `daemon::control` | `Manager::remove` / `shutdown`, `Server::stop` |
+| uTP | `utp::socket` (one thread for every connection) | `Services::shutdown` |
 
 **Shared state**, all small: the `WorkQueue` (pieces still to fetch, how
 common each is, and blocks left over from peers that failed part-way), the
@@ -76,7 +82,7 @@ return at once. A second signal skips all of this and exits with status 130.
    seeder, the DHT and the port mapping (`Services`). Make the first announce.
 3. **Run** (`Session::run`), on a 250 ms tick: collect verified pieces from
    the workers, retire ended workers into the `PeerPool` (which decides on
-   retries and bans), gather new addresses from PEX and the DHT, dial more
+   retries and bans), gather new addresses from PEX, the DHT and the local network, dial more
    peers, re-announce when due, publish a snapshot to the dashboard.
 4. **In a worker** (`downloader::worker`): connect, handshake, exchange
    extended handshakes, express interest, wait to be unchoked. Then loop:
@@ -93,12 +99,117 @@ return at once. A second signal skips all of this and exits with status 130.
 **The seeder** runs for the whole session, not only after completion: it
 serves what has been verified so far, tells connected peers of each new piece
 (`Have`), serves at most four peers at a time chosen by `choker` (three by
-how much they took, one optimistic), and offers the info dictionary to peers
-that have only a magnet link (BEP 9), saying `upload_only` once it has every
-piece (BEP 21).
+how much they gave us and then took, one optimistic), and offers the info
+dictionary to peers that have only a magnet link (BEP 9), saying `upload_only`
+once it has every piece (BEP 21).
+
+**Serving** (`serving.rs`) is one connection's upload side, and it is the
+same whoever made the connection and whatever else goes on over it. `Serving`
+says what there is to serve when the connection opens (bitfield, `have all`,
+`have none`, allowed-fast pieces), announces new pieces and changes of choke
+from `tick`, and answers what a peer asks in `handle`: blocks, the info
+dictionary, hashes. The seeder's loop owns connections that only serve. A
+download worker owns a connection that fetches pieces, and when the torrent has
+a listener it holds a `Serving` for the same connection, so that the peer it is
+fetching from is served too: `messages::take` gives each message to the upload
+side first and then to the download side's bookkeeping, and `keep_serving`
+runs between messages. What a peer gives the worker is counted in the same
+`choker` that ranks who is unchoked, which is what makes it tit-for-tat.
+
+**A connection a peer made** starts in the seeder's serve loop (it is the
+listener's), and stays there unless the peer says it has a piece the download
+still lacks. The loop keeps what the peer has said (`bitfield`, `have all`,
+`have`) and asks the torrent's `Adopter` (`session/workers.rs`: the queue's
+`any_wanted_in`, and room) whether it is wanted; if so, the stream and its
+`Serving` go over a channel to the session, which starts a worker on them
+(`run_adopted`). That worker is the one for a dialed connection from the point
+where the handshakes are done: it says it is interested, waits to be unchoked,
+and fetches. When there is nothing more to fetch from the peer, because the
+queue is drained or the peer never unchokes or has nothing new, the connection
+is not dropped, as one dialed for downloading would be: the peer came to be
+served, so the worker hands the stream and `Serving` back and a thread of the
+seeder's runs `serve_adopted`, the same loop.
+
+**Connections are `PeerStream`s** (`peer/stream.rs`): anything that reads and
+writes and can be shut down from another thread. A worker or the seeder does
+not know whether it has a plain socket or an encrypted one (`peer/mse.rs`), so
+a transport is one more implementation of the trait. **The Fast Extension**
+(`peer/fast.rs`, and the choke handling in `worker/piece.rs` and `serving.rs`)
+changes what "choked" means: a worker may still ask for the pieces a peer has
+allowed, and a peer that refuses a request says so instead of staying silent.
+
+**uTP** (`utp/`) is a transport like TCP, chosen by `--transport`. The
+protocol lives in `utp::conn::Connection`, which is given packets and the
+time and says what to send; it has no socket and no clock, which is why loss,
+reordering and timeouts are tested by simulation on a virtual clock. `socket`
+runs the UDP port: one thread feeds datagrams to connections and gives them
+the time, and each connection is a `PeerStream`, so the workers and the seeder
+neither know nor care. Datagrams that are not uTP go to the DHT, which is how
+the two share a port.
+
+**v2 torrents** (`v2.rs`) fit the same machinery by giving each piece its own
+length and its own check. A v2 piece belongs to one file, so a file's last
+piece is short and the flat byte space has gaps where files are aligned to piece
+boundaries (`file_spans`); `PieceWork` carries a merkle root and tree width
+beside the SHA-1 slot, and `PieceWork::matches` picks the check. Everything
+downstream (queue, workers, seeder, resume) is unchanged apart from asking the
+torrent for a piece's length and how to verify it.
+
+**Padding files** (BEP 47) are handled where bytes meet files and nowhere
+else. A v1 file list may hold entries whose `attr` says `p`: zeros that the
+piece hashes cover and no file holds. They stay in `TorrentFile::files` (the
+piece arithmetic needs their length) and are flagged in a parallel `padding`
+vector; `file_spans` carries the flag into each `FileSpan`, and the span
+functions do the rest: writing skips it, reading returns zeros, creating empty
+files and looking for data on disk pass it by, and a web seed's request for it
+is that many zeros rather than a GET. What a person sees is `visible_files`, and
+a selection made over those becomes a mask over all the entries
+(`layout_mask`) in which padding is never selected on its own, since a piece is
+wanted because a real file has bytes in it.
 
 Piece data reaches disk only after its hash has matched. Everything before
 that is untrusted bytes in a buffer.
+
+## The daemon
+
+`download` is one torrent. The daemon (`daemon/`, `bin/daemon.rs`) is the same
+session run for many, and the work was in deciding what a torrent owns and what
+they share.
+
+**Shared, in `session::network::SharedNetwork`**, made once: the TCP listener
+(`seeder::Listener`, which serves any number of torrents on its one port: it looks up the info hash of each peer's handshake in a registry, and for an encrypted connection tries each registered hash against what the peer sent); a DHT node per address family (`dht::DhtNode`, which
+looks up and announces a set of torrents added and removed while it runs, each
+with its own schedule, announce port and peer channel); the uTP socket the DHT
+shares; the port mapping; and the two `RateLimiter`s. **Owned by each torrent**:
+its `Services` (built with `Services::shared`, so that starting the DHT, the
+seeder and the uTP socket means taking a place on the network's rather than
+opening one), its local-discovery instance, its `WorkQueue`, workers, announcer
+and resume file. Stopping a torrent takes its place off the shared things and
+leaves them running; `prepare` is the same function for both, choosing on
+whether its `Services` has a network.
+
+A **`Job`** is `download`'s orchestration on a thread of its own, with a sink
+that keeps the latest snapshot and log lines for `status`, and a stop flag in
+place of the terminal; being told to stop is never reported as a failure. The
+**`Manager`** holds the jobs in the order they were added, refuses a torrent it
+has, and remembers them in the state directory (`daemon/state.rs`: one flat JSON
+object to a line, written whole-file-atomically; the daemon keeps its own copy of
+each `.torrent`, and a magnet link becomes one once its metadata arrives).
+A torrent that is *dormant* (paused, or seeded up to a limit) is a `Job` with no
+thread, made by `Job::dormant`, that shows what is known of it; the state
+directory says which, so a restart brings it back as it was. `pause` and
+`resume` swap one kind of job for the other under the manager's locks, taking
+care never to join a job's thread while holding the lock its exit wants. A
+torrent's own rate limit is a `RateLimiter::under` the daemon's, so both hold and
+the torrents stay under the whole between them.
+The **control socket** (`daemon/control.rs`) is a Unix socket, mode 0600 (bound
+inside a private directory and moved into place, so it is never there with wider
+permissions), for at most 32 clients at once, with
+one JSON object to a line each way, using the same small JSON reader and writer
+as `--json`; requests are handled by a pure function of the manager, so the
+protocol is tested without a socket and the socket without a network.
+
+Removing a torrent deletes nothing but the daemon's own copy of its `.torrent`.
 
 ## Rules that hold everywhere
 
@@ -146,9 +257,6 @@ Four layers, each catching what the one below cannot.
 
 Deliberate, and the README's Limitations lists them: one thread per
 connection (fine for tens of peers, not thousands); choking is only the
-seeding half of tit-for-tat, since inbound peers are never downloaded from;
-trackers are asked concurrently rather than by BEP 12 tier; a piece
-interrupted part-way is handed to the next peer within a run but not saved
-across runs; one piece is downloaded at a time per connection, so a request
-pipeline drains at each piece boundary; no encryption, uTP, BEP 6, BEP 14 or
-BEP 32, and no BEP 52 (v2) torrents.
+choking that rewards what a peer gives is tested against one other client (libtorrent) and not on a real swarm;
+a magnet link's trackers are asked concurrently, having no tiers, and `--tracker-mode concurrent` does the same for a torrent's; a piece
+interrupted part-way is handed to the next peer, and kept across a clean stop but not a crash (`downloader/partial.rs`); a connection fetches one piece at a time but asks ahead for up to eight more once the one in hand is fully asked for, and the queue it keeps full is bounded by the peer's `reqq` (so a piece is not a round trip on its own, and no more than that is held by one peer); local discovery is IPv4 only.

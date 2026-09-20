@@ -19,19 +19,22 @@ use crate::peer::pex::parse_ut_pex;
 use crate::peer::state::PeerState;
 use crate::torrent::parse_torrent_file;
 use crate::tracker::{parse_compact_peers, parse_compact_peers_v6};
-use std::net::SocketAddrV4;
 use std::path::{Component, Path};
 
 /// Mutations tried per seed. Every prefix of each seed is tried as well.
 const ITERATIONS: usize = 4000;
 
-fn v4(s: &str) -> SocketAddrV4 {
+fn v4(s: &str) -> std::net::SocketAddr {
     s.parse().unwrap()
 }
 
 // ---- seeds -----------------------------------------------------------
 
 fn torrent_seeds() -> Vec<Vec<u8>> {
+    let unhex = |text: &str| -> Vec<u8> { (0..text.len() / 2).map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap()).collect() };
+    // BitTorrent v2 (BEP 52): v2 only, and hybrid, built by a separate script.
+    let v2_only = unhex("64383a616e6e6f756e636531383a687474703a2f2f742e6578616d706c652f61343a696e666f64393a66696c65207472656564353a662e62696e64303a64363a6c656e6774686934303030306531313a70696563657320726f6f7433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68265656531323a6d6574612076657273696f6e693265343a6e616d65353a662e62696e31323a7069656365206c656e677468693136333834656531323a7069656365206c61796572736433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68239363acfa57d60545ac82e09b63df067e2396f9377bac5311c3b159e50a61a2275876be25b78513a631bd38a5cc26875de9b787f1250a16ec6ad92f880fb37bfe5fa62eebf7c92de9855ef3886236a4378a7054258749ace85d10875991b9f13a6abab6565");
+    let hybrid = unhex("64343a696e666f64393a66696c65207472656564353a662e62696e64303a64363a6c656e6774686934303030306531313a70696563657320726f6f7433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa682656565363a6c656e6774686934303030306531323a6d6574612076657273696f6e693265343a6e616d65353a662e62696e31323a7069656365206c656e67746869313633383465363a70696563657336303a6ab462cc165379d368dc9206fc25f8546e894131fd1d4adde2a16bf56c84129d6902e8d056d38311218898aa5c30e0ed9d2e1f9451b673dda2498a366531323a7069656365206c61796572736433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68239363acfa57d60545ac82e09b63df067e2396f9377bac5311c3b159e50a61a2275876be25b78513a631bd38a5cc26875de9b787f1250a16ec6ad92f880fb37bfe5fa62eebf7c92de9855ef3886236a4378a7054258749ace85d10875991b9f13a6abab6565");
     let hashes = |n: usize| vec![0xAB; n * 20];
     let single = {
         let mut v = b"d8:announce20:http://tracker.test/13:announce-listll20:http://tracker.test/ee4:infod6:lengthi40000e4:name8:file.bin12:piece lengthi16384e6:pieces60:".to_vec();
@@ -54,7 +57,7 @@ fn torrent_seeds() -> Vec<Vec<u8>> {
         v.extend_from_slice(b"ee");
         v
     };
-    vec![single, multi, hostile("dir", ".."), hostile("dir", "/etc/passwd"), hostile("..", "ok"), hostile("a/b", "ok"), hostile("dir", "a\\b")]
+    vec![single, multi, v2_only, hybrid, hostile("dir", ".."), hostile("dir", "/etc/passwd"), hostile("..", "ok"), hostile("a/b", "ok"), hostile("dir", "a\\b")]
 }
 
 fn bencode_seeds() -> Vec<Vec<u8>> {
@@ -73,6 +76,17 @@ fn krpc_seeds() -> Vec<Vec<u8>> {
         KrpcMessage::Query { t: b"ad".to_vec(), query: Query::AnnouncePeer { id, info_hash: [0x44; 20], port: 6881, token: b"tok".to_vec(), implied_port: true } }.encode(),
         KrpcMessage::Response { t: b"ae".to_vec(), response: Response { id, nodes: vec![node.clone(), node], values: vec![v4("1.2.3.4:5678")], token: Some(b"tok".to_vec()) } }.encode(),
         KrpcMessage::Error { t: b"af".to_vec(), code: 203, message: "bad token".to_string() }.encode(),
+        // BEP 32: nodes6, and values of both sizes.
+        KrpcMessage::Response {
+            t: b"ag".to_vec(),
+            response: Response {
+                id,
+                nodes: vec![CompactNode { id: [0x33; 20], addr: "[2001:db8::3]:6881".parse().unwrap() }, CompactNode { id: [0x22; 20], addr: v4("10.0.0.2:6881") }],
+                values: vec!["[2001:db8::4]:5678".parse().unwrap(), v4("1.2.3.4:5678")],
+                token: Some(b"tok".to_vec()),
+            },
+        }
+        .encode(),
     ]
 }
 
@@ -90,6 +104,9 @@ fn message_seeds() -> Vec<Vec<u8>> {
         Message::Cancel { index: 1, begin: 0, length: 16384 },
         Message::Port(6881),
         Message::Extended { id: 1, payload: b"d1:md6:ut_pexi2eee".to_vec() },
+        Message::HashRequest(crate::peer::message::HashRequest { root: [3; 32], base_layer: 2, index: 0, length: 512, proof_layers: 9 }),
+        Message::HashReject(crate::peer::message::HashRequest { root: [4; 32], base_layer: 0, index: 2, length: 2, proof_layers: 0 }),
+        Message::Hashes { request: crate::peer::message::HashRequest { root: [5; 32], base_layer: 2, index: 4, length: 2, proof_layers: 2 }, hashes: vec![[1; 32], [2; 32], [3; 32], [4; 32]] },
     ]
     .iter()
     .map(Message::to_bytes)
@@ -170,6 +187,7 @@ fn torrent_parsing_survives_hostile_input_and_only_yields_safe_torrents() {
 
         // Nothing that gets past the parser can escape the download directory.
         assert!(is_plain_component(&t.name), "name {:?}", t.name);
+        assert_eq!(t.padding.len(), t.files.len(), "the padding flags are one per file");
         for (path, _) in &t.files {
             assert!(!path.is_empty(), "a file with no path");
             for part in path {
@@ -179,6 +197,20 @@ fn torrent_parsing_survives_hostile_input_and_only_yields_safe_torrents() {
 
         // The piece arithmetic downstream is consistent for anything accepted.
         assert!(t.piece_length > 0 && t.piece_length <= crate::torrent::MAX_PIECE_LENGTH);
+        if t.is_v2_only() {
+            // BitTorrent v2: no v1 hashes; the layers add up, and the files are the tree's.
+            let meta = t.v2.as_ref().unwrap();
+            assert!(t.pieces.len() == t.v2_pieces.len() && crate::v2::valid_piece_length(t.piece_length));
+            assert_eq!(build_work_queue(&t).len(), t.v2_pieces.len());
+            if t.v2_ready() {
+                assert_eq!(t.v2_pieces.iter().map(|p| p.length as u64).sum::<u64>(), t.total_length(), "the pieces cover the files exactly");
+            }
+            assert!(crate::v2::validate_layers(&meta.files, &meta.layers, t.piece_length).is_ok());
+            assert_eq!(meta.files.len(), t.files.len());
+            assert_eq!(meta.short_hash(), t.info_hash);
+            let _ = t.tracker_urls();
+            return;
+        }
         let total = t.total_length();
         assert_eq!(t.pieces.len() as u64, total.div_ceil(t.piece_length as u64), "piece count matches the length");
         if t.pieces.len() <= 100_000 {
@@ -204,6 +236,7 @@ fn krpc_survives_hostile_input_and_round_trips_what_it_accepts() {
             assert_eq!(KrpcMessage::decode(&message.encode()).ok(), Some(message.clone()), "re-reading what we would send back gives the same message");
         }
         let _ = parse_compact_nodes(input);
+        let _ = crate::dht::krpc::parse_compact_nodes6(input);
     });
 }
 
@@ -276,7 +309,7 @@ fn piece_assembly_survives_blocks_at_hostile_offsets_and_sizes() {
     let mut rng = Rng::new(21);
     for _ in 0..500 {
         let length = 1 + rng.below(70_000) as u32;
-        let mut assembler = PieceAssembler::new(PieceWork { index: 0, hash: [0; 20], length });
+        let mut assembler = PieceAssembler::new(PieceWork { index: 0, hash: [0; 20], length, merkle: None });
         for _ in 0..40 {
             // Offsets and lengths a lying peer might use, including ones
             // that overflow when added.
@@ -325,4 +358,155 @@ fn a_claimed_metadata_size_is_only_ever_accepted_within_its_bounds() {
             Err(_) => assert!(!(1..=MAX_METADATA_SIZE).contains(&claimed), "{} was refused", claimed),
         }
     }
+}
+
+#[test]
+fn local_discovery_announcements_survive_hostile_input_and_round_trip() {
+    use crate::lsd::{announcement, parse};
+    let host = std::net::SocketAddr::from(([239, 192, 152, 143], 6771));
+    let seeds = vec![announcement(host, 6881, &[0xAB; 20], "cookie"), announcement(host, 1, &[0x00; 20], ""), b"BT-SEARCH * HTTP/1.1\nport: 5\ninfohash: ABABABABABABABABABABABABABABABABABABABAB\n\n".to_vec()];
+    hammer(&seeds, ITERATIONS, |input| {
+        if let Ok(parsed) = parse(input) {
+            assert!(parsed.port != 0 && !parsed.info_hashes.is_empty() && parsed.info_hashes.len() <= 16);
+            assert!(parsed.cookie.as_deref().is_none_or(|c| c.len() <= 64));
+        }
+    });
+}
+
+#[test]
+fn utp_packets_survive_hostile_input_and_round_trip_what_they_accept() {
+    use crate::utp::packet::{Packet, PacketType};
+    let base = Packet { kind: PacketType::Data, connection_id: 0x1234, timestamp: 99, timestamp_diff: 7, wnd_size: 1 << 20, seq_nr: 65535, ack_nr: 3, sack: Vec::new(), payload: b"payload".to_vec() };
+    let seeds = vec![base.encode(), Packet { kind: PacketType::State, sack: vec![0b101, 0, 0, 0x80], payload: Vec::new(), ..base.clone() }.encode(), Packet { kind: PacketType::Syn, payload: Vec::new(), ..base.clone() }.encode(), Packet { kind: PacketType::Fin, ..base.clone() }.encode()];
+    hammer(&seeds, ITERATIONS, |input| {
+        if let Ok(packet) = Packet::decode(input) {
+            assert_eq!(Packet::decode(&packet.encode()).as_ref(), Ok(&packet), "what is accepted means the same written out and read back");
+        }
+    });
+}
+
+/// A connection is fed packets that are damaged versions of real ones, in
+/// both of its states, with time passing. It must not panic (an arithmetic
+/// slip on a hostile acknowledgement would) nor let its bookkeeping go wrong.
+#[test]
+fn a_utp_connection_survives_hostile_packets_and_time() {
+    use crate::utp::conn::Connection;
+    use crate::utp::packet::{Packet, PacketType};
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    // Real traffic of both kinds, from a real pair of connections.
+    let mut a = Connection::connect(start, 100);
+    let syn = Packet::decode(&a.take_outgoing()[0]).unwrap();
+    let mut b = Connection::accept(start, &syn, 5000);
+    let mut seeds = Vec::new();
+    let mut now = start;
+    a.write(&vec![7u8; 60_000]);
+    for _ in 0..200 {
+        now += Duration::from_millis(30);
+        for bytes in b.take_outgoing() {
+            seeds.push(bytes.clone());
+            a.on_packet(now, &Packet::decode(&bytes).unwrap());
+        }
+        a.on_tick(now);
+        for bytes in a.take_outgoing() {
+            seeds.push(bytes.clone());
+            b.on_packet(now, &Packet::decode(&bytes).unwrap());
+        }
+        b.on_tick(now);
+    }
+    seeds.push(Packet { kind: PacketType::Reset, connection_id: 100, timestamp: 0, timestamp_diff: 0, wnd_size: 0, seq_nr: 0, ack_nr: 0, sack: vec![0xFF; 8], payload: Vec::new() }.encode());
+    assert!(seeds.len() > 20, "the pair produced traffic to damage: {} packets, a {:?} b {:?}", seeds.len(), a.state(), b.state());
+
+    hammer(&seeds, 200, |input| {
+        let Ok(packet) = Packet::decode(input) else { return };
+        for mut conn in [Connection::connect(start, 1), Connection::accept(start, &syn, 9)] {
+            conn.write(&[1u8; 3000]);
+            let mut at = start;
+            for step in 0..6 {
+                at += Duration::from_millis(400 * (step + 1));
+                conn.on_packet(at, &packet);
+                conn.on_tick(at);
+                conn.flush(at);
+                let _ = conn.take_outgoing();
+                let mut buf = [0u8; 256];
+                let _ = conn.read(&mut buf);
+                let _ = conn.next_timeout();
+            }
+            conn.close();
+            conn.on_tick(at + Duration::from_secs(120));
+        }
+    });
+}
+
+// ---- the daemon ------------------------------------------------------
+
+#[test]
+fn control_requests_survive_hostile_input_and_round_trip_what_they_accept() {
+    use crate::daemon::control::{parse_request, Request};
+    let seeds: Vec<Vec<u8>> = [
+        Request::Add { source: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=a%20b".into(), out: "/downloads/a b".into(), options: Default::default() },
+        Request::Add { source: "/tmp/x \"quoted\".torrent".into(), out: "/o".into(), options: crate::daemon::JobOptions { files: vec![1, 3], only: vec!["a".into(), "b c".into()], prefer: vec!["x".into()], sequential: true, max_up: Some(5), max_down: Some(6) } },
+        Request::Pause { id: "ab12".into() },
+        Request::Resume { id: "ab12".into() },
+        Request::List,
+        Request::Status { id: "ab12".into() },
+        Request::Remove { id: "0123456789abcdef".into() },
+        Request::Shutdown,
+    ]
+    .iter()
+    .map(|r| r.to_line().into_bytes())
+    .collect();
+    hammer(&seeds, ITERATIONS, |input| {
+        let Ok(text) = std::str::from_utf8(input) else { return };
+        if let Ok(request) = parse_request(text) {
+            assert_eq!(parse_request(&request.to_line()), Ok(request.clone()), "{:?} did not survive being written and read", request);
+        }
+    });
+}
+
+#[test]
+fn the_daemons_state_file_survives_hostile_input_and_round_trips_what_it_accepts() {
+    use crate::daemon::state::{parse_entries, Entry};
+    use crate::daemon::Source;
+    use crate::daemon::state::Dormant;
+    use crate::daemon::JobOptions;
+    let mut with_options = Entry::new([2; 20], Source::File("/state/torrents/y.torrent".into()), "/o".into());
+    with_options.options = JobOptions { files: vec![2, 4], only: vec!["a b".into(), ".mkv".into()], prefer: vec!["\"q\"".into()], sequential: true, max_up: Some(1000), max_down: Some(2_000_000) };
+    with_options.dormant = Some(Dormant::Finished("seed ratio 1.00 reached".into()));
+    let mut paused = Entry::new([3; 20], Source::Magnet("magnet:?xt=urn:btih:0303".into()), "/o".into());
+    paused.dormant = Some(Dormant::Paused);
+    let entries = [Entry::new([0xAB; 20], Source::Magnet("magnet:?xt=urn:btih:abab&dn=\"q\"".into()), "/down loads".into()), Entry::new([1; 20], Source::File("/state/torrents/x.torrent".into()), "/o".into()), with_options, paused];
+    let mut file = String::new();
+    for entry in &entries {
+        file.push_str(&entry.to_line());
+        file.push('\n');
+    }
+    let seeds = vec![file.into_bytes(), entries[0].to_line().into_bytes()];
+    hammer(&seeds, ITERATIONS, |input| {
+        let Ok(text) = std::str::from_utf8(input) else { return };
+        let (read, _) = parse_entries(text);
+        for entry in read {
+            assert_eq!(Entry::from_line(&entry.to_line()), Ok(entry.clone()), "{:?}", entry);
+        }
+    });
+}
+
+#[test]
+fn flat_json_survives_hostile_input() {
+    let seeds: Vec<Vec<u8>> = [
+        r#"{"cmd":"add","source":"a\"b\\c\n","out":"/o"}"#,
+        r#"{"ok":true,"n":-12.5e3,"x":null,"u":"\u00e9\ud83d\ude00"}"#,
+        r#"{"a":1,"b":[1]}"#,
+        r#"{ "spaced" : "out" }"#,
+        "{}",
+    ]
+    .iter()
+    .map(|s| s.as_bytes().to_vec())
+    .collect();
+    hammer(&seeds, ITERATIONS, |input| {
+        if let Ok(text) = std::str::from_utf8(input) {
+            let _ = crate::json::parse_object(text);
+        }
+    });
 }

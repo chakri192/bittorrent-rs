@@ -7,6 +7,8 @@ use crate::session::{Announcer, PeerPool, ProgressSink, Progress, RateSampler, S
 use crate::ui::format_bytes;
 use crate::tracker_discovery::TransferTotals;
 use crate::ui::Snapshot;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
@@ -43,6 +45,8 @@ pub struct Setup<'a> {
     pub goal_pieces: usize,
     /// Give up after this long (`--timeout`), if set.
     pub timeout: Option<Duration>,
+    /// Where to keep the blocks of pieces left unfinished when the run ends (see [`crate::downloader::partial`]).
+    pub partial_path: Option<std::path::PathBuf>,
 }
 
 /// How a [`Session::run`] ended.
@@ -78,6 +82,7 @@ pub struct Session<'a> {
     display_total: u64,
     goal_pieces: usize,
     timeout: Option<Duration>,
+    partial_path: Option<std::path::PathBuf>,
     run_start: Instant,
     pex_total: usize,
     fresh_since_announce: usize,
@@ -105,6 +110,7 @@ impl<'a> Session<'a> {
             display_total: setup.display_total,
             goal_pieces: setup.goal_pieces,
             timeout: setup.timeout,
+            partial_path: setup.partial_path,
             run_start: Instant::now(),
             pex_total: 0,
             fresh_since_announce: 0,
@@ -178,6 +184,16 @@ impl<'a> Session<'a> {
         for result in self.workers.shutdown() {
             self.progress.absorb(result, |m| sink.log(m));
         }
+        // The blocks of pieces left half fetched are kept for the next run: the connections that held them have ended, and
+        // put what they had into the queue as they did.
+        if let Some(path) = &self.partial_path {
+            let partials = if self.queue.is_empty() { Vec::new() } else { self.queue.partials() };
+            match crate::downloader::partial::save(path, &partials) {
+                Ok(()) if !partials.is_empty() => sink.log(format!("kept the blocks of {} unfinished piece(s) for the next run", partials.len())),
+                Ok(()) => {}
+                Err(e) => sink.log(format!("could not keep the blocks of unfinished pieces: {}", e)),
+            }
+        }
         // What the loop last published predates the pieces absorbed above,
         // so without this the final numbers shown -- and, in `--json`, the
         // last progress event -- describe a download that was not quite done.
@@ -201,7 +217,7 @@ impl<'a> Session<'a> {
     }
 
     /// Feeds the dial queue from the passive discovery sources: peer
-    /// exchange and the DHT.
+    /// exchange, the DHT and the local network.
     fn poll_discovery(&mut self) {
         let sink = self.sink;
         let pex_fresh: usize = self.workers.pex_batches().map(|batch| self.pool.add(batch)).sum();
@@ -216,6 +232,13 @@ impl<'a> Session<'a> {
                 sink.log(format!("DHT: {} new peer address(es)", dht_fresh));
             }
             self.fresh_since_announce += dht_fresh;
+        }
+        if let Some(lsd) = self.services.lsd() {
+            let lsd_fresh: usize = lsd.peers_rx.try_iter().map(|batch| self.pool.add(batch)).sum();
+            if lsd_fresh > 0 {
+                sink.log(format!("LSD: {} new peer address(es) on the local network", lsd_fresh));
+            }
+            self.fresh_since_announce += lsd_fresh;
         }
     }
 
@@ -288,7 +311,7 @@ impl<'a> Session<'a> {
             endgame: self.queue.in_endgame(),
             trackers_ok: self.announcer.trackers_ok(),
             trackers_total: self.announcer.tracker_count(),
-            dht_nodes: self.services.dht().map(|d| d.nodes.load(Ordering::SeqCst)).unwrap_or(0),
+            dht_nodes: self.services.dht().map(|d| d.node_count()).unwrap_or(0),
             pex_total: self.pex_total,
             web_seeds: self.workers.web_running(),
             eta_secs,
@@ -316,6 +339,36 @@ impl<'a> Session<'a> {
         self.announcer.stopped(totals, STOP_ANNOUNCE_DEADLINE);
     }
 
+    /// Connects out to the peers known, from the trackers, the DHT and the local network, to serve them:
+    /// a seed that only waited to be connected to would give nothing to a peer that cannot be reached
+    /// from outside, or that has not found it. Each peer is tried again only after a while, and only
+    /// so many are dialed at once (see [`crate::seeder::SeederHandle::dial`]).
+    fn dial_to_serve(&mut self, dialed_at: &mut HashMap<SocketAddr, Instant>) {
+        /// How long before a peer dialed is dialed again.
+        const REDIAL_AFTER: Duration = Duration::from_secs(300);
+        let Some(seeder) = self.services.seeder() else { return };
+        if let Some(dht) = self.services.dht() {
+            for batch in dht.peers_rx.try_iter() {
+                self.pool.add(batch);
+            }
+        }
+        if let Some(lsd) = self.services.lsd() {
+            for batch in lsd.peers_rx.try_iter() {
+                self.pool.add(batch);
+            }
+        }
+        let now = Instant::now();
+        let config = self.workers.config();
+        for addr in self.pool.known_addresses() {
+            if dialed_at.get(&addr).is_some_and(|&at| now.saturating_duration_since(at) < REDIAL_AFTER) {
+                continue;
+            }
+            if seeder.dial(addr, config.transport.clone(), config.connect_timeout, config.encryption) {
+                dialed_at.insert(addr, now);
+            }
+        }
+    }
+
     /// Post-completion seeding: keep the listener and DHT alive,
     /// re-announce with `left = 0` on the tracker interval, publish upload
     /// stats. Returns when `stop` is set (user quit), with `None`, or when
@@ -330,6 +383,8 @@ impl<'a> Session<'a> {
 
         // Seeding has its own cadence: count the interval from here.
         self.announcer.restart_clock(Instant::now());
+        // When each peer was last dialed to be served.
+        let mut dialed_at: HashMap<SocketAddr, Instant> = HashMap::new();
         // Seeding downloads nothing, so the down total stays at 0.
         let mut rates = RateSampler::new(Instant::now(), 0, self.uploaded_bytes());
 
@@ -358,8 +413,10 @@ impl<'a> Session<'a> {
 
             if self.announcer.has_trackers() && self.announcer.is_due(Instant::now(), false) {
                 let totals = TransferTotals { uploaded: self.uploaded_bytes(), downloaded: self.progress.bytes_this_run(), left: 0 };
-                let _ = self.announcer.reannounce(Instant::now(), totals, |m| sink.log(m));
+                let found = self.announcer.reannounce(Instant::now(), totals, |m| sink.log(m));
+                self.pool.add(found);
             }
+            self.dial_to_serve(&mut dialed_at);
             thread::sleep(UI_TICK);
         }
         None
@@ -449,10 +506,10 @@ mod tests {
     /// As [`session_with_floor`], with the whole retry policy chosen.
     fn session_with_policy<'a>(sink: &'a Arc<RecordingSink>, services: &'a Services, dir: &Path, peers: &[SocketAddr], timeout: Option<Duration>, floor: Duration, policy: crate::session::peer_pool::RetryPolicy) -> Session<'a> {
         let data = data();
-        let work = data.chunks(PIECE_LEN).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32 }).collect();
+        let work = data.chunks(PIECE_LEN).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32, merkle: None }).collect();
         let queue = Arc::new(WorkQueue::new(work, PIECES));
         let spans = Arc::new(build_file_spans(dir, &[(vec!["f.bin".to_string()], data.len() as i64)]));
-        let config = Arc::new(WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(1), down_limit: None, interrupt: Default::default(), peers: Default::default() });
+        let config = Arc::new(WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(1), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None });
         let log: Log = {
             let sink = Arc::clone(sink);
             Arc::new(move |m| sink.log(m))
@@ -472,6 +529,7 @@ mod tests {
             display_total: data.len() as u64,
             goal_pieces: PIECES,
             timeout,
+            partial_path: None,
         })
     }
 
@@ -490,7 +548,47 @@ mod tests {
         for piece in 0..PIECES {
             assert!(sink.lines.lock().unwrap().iter().any(|l| l.starts_with(&format!("piece {} verified (", piece))), "piece {} was reported", piece);
         }
-        assert!(sink.snapshots.lock().unwrap().iter().any(|snap| snap.status == "downloading"), "and the dashboard saw it downloading");
+        // (Whether a snapshot in between said "downloading" depends on how fast the pieces arrive: with the requests going on across
+        // pieces, all four here can be in before the loop has published anything but the end.)
+        let last = sink.last_snapshot();
+        assert_eq!((last.status, last.verified, last.done_bytes), ("complete", PIECES, data().len() as u64), "and the dashboard's last word is that it is done");
+    }
+
+    /// A partial piece: the one block of piece `index` (the pieces here are one block long), received.
+    fn stash_of(index: u32) -> (u32, crate::downloader::PartialPiece) {
+        let mut assembler = crate::downloader::PieceAssembler::new(crate::downloader::PieceWork { index, hash: [0; 20], length: PIECE_LEN as u32, merkle: None });
+        assembler.record_block(0, &vec![1u8; PIECE_LEN]).unwrap();
+        (index, assembler.into_partial().unwrap())
+    }
+
+    #[test]
+    fn a_run_that_ends_with_pieces_unfinished_keeps_the_blocks_it_held_and_one_that_finishes_leaves_none() {
+        use crate::downloader::partial;
+        // No peer to fetch from, and a queue with a stash: the run times out with the piece unfinished.
+        let dir = tmp_dir("partial-kept-unfinished");
+        let path = dir.join("kept.partial");
+        let sink = Arc::new(RecordingSink::default());
+        let services = Services::new();
+        let mut s = session(&sink, &services, &dir, &[dead_addr()], Some(Duration::from_millis(400)));
+        s.partial_path = Some(path.clone());
+        let (index, stash) = stash_of(2);
+        s.queue.stash_partial(index, stash.clone());
+
+        let report = s.run(&AtomicBool::new(false));
+
+        assert!(!report.complete);
+        assert_eq!(partial::load(&path), vec![(2, stash)], "what was held is on disk");
+        assert!(sink.logged("kept the blocks of 1 unfinished piece(s) for the next run"));
+
+        // A run that completes leaves nothing, and takes away what an earlier one left.
+        let dir = tmp_dir("partial-kept-complete");
+        let path = dir.join("kept.partial");
+        partial::save(&path, &[stash_of(0)]).unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        let mut s = session(&sink, &services, &dir, &[fake_peer(true)], None);
+        s.partial_path = Some(path.clone());
+        assert!(s.run(&AtomicBool::new(false)).complete);
+        assert!(!path.exists());
     }
 
     #[test]
@@ -703,7 +801,7 @@ mod tests {
         let services = Services::new();
         let mut s = session(&sink, &services, &dir, &[], None);
         let len = data().len() as i64;
-        s.workers.start_web_seeds(&[stalled_web_seed()], "t", &[(vec!["f.bin".to_string()], len)], false, len as u64);
+        s.workers.start_web_seeds(&[stalled_web_seed()], "t", &[(vec!["f.bin".to_string()], len)], false, len as u64, None);
         assert!(s.workers.web_active());
         s.fruitless_rounds = MAX_FRUITLESS_ROUNDS - 1;
 
@@ -794,6 +892,83 @@ mod tests {
         let started = Instant::now();
         let end = s.seed("f.bin", 6881, &stop, limits);
         (end, started.elapsed(), sink)
+    }
+
+    #[test]
+    fn a_seeding_session_dials_the_peers_it_knows_and_serves_them() {
+        seed_and_serve_a_listed_peer("seed-dials", |_, addr| vec![addr]);
+    }
+
+    #[test]
+    fn a_seeding_session_dials_a_peer_announced_on_the_local_network() {
+        seed_and_serve_a_listed_peer("seed-dials-lsd", |services, addr| {
+            let listen = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+            let config = crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen, join: None, share_port: false, interval: Duration::from_secs(3600), reply_interval: Duration::from_secs(3600) };
+            services.start_lsd(config, INFO_HASH, 6881, |_| {});
+            let heard_at = services.lsd().expect("the service started").listen_addr;
+            let neighbour = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            neighbour.send_to(&crate::lsd::announcement(heard_at, addr.port(), &INFO_HASH, "the-neighbour"), heard_at).unwrap();
+            Vec::new() // nothing known to begin with
+        });
+    }
+
+    /// Seeds a torrent from disk while a leecher, which nothing has connected to us from, waits to be dialed: `discover` says how
+    /// the session comes to know of it (and returns the peers it starts out knowing).
+    fn seed_and_serve_a_listed_peer(name: &str, discover: impl FnOnce(&mut Services, SocketAddr) -> Vec<SocketAddr>) {
+        use crate::downloader::file_writer::write_piece;
+        let dir = tmp_dir(name);
+        let payload = data();
+        let spans = Arc::new(build_file_spans(&dir, &[(vec!["f.bin".to_string()], payload.len() as i64)]));
+        for (i, chunk) in payload.chunks(PIECE_LEN).enumerate() {
+            write_piece(&spans, i as u32, PIECE_LEN as u64, chunk).unwrap();
+        }
+        let have = Arc::new(HaveMap::new(PIECES));
+        (0..PIECES as u32).for_each(|i| have.set(i));
+        let mut services = Services::new();
+        services.attach_seeder(seeder::start(0, INFO_HASH, [2; 20], spans, PIECE_LEN as u64, payload.len() as u64, have, None).unwrap());
+
+        // A leecher that is not connected to us: it can only be served if we dial it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let known = discover(&mut services, addr);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let flag = Arc::clone(&stop);
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut hs = [0u8; 68];
+            let _ = stream.read_exact(&mut hs);
+            let _ = stream.write_all(&Handshake::new(INFO_HASH, [9; 20], false).to_bytes());
+            let _ = Message::Interested.write_to(&mut stream);
+            loop {
+                match Message::read_from(&mut stream) {
+                    Ok(Message::Unchoke) => break,
+                    Ok(_) => continue,
+                    Err(_) => return,
+                }
+            }
+            let _ = Message::Request { index: 1, begin: 0, length: PIECE_LEN as u32 }.write_to(&mut stream);
+            while let Ok(message) = Message::read_from(&mut stream) {
+                if let Message::Piece { block, .. } = message {
+                    let _ = tx.send(block);
+                    break;
+                }
+            }
+            flag.store(true, Ordering::SeqCst);
+        });
+        let watchdog = Arc::clone(&stop);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(15));
+            watchdog.store(true, Ordering::SeqCst);
+        });
+
+        let sink = Arc::new(RecordingSink::default());
+        let mut s = session(&sink, &services, &dir, &known, None);
+        s.seed("f.bin", 6881, &stop, SeedLimits::default());
+
+        let block = rx.try_recv().expect("the leecher was served: a seed that waited to be connected to would never have met it");
+        assert_eq!(block, payload[PIECE_LEN..2 * PIECE_LEN]);
     }
 
     #[test]
@@ -912,6 +1087,49 @@ mod tests {
     }
 
     const SAFETY: Duration = Duration::from_secs(20); // only a net: a regression fails instead of hanging
+
+    #[test]
+    fn a_peer_heard_of_on_the_local_network_is_news_to_the_round_it_arrives_in() {
+        // A round that found nobody is fruitless, and enough of them end the run; one that heard of a peer is not.
+        let dir = tmp_dir("lsd-fresh");
+        let sink = Arc::new(RecordingSink::default());
+        let mut services = Services::new();
+        let listen = SocketAddr::from(([127, 0, 0, 1], 0));
+        services.start_lsd(crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen, join: None, share_port: false, interval: Duration::from_secs(3600), reply_interval: Duration::from_secs(3600) }, INFO_HASH, 6881, |_| {});
+        let heard_at = services.lsd().expect("the service started").listen_addr;
+        let neighbour = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        neighbour.send_to(&crate::lsd::announcement(heard_at, 5555, &INFO_HASH, "the-neighbour"), heard_at).unwrap();
+        let mut s = session(&sink, &services, &dir, &[], None);
+        let until = Instant::now() + Duration::from_secs(5);
+        while s.fresh_since_announce == 0 && Instant::now() < until {
+            s.poll_discovery();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(s.fresh_since_announce, 1);
+    }
+
+    #[test]
+    fn a_peer_found_on_the_local_network_is_dialed_and_the_download_finishes() {
+        // No tracker, no DHT and no address to begin with: the only way to the
+        // peer is a datagram from the local network, as LSD would deliver it.
+        let dir = tmp_dir("lsd");
+        let sink = Arc::new(RecordingSink::default());
+        let mut services = Services::new();
+        let listen = SocketAddr::from(([127, 0, 0, 1], 0));
+        let config = crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen, join: None, share_port: false, interval: Duration::from_secs(3600), reply_interval: Duration::from_secs(3600) };
+        services.start_lsd(config, INFO_HASH, 6881, |_| {});
+        let heard_at = services.lsd().expect("the service started").listen_addr;
+        let peer = fake_peer(true);
+        let neighbour = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        neighbour.send_to(&crate::lsd::announcement(heard_at, peer.port(), &INFO_HASH, "the-neighbour"), heard_at).unwrap();
+        let mut s = session(&sink, &services, &dir, &[], Some(SAFETY));
+
+        let report = s.run(&AtomicBool::new(false));
+
+        assert!(report.complete, "{:?}", sink.lines.lock().unwrap());
+        assert!(sink.logged("LSD: 1 new peer address(es) on the local network"));
+        assert_eq!(std::fs::read(dir.join("f.bin")).unwrap(), data());
+    }
 
     #[test]
     fn a_peer_that_drops_us_once_is_dialed_again_and_the_download_finishes() {

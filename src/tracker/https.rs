@@ -8,7 +8,7 @@
 //! `tracker::http` uses, just handed a TLS-wrapped stream instead of a
 //! bare `TcpStream`.
 
-use super::http::{parse_authority_and_path, perform_request_and_parse, ParsedUrl};
+use super::http::{get_body, parse_authority_and_path, perform_request_and_parse, ParsedUrl};
 use super::{AnnounceRequest, AnnounceResponse, TrackerError};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -62,6 +62,17 @@ pub fn announce(tracker_url: &str, req: &AnnounceRequest) -> Result<AnnounceResp
 
     let mut tls_stream = StreamOwned::new(conn, sock);
     perform_request_and_parse(&mut tls_stream, &url, req)
+}
+
+/// A GET of `tracker_url` with `query`, over TLS: what a scrape of an `https://` tracker is.
+pub fn get(tracker_url: &str, query: &str) -> Result<Vec<u8>, TrackerError> {
+    let url = parse_https_url(tracker_url)?;
+    let server_name = ServerName::try_from(url.host.clone()).map_err(|e| TrackerError::Tls(format!("invalid hostname {:?}: {}", url.host, e)))?;
+    let conn = ClientConnection::new(tls_client_config(), server_name).map_err(|e| TrackerError::Tls(e.to_string()))?;
+    let sock = TcpStream::connect((url.host.as_str(), url.port))?;
+    sock.set_read_timeout(Some(Duration::from_secs(15)))?;
+    sock.set_write_timeout(Some(Duration::from_secs(15)))?;
+    get_body(&mut StreamOwned::new(conn, sock), &url, query)
 }
 
 #[cfg(test)]

@@ -1,13 +1,14 @@
 //! The threads that fetch pieces: one per connected peer, one per web
 //! seed, all draining the same work queue.
 
-use crate::downloader::{run_worker, FileSpan, PexSender, PieceResult, WorkQueue, WorkerConfig, WorkerError};
+use crate::downloader::{run_adopted, run_worker, Adopted, Adoption, FileSpan, PexSender, PieceResult, WorkQueue, WorkerConfig, WorkerError};
+use crate::seeder::Adopter;
 use crate::session::peer_pool::Outcome;
 use crate::session::PeerPool;
 use crate::sync::lock;
 use crate::webseed::{run_web_worker, WebEnd};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -26,6 +27,39 @@ pub fn classify(result: &Result<(), WorkerError>) -> Outcome {
         // Our disk failed; the peer did nothing wrong.
         Err(WorkerError::Connection { stage: "write_piece_to_disk", .. }) => Outcome::Local,
         Err(WorkerError::Connection { .. }) => Outcome::Dropped,
+    }
+}
+
+/// Takes the connections that peers made to us and that turn out to be of use to the download: it asks the peer's pieces of the queue, and
+/// hands the connection over to [`Workers::take_adopted`] on a channel.
+struct Adoptions {
+    queue: Arc<WorkQueue>,
+    tx: Mutex<Sender<Adopted>>,
+    /// Adopted connections that are running, and the most there are to be.
+    running: AtomicUsize,
+    max: usize,
+    /// Set when the workers are stopped: nothing more is taken.
+    closed: AtomicBool,
+    /// Addresses whose connections gave data that failed its hash. An address that dialed us has no port to remember it by, as one we
+    /// dialed does, so it is the address: such a peer is still served, but not downloaded from again.
+    banned: Mutex<std::collections::HashSet<std::net::IpAddr>>,
+}
+
+/// Whether a connection that ended this way is one whose peer is not to be downloaded from again: it sent what did not match its hash.
+fn is_to_be_banned(result: &Result<(), WorkerError>) -> bool {
+    matches!(result, Err(WorkerError::PieceHashMismatch))
+}
+
+impl Adopter for Adoptions {
+    fn wants(&self, peer: std::net::IpAddr, has: &[bool]) -> bool {
+        !self.closed.load(Ordering::SeqCst) && self.running.load(Ordering::SeqCst) < self.max && !lock(&self.banned).contains(&peer) && self.queue.any_wanted_in(has)
+    }
+
+    fn adopt(&self, connection: Adopted) {
+        self.running.fetch_add(1, Ordering::SeqCst);
+        if lock(&self.tx).send(connection).is_err() {
+            self.running.fetch_sub(1, Ordering::SeqCst); // the workers are gone: the connection closes
+        }
     }
 }
 
@@ -54,9 +88,23 @@ pub struct Workers {
     /// Why writing to disk failed, once it has: with nothing to write to,
     /// no peer can help, and the run cannot go on.
     disk_failure: Arc<Mutex<Option<String>>>,
+    /// Connections that peers made and the download is to take over, and where they wait to be started.
+    adoptions: Arc<Adoptions>,
+    adopted_rx: Receiver<Adopted>,
 }
 
 impl Workers {
+    /// How connections are made and what is said on them: what a peer dialed for any other reason is dialed with.
+    pub fn config(&self) -> &Arc<WorkerConfig> {
+        &self.config
+    }
+
+    /// The limit the downloads are held to, for tests to see whose it is.
+    #[cfg(test)]
+    pub(crate) fn down_limit(&self) -> Option<Arc<crate::ratelimit::RateLimiter>> {
+        self.config.down_limit.clone()
+    }
+
     /// A worker set that will keep at most `max_peers` peer connections
     /// going. Nothing runs until [`spawn_peers`](Self::spawn_peers) or
     /// [`start_web_seeds`](Self::start_web_seeds).
@@ -64,21 +112,64 @@ impl Workers {
         let (results_tx, results_rx) = mpsc::channel();
         let (pex_tx, pex_rx) = mpsc::channel();
         let (outcomes_tx, outcomes_rx) = mpsc::channel();
-        Workers { queue, spans, config, piece_length, max_peers, log, results_tx, results_rx, pex_tx: (!private).then_some(pex_tx), pex_rx, outcomes_tx, outcomes_rx, peers: Vec::new(), web_seeds: Vec::new(), web_stop: Arc::new(AtomicBool::new(false)), disk_failure: Arc::new(Mutex::new(None)) }
+        let (adopted_tx, adopted_rx) = mpsc::channel();
+        let adoptions = Arc::new(Adoptions { queue: Arc::clone(&queue), tx: Mutex::new(adopted_tx), running: AtomicUsize::new(0), max: max_peers, closed: AtomicBool::new(false), banned: Mutex::new(Default::default()) });
+        Workers { queue, spans, config, piece_length, max_peers, log, results_tx, results_rx, pex_tx: (!private).then_some(pex_tx), pex_rx, outcomes_tx, outcomes_rx, peers: Vec::new(), web_seeds: Vec::new(), web_stop: Arc::new(AtomicBool::new(false)), disk_failure: Arc::new(Mutex::new(None)), adoptions, adopted_rx }
+    }
+
+    /// What lets the listener give this download the connections of peers that have pieces it lacks (see [`crate::seeder::SeederHandle::set_adopter`]).
+    pub fn adopter(&self) -> Arc<dyn Adopter> {
+        Arc::clone(&self.adoptions) as Arc<dyn Adopter>
+    }
+
+    /// Starts a worker on each connection that has been adopted since the last call. What a worker does with one that has nothing
+    /// more to give is to serve it on, on a thread of its own, so that its slot is free for a peer that has.
+    pub fn take_adopted(&mut self) {
+        let adopted: Vec<Adopted> = self.adopted_rx.try_iter().collect();
+        for connection in adopted {
+            let (queue, spans, config) = (Arc::clone(&self.queue), Arc::clone(&self.spans), Arc::clone(&self.config));
+            let (tx, pex_tx, log) = (self.results_tx.clone(), self.pex_tx.clone(), Arc::clone(&self.log));
+            let disk_failure = Arc::clone(&self.disk_failure);
+            let (adoptions, piece_length) = (Arc::clone(&self.adoptions), self.piece_length);
+            self.peers.push(thread::spawn(move || {
+                let peer = connection.peer;
+                let result = match run_adopted(connection, &config, &queue, &spans, piece_length, &tx, pex_tx.as_ref()) {
+                    Adoption::ServeOn(stream, serving) => {
+                        if let Some(upload) = config.upload.clone() {
+                            thread::spawn(move || {
+                                let _ = crate::seeder::serve_adopted(stream, serving, &upload);
+                            });
+                        }
+                        Ok(())
+                    }
+                    Adoption::Ended(result) => result,
+                };
+                adoptions.running.fetch_sub(1, Ordering::SeqCst);
+                if is_to_be_banned(&result) {
+                    lock(&adoptions.banned).insert(peer.ip());
+                }
+                if let Err(e) = &result {
+                    log(format!("peer {} (connected to us) disconnected: {:?}", peer, e));
+                    if let WorkerError::Connection { stage: "write_piece_to_disk", error } = e {
+                        lock(&disk_failure).get_or_insert(error.to_string());
+                    }
+                }
+            }));
+        }
     }
 
     /// Starts one worker per BEP 19 web seed, each dialing nobody: they
     /// fetch ranges over HTTP into the same queue.
-    pub fn start_web_seeds(&mut self, urls: &[String], name: &str, files: &[(Vec<String>, i64)], multi_file: bool, total_length: u64) {
+    pub fn start_web_seeds(&mut self, urls: &[String], name: &str, files: &[(Vec<String>, i64)], multi_file: bool, total_length: u64, v2_pieces: Option<Arc<Vec<crate::v2::V2Piece>>>) {
         let files = Arc::new(files.to_vec());
         for url in urls {
-            let (url, name, files) = (url.clone(), name.to_string(), Arc::clone(&files));
+            let (url, name, files, v2_pieces) = (url.clone(), name.to_string(), Arc::clone(&files), v2_pieces.clone());
             let (queue, spans, tx, stop, log) = (Arc::clone(&self.queue), Arc::clone(&self.spans), self.results_tx.clone(), Arc::clone(&self.web_stop), Arc::clone(&self.log));
             let limiter = self.config.down_limit.clone();
             let piece_length = self.piece_length;
             let disk_failure = Arc::clone(&self.disk_failure);
             self.web_seeds.push(thread::spawn(move || {
-                let end = run_web_worker(&url, &name, &files, multi_file, limiter.as_deref(), &queue, &spans, piece_length, total_length, &tx, &stop, move |m| log(m));
+                let end = run_web_worker(&url, &name, &files, multi_file, limiter.as_deref(), &queue, &spans, piece_length, total_length, v2_pieces.as_deref().map(Vec::as_slice), &tx, &stop, move |m| log(m));
                 if let WebEnd::DiskFailed(why) = end {
                     lock(&disk_failure).get_or_insert(why);
                 }
@@ -90,6 +181,7 @@ impl Workers {
     /// waiting retry is due) until `max_peers` are connected or there is
     /// nothing left to dial or fetch.
     pub fn spawn_peers(&mut self, pool: &mut PeerPool, now: Instant) {
+        self.take_adopted();
         while self.peers.len() < self.max_peers && !self.queue.is_empty() {
             let Some(addr) = pool.next_to_dial(now) else { break };
             let (queue, spans, config) = (Arc::clone(&self.queue), Arc::clone(&self.spans), Arc::clone(&self.config));
@@ -116,6 +208,11 @@ impl Workers {
     }
 
     /// Peer connections currently held (as of the last [`reap`](Self::reap)).
+    /// How connections to peers are opened.
+    pub fn transport_mode(&self) -> crate::peer::TransportMode {
+        self.config.transport.mode
+    }
+
     pub fn active_peers(&self) -> usize {
         self.peers.len()
     }
@@ -172,6 +269,7 @@ impl Workers {
     /// the pieces they completed that nobody had collected yet.
     pub fn shutdown(&mut self) -> Vec<PieceResult> {
         self.web_stop.store(true, Ordering::SeqCst);
+        self.adoptions.closed.store(true, Ordering::SeqCst);
         // Workers blocked on a silent peer would otherwise be waited for
         // until their read timeout.
         self.config.interrupt.trigger();
@@ -192,7 +290,7 @@ mod tests {
     use std::time::Instant;
 
     fn queue_with(pieces: usize) -> Arc<WorkQueue> {
-        let work = (0..pieces).map(|i| PieceWork { index: i as u32, hash: [0; 20], length: 16 }).collect();
+        let work = (0..pieces).map(|i| PieceWork { index: i as u32, hash: [0; 20], length: 16, merkle: None }).collect();
         Arc::new(WorkQueue::new(work, pieces))
     }
 
@@ -203,7 +301,7 @@ mod tests {
     }
 
     fn workers(queue: Arc<WorkQueue>, max_peers: usize, private: bool, log: Log) -> Workers {
-        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default() });
+        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None });
         Workers::new(queue, Arc::new(Vec::new()), config, 16, max_peers, private, log)
     }
 
@@ -308,7 +406,7 @@ mod tests {
         let url = format!("http://{}/", dead_addr());
         let files = vec![(vec!["a.bin".to_string()], 16)];
 
-        w.start_web_seeds(&[url], "t", &files, false, 16);
+        w.start_web_seeds(&[url], "t", &files, false, 16, None);
         wait_until("the web seed to give up", || !w.web_active());
         w.shutdown();
 
@@ -361,18 +459,131 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bittorrent-rs-workers-disk-failure-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("file.bin")).unwrap(); // a directory where the file goes
-        let work = content.chunks(1024).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32 }).collect();
+        let work = content.chunks(1024).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32, merkle: None }).collect();
         let queue = Arc::new(WorkQueue::new(work, 3));
         let files = vec![(vec!["file.bin".to_string()], 3000i64)];
         let spans = Arc::new(build_file_spans(&dir, &files));
-        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default() });
+        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None });
         let (log, _) = recording_log();
         let mut w = Workers::new(queue, spans, config, 1024, 1, false, log);
         assert_eq!(w.disk_failure(), None, "nothing has failed yet");
 
-        w.start_web_seeds(std::slice::from_ref(&mirror.base), "file.bin", &files, false, 3000);
+        w.start_web_seeds(std::slice::from_ref(&mirror.base), "file.bin", &files, false, 3000, None);
 
         wait_until("the disk failure to be reported", || w.disk_failure().is_some());
         w.shutdown();
+    }
+
+    // ---- connections peers made ----
+
+    const LOCAL: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+    fn adoptions_for(pieces: usize, max: usize) -> (Workers, Arc<dyn Adopter>) {
+        let workers = Workers::new(queue_with(pieces), Arc::new(Vec::new()), Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None }), 16, max, false, recording_log().0);
+        let adopter = workers.adopter();
+        (workers, adopter)
+    }
+
+    #[test]
+    fn a_peer_is_wanted_when_it_has_a_piece_still_to_fetch_and_only_then() {
+        let (_workers, adopter) = adoptions_for(3, 4);
+        assert!(adopter.wants(LOCAL, &[false, false, true]));
+        assert!(adopter.wants(LOCAL, &[true, false, false]));
+        assert!(!adopter.wants(LOCAL, &[false, false, false]), "it has nothing");
+        assert!(!adopter.wants(LOCAL, &[]), "it has said nothing");
+        assert!(!adopter.wants(LOCAL, &[false, false, false, true]), "a piece the torrent does not have is nothing to want");
+    }
+
+    #[test]
+    fn a_piece_that_has_been_fetched_is_no_reason_to_want_a_peer() {
+        let (workers, adopter) = adoptions_for(2, 4);
+        let (a, b) = (workers.queue.pop().unwrap(), workers.queue.pop().unwrap());
+        // Both are claimed by workers, not yet done: the peer might yet be the one to give them.
+        assert!(adopter.wants(LOCAL, &[true, true]));
+        workers.queue.mark_done(a.index);
+        workers.queue.mark_done(b.index);
+        assert!(!adopter.wants(LOCAL, &[true, true]), "the download has everything");
+    }
+
+    #[test]
+    fn no_more_connections_are_taken_than_the_limit_and_none_once_the_workers_are_stopped() {
+        let (mut workers, adopter) = adoptions_for(3, 1);
+        assert!(adopter.wants(LOCAL, &[true, true, true]));
+        workers.adoptions.running.store(1, Ordering::SeqCst);
+        assert!(!adopter.wants(LOCAL, &[true, true, true]), "the one allowed is running");
+        workers.adoptions.running.store(0, Ordering::SeqCst);
+        assert!(adopter.wants(LOCAL, &[true, true, true]));
+        workers.shutdown();
+        assert!(!adopter.wants(LOCAL, &[true, true, true]), "nothing is taken by workers that are stopping");
+    }
+
+    #[test]
+    fn only_a_hash_mismatch_gets_a_peer_banned_and_a_ban_is_by_address() {
+        assert!(is_to_be_banned(&Err(WorkerError::PieceHashMismatch)));
+        assert!(!is_to_be_banned(&Ok(())));
+        assert!(!is_to_be_banned(&Err(WorkerError::Connection { stage: "serve_peer", error: crate::peer::ConnectionError::Io(std::io::Error::other("x")) })), "a connection that failed is not one that lied");
+        let (workers, adopter) = adoptions_for(3, 4);
+        let other: std::net::IpAddr = "10.1.2.3".parse().unwrap();
+        assert!(adopter.wants(LOCAL, &[true, true, true]) && adopter.wants(other, &[true, true, true]));
+        lock(&workers.adoptions.banned).insert(other);
+        assert!(!adopter.wants(other, &[true, true, true]), "that address is not wanted again");
+        assert!(adopter.wants(LOCAL, &[true, true, true]), "and the others still are");
+    }
+
+    #[test]
+    fn a_peer_that_connected_and_sent_a_piece_that_fails_its_hash_is_not_adopted_again() {
+        use sha1::Digest;
+        use std::io::{Read, Write};
+        let info_hash = [0x5C; 20];
+        let good = vec![0x11u8; 16384];
+        let dir = std::env::temp_dir().join(format!("bt-adopt-ban-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A torrent of one piece that we lack, and a listener to serve from.
+        let spans = Arc::new(crate::downloader::build_file_spans(&dir, &[(vec!["f.bin".to_string()], 16384)]));
+        let have = Arc::new(crate::seeder::HaveMap::new(1));
+        let mut seeder = crate::seeder::start(0, info_hash, [7; 20], Arc::clone(&spans), 16384, 16384, have, None).unwrap();
+        let hash: [u8; 20] = sha1::Sha1::digest(&good).into();
+        let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash, length: 16384, merkle: None }], 1));
+        let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [2; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: Some(seeder.upload()) });
+        let mut workers = Workers::new(Arc::clone(&queue), spans, config, 16384, 4, false, recording_log().0);
+        seeder.set_adopter(Some(workers.adopter()));
+
+        // A peer connects, says it has the piece, unchokes us, and sends the piece with the wrong bytes.
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", seeder.port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.write_all(&crate::peer::handshake::Handshake::new(info_hash, [9; 20], false).to_bytes()).unwrap();
+        let mut hs = [0u8; 68];
+        stream.read_exact(&mut hs).unwrap();
+        // (Short reads from here: the loop below starts the worker as soon as the connection has been handed over.)
+        stream.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        crate::peer::message::Message::Bitfield(vec![0x80]).write_to(&mut stream).unwrap();
+        crate::peer::message::Message::Unchoke.write_to(&mut stream).unwrap();
+        let bad = vec![0x22u8; 16384];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut sent = false;
+        while Instant::now() < deadline && !sent {
+            workers.take_adopted();
+            match crate::peer::message::Message::read_from(&mut stream) {
+                Ok(crate::peer::message::Message::Request { index: 0, begin, length }) => {
+                    crate::peer::message::Message::Piece { index: 0, begin, block: bad[begin as usize..(begin + length) as usize].to_vec() }.write_to(&mut stream).unwrap();
+                    sent = true;
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(sent, "the worker asked for the piece over the connection the peer made");
+        // Once the worker has judged it, that address is not wanted again.
+        let adopter = workers.adopter();
+        let banned_by = Instant::now() + Duration::from_secs(5);
+        while adopter.wants(LOCAL, &[true]) && Instant::now() < banned_by {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!adopter.wants(LOCAL, &[true]), "a peer that sent a bad piece is not downloaded from again");
+        assert!(queue.is_wanted(0), "and the piece is still to be fetched");
+        drop(stream);
+        workers.shutdown();
+        seeder.stop();
     }
 }

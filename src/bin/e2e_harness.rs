@@ -102,6 +102,38 @@ enum Kind {
     /// A tracker that redirects every announce: the client follows it, and
     /// the download is unaffected.
     TrackerRedirect,
+    /// `--encryption`: an encrypted connection is made and used where the
+    /// peer will, a plain one where it will not (unless required), and
+    /// incoming connections are taken either way (unless required).
+    Encryption,
+    /// BitTorrent v2 (BEP 52): `create_torrent --v2` makes the torrent an
+    /// independently written builder makes (same info hash), the client
+    /// lists it, `--verify` passes intact files and names a damaged one, and
+    /// a download of a copy without its piece layers is refused, saying why.
+    V2Torrents,
+    /// BEP 32: the DHT's IPv6 node. A torrent with no tracker finds its only
+    /// peer, which listens on `[::1]`, from a fake DHT node on `[::1]` that
+    /// answers `get_peers` with an 18-byte value; with `--no-ipv6` it does not.
+    DhtIpv6,
+    /// BitTorrent v2 (BEP 52) downloads: a v2-only torrent (built by hand,
+    /// with piece layers and multi-block pieces) is downloaded from a fake
+    /// peer byte for byte, and the client as a seeder serves it to a
+    /// leecher, each verified by the merkle trees.
+    V2Download,
+    /// uTP (BEP 29): a peer reachable only over uTP is downloaded from with
+    /// `--transport both` and `--transport utp` and is out of reach for
+    /// `tcp`; and as a seeder the client serves a leecher that comes in over
+    /// uTP.
+    Utp,
+    /// Local service discovery (BEP 14): a torrent with no tracker and no
+    /// DHT finds its only peer from a datagram on the local network, and
+    /// announces itself the way the BEP describes. Kept on loopback with
+    /// unicast addresses in place of the multicast group.
+    LocalDiscovery,
+    /// The Fast Extension (BEP 6): the client downloads what a peer allows
+    /// while still choked, and as a seeder tells a fast peer what it has
+    /// with `have all`, allows it pieces and serves them before any unchoke.
+    FastExtension,
     /// A disk that cannot be written to ends the run at once with a message
     /// saying so, instead of dialing the same peers over and over.
     DiskFailure,
@@ -130,6 +162,22 @@ enum Kind {
     StoppedAnnounceIsBounded,
     /// A second signal during that wait exits at once with status 130.
     SecondSignalForcesExit,
+    /// A run stopped with a piece half fetched keeps its blocks: the next run asks only for the
+    /// blocks it lacks, of that piece and of the others.
+    ResumePartialPiece,
+    PaddedTorrent,
+    MagnetSelectOnly,
+    DialedPeerIsServed,
+    InboundPeerIsDownloadedFrom,
+    Scrape,
+    /// BEP 12: a torrent whose announce list is [[a dead tracker, one that works], [another]] is
+    /// announced to the first tier's working tracker and to no other, and that tracker alone hears
+    /// `stopped`; with `--tracker-mode concurrent` every tracker is asked.
+    TrackerTiers,
+    /// The multi-torrent daemon: two torrents downloaded and then seeded on one
+    /// port, told to it over its control socket; one paused and resumed; one removed while the other
+    /// carries on; and, after a restart, what was left remembered.
+    Daemon,
 }
 
 struct Scenario {
@@ -160,6 +208,13 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "serve-metadata", kind: Kind::ServeMetadata },
     Scenario { name: "magnet-peer-hint", kind: Kind::MagnetPeerHint },
     Scenario { name: "tracker-redirect", kind: Kind::TrackerRedirect },
+    Scenario { name: "encryption", kind: Kind::Encryption },
+    Scenario { name: "v2-torrents", kind: Kind::V2Torrents },
+    Scenario { name: "v2-download", kind: Kind::V2Download },
+    Scenario { name: "dht-ipv6", kind: Kind::DhtIpv6 },
+    Scenario { name: "utp", kind: Kind::Utp },
+    Scenario { name: "local-discovery", kind: Kind::LocalDiscovery },
+    Scenario { name: "fast-extension", kind: Kind::FastExtension },
     Scenario { name: "disk-failure", kind: Kind::DiskFailure },
     Scenario { name: "prefer-files", kind: Kind::PreferFiles },
     Scenario { name: "json-events", kind: Kind::JsonEvents },
@@ -170,6 +225,14 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "seed-time-ends-seeding", kind: Kind::SeedTime },
     Scenario { name: "stopped-announce-is-bounded", kind: Kind::StoppedAnnounceIsBounded },
     Scenario { name: "second-signal-forces-exit", kind: Kind::SecondSignalForcesExit },
+    Scenario { name: "resume-partial-piece", kind: Kind::ResumePartialPiece },
+    Scenario { name: "padded-torrent", kind: Kind::PaddedTorrent },
+    Scenario { name: "magnet-select-only", kind: Kind::MagnetSelectOnly },
+    Scenario { name: "dialed-peer-is-served", kind: Kind::DialedPeerIsServed },
+    Scenario { name: "inbound-peer-is-downloaded-from", kind: Kind::InboundPeerIsDownloadedFrom },
+    Scenario { name: "scrape", kind: Kind::Scrape },
+    Scenario { name: "tracker-tiers", kind: Kind::TrackerTiers },
+    Scenario { name: "daemon-two-torrents", kind: Kind::Daemon },
 ];
 
 fn main() {
@@ -203,6 +266,13 @@ fn main() {
             Kind::ServeMetadata => run_serve_metadata(scenario.name),
             Kind::MagnetPeerHint => run_magnet_peer_hint(scenario.name),
             Kind::TrackerRedirect => run_tracker_redirect(scenario.name),
+            Kind::Encryption => run_encryption(scenario.name),
+            Kind::V2Torrents => run_v2_torrents(scenario.name),
+            Kind::V2Download => run_v2_download(scenario.name),
+            Kind::DhtIpv6 => run_dht_ipv6(scenario.name),
+            Kind::Utp => run_utp(scenario.name),
+            Kind::LocalDiscovery => run_local_discovery(scenario.name),
+            Kind::FastExtension => run_fast_extension(scenario.name),
             Kind::DiskFailure => run_disk_failure(scenario.name),
             Kind::PreferFiles => run_prefer_files(scenario.name),
             Kind::JsonEvents => run_json_events(scenario.name),
@@ -213,6 +283,14 @@ fn main() {
             Kind::SeedTime => run_seed_time(scenario.name),
             Kind::StoppedAnnounceIsBounded => run_stopped_announce_is_bounded(scenario.name),
             Kind::SecondSignalForcesExit => run_second_signal_forces_exit(scenario.name),
+            Kind::ResumePartialPiece => run_resume_partial_piece(scenario.name),
+            Kind::PaddedTorrent => run_padded_torrent(scenario.name),
+            Kind::MagnetSelectOnly => run_magnet_select_only(scenario.name),
+            Kind::DialedPeerIsServed => run_dialed_peer_is_served(scenario.name),
+            Kind::InboundPeerIsDownloadedFrom => run_inbound_peer_is_downloaded_from(scenario.name),
+            Kind::Scrape => run_scrape(scenario.name),
+            Kind::TrackerTiers => run_tracker_tiers(scenario.name),
+            Kind::Daemon => run_daemon(scenario.name),
         };
         match outcome {
             Ok(summary) => println!("PASS [{}]: {}", scenario.name, summary),
@@ -240,6 +318,10 @@ struct Fixture {
     piece_count: usize,
     info_bytes: Vec<u8>,
     info_hash: [u8; 20],
+    /// For a v2 torrent: the bytes of every piece, in piece order (a piece never spans files).
+    v2_pieces: Option<Vec<Vec<u8>>>,
+    /// For a v2 torrent: the `piece layers` entry of the .torrent file, bencoded, key and all.
+    torrent_extra: Vec<u8>,
 }
 
 /// `len` bytes that differ from `salt` to `salt` and don't repeat within a
@@ -305,7 +387,47 @@ impl Fixture {
             .iter()
             .map(|(path, content)| (if single { path.join("/") } else { format!("{}/{}", name, path.join("/")) }, content.clone()))
             .collect();
-        Fixture { files, piece_count: pieces_concat.len() / 20, data, piece_len, info_bytes: v, info_hash }
+        Fixture { files, piece_count: pieces_concat.len() / 20, data, piece_len, info_bytes: v, info_hash, v2_pieces: None, torrent_extra: Vec::new() }
+    }
+
+    /// A multi-file torrent as libtorrent and qBittorrent lay it out (BEP 47): after each file
+    /// that does not end on a piece boundary comes a padding file (`.pad/N`, `attr` `p`) of
+    /// zeros, so that the next one begins on one. The pieces cover the padding; `files` (what
+    /// is on disk) does not have it, and `data` (what the pieces hash) does.
+    fn build_padded(name: &str, files: &[(Vec<&str>, Vec<u8>)], piece_len: usize) -> Self {
+        let mut layout: Vec<(Vec<String>, usize, bool)> = Vec::new();
+        let mut data = Vec::new();
+        for (index, (path, content)) in files.iter().enumerate() {
+            layout.push((path.iter().map(|part| part.to_string()).collect(), content.len(), false));
+            data.extend_from_slice(content);
+            let gap = data.len().next_multiple_of(piece_len) - data.len();
+            if index + 1 < files.len() && gap > 0 {
+                layout.push((vec![".pad".to_string(), gap.to_string()], gap, true));
+                data.resize(data.len() + gap, 0);
+            }
+        }
+        let mut pieces_concat = Vec::new();
+        for chunk in data.chunks(piece_len) {
+            pieces_concat.extend_from_slice(&Sha1::digest(chunk));
+        }
+        let mut v = b"d5:filesl".to_vec();
+        for (path, length, padding) in &layout {
+            v.extend_from_slice(b"d");
+            if *padding {
+                v.extend_from_slice(b"4:attr1:p");
+            }
+            v.extend_from_slice(format!("6:lengthi{}e4:pathl", length).as_bytes());
+            for part in path {
+                v.extend_from_slice(format!("{}:{}", part.len(), part).as_bytes());
+            }
+            v.extend_from_slice(b"ee");
+        }
+        v.extend_from_slice(format!("e4:name{}:{}12:piece lengthi{}e6:pieces{}:", name.len(), name, piece_len, pieces_concat.len()).as_bytes());
+        v.extend_from_slice(&pieces_concat);
+        v.extend_from_slice(b"e");
+        let info_hash: [u8; 20] = Sha1::digest(&v).into();
+        let files = files.iter().map(|(path, content)| (format!("{}/{}", name, path.join("/")), content.clone())).collect();
+        Fixture { files, piece_count: pieces_concat.len() / 20, data, piece_len, info_bytes: v, info_hash, v2_pieces: None, torrent_extra: Vec::new() }
     }
 
     /// A magnet link for this torrent naming the tracker at `tracker_addr`.
@@ -324,8 +446,103 @@ impl Fixture {
         v.extend_from_slice(format!("8:announce{}:{}", announce_url.len(), announce_url).as_bytes());
         v.extend_from_slice(b"4:info");
         v.extend_from_slice(&self.info_bytes);
+        v.extend_from_slice(&self.torrent_extra);
         v.extend_from_slice(b"e");
         v
+    }
+
+    /// A BitTorrent v2 torrent (BEP 52) of `files`, built by hand: the only
+    /// thing taken from the library is the SHA-256 primitive. Its pieces are
+    /// cut file by file, and its info hash is the first 20 bytes of the
+    /// SHA-256 of the info dictionary. `name/` prefixes the files' paths in the
+    /// output directory unless there is a single file named `name`.
+    fn build_v2(name: &str, files: &[(Vec<&str>, Vec<u8>)], piece_len: usize) -> Self {
+        use bittorrent_rs::sha256::sha256;
+        const BLOCK: usize = 16384;
+        fn root(leaves: &[[u8; 32]], width: usize, pad: [u8; 32]) -> [u8; 32] {
+            let mut level = leaves.to_vec();
+            level.resize(width, pad);
+            while level.len() > 1 {
+                level = level.chunks(2).map(|pair| sha256(&[pair[0].as_slice(), pair[1].as_slice()].concat())).collect();
+            }
+            level[0]
+        }
+        fn bstr(bytes: &[u8]) -> Vec<u8> {
+            let mut out = format!("{}:", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out
+        }
+        enum Node {
+            Dir(std::collections::BTreeMap<String, Node>),
+            File(usize, Option<[u8; 32]>),
+        }
+        fn encode(node: &Node) -> Vec<u8> {
+            match node {
+                Node::File(length, root) => {
+                    let mut out = format!("d0:d6:lengthi{}e", length).into_bytes();
+                    if let Some(root) = root {
+                        out.extend_from_slice(b"11:pieces root");
+                        out.extend_from_slice(&bstr(root));
+                    }
+                    out.extend_from_slice(b"ee");
+                    out
+                }
+                Node::Dir(entries) => {
+                    let mut out = b"d".to_vec();
+                    for (name, child) in entries {
+                        out.extend_from_slice(&bstr(name.as_bytes()));
+                        out.extend_from_slice(&encode(child));
+                    }
+                    out.push(b'e');
+                    out
+                }
+            }
+        }
+        let blocks_per_piece = piece_len / BLOCK;
+        let mut zero_piece = [0u8; 32];
+        for _ in 0..blocks_per_piece.trailing_zeros() {
+            zero_piece = sha256(&[zero_piece.as_slice(), zero_piece.as_slice()].concat());
+        }
+
+        let mut tree = std::collections::BTreeMap::new();
+        let mut layers: std::collections::BTreeMap<[u8; 32], Vec<u8>> = std::collections::BTreeMap::new();
+        let mut pieces = Vec::new();
+        for (path, content) in files {
+            let file_root = if content.is_empty() {
+                None
+            } else if content.len() <= piece_len {
+                let leaves: Vec<[u8; 32]> = content.chunks(BLOCK).map(sha256).collect();
+                pieces.push(content.clone());
+                Some(root(&leaves, leaves.len().next_power_of_two(), [0; 32]))
+            } else {
+                let layer: Vec<[u8; 32]> = content.chunks(piece_len).map(|piece| root(&piece.chunks(BLOCK).map(sha256).collect::<Vec<_>>(), blocks_per_piece, [0; 32])).collect();
+                pieces.extend(content.chunks(piece_len).map(<[u8]>::to_vec));
+                let file_root = root(&layer, layer.len().next_power_of_two(), zero_piece);
+                layers.insert(file_root, layer.concat());
+                Some(file_root)
+            };
+            let mut node = &mut tree;
+            for part in &path[..path.len() - 1] {
+                let Node::Dir(next) = node.entry(part.to_string()).or_insert_with(|| Node::Dir(Default::default())) else { unreachable!("a file and a directory of one name") };
+                node = next;
+            }
+            node.insert(path[path.len() - 1].to_string(), Node::File(content.len(), file_root));
+        }
+        let mut info = b"d9:file tree".to_vec();
+        info.extend_from_slice(&encode(&Node::Dir(tree)));
+        info.extend_from_slice(format!("12:meta versioni2e4:name{}:{}12:piece lengthi{}ee", name.len(), name, piece_len).as_bytes());
+        let mut info_hash = [0u8; 20];
+        info_hash.copy_from_slice(&sha256(&info)[..20]);
+
+        let mut extra = b"12:piece layersd".to_vec();
+        for (file_root, layer) in &layers {
+            extra.extend_from_slice(&bstr(file_root));
+            extra.extend_from_slice(&bstr(layer));
+        }
+        extra.push(b'e');
+        let single = files.len() == 1 && files[0].0 == [name];
+        let out_files = files.iter().map(|(path, content)| (if single { path.join("/") } else { format!("{}/{}", name, path.join("/")) }, content.clone())).collect();
+        Fixture { files: out_files, data: files.iter().flat_map(|(_, c)| c.iter().copied()).collect(), piece_len, piece_count: pieces.len(), info_bytes: info, info_hash, v2_pieces: Some(pieces), torrent_extra: extra }
     }
 }
 
@@ -334,8 +551,17 @@ impl Fixture {
 /// What one fake peer observed of the client.
 #[derive(Default)]
 struct PeerLog {
+    /// Connections that came in over uTP.
+    utp_connections: usize,
+    /// Connections that turned out to be encrypted (MSE) and plain.
+    encrypted_connections: usize,
+    plain_connections: usize,
     /// Whether the client's extended handshake offered `ut_pex`.
     pex_offered: Option<bool>,
+    /// Whether the client's handshake had the Fast Extension bit.
+    fast_offered: Option<bool>,
+    /// Requests a `Fast` peer turned away because it had the client choked.
+    refused_while_choked: usize,
     /// Every piece index the client asked for, in order (repeats included).
     requested: Vec<u32>,
     /// Every block requested as (piece, offset within the piece), in order.
@@ -348,6 +574,10 @@ struct PeerLog {
     metadata_pieces_served: usize,
     /// Connections the peer has accepted and handshaken.
     connections: usize,
+    /// The bitfield the client sent, if it did (the first thing it says when it has pieces to offer).
+    client_bitfield: Option<Vec<u8>>,
+    /// Blocks the client sent this peer: (piece, offset, bytes).
+    received: Vec<(u32, u32, Vec<u8>)>,
 }
 
 /// A latch one fake peer can open for another to wait on, to force an
@@ -387,6 +617,8 @@ enum Behavior {
     /// but never answers another request, which is a client mid-download
     /// as far as the client can tell.
     StallAfter(usize),
+    /// Serves `n` blocks, whichever pieces they are of, then goes silent as `StallAfter` does.
+    StallAfterBlocks(usize),
     /// Serves `after_pieces` pieces in full, then on the next piece sends
     /// only the first block and hangs up. Opens `dropped` as it does.
     DropMidPiece { after_pieces: usize, dropped: Arc<Gate> },
@@ -401,6 +633,13 @@ enum Behavior {
     /// Serves normally but has only these pieces, and says so in its
     /// bitfield: what a mid-download peer in a real swarm looks like.
     Partial(BTreeSet<u32>),
+    /// Speaks the Fast Extension: `have all`, then `allowed fast` for these
+    /// pieces, and no unchoke until they have all been served. A request for
+    /// any other piece while choked is refused with `reject request`.
+    Fast(BTreeSet<u32>),
+    /// Has only the pieces `has`, serves them, and wants piece `wants` *from the client*: it says it is interested,
+    /// and asks for the piece once the client unchokes it. A peer in a real swarm is a downloader too.
+    AlsoAsks { has: BTreeSet<u32>, wants: u32 },
 }
 
 /// How the fake tracker treats the client's announces.
@@ -436,26 +675,52 @@ fn announce_param(request_line: &str, key: &str) -> Option<String> {
 
 /// What a fake peer needs to know about the torrent it serves.
 struct PeerContext {
+    /// Whether this peer takes encrypted (MSE) connections, and plain ones.
+    encryption: bittorrent_rs::peer::Encryption,
     data: Vec<u8>,
     /// The bencoded info dict, served to clients that ask for it (BEP 9).
     info_bytes: Vec<u8>,
     info_hash: [u8; 20],
     piece_len: usize,
     piece_count: usize,
+    /// Every piece's bytes, where they are not simply `data` cut into `piece_len`s (a v2 torrent).
+    pieces: Option<Arc<Vec<Vec<u8>>>>,
 }
 
 /// Starts a fake tracker (answers every announce with the full peer list,
 /// and records it) and one fake peer per entry of `behaviors`, all on
 /// loopback.
+/// The bytes of query parameter `key` in a request line, with its percent-encoding undone (an info hash is 20 bytes that are not text).
+fn percent_decoded_param(request_line: &str, key: &str) -> Option<Vec<u8>> {
+    let query = request_line.split_once('?')?.1.split(' ').next()?;
+    let value = query.split('&').find_map(|pair| pair.strip_prefix(&format!("{}=", key)))?;
+    let bytes = value.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            out.push(u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
 fn spawn_swarm(fx: &Fixture, behaviors: Vec<Behavior>) -> Swarm {
     spawn_swarm_with_tracker(fx, behaviors, TrackerMode::Answer)
 }
 
 /// [`spawn_swarm`] with a chosen way for the tracker to behave.
 fn spawn_swarm_with_tracker(fx: &Fixture, behaviors: Vec<Behavior>, mode: TrackerMode) -> Swarm {
-    let tracker_listener = TcpListener::bind("127.0.0.1:0").expect("bind fake tracker");
-    let tracker_addr = tracker_listener.local_addr().unwrap();
+    spawn_swarm_full(fx, behaviors, mode, bittorrent_rs::peer::Encryption::Off)
+}
 
+/// [`spawn_swarm_with_tracker`] with the peers taking encrypted connections
+/// too, if `encryption` says so.
+fn spawn_swarm_full(fx: &Fixture, behaviors: Vec<Behavior>, mode: TrackerMode, encryption: bittorrent_rs::peer::Encryption) -> Swarm {
     let mut peer_addrs = Vec::new();
     let mut logs = Vec::new();
     for behavior in behaviors {
@@ -463,13 +728,23 @@ fn spawn_swarm_with_tracker(fx: &Fixture, behaviors: Vec<Behavior>, mode: Tracke
         peer_addrs.push(listener.local_addr().unwrap());
         let log = Arc::new(Mutex::new(PeerLog::default()));
         logs.push(Arc::clone(&log));
-        let cx = PeerContext { data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count };
+        let cx = PeerContext { encryption, data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count, pieces: fx.v2_pieces.clone().map(Arc::new) };
         thread::spawn(move || run_fake_peer(listener, cx, behavior, log));
     }
 
-    let peer_addrs_for_swarm = peer_addrs.clone();
+    let (tracker_addr, announces) = spawn_tracker(peer_addrs.clone(), mode);
+    Swarm { tracker_addr, peer_addrs, logs, announces }
+}
+
+/// A fake tracker that lists `peer_addrs` in answer to every announce (and
+/// misbehaves as `mode` says). Returns where it listens and the request line
+/// of every announce it receives.
+fn spawn_tracker(peer_addrs: Vec<SocketAddr>, mode: TrackerMode) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let tracker_listener = TcpListener::bind("127.0.0.1:0").expect("bind fake tracker");
+    let tracker_addr = tracker_listener.local_addr().unwrap();
     let announces = Arc::new(Mutex::new(Vec::new()));
     let tracker_announces = Arc::clone(&announces);
+    let tracker_scrapes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     thread::spawn(move || {
         let mut peers_bin = Vec::new();
         for addr in &peer_addrs {
@@ -496,6 +771,17 @@ fn spawn_swarm_with_tracker(fx: &Fixture, behaviors: Vec<Behavior>, mode: Tracke
             let request_line = request.lines().next().unwrap_or("").to_string();
             let ignored = mode == TrackerMode::IgnoreStopped && announce_param(&request_line, "event").as_deref() == Some("stopped");
             let redirected = mode == TrackerMode::Redirect && request_line.starts_with("GET /announce?");
+            // A scrape (BEP 48) is not an announce and is not counted as one: it says 5 seeders, 2 leechers and 42 completed for the hash asked about.
+            if request_line.starts_with("GET /scrape?") {
+                let hash = percent_decoded_param(&request_line, "info_hash").unwrap_or_default();
+                let mut scrape_body = format!("d5:filesd{}:", hash.len()).into_bytes();
+                scrape_body.extend_from_slice(&hash);
+                scrape_body.extend_from_slice(b"d8:completei5e10:downloadedi42e10:incompletei2eeee");
+                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", scrape_body.len()).as_bytes());
+                let _ = stream.write_all(&scrape_body);
+                tracker_scrapes.lock().unwrap().push(request_line);
+                continue;
+            }
             tracker_announces.lock().unwrap().push(request_line);
             if ignored {
                 hung.push(stream);
@@ -509,8 +795,37 @@ fn spawn_swarm_with_tracker(fx: &Fixture, behaviors: Vec<Behavior>, mode: Tracke
             let _ = stream.write_all(&body);
         }
     });
+    (tracker_addr, announces)
+}
 
-    Swarm { tracker_addr, peer_addrs: peer_addrs_for_swarm, logs, announces }
+/// [`spawn_swarm`] with peers that can be reached only over uTP: each has a
+/// UDP port and, on that number, nothing listening on TCP (the port is taken
+/// from a TCP listener that is then let go, so a connection there is
+/// refused).
+fn spawn_utp_swarm(fx: &Fixture, behaviors: Vec<Behavior>) -> (Swarm, Vec<Arc<bittorrent_rs::utp::UtpSocket>>) {
+    let mut peer_addrs = Vec::new();
+    let mut logs = Vec::new();
+    let mut sockets = Vec::new();
+    for behavior in behaviors {
+        let port = TcpListener::bind("127.0.0.1:0").expect("pick a port").local_addr().unwrap().port();
+        let socket = Arc::new(bittorrent_rs::utp::UtpSocket::bind(SocketAddr::from(([127, 0, 0, 1], port))).expect("bind uTP"));
+        socket.listen();
+        peer_addrs.push(SocketAddr::from(([127, 0, 0, 1], port)));
+        let log = Arc::new(Mutex::new(PeerLog::default()));
+        logs.push(Arc::clone(&log));
+        let cx = Arc::new(PeerContext { encryption: bittorrent_rs::peer::Encryption::Off, data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count, pieces: fx.v2_pieces.clone().map(Arc::new) });
+        let behavior = Arc::new(behavior);
+        let accepting = Arc::clone(&socket);
+        thread::spawn(move || {
+            while let Some(stream) = accepting.accept(Duration::from_secs(3600)) {
+                let (cx, behavior, log) = (Arc::clone(&cx), Arc::clone(&behavior), Arc::clone(&log));
+                thread::spawn(move || serve_stream(Box::new(stream), true, &cx, &behavior, &log));
+            }
+        });
+        sockets.push(socket);
+    }
+    let (tracker_addr, announces) = spawn_tracker(peer_addrs.clone(), TrackerMode::Answer);
+    (Swarm { tracker_addr, peer_addrs, logs, announces }, sockets)
 }
 
 /// The extended-message id the fake peer uses for ut_metadata. Deliberately
@@ -529,7 +844,15 @@ fn run_fake_peer(listener: TcpListener, cx: PeerContext, behavior: Behavior, log
     }
 }
 
-fn serve_connection(mut stream: TcpStream, cx: &PeerContext, behavior: &Behavior, log: &Mutex<PeerLog>) {
+fn serve_connection(tcp: TcpStream, cx: &PeerContext, behavior: &Behavior, log: &Mutex<PeerLog>) {
+    serve_stream(Box::new(tcp), false, cx, behavior, log);
+}
+
+/// One connection, over TCP or uTP.
+fn serve_stream(stream: Box<dyn bittorrent_rs::peer::PeerStream>, over_utp: bool, cx: &PeerContext, behavior: &Behavior, log: &Mutex<PeerLog>) {
+    // Plain or encrypted, whichever the client begins with (as far as this
+    // peer is set to take).
+    let Ok((mut stream, encrypted)) = bittorrent_rs::peer::mse::accept(stream, &[cx.info_hash], cx.encryption) else { return };
     let mut hs_buf = [0u8; 68];
     if stream.read_exact(&mut hs_buf).is_err() {
         return;
@@ -538,18 +861,60 @@ fn serve_connection(mut stream: TcpStream, cx: &PeerContext, behavior: &Behavior
     if their_hs.info_hash != cx.info_hash {
         return;
     }
-    let our_hs = Handshake::new(cx.info_hash, [0x99; 20], true);
+    let fast = matches!(behavior, Behavior::Fast(_));
+    let our_hs = Handshake::new(cx.info_hash, [0x99; 20], true).with_fast(fast);
     if stream.write_all(&our_hs.to_bytes()).is_err() {
         return;
+    }
+    converse(stream, &their_hs, encrypted, over_utp, cx, behavior, log);
+}
+
+/// A fake peer that connects to the client, at `addr`, instead of being connected to: it sends its handshake first, and then does
+/// what it does on any connection.
+fn dial_client(addr: SocketAddr, cx: &PeerContext, behavior: &Behavior, log: &Mutex<PeerLog>) {
+    let Ok(tcp) = TcpStream::connect(addr) else { return };
+    let mut stream = bittorrent_rs::peer::mse::MseStream::plain(Box::new(tcp));
+    let fast = matches!(behavior, Behavior::Fast(_));
+    if stream.write_all(&Handshake::new(cx.info_hash, [0x98; 20], true).with_fast(fast).to_bytes()).is_err() {
+        return;
+    }
+    let mut hs_buf = [0u8; 68];
+    if stream.read_exact(&mut hs_buf).is_err() {
+        return;
+    }
+    let Ok(their_hs) = Handshake::from_bytes(&hs_buf) else { return };
+    if their_hs.info_hash != cx.info_hash {
+        return;
+    }
+    converse(stream, &their_hs, false, false, cx, behavior, log);
+}
+
+/// What a fake peer says and does on a connection whose handshakes are done, until it ends.
+fn converse(mut stream: bittorrent_rs::peer::mse::MseStream, their_hs: &Handshake, encrypted: bool, over_utp: bool, cx: &PeerContext, behavior: &Behavior, log: &Mutex<PeerLog>) {
+    {
+        let mut log = log.lock().unwrap();
+        log.fast_offered = Some(their_hs.supports_fast());
+        if over_utp {
+            log.utp_connections += 1;
+        }
+        if encrypted {
+            log.encrypted_connections += 1;
+        } else {
+            log.plain_connections += 1;
+        }
     }
 
     let mut bits = vec![0u8; cx.piece_count.div_ceil(8)];
     for i in 0..cx.piece_count {
-        if !matches!(behavior, Behavior::Partial(has) if !has.contains(&(i as u32))) {
+        if !matches!(behavior, Behavior::Partial(has) | Behavior::AlsoAsks { has, .. } if !has.contains(&(i as u32))) {
             bits[i / 8] |= 1 << (7 - (i % 8));
         }
     }
-    if Message::Bitfield(bits).write_to(&mut stream).is_err() {
+    if let Behavior::Fast(allowed) = behavior {
+        if Message::HaveAll.write_to(&mut stream).is_err() || allowed.iter().any(|&piece_index| Message::AllowedFast { piece_index }.write_to(&mut stream).is_err()) {
+            return;
+        }
+    } else if Message::Bitfield(bits).write_to(&mut stream).is_err() {
         return;
     }
     let nth_connection = {
@@ -563,7 +928,13 @@ fn serve_connection(mut stream: TcpStream, cx: &PeerContext, behavior: &Behavior
     if let Behavior::UnchokeAfter(delay) = behavior {
         thread::sleep(*delay);
     }
-    if Message::Unchoke.write_to(&mut stream).is_err() {
+    // An `AlsoAsks` peer wants something of the client, and says so before it unchokes it.
+    if matches!(behavior, Behavior::AlsoAsks { .. }) && Message::Interested.write_to(&mut stream).is_err() {
+        return;
+    }
+    // A `Fast` peer holds the client choked until it has served what it allowed.
+    let mut choking = matches!(behavior, Behavior::Fast(_));
+    if !choking && Message::Unchoke.write_to(&mut stream).is_err() {
         return;
     }
 
@@ -576,12 +947,32 @@ fn serve_connection(mut stream: TcpStream, cx: &PeerContext, behavior: &Behavior
             Ok(Message::Request { index, begin, length }) => {
                 let piece_start = index as usize * cx.piece_len;
                 let piece_end = (piece_start + cx.piece_len).min(cx.data.len());
+                let piece_bytes: &[u8] = match &cx.pieces {
+                    Some(pieces) => match pieces.get(index as usize) {
+                        Some(bytes) => bytes,
+                        None => continue,
+                    },
+                    None => &cx.data[piece_start.min(piece_end)..piece_end],
+                };
+                if let (Behavior::Fast(allowed), true) = (behavior, choking) {
+                    if !allowed.contains(&index) {
+                        let mut log = log.lock().unwrap();
+                        log.requested.push(index);
+                        log.refused_while_choked += 1;
+                        drop(log);
+                        if (Message::RejectRequest { index, begin, length }).write_to(&mut stream).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
                 let hang_up = {
                     let mut log = log.lock().unwrap();
                     log.requested.push(index);
                     log.requested_blocks.push((index, begin));
                     match behavior {
                         Behavior::StallAfter(limit) if log.served.len() >= *limit && !log.served.contains(&index) => continue, // read it, never answer
+                        Behavior::StallAfterBlocks(limit) if log.requested_blocks.len() > *limit => continue,
                         Behavior::DropMidPiece { after_pieces, .. } => {
                             if doomed.is_none() && log.served.len() >= *after_pieces && !log.served.contains(&index) {
                                 doomed = Some(index);
@@ -595,28 +986,61 @@ fn serve_connection(mut stream: TcpStream, cx: &PeerContext, behavior: &Behavior
                     // The piece counts as served once its last block is
                     // sent -- recorded *before* the send, so it is never
                     // behind what the client can have received.
-                    if log.dropped_piece != Some(index) && (begin + length) as usize == piece_end - piece_start {
+                    if log.dropped_piece != Some(index) && (begin + length) as usize == piece_bytes.len() {
                         log.served.insert(index);
                     }
                     log.dropped_piece == Some(index)
                 };
                 if hang_up {
                     if let Behavior::DropMidPiece { dropped, .. } = behavior {
-                        dropped.open();
+                        // The other peer is let in a moment after this one has gone, not as it goes: the client hands back the
+                        // pieces it had taken from this connection, and what arrived of them, when it sees the connection
+                        // end, and a peer that came in before it had would be asked for a piece that is still someone's.
+                        let dropped = Arc::clone(dropped);
+                        thread::spawn(move || {
+                            thread::sleep(Duration::from_millis(300));
+                            dropped.open();
+                        });
                     }
+                    // Closes as a peer that shuts a connection down properly does: what the client has already sent is read (and
+                    // ignored) first. Closing with requests unread makes Linux send a reset, which throws away what this peer sent
+                    // and the client has not read yet -- the block that was to arrive before the connection ended.
+                    let _ = bittorrent_rs::peer::PeerStream::set_read_timeout(&stream, Some(Duration::from_millis(150)));
+                    while Message::read_from(&mut stream).is_ok() {}
                     return; // the stream closes with the piece half-sent
                 }
                 if matches!(behavior, Behavior::DropFirstConnection) && nth_connection == 1 {
                     return; // hang up on the request
                 }
-                let mut block = cx.data[piece_start..piece_end][begin as usize..(begin + length) as usize].to_vec();
+                let Some(slice) = piece_bytes.get(begin as usize..(begin + length) as usize) else { continue };
+                let mut block = slice.to_vec();
                 if matches!(behavior, Behavior::Corrupt) {
                     block.iter_mut().for_each(|b| *b ^= 0xFF);
                 }
                 if (Message::Piece { index, begin, block }).write_to(&mut stream).is_err() {
                     return;
                 }
+                if let Behavior::Fast(allowed) = behavior {
+                    if choking && allowed.is_subset(&log.lock().unwrap().served) {
+                        choking = false;
+                        if Message::Unchoke.write_to(&mut stream).is_err() {
+                            return;
+                        }
+                    }
+                }
             }
+            Ok(Message::Bitfield(bits)) => log.lock().unwrap().client_bitfield = Some(bits),
+            // The client will serve us: ask for what we came for.
+            Ok(Message::Unchoke) => {
+                if let Behavior::AlsoAsks { wants, .. } = behavior {
+                    let start = *wants as usize * cx.piece_len;
+                    let length = (start + cx.piece_len).min(cx.data.len()).saturating_sub(start) as u32;
+                    if (Message::Request { index: *wants, begin: 0, length }).write_to(&mut stream).is_err() {
+                        return;
+                    }
+                }
+            }
+            Ok(Message::Piece { index, begin, block }) => log.lock().unwrap().received.push((index, begin, block)),
             Ok(Message::Extended { id: 0, payload }) => {
                 if let Ok(hs) = ExtendedHandshake::parse(&payload) {
                     log.lock().unwrap().pex_offered = Some(hs.peer_ut_pex_id().is_some());
@@ -669,6 +1093,8 @@ fn client_command(source: impl AsRef<std::ffi::OsStr>, out_dir: &Path, log: &Pat
     // gateway, and a client killed mid-run can't remove the mapping it
     // made, which would leave it on a real router.
     cmd.arg("--no-portmap");
+    // And local discovery would announce on the real network's multicast group.
+    cmd.arg("--no-lsd");
     // Plain output, but a logfile: assertions read what the client says
     // about its own decisions (DHT started or not, pieces resumed).
     cmd.arg("--no-tui").arg("--log").arg(log);
@@ -934,7 +1360,7 @@ fn run_drop_mid_piece(name: &str) -> Result<String, String> {
     // the client kept it: the healthy peer is asked only for the second.
     let asked_for_dropped: Vec<u32> = healthy.lock().unwrap().requested_blocks.iter().filter(|&&(piece, _)| piece == dropped_piece).map(|&(_, begin)| begin).collect();
     if asked_for_dropped != [16384] {
-        return Err(format!("the healthy peer was asked for blocks {:?} of piece {}; the first block had already arrived, so only the block at 16384 was needed", asked_for_dropped, dropped_piece));
+        return Err(format!("the healthy peer was asked for blocks {:?} of piece {}; the first block had already arrived, so only the block at 16384 was needed [flaky saw {:?}; healthy saw {:?}]", asked_for_dropped, dropped_piece, flaky.lock().unwrap().requested_blocks, healthy.lock().unwrap().requested_blocks));
     }
 
     let log = fs::read_to_string(&log_path).map_err(|e| format!("reading client log {:?}: {}", log_path, e))?;
@@ -1083,9 +1509,14 @@ fn leech_everything(fx: &Fixture, port: u16) -> Result<(), String> {
 
 /// [`leech_everything`], but downloading only the pieces in `wanted`.
 fn leech_pieces(fx: &Fixture, port: u16, wanted: std::ops::Range<usize>) -> Result<(), String> {
-    let wire = |what: &str, e: bittorrent_rs::peer::message::WireError| format!("{}: {:?}", what, e);
     let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connecting to the client's listener on port {}: {}", port, e))?;
     stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    leech_over(fx, &mut stream, wanted)
+}
+
+/// [`leech_pieces`] over a connection already made, TCP or uTP.
+fn leech_over<S: Read + Write>(fx: &Fixture, stream: &mut S, wanted: std::ops::Range<usize>) -> Result<(), String> {
+    let wire = |what: &str, e: bittorrent_rs::peer::message::WireError| format!("{}: {:?}", what, e);
 
     let ours = Handshake::new(fx.info_hash, [0x77; 20], false);
     stream.write_all(&ours.to_bytes()).map_err(|e| format!("sending the handshake: {}", e))?;
@@ -1097,7 +1528,7 @@ fn leech_pieces(fx: &Fixture, port: u16, wanted: std::ops::Range<usize>) -> Resu
     }
 
     let bitfield = loop {
-        match Message::read_from(&mut stream).map_err(|e| wire("waiting for the bitfield", e))? {
+        match Message::read_from(&mut *stream).map_err(|e| wire("waiting for the bitfield", e))? {
             Message::Bitfield(bits) => break bits,
             _ => continue,
         }
@@ -1107,9 +1538,9 @@ fn leech_pieces(fx: &Fixture, port: u16, wanted: std::ops::Range<usize>) -> Resu
         return Err(format!("the client advertised {} of {} pieces after finishing", advertised, fx.piece_count));
     }
 
-    Message::Interested.write_to(&mut stream).map_err(|e| wire("sending interested", e))?;
+    Message::Interested.write_to(&mut *stream).map_err(|e| wire("sending interested", e))?;
     loop {
-        match Message::read_from(&mut stream).map_err(|e| wire("waiting for the unchoke", e))? {
+        match Message::read_from(&mut *stream).map_err(|e| wire("waiting for the unchoke", e))? {
             Message::Unchoke => break,
             _ => continue,
         }
@@ -1118,9 +1549,9 @@ fn leech_pieces(fx: &Fixture, port: u16, wanted: std::ops::Range<usize>) -> Resu
     for index in wanted {
         let start = index * fx.piece_len;
         let end = (start + fx.piece_len).min(fx.data.len());
-        Message::Request { index: index as u32, begin: 0, length: (end - start) as u32 }.write_to(&mut stream).map_err(|e| wire("requesting a piece", e))?;
+        Message::Request { index: index as u32, begin: 0, length: (end - start) as u32 }.write_to(&mut *stream).map_err(|e| wire("requesting a piece", e))?;
         let block = loop {
-            match Message::read_from(&mut stream).map_err(|e| wire(&format!("waiting for piece {}", index), e))? {
+            match Message::read_from(&mut *stream).map_err(|e| wire(&format!("waiting for piece {}", index), e))? {
                 Message::Piece { index: got, begin: 0, block } if got as usize == index => break block,
                 _ => continue,
             }
@@ -2333,6 +2764,542 @@ fn run_serve_metadata(name: &str) -> Result<String, String> {
     Ok(format!("a peer holding only the info hash got the {}-byte info dictionary from the seeding client, byte for byte, and was told it is a seed", fx.info_bytes.len()))
 }
 
+/// BitTorrent v2 (BEP 52), made and read back by things that do not share
+/// the merkle code: the harness builds the torrent's info dictionary and hash
+/// itself (only the SHA-256 primitive is the library's, and that is checked
+/// against the standard's vectors), and `create_torrent --v2` must come to the
+/// same hash.
+fn run_v2_torrents(name: &str) -> Result<String, String> {
+    const BLOCK: usize = 16384;
+    let files: Vec<(Vec<&str>, Vec<u8>)> = vec![(vec!["a.bin"], pattern(40_000, 1)), (vec!["sub", "b.bin"], pattern(5000, 2)), (vec!["z.bin"], pattern(2 * BLOCK, 3)), (vec!["empty"], Vec::new())];
+    let fx = Fixture::build_v2("pack", &files, BLOCK);
+    let (info, expected_hash) = (fx.info_bytes.clone(), fx.info_hash);
+
+    // The tree of directories on disk.
+    let dir = scratch_dir(name);
+    let source = dir.join("src/pack");
+    for (path, content) in &files {
+        let full = path.iter().fold(source.clone(), |acc, part| acc.join(part));
+        fs::create_dir_all(full.parent().ok_or("no parent")?).map_err(|e| e.to_string())?;
+        fs::write(&full, content).map_err(|e| e.to_string())?;
+    }
+
+    let torrent_path = dir.join("v2.torrent");
+    let create_bin = std::env::current_exe().map_err(|e| e.to_string())?.parent().ok_or("no exe dir")?.join("create_torrent");
+    let made = Command::new(&create_bin).arg(&source).arg("--out").arg(&torrent_path).args(["--v2", "--piece-length", "16K", "--no-date", "--quiet"]).output().map_err(|e| e.to_string())?;
+    if !made.status.success() {
+        return Err(format!("create_torrent --v2 failed: {}", String::from_utf8_lossy(&made.stderr).trim()));
+    }
+    let bytes = fs::read(&torrent_path).map_err(|e| e.to_string())?;
+    let parsed = bittorrent_rs::torrent::parse_torrent_file(&bytes).map_err(|e| format!("the client cannot read what create_torrent --v2 wrote: {}", e))?;
+    if !parsed.is_v2_only() || parsed.info_hash != expected_hash {
+        return Err(format!("info hash {} differs from the independently built {}", bittorrent_rs::torrent::info_hash_hex(&parsed.info_hash), bittorrent_rs::torrent::info_hash_hex(&expected_hash)));
+    }
+    // The info dictionary is byte for byte what the harness wrote.
+    let (start, end) = (bytes.windows(info.len()).position(|w| w == info.as_slice()), info.len());
+    if start.is_none() {
+        return Err(format!("the torrent does not contain the info dictionary the harness built ({} bytes)", end));
+    }
+
+    // --list names the files, with the empty one.
+    let run = |extra: &[&str]| client_command(&torrent_path, &dir.join("out"), &dir.join("client.log"), 1).arg("--no-dht").args(extra).output().map_err(|e| format!("running the client: {}", e));
+    let listed = run(&["--list"])?;
+    let listing = String::from_utf8_lossy(&listed.stdout).to_string();
+    if !listed.status.success() || !["a.bin", "sub/b.bin", "z.bin", "empty"].iter().all(|f| listing.contains(f)) {
+        return Err(format!("--list should name every file; exit {:?}, stdout {:?}", listed.status.code(), listing.trim()));
+    }
+
+    // --verify: intact, then one byte wrong in the middle of a.bin.
+    let out_dir = dir.join("out");
+    for (path, content) in &files {
+        let full = path.iter().fold(out_dir.join("pack"), |acc, part| acc.join(part));
+        fs::create_dir_all(full.parent().ok_or("no parent")?).map_err(|e| e.to_string())?;
+        fs::write(&full, content).map_err(|e| e.to_string())?;
+    }
+    let whole = run(&["--verify"])?;
+    let text = String::from_utf8_lossy(&whole.stdout).to_string();
+    if !whole.status.success() || !text.contains("6 of 6 piece(s) verified") || !text.contains("4 of 4 file(s) whole") {
+        return Err(format!("intact files should verify; exit {:?}, stdout {:?}, stderr {:?}", whole.status.code(), text.trim(), String::from_utf8_lossy(&whole.stderr).trim()));
+    }
+    let a_path = out_dir.join("pack/a.bin");
+    let mut a = fs::read(&a_path).map_err(|e| e.to_string())?;
+    a[20_000] ^= 0xFF;
+    fs::write(&a_path, a).map_err(|e| e.to_string())?;
+    let damaged = run(&["--verify"])?;
+    let stderr = String::from_utf8_lossy(&damaged.stderr).to_string();
+    if damaged.status.code() != Some(1) || !stderr.contains("[damaged] a.bin") || stderr.contains("b.bin") || stderr.contains("z.bin") || !stderr.contains("5 of 6 piece(s) verified") {
+        return Err(format!("a damaged file should be named, and only its bad piece not counted; exit {:?}, stderr {:?}", damaged.status.code(), stderr.trim()));
+    }
+
+    // Without its piece layers there is nothing to check the pieces against, and a download is refused, saying so.
+    let mut top = bittorrent_rs::bencode::decode(&bytes).map_err(|e| e.to_string())?;
+    if let bittorrent_rs::bencode::Bencode::Dict(entries) = &mut top {
+        entries.remove(b"piece layers".as_slice());
+    }
+    let bare = dir.join("bare.torrent");
+    fs::write(&bare, bittorrent_rs::bencode::encode(&top)).map_err(|e| e.to_string())?;
+    let refused = client_command(&bare, &dir.join("out2"), &dir.join("client2.log"), 1).args(["--no-dht", "--timeout", "5"]).output().map_err(|e| format!("running the client: {}", e))?;
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    if refused.status.success() || !stderr.contains("piece layers") {
+        return Err(format!("a v2-only torrent without piece layers should be refused, saying why; exit {:?}, stderr {:?}", refused.status.code(), stderr.trim()));
+    }
+    Ok(format!("create_torrent --v2 made the independently built info hash ({}), --list named the files, --verify passed intact ones and caught a wrong byte to the piece, and a copy without its piece layers was refused for a download, with the reason", &bittorrent_rs::torrent::info_hash_hex(&parsed.info_hash)[..8]))
+}
+
+/// BEP 32. The client is given a torrent with no tracker and a DHT router on
+/// `[::1]`; the only peer, listening on `[::1]` too, is known to that router
+/// alone, and is named in an 18-byte `values` entry. The client's IPv6 DHT node
+/// must ask, be told, dial an IPv6 peer, and download; and with `--no-ipv6` it
+/// must not have an IPv6 node at all.
+fn run_dht_ipv6(name: &str) -> Result<String, String> {
+    use std::net::UdpSocket;
+    if TcpListener::bind("[::1]:0").is_err() || UdpSocket::bind("[::1]:0").is_err() {
+        return Ok("skipped: this machine has no IPv6 loopback".to_string());
+    }
+    let fx = Fixture::new(false);
+    let dir = scratch_dir(name);
+
+    // The peer, on [::1].
+    let listener = TcpListener::bind("[::1]:0").map_err(|e| e.to_string())?;
+    let peer_port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let log = Arc::new(Mutex::new(PeerLog::default()));
+    let cx = PeerContext { encryption: bittorrent_rs::peer::Encryption::Off, data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count, pieces: None };
+    let peer_log = Arc::clone(&log);
+    thread::spawn(move || run_fake_peer(listener, cx, Behavior::Serve, peer_log));
+
+    // The DHT router, on [::1], written by hand from BEP 5 and BEP 32.
+    let router = UdpSocket::bind("[::1]:0").map_err(|e| e.to_string())?;
+    router.set_read_timeout(Some(Duration::from_millis(100))).map_err(|e| e.to_string())?;
+    let router_addr = router.local_addr().map_err(|e| e.to_string())?;
+    let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&queries);
+    let ours = [0x5A; 20];
+    thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, from) = match router.recv_from(&mut buf) {
+                Ok(received) => received,
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+                Err(_) => break,
+            };
+            let Ok(message) = bittorrent_rs::bencode::decode_lenient(&buf[..n]) else { continue };
+            let (Some(t), Some(q)) = (message.get("t").and_then(|v| v.as_bytes()), message.get("q").and_then(|v| v.as_str())) else { continue };
+            seen.lock().unwrap().push(q.to_string());
+            let mut r = b"d1:rd2:id20:".to_vec();
+            r.extend_from_slice(&ours);
+            if q == "get_peers" {
+                r.extend_from_slice(b"5:token2:tk6:valuesl18:");
+                r.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+                r.extend_from_slice(&peer_port.to_be_bytes());
+                r.extend_from_slice(b"e");
+            }
+            r.extend_from_slice(format!("e1:t{}:", t.len()).as_bytes());
+            r.extend_from_slice(t);
+            r.extend_from_slice(b"1:y1:re");
+            let _ = router.send_to(&r, from);
+        }
+    });
+
+    // A torrent that names no tracker.
+    let torrent = dir.join("e2e.torrent");
+    let mut bytes = b"d4:info".to_vec();
+    bytes.extend_from_slice(&fx.info_bytes);
+    bytes.push(b'e');
+    fs::write(&torrent, bytes).expect("write torrent file");
+    let bootstrap = format!("[::1]:{}", router_addr.port());
+
+    // With IPv6 wanted: found, dialed, downloaded.
+    let out_dir = dir.join("out");
+    let log_path = dir.join("client.log");
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1).args(["--dht", "--ipv6", "--timeout", "40"]).env("BITTORRENT_RS_DHT_BOOTSTRAP", &bootstrap).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    let text = fs::read_to_string(&log_path).unwrap_or_default();
+    if !status.success() {
+        return Err(format!("the client exited with {:?}; its log: {}", status.code(), text.lines().rev().take(6).collect::<Vec<_>>().join(" | ")));
+    }
+    check_downloaded(&fx, &out_dir)?;
+    if !text.contains("(IPv6)") || !text.contains("DHT: 1 new peer address(es)") {
+        return Err(format!("the log should show an IPv6 DHT node and a peer from the DHT: {}", text.lines().take(12).collect::<Vec<_>>().join(" | ")));
+    }
+    if !queries.lock().unwrap().iter().any(|q| q == "get_peers") {
+        return Err("the router was never asked for peers".to_string());
+    }
+
+    // With IPv6 off, the DHT has no IPv6 node, so this router is out of reach and there is nobody to ask.
+    let before = queries.lock().unwrap().len();
+    let mut child = client_command(&torrent, &dir.join("out2"), &dir.join("client2.log"), 1).args(["--dht", "--no-ipv6", "--timeout", "6"]).env("BITTORRENT_RS_DHT_BOOTSTRAP", &bootstrap).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    let text2 = fs::read_to_string(dir.join("client2.log")).unwrap_or_default();
+    if status.success() || text2.contains("(IPv6)") || queries.lock().unwrap().len() != before {
+        return Err(format!("--no-ipv6 should leave the DHT with no IPv6 node and the router unasked; exit {:?}, {} more queries, log {:?}", status.code(), queries.lock().unwrap().len() - before, text2.lines().take(8).collect::<Vec<_>>().join(" | ")));
+    }
+    Ok(format!("a peer known only to a DHT router on [::1], named in an 18-byte value, was found by the client's IPv6 DHT node, dialed on [::1] and downloaded from ({} bytes); --no-ipv6 left the DHT without an IPv6 node", fx.data.len()))
+}
+
+/// A v2-only torrent is downloaded. The fake peer serves pieces by the v2
+/// layout (a file's last piece is short, and no piece spans two files), the
+/// client checks each against the merkle trees of the torrent's piece layers,
+/// and writes each file whole. Then, as a seeder, it serves those pieces back
+/// to a leecher, which verifies them itself with the harness's own trees.
+fn run_v2_download(name: &str) -> Result<String, String> {
+    const PIECE: usize = 32768; // two blocks
+    let files: Vec<(Vec<&str>, Vec<u8>)> = vec![(vec!["a.bin"], pattern(100_000, 1)), (vec!["sub", "b.bin"], pattern(20_000, 2)), (vec!["sub", "deep", "c.bin"], pattern(2 * PIECE, 3)), (vec!["empty"], Vec::new()), (vec!["z.bin"], pattern(70_001, 4))];
+    let fx = Fixture::build_v2("pack", &files, PIECE);
+    // a.bin 4 pieces, b.bin 1 (of two blocks, short of a piece), c.bin 2, z.bin 3.
+    if fx.piece_count != 4 + 1 + 2 + 3 {
+        return Err(format!("the fixture has {} pieces, not 10", fx.piece_count));
+    }
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("v2.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    let child = client_command(&torrent, &out_dir, &log_path, 1).args(["--no-dht", "--seed", "--port", "0"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, "seeding pack on port", Duration::from_secs(30), &mut client.0)?;
+    check_downloaded(&fx, &out_dir)?;
+    let seen = swarm.logs[0].lock().unwrap();
+    let wanted: BTreeSet<u32> = (0..fx.piece_count as u32).collect();
+    if seen.requested.iter().copied().collect::<BTreeSet<_>>() != wanted {
+        return Err(format!("the client should ask for each of the {} pieces; it asked for {:?}", fx.piece_count, seen.requested));
+    }
+    drop(seen);
+    if fs::metadata(out_dir.join("pack/empty")).map_err(|e| format!("the empty file: {}", e))?.len() != 0 {
+        return Err("the empty file has content".to_string());
+    }
+
+    // As a seeder: a leecher asks for every piece over TCP and checks it against the layout.
+    let port: u16 = swarm.announces.lock().unwrap().first().and_then(|line| announce_param(line, "port")).and_then(|p| p.parse().ok()).ok_or("no port in the client's first announce")?;
+    let pieces = fx.v2_pieces.clone().ok_or("a v2 fixture has its pieces")?;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connecting to the seeding client: {}", e))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    stream.write_all(&Handshake::new(fx.info_hash, [0x71; 20], false).to_bytes()).map_err(|e| e.to_string())?;
+    let mut hs = [0u8; 68];
+    stream.read_exact(&mut hs).map_err(|e| format!("reading the handshake: {}", e))?;
+    if Handshake::from_bytes(&hs).map_err(|e| format!("{:?}", e))?.info_hash != fx.info_hash {
+        return Err("the seeding client answered with another info hash".to_string());
+    }
+    let wire = |what: &str, e: bittorrent_rs::peer::message::WireError| format!("{}: {:?}", what, e);
+    let bitfield = loop {
+        match Message::read_from(&mut stream).map_err(|e| wire("waiting for the bitfield", e))? {
+            Message::Bitfield(bits) => break bits,
+            _ => continue,
+        }
+    };
+    let advertised = (0..pieces.len()).filter(|i| bitfield.get(i / 8).is_some_and(|byte| byte & (1 << (7 - i % 8)) != 0)).count();
+    if advertised != pieces.len() {
+        return Err(format!("the seeding client advertised {} of {} pieces", advertised, pieces.len()));
+    }
+    Message::Interested.write_to(&mut stream).map_err(|e| wire("sending interested", e))?;
+    loop {
+        if matches!(Message::read_from(&mut stream).map_err(|e| wire("waiting for the unchoke", e))?, Message::Unchoke) {
+            break;
+        }
+    }
+    for (index, piece) in pieces.iter().enumerate() {
+        let mut got = Vec::new();
+        while got.len() < piece.len() {
+            let begin = got.len() as u32;
+            let length = (piece.len() - got.len()).min(16384) as u32;
+            Message::Request { index: index as u32, begin, length }.write_to(&mut stream).map_err(|e| wire("requesting", e))?;
+            loop {
+                match Message::read_from(&mut stream).map_err(|e| wire(&format!("waiting for piece {}", index), e))? {
+                    Message::Piece { index: i, begin: b, block } if i as usize == index && b == begin => {
+                        got.extend_from_slice(&block);
+                        break;
+                    }
+                    Message::RejectRequest { .. } => return Err(format!("the seeding client refused a block of piece {}", index)),
+                    _ => continue,
+                }
+            }
+        }
+        if got != *piece {
+            return Err(format!("piece {} served by the seeding client differs from the layout's ({} bytes against {})", index, got.len(), piece.len()));
+        }
+    }
+    // A request for more than a short piece holds is ignored (not served out of the padding, and
+    // not a reason to drop the connection): the next, proper, request is still answered.
+    let short = pieces.iter().position(|p| p.len() < PIECE / 2).ok_or("no short piece in the fixture")?;
+    Message::Request { index: short as u32, begin: 0, length: 16384 }.write_to(&mut stream).map_err(|e| wire("requesting past the end", e))?;
+    Message::Request { index: 0, begin: 0, length: 16384 }.write_to(&mut stream).map_err(|e| wire("requesting after that", e))?;
+    let first = loop {
+        match Message::read_from(&mut stream).map_err(|e| wire("waiting for an answer after the over-long request", e))? {
+            Message::Piece { index, begin, block } => break (index, begin, block.len()),
+            _ => continue,
+        }
+    };
+    if first != (0, 0, 16384) {
+        return Err(format!("the first answer should be to the proper request (piece 0), not to the over-long one; it was {:?}", first));
+    }
+
+    Ok(format!("a v2-only torrent of 5 files (one empty) and {} pieces was downloaded byte for byte from a peer serving the v2 layout, and the seeding client served every piece back", fx.piece_count))
+}
+
+/// uTP (BEP 29). The fake peers can be reached only over uTP: their TCP port
+/// is refused. `--transport both` must try TCP, be refused, and go by uTP;
+/// `--transport utp` must go by uTP at once; `--transport tcp` must not reach
+/// them at all. And with a port that is free for both TCP and UDP, the
+/// client as a seeder serves a leecher that comes in over uTP.
+fn run_utp(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let dir = scratch_dir(name);
+
+    for mode in ["both", "utp"] {
+        let (swarm, _sockets) = spawn_utp_swarm(&fx, vec![Behavior::Serve]);
+        let torrent = dir.join(format!("{}.torrent", mode));
+        fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+        let out_dir = dir.join(format!("{}-out", mode));
+        let log_path = dir.join(format!("{}.log", mode));
+        let mut child = client_command(&torrent, &out_dir, &log_path, 1).args(["--no-dht", "--transport", mode, "--timeout", "40"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+        let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+        if !status.success() {
+            return Err(format!("--transport {}: the client exited with {:?}; its log: {}", mode, status.code(), fs::read_to_string(&log_path).unwrap_or_default().lines().rev().take(6).collect::<Vec<_>>().join(" | ")));
+        }
+        check_downloaded(&fx, &out_dir)?;
+        let seen = swarm.logs[0].lock().unwrap();
+        if seen.utp_connections == 0 || seen.plain_connections != seen.utp_connections {
+            return Err(format!("--transport {}: {} uTP and {} plain connections; every one should have been uTP", mode, seen.utp_connections, seen.plain_connections));
+        }
+    }
+
+    // TCP alone cannot reach a uTP-only peer.
+    let (swarm, _sockets) = spawn_utp_swarm(&fx, vec![Behavior::Serve]);
+    let torrent = dir.join("tcp.torrent");
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let mut child = client_command(&torrent, &dir.join("tcp-out"), &dir.join("tcp.log"), 1).args(["--no-dht", "--transport", "tcp", "--timeout", "5", "--retry-delay", "1"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if status.success() || swarm.logs[0].lock().unwrap().connections != 0 {
+        return Err(format!("--transport tcp reached a peer that only speaks uTP (exit {:?})", status.code()));
+    }
+
+    // The client as a seeder, on a port that is free for TCP and for UDP.
+    let port = (0..50)
+        .find_map(|_| {
+            let tcp = TcpListener::bind("127.0.0.1:0").ok()?;
+            let port = tcp.local_addr().ok()?.port();
+            let udp = std::net::UdpSocket::bind(("0.0.0.0", port)).ok()?;
+            drop((tcp, udp));
+            Some(port)
+        })
+        .ok_or("no port free for both TCP and UDP")?;
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let torrent = dir.join("seed.torrent");
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let log_path = dir.join("seed.log");
+    let child = client_command(&torrent, &dir.join("seed-out"), &log_path, 1)
+        .args(["--no-dht", "--seed", "--transport", "both", "--port", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, &format!("seeding e2e.bin on port {}", port), Duration::from_secs(20), &mut client.0)?;
+
+    let leech = bittorrent_rs::utp::UtpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).map_err(|e| e.to_string())?;
+    let mut stream = leech.connect(SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_secs(10)).map_err(|e| format!("the seeding client did not take a uTP connection on UDP port {}: {}", port, e))?;
+    bittorrent_rs::peer::PeerStream::set_read_timeout(&stream, Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    leech_over(&fx, &mut stream, 0..fx.piece_count)?;
+
+    Ok(format!("--transport both and utp downloaded from a peer whose TCP port refuses (every connection was uTP), --transport tcp did not reach it, and the seeding client served all {} pieces to a leecher on UDP port {}", fx.piece_count, port))
+}
+
+/// Local service discovery (BEP 14). The torrent names no tracker and the DHT
+/// is off, so the fake peer can be found only through a datagram from the
+/// "local network" -- here the harness, writing the announcement by hand.
+/// The client's own announcement, which the harness receives, must be what
+/// the BEP shows: the request line, the info hash in hex, and the port the
+/// client is really listening on. A neighbour announcing a different torrent
+/// must not be dialed.
+fn run_local_discovery(name: &str) -> Result<String, String> {
+    use std::net::UdpSocket;
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    // No `announce` at all.
+    let mut bytes = b"d4:info".to_vec();
+    bytes.extend_from_slice(&fx.info_bytes);
+    bytes.push(b'e');
+    fs::write(&torrent, bytes).expect("write torrent file");
+
+    // Where the client will hear from its neighbours, and where it will announce to.
+    let listens_on = {
+        let probe = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        probe.local_addr().map_err(|e| e.to_string())?
+    };
+    let network = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    network.set_read_timeout(Some(Duration::from_secs(20))).map_err(|e| e.to_string())?;
+    let network_addr = network.local_addr().map_err(|e| e.to_string())?;
+
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1)
+        .args(["--no-dht", "--lsd", "--timeout", "40"])
+        .env("BITTORRENT_RS_LSD_LISTEN", listens_on.to_string())
+        .env("BITTORRENT_RS_LSD_SEND_TO", network_addr.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+
+    // Its announcement, as the network sees it.
+    let mut buf = [0u8; 2048];
+    let (len, _) = network.recv_from(&mut buf).map_err(|e| format!("the client announced nothing on the local network: {}", e))?;
+    let heard = String::from_utf8_lossy(&buf[..len]).to_string();
+    let lines: Vec<&str> = heard.split("\r\n").collect();
+    let hash_hex = bittorrent_rs::torrent::info_hash_hex(&fx.info_hash);
+    if lines.first() != Some(&"BT-SEARCH * HTTP/1.1") {
+        let _ = child.kill();
+        return Err(format!("the announcement does not begin with BEP 14's request line: {:?}", heard));
+    }
+    if !lines.iter().any(|l| l.eq_ignore_ascii_case(&format!("Infohash: {}", hash_hex))) {
+        let _ = child.kill();
+        return Err(format!("the announcement does not carry the info hash {}: {:?}", hash_hex, heard));
+    }
+    let announced_port: u16 = lines.iter().find_map(|l| l.strip_prefix("Port: ")).and_then(|p| p.parse().ok()).ok_or("the announcement has no Port header")?;
+    if !heard.ends_with("\r\n\r\n") || !lines.iter().any(|l| l.starts_with("cookie: ")) {
+        let _ = child.kill();
+        return Err(format!("the announcement lacks its cookie or its blank-line ending: {:?}", heard));
+    }
+
+    // Neighbours. One has a different torrent (and nothing listening where it says).
+    let decoy = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    decoy.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let neighbour = |port: u16, hash: &str| format!("BT-SEARCH * HTTP/1.1\r\nHost: 239.192.152.143:6771\r\nPort: {}\r\nInfohash: {}\r\ncookie: the-harness\r\n\r\n\r\n", port, hash);
+    network.send_to(neighbour(decoy.local_addr().map_err(|e| e.to_string())?.port(), &"cd".repeat(20)).as_bytes(), listens_on).map_err(|e| e.to_string())?;
+    network.send_to(neighbour(swarm.peer_addrs[0].port(), &hash_hex).as_bytes(), listens_on).map_err(|e| e.to_string())?;
+
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("the client exited with {:?}; its log: {}", status.code(), fs::read_to_string(&log_path).unwrap_or_default().lines().rev().take(8).collect::<Vec<_>>().join(" | ")));
+    }
+    check_downloaded(&fx, &out_dir)?;
+    let log = fs::read_to_string(&log_path).map_err(|e| e.to_string())?;
+    if !log.contains("LSD: 1 new peer address(es)") {
+        return Err("the log does not say the peer came from local discovery".to_string());
+    }
+    if !log.contains(&format!("listening for inbound peers on port {}", announced_port)) {
+        return Err(format!("it announced port {}, which is not the one it says it listens on", announced_port));
+    }
+    if !swarm.announces.lock().unwrap().is_empty() {
+        return Err("a tracker was contacted although the torrent names none".to_string());
+    }
+    if decoy.accept().is_ok() {
+        return Err("the client dialed a neighbour that announced a different torrent".to_string());
+    }
+    Ok(format!("a trackerless torrent with no DHT found its peer from a local announcement, announced itself with the right hash and port ({}), and ignored a neighbour with another torrent", announced_port))
+}
+
+/// The Fast Extension (BEP 6), both ways round.
+///
+/// As a downloader: the peer says `have all`, allows one piece and keeps the
+/// client choked until it has been given that piece, so the download can only
+/// finish if the client asks for it while choked -- and it must not ask for
+/// any other piece before the unchoke. As a seeder: a peer that offers the
+/// extension is told `have all` rather than sent a bitfield, is allowed the
+/// pieces BEP 6 says for its address, gets one of them without ever being
+/// unchoked, and has a request for another piece refused, not ignored.
+fn run_fast_extension(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let dir = scratch_dir(name);
+
+    // The client downloading.
+    const ALLOWED: u32 = 5;
+    let swarm = spawn_swarm(&fx, vec![Behavior::Fast(BTreeSet::from([ALLOWED]))]);
+    let torrent = dir.join("e2e.torrent");
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let out_dir = dir.join("out");
+    let mut child = client_command(&torrent, &out_dir, &dir.join("client.log"), 1).arg("--no-dht").spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("the client exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+    {
+        let seen = swarm.logs[0].lock().unwrap();
+        if seen.fast_offered != Some(true) {
+            return Err(format!("the client's handshake should offer the Fast Extension, and said {:?}", seen.fast_offered));
+        }
+        if seen.requested.first() != Some(&ALLOWED) {
+            return Err(format!("with only piece {} allowed while choked, that should be the first asked for; the requests were {:?}", ALLOWED, seen.requested));
+        }
+        if seen.refused_while_choked != 0 {
+            return Err(format!("the client asked for {} piece(s) the peer had not allowed while it had the client choked", seen.refused_while_choked));
+        }
+    }
+
+    // The client seeding.
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let torrent = dir.join("seed.torrent");
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let log_path = dir.join("seed.log");
+    let child = client_command(&torrent, &dir.join("seed-out"), &log_path, 1).args(["--no-dht", "--seed", "--port", "0"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, "seeding e2e.bin on port", Duration::from_secs(20), &mut client.0)?;
+    let port: u16 = swarm.announces.lock().unwrap().first().and_then(|line| announce_param(line, "port")).and_then(|p| p.parse().ok()).ok_or("no port in the client's first announce")?;
+
+    let wire = |what: &str, e: bittorrent_rs::peer::message::WireError| format!("{}: {:?}", what, e);
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connecting to the listener: {}", e))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    stream.write_all(&Handshake::new(fx.info_hash, [0x58; 20], false).with_fast(true).to_bytes()).map_err(|e| e.to_string())?;
+    let mut hs_buf = [0u8; 68];
+    stream.read_exact(&mut hs_buf).map_err(|e| format!("reading the handshake: {}", e))?;
+    if !Handshake::from_bytes(&hs_buf).map_err(|e| format!("the handshake: {:?}", e))?.supports_fast() {
+        return Err("the seeding client does not offer the Fast Extension".to_string());
+    }
+
+    // Its opening: `have all`, and the allowed pieces, in whatever order, and no bitfield. Nothing else
+    // need come, so read until we have both `have all` and a quiet moment.
+    let (mut have_all, mut allowed) = (false, Vec::new());
+    stream.set_read_timeout(Some(Duration::from_millis(700))).map_err(|e| e.to_string())?;
+    loop {
+        match Message::read_from(&mut stream) {
+            Ok(Message::HaveAll) => have_all = true,
+            Ok(Message::AllowedFast { piece_index }) => allowed.push(piece_index),
+            Ok(Message::Bitfield(_)) => return Err("a fast peer should be sent have-all, not a bitfield, by a client with every piece".to_string()),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    if !have_all {
+        return Err("the seeding client did not send have-all".to_string());
+    }
+    let mut expected = bittorrent_rs::peer::fast::allowed_fast_set(std::net::Ipv4Addr::LOCALHOST, &fx.info_hash, fx.piece_count as u32, 5);
+    expected.sort_unstable();
+    allowed.sort_unstable();
+    if allowed != expected {
+        return Err(format!("allowed fast pieces {:?}, where BEP 6's recipe for 127.0.0.1 gives {:?}", allowed, expected));
+    }
+
+    // An allowed piece, asked for without ever having said `interested`.
+    let index = allowed[0] as usize;
+    let (start, end) = (index * fx.piece_len, ((index + 1) * fx.piece_len).min(fx.data.len()));
+    Message::Request { index: index as u32, begin: 0, length: (end - start) as u32 }.write_to(&mut stream).map_err(|e| wire("requesting an allowed piece", e))?;
+    let block = loop {
+        match Message::read_from(&mut stream).map_err(|e| wire("waiting for the allowed piece", e))? {
+            Message::Piece { index: got, block, .. } if got as usize == index => break block,
+            Message::RejectRequest { .. } => return Err("the client refused a piece it had allowed".to_string()),
+            _ => continue,
+        }
+    };
+    if block != fx.data[start..end] {
+        return Err(format!("the allowed piece {} came back different from the source", index));
+    }
+
+    // One it did not allow: refused, not left unanswered.
+    let other = (0..fx.piece_count as u32).find(|piece| !allowed.contains(piece)).ok_or("every piece was allowed; the fixture is too small for this check")?;
+    let length = (fx.piece_len).min(fx.data.len() - other as usize * fx.piece_len) as u32;
+    Message::Request { index: other, begin: 0, length }.write_to(&mut stream).map_err(|e| wire("requesting a piece not allowed", e))?;
+    loop {
+        match Message::read_from(&mut stream).map_err(|e| wire("waiting for the refusal", e))? {
+            Message::RejectRequest { index: got, .. } if got == other => break,
+            Message::Piece { .. } => return Err("a choked fast peer was sent a piece it had not been allowed".to_string()),
+            _ => continue,
+        }
+    }
+
+    Ok(format!("downloaded from a peer that kept it choked until the allowed piece {} was served; as a seeder said have-all, allowed {:?}, served piece {} choked and refused piece {}", ALLOWED, allowed, index, other))
+}
+
 /// `--verify` on files written by the harness itself: whole ones pass with
 /// status 0; a damaged, a truncated and a missing file each fail with
 /// status 1 and are named; and no tracker or peer is contacted.
@@ -2402,3 +3369,667 @@ fn run_verify(name: &str) -> Result<String, String> {
     }
     Ok("intact files pass with status 0; a wrong byte, a truncated file and a missing one each fail with status 1 and are named; --only ignores the rest; no tracker or peer was contacted".to_string())
 }
+
+/// Message stream encryption through the real binary, both directions.
+fn run_encryption(name: &str) -> Result<String, String> {
+    use bittorrent_rs::peer::mse;
+    use bittorrent_rs::peer::Encryption;
+    let fx = Fixture::new(false);
+    let dir = scratch_dir(name);
+    let run_download = |label: &str, peer_takes: Encryption, flag: &str| -> Result<(std::process::ExitStatus, Arc<Mutex<PeerLog>>), String> {
+        let swarm = spawn_swarm_full(&fx, vec![Behavior::Serve], TrackerMode::Answer, peer_takes);
+        let torrent = dir.join(format!("{}.torrent", label));
+        fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+        let mut child = client_command(&torrent, &dir.join(format!("{}-out", label)), &dir.join(format!("{}.log", label)), 1)
+            .args(["--no-dht", "--retry-delay", "1", "--encryption", flag, "--timeout", "12"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to spawn the client: {}", e))?;
+        let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+        Ok((status, Arc::clone(&swarm.logs[0])))
+    };
+
+    // 1. --encryption require, against a peer that does MSE: encrypted, and the file arrives.
+    let (status, log) = run_download("require", Encryption::Prefer, "require")?;
+    check_downloaded(&fx, &dir.join("require-out"))?;
+    let seen = log.lock().unwrap();
+    if !status.success() || seen.encrypted_connections == 0 || seen.plain_connections != 0 {
+        return Err(format!("--encryption require: exit {:?}, {} encrypted and {} plain connections", status.code(), seen.encrypted_connections, seen.plain_connections));
+    }
+    drop(seen);
+
+    // 2. --encryption prefer, against a peer that only speaks plain: falls back and finishes.
+    let (status, log) = run_download("prefer", Encryption::Off, "prefer")?;
+    check_downloaded(&fx, &dir.join("prefer-out"))?;
+    let seen = log.lock().unwrap();
+    if !status.success() || seen.plain_connections == 0 || seen.encrypted_connections != 0 {
+        return Err(format!("--encryption prefer against a plain peer: exit {:?}, {} encrypted and {} plain", status.code(), seen.encrypted_connections, seen.plain_connections));
+    }
+    drop(seen);
+
+    // 3. --encryption require, against a peer that only speaks plain: never falls back.
+    let (status, log) = run_download("refused", Encryption::Off, "require")?;
+    let seen = log.lock().unwrap();
+    if status.success() || seen.plain_connections != 0 {
+        return Err(format!("--encryption require must not use a plain peer: exit {:?}, {} plain connections", status.code(), seen.plain_connections));
+    }
+    drop(seen);
+
+    // 4. Incoming: a client that requires encryption serves an encrypted leecher and turns a plain one away.
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let torrent = dir.join("inbound.torrent");
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let log_path = dir.join("inbound.log");
+    let child = client_command(&torrent, &dir.join("inbound-out"), &log_path, 1)
+        .args(["--no-dht", "--seed", "--port", "0", "--encryption", "prefer"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, "seeding e2e.bin on port", Duration::from_secs(20), &mut client.0)?;
+    let port: u16 = swarm.announces.lock().unwrap().first().and_then(|line| announce_param(line, "port")).and_then(|p| p.parse().ok()).ok_or("no port in the client's first announce")?;
+
+    let tcp = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    let mut stream = mse::initiate(Box::new(tcp), &fx.info_hash, false, &Handshake::new(fx.info_hash, [0x66; 20], false).to_bytes()).map_err(|e| format!("the client would not take an encrypted connection: {}", e))?;
+    let mut hs = [0u8; 68];
+    stream.read_exact(&mut hs).map_err(|e| format!("reading its handshake: {}", e))?;
+    Message::Interested.write_to(&mut stream).map_err(|e| format!("{:?}", e))?;
+    loop {
+        if matches!(Message::read_from(&mut stream).map_err(|e| format!("waiting for the unchoke: {:?}", e))?, Message::Unchoke) {
+            break;
+        }
+    }
+    let piece_len = fx.piece_len.min(fx.data.len());
+    Message::Request { index: 0, begin: 0, length: piece_len as u32 }.write_to(&mut stream).map_err(|e| format!("{:?}", e))?;
+    let block = loop {
+        if let Message::Piece { block, .. } = Message::read_from(&mut stream).map_err(|e| format!("waiting for the block: {:?}", e))? {
+            break block;
+        }
+    };
+    if block != fx.data[..piece_len] {
+        return Err("the block served over the encrypted connection is wrong".to_string());
+    }
+
+    // A client set to `require` refuses plain, which the default `prefer` above did not.
+    let strict_log = dir.join("strict.log");
+    // Its own peer must do MSE, or the client could not download to have anything to serve.
+    let strict_swarm = spawn_swarm_full(&fx, vec![Behavior::Serve], TrackerMode::Answer, Encryption::Prefer);
+    let strict_torrent = dir.join("strict.torrent");
+    fs::write(&strict_torrent, fx.torrent_bytes(strict_swarm.tracker_addr)).expect("write torrent file");
+    let child = client_command(&strict_torrent, &dir.join("strict-out"), &strict_log, 1)
+        .args(["--no-dht", "--seed", "--port", "0", "--encryption", "require"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut strict = KillOnDrop(child);
+    wait_for_log(&strict_log, "seeding e2e.bin on port", Duration::from_secs(20), &mut strict.0)?;
+    let strict_port: u16 = strict_swarm.announces.lock().unwrap().first().and_then(|line| announce_param(line, "port")).and_then(|p| p.parse().ok()).ok_or("no port in the strict client's announce")?;
+    let mut plain = TcpStream::connect(("127.0.0.1", strict_port)).map_err(|e| e.to_string())?;
+    plain.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+    plain.write_all(&Handshake::new(fx.info_hash, [0x66; 20], false).to_bytes()).map_err(|e| e.to_string())?;
+    let mut reply = [0u8; 68];
+    if plain.read_exact(&mut reply).is_ok() {
+        return Err("a client set to require encryption answered a plain handshake".to_string());
+    }
+
+    Ok("require encrypted a download from an MSE peer; prefer fell back to plain for a plain-only peer; require refused it; an encrypted leecher was served by the client, and a require-client turned a plain one away".to_string())
+}
+
+// ---- the daemon ------------------------------------------------------
+
+/// A running `daemon run`, killed if the scenario leaves it. What it prints is kept.
+struct RunningDaemon {
+    child: KillOnDrop,
+    port: u16,
+    stdout: Arc<Mutex<Vec<String>>>,
+}
+
+fn daemon_bin() -> PathBuf {
+    std::env::current_exe().expect("current exe").parent().expect("exe dir").join("daemon")
+}
+
+/// Starts the daemon on loopback-only settings, with state in `state_dir`, and waits until it says which port it listens on.
+fn start_daemon(state_dir: &Path, socket: &Path) -> Result<RunningDaemon, String> {
+    let mut child = Command::new(daemon_bin())
+        .arg("run")
+        .args(["--state-dir"])
+        .arg(state_dir)
+        .arg("--socket")
+        .arg(socket)
+        // Nothing here may leave loopback: no DHT, no local discovery, no port mapping on the LAN's router.
+        .args(["--port", "0", "--no-dht", "--no-lsd", "--no-portmap", "--no-ipv6"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the daemon: {}", e))?;
+    let out = child.stdout.take().ok_or("no stdout")?;
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    // Read for as long as the daemon runs: a closed pipe would kill it the next time it printed.
+    let lines = Arc::clone(&stdout);
+    thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            lines.lock().unwrap().push(line);
+        }
+    });
+    let mut daemon = RunningDaemon { child: KillOnDrop(child), port: 0, stdout };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let running = daemon.stdout.lock().unwrap().iter().find_map(|l| l.strip_prefix("daemon running: port ")?.split(',').next()?.parse::<u16>().ok());
+        if let Some(port) = running {
+            daemon.port = port;
+            return Ok(daemon);
+        }
+        if let Some(status) = daemon.child.0.try_wait().map_err(|e| e.to_string())? {
+            return Err(format!("the daemon exited ({:?}) before it was running: {:?}", status.code(), daemon.stdout.lock().unwrap()));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("the daemon was not running after 20 s: {:?}", daemon.stdout.lock().unwrap()));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// `daemon <args> --socket <socket> --json`: its stdout, or its stderr if it failed.
+fn daemon_ctl(socket: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(daemon_bin()).args(args).arg("--socket").arg(socket).arg("--json").output().map_err(|e| format!("running the daemon's client: {}", e))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// The daemon's torrents, as `(info hash, state)`.
+fn daemon_list(socket: &Path) -> Result<Vec<(String, String)>, String> {
+    let lines = json_lines(&daemon_ctl(socket, &["list"])?)?;
+    Ok(lines.iter().map(|l| (l["torrent"].as_str().unwrap_or("?").to_string(), l["state"].as_str().unwrap_or("?").to_string())).collect())
+}
+
+fn wait_for_state(socket: &Path, hash: &str, wanted: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let states = daemon_list(socket)?;
+        if states.iter().any(|(h, s)| h == hash && s == wanted) {
+            return Ok(());
+        }
+        if states.iter().any(|(h, s)| h == hash && s == "failed") {
+            return Err(format!("{} failed: {}", hash, daemon_ctl(socket, &["status", hash]).unwrap_or_default()));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("{} was not {} after 30 s: {:?}", hash, wanted, states));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn hex(hash: &[u8; 20]) -> String {
+    hash.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn run_daemon(name: &str) -> Result<String, String> {
+    let fx1 = Fixture::new(false);
+    let fx2 = Fixture::build("second.bin", &[("second.bin", pattern(5000, 7))], 256, false);
+    let (swarm1, swarm2) = (spawn_swarm(&fx1, vec![Behavior::Serve]), spawn_swarm(&fx2, vec![Behavior::Serve]));
+    let dir = scratch_dir(name);
+    let (state_dir, out_dir) = (dir.join("state"), dir.join("out"));
+    let socket = state_dir.join("d.sock");
+    let (torrent1, torrent2) = (dir.join("e2e.torrent"), dir.join("second.torrent"));
+    fs::write(&torrent1, fx1.torrent_bytes(swarm1.tracker_addr)).expect("write torrent file");
+    fs::write(&torrent2, fx2.torrent_bytes(swarm2.tracker_addr)).expect("write torrent file");
+    let (id1, id2) = (hex(&fx1.info_hash), hex(&fx2.info_hash));
+
+    // 1. Two torrents, told to the daemon, downloaded at the same time and then seeded.
+    let daemon = start_daemon(&state_dir, &socket)?;
+    for torrent in [&torrent1, &torrent2] {
+        daemon_ctl(&socket, &["add", &torrent.to_string_lossy(), "--out", &out_dir.to_string_lossy()])?;
+    }
+    wait_for_state(&socket, &id1, "seeding")?;
+    wait_for_state(&socket, &id2, "seeding")?;
+    check_downloaded(&fx1, &out_dir)?;
+    check_downloaded(&fx2, &out_dir)?;
+
+    // 2. Both announced the one port the daemon listens on, and both are served on it.
+    for (swarm, what) in [(&swarm1, "first"), (&swarm2, "second")] {
+        let started = swarm.announces.lock().unwrap().first().cloned().ok_or_else(|| format!("the {} tracker heard nothing", what))?;
+        let port = announce_param(&started, "port").ok_or_else(|| format!("no port in {}", started))?;
+        if port != daemon.port.to_string() {
+            return Err(format!("the {} torrent announced port {}, not the daemon's {}", what, port, daemon.port));
+        }
+    }
+    leech_everything(&fx1, daemon.port)?;
+    leech_everything(&fx2, daemon.port)?;
+
+    // 3. What the daemon says of one.
+    let status = json_lines(&daemon_ctl(&socket, &["status", &id2[..8]])?)?;
+    let log = status.first().and_then(|l| l["log"].as_str().map(str::to_string)).unwrap_or_default();
+    if !log.contains("download complete") || status[0]["name"].as_str() != Some("second.bin") || status[0]["progress"].as_f64() != Some(1.0) {
+        return Err(format!("status of the second torrent: {:?}", status));
+    }
+    let again = daemon_ctl(&socket, &["add", &torrent1.to_string_lossy(), "--out", &out_dir.to_string_lossy()]).err().ok_or("adding a torrent twice was accepted")?;
+    if !again.contains("already added") {
+        return Err(format!("adding a torrent twice said: {}", again));
+    }
+
+    // 3b. One paused: off the port, and listed as paused, while the other is served; resumed, it is served again.
+    daemon_ctl(&socket, &["pause", &id2[..8]])?;
+    wait_for_state(&socket, &id2, "paused")?;
+    if leech_everything(&fx2, daemon.port).is_ok() {
+        return Err("a paused torrent was still served on the port".to_string());
+    }
+    leech_everything(&fx1, daemon.port)?;
+    if !daemon_ctl(&socket, &["pause", &id2]).err().is_some_and(|e| e.contains("already")) {
+        return Err("pausing a paused torrent was accepted".to_string());
+    }
+    daemon_ctl(&socket, &["resume", &id2])?;
+    wait_for_state(&socket, &id2, "seeding")?;
+    leech_everything(&fx2, daemon.port)?;
+
+    // 4. One removed: it is told to its tracker, refused on the port, and its files stay; the other carries on.
+    daemon_ctl(&socket, &["remove", &id1])?;
+    let left = daemon_list(&socket)?;
+    if left.len() != 1 || left[0].0 != id2 {
+        return Err(format!("after removing the first torrent the list is {:?}", left));
+    }
+    check_stopped_last(&swarm1, fx1.data.len(), 0)?;
+    if leech_everything(&fx1, daemon.port).is_ok() {
+        return Err("the removed torrent was still served on the port".to_string());
+    }
+    leech_everything(&fx2, daemon.port)?;
+    check_downloaded(&fx1, &out_dir).map_err(|e| format!("removing a torrent must leave its files: {}", e))?;
+
+    // 5. `stop` ends the daemon, promptly and cleanly, and takes the socket file with it.
+    daemon_ctl(&socket, &["stop"])?;
+    let mut child = daemon.child;
+    let status = wait_or_kill(&mut child.0, Duration::from_secs(20))?;
+    if !status.success() {
+        return Err(format!("the daemon exited with {:?}", status.code()));
+    }
+    if socket.exists() {
+        return Err("the socket file was left behind".to_string());
+    }
+
+    // 6. Started again on the same state directory, it has the torrent that was left, and not the one removed.
+    let daemon = start_daemon(&state_dir, &socket)?;
+    let restored = daemon_list(&socket)?;
+    if restored.len() != 1 || restored[0].0 != id2 {
+        return Err(format!("the restarted daemon lists {:?}", restored));
+    }
+    wait_for_state(&socket, &id2, "seeding")?;
+    leech_everything(&fx2, daemon.port)?;
+    daemon_ctl(&socket, &["stop"])?;
+    let mut child = daemon.child;
+    wait_or_kill(&mut child.0, Duration::from_secs(20))?;
+
+    Ok(format!("two torrents downloaded and seeded on the one port {}, both announcing it and both served on it; one paused and resumed (refused on the port while it was paused); one removed (told to its tracker, files kept, refused on the port) while the other carried on; and after stop and a restart only the other was there, seeding again", daemon.port))
+}
+
+// ---- BEP 12 ----------------------------------------------------------
+
+fn run_tracker_tiers(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]); // its tracker is the one that works, and lists the peer
+    let (second_tier, second_announces) = spawn_tracker(Vec::new(), TrackerMode::Answer);
+    let dead = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("addr") // closed again at once: nothing listens there
+    };
+    let dir = scratch_dir(name);
+    let url = |addr: SocketAddr| format!("http://{}/announce", addr);
+    let bstr = |text: &str| format!("{}:{}", text.len(), text);
+    let mut torrent = Vec::new();
+    torrent.extend_from_slice(b"d");
+    torrent.extend_from_slice(format!("8:announce{}", bstr(&url(dead))).as_bytes());
+    torrent.extend_from_slice(format!("13:announce-listll{}{}el{}ee", bstr(&url(dead)), bstr(&url(swarm.tracker_addr)), bstr(&url(second_tier))).as_bytes());
+    torrent.extend_from_slice(b"4:info");
+    torrent.extend_from_slice(&fx.info_bytes);
+    torrent.extend_from_slice(b"e");
+    let torrent_path = dir.join("tiers.torrent");
+    fs::write(&torrent_path, &torrent).expect("write torrent file");
+
+    // By tier (the default): the tracker that works hears everything, and the one in the next tier nothing.
+    let out_dir = dir.join("out-tiered");
+    let mut child = client_command(&torrent_path, &out_dir, &dir.join("tiered.log"), 1).arg("--no-dht").spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    if !wait_or_kill(&mut child, RUN_LIMIT)?.success() {
+        return Err("the client did not finish".to_string());
+    }
+    check_downloaded(&fx, &out_dir)?;
+    let heard = swarm.announces.lock().unwrap().clone();
+    if heard.is_empty() || !heard[0].contains("event=started") {
+        return Err(format!("the working tracker of the first tier did not hear `started` first: {:?}", heard));
+    }
+    check_stopped_last(&swarm, fx.data.len(), 0)?;
+    if !second_announces.lock().unwrap().is_empty() {
+        return Err(format!("the second tier was asked though the first had an answer: {:?}", second_announces.lock().unwrap()));
+    }
+
+    // Concurrent: every tracker, so the second tier's too.
+    let out_dir = dir.join("out-concurrent");
+    let mut child = client_command(&torrent_path, &out_dir, &dir.join("concurrent.log"), 1).args(["--no-dht", "--tracker-mode", "concurrent"]).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    if !wait_or_kill(&mut child, RUN_LIMIT)?.success() {
+        return Err("the client did not finish with --tracker-mode concurrent".to_string());
+    }
+    if !second_announces.lock().unwrap().iter().any(|line| line.contains("event=started")) {
+        return Err("--tracker-mode concurrent did not ask the second tier".to_string());
+    }
+    Ok("by tier: the first tier's dead tracker was passed over, its working one heard `started` and `stopped`, and the second tier heard nothing; concurrent: the second tier was asked too".to_string())
+}
+
+// ---- blocks kept across a stop ------------------------------------------
+
+fn run_resume_partial_piece(name: &str) -> Result<String, String> {
+    // Four pieces of four blocks each.
+    let fx = Fixture::build("partial.bin", &[("partial.bin", pattern(4 * 65536, 3))], 65536, false);
+    let dir = scratch_dir(name);
+    let out_dir = dir.join("out");
+    let partial = out_dir.join(format!(".{}.partial", hex(&fx.info_hash)));
+
+    // Run 1: the peer serves six blocks -- the whole of piece 0 and the first two of piece 1 -- and goes silent. The client
+    // is left to time out, which stops it cleanly, as a signal would.
+    let swarm1 = spawn_swarm(&fx, vec![Behavior::StallAfterBlocks(6)]);
+    let torrent1 = dir.join("run1.torrent");
+    fs::write(&torrent1, fx.torrent_bytes(swarm1.tracker_addr)).expect("write torrent file");
+    let mut child = client_command(&torrent1, &out_dir, &dir.join("run1.log"), 1).args(["--no-dht", "--timeout", "4"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !partial.exists() {
+        return Err(format!("the blocks of the unfinished piece were not kept: no {}", partial.display()));
+    }
+    let log1 = fs::read_to_string(dir.join("run1.log")).unwrap_or_default();
+    if !log1.contains("kept the blocks of 1 unfinished piece") {
+        return Err(format!("the first run's log does not say it kept the blocks of one piece: {}", log1));
+    }
+
+    // Run 2: a peer that serves everything. It must be asked only for what is missing.
+    let swarm2 = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let torrent2 = dir.join("run2.torrent");
+    fs::write(&torrent2, fx.torrent_bytes(swarm2.tracker_addr)).expect("write torrent file");
+    let mut child = client_command(&torrent2, &out_dir, &dir.join("run2.log"), 1).arg("--no-dht").stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    if !wait_or_kill(&mut child, RUN_LIMIT)?.success() {
+        return Err("the second run did not finish".to_string());
+    }
+    check_downloaded(&fx, &out_dir)?;
+    let asked: BTreeSet<(u32, u32)> = swarm2.logs[0].lock().unwrap().requested_blocks.iter().copied().collect();
+    let block = |piece: u32, n: u32| (piece, n * 16384);
+    for kept in [block(0, 0), block(0, 1), block(0, 2), block(0, 3), block(1, 0), block(1, 1)] {
+        if asked.contains(&kept) {
+            return Err(format!("the second run asked again for {:?}, which the first had fetched: asked {:?}", kept, asked));
+        }
+    }
+    let expected: BTreeSet<(u32, u32)> = [block(1, 2), block(1, 3)].into_iter().chain((2..4).flat_map(|p| (0..4).map(move |n| block(p, n)))).collect();
+    if asked != expected {
+        return Err(format!("the second run asked for {:?}, expected {:?}", asked, expected));
+    }
+    if partial.exists() {
+        return Err("the blocks kept were not cleared once the download was complete".to_string());
+    }
+    let log2 = fs::read_to_string(dir.join("run2.log")).unwrap_or_default();
+    if !log2.contains("resuming: 2 block(s) of unfinished pieces kept from the last run") {
+        return Err(format!("the second run's log does not say it resumed two blocks: {}", log2));
+    }
+    Ok("a run stopped with two blocks of a piece fetched kept them; the next asked only for the other two of that piece and for the pieces it had none of, and cleared them once it was done".to_string())
+}
+
+/// A torrent with padding files (BEP 47), as libtorrent and qBittorrent make them. The client
+/// downloads it from a peer that serves the padding as the zeros it is, and must leave no
+/// padding on disk and no trace of it in what it lists; then, seeding it, must serve the
+/// pieces the padding is part of with the zeros in them, or a leecher's hash check fails.
+fn run_padded_torrent(name: &str) -> Result<String, String> {
+    let files = [(vec!["a.bin"], pattern(600, 1)), (vec!["sub", "b.bin"], pattern(500, 2)), (vec!["c.bin"], pattern(300, 3))];
+    let fx = Fixture::build_padded("pack", &files, 256);
+    if fx.data.len() <= files.iter().map(|(_, c)| c.len()).sum::<usize>() {
+        return Err("the fixture has no padding in it".to_string());
+    }
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    // What --list shows: the three files, numbered 1 to 3, and none of the padding.
+    let listed = client_command(&torrent, &out_dir, &dir.join("list.log"), 1).args(["--no-dht", "--json", "--list"]).output().map_err(|e| format!("running the client: {}", e))?;
+    let list_events = json_lines(&String::from_utf8_lossy(&listed.stdout))?;
+    if !listed.status.success() || event_kinds(&list_events) != ["file", "file", "file", "done"] {
+        return Err(format!("--list should give three file events then done; exit {:?}, events {:?}", listed.status.code(), event_kinds(&list_events)));
+    }
+    let paths: Vec<&str> = list_events.iter().filter_map(|e| e.get("path").and_then(|p| p.as_str())).collect();
+    if paths != ["a.bin", "sub/b.bin", "c.bin"] {
+        return Err(format!("--list names the wrong files: {:?}", paths));
+    }
+
+    let child = client_command(&torrent, &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .arg("--seed")
+        .args(["--port", "0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, "seeding pack on port", Duration::from_secs(20), &mut client.0)?;
+    check_downloaded(&fx, &out_dir)?;
+
+    // On disk: the three files and the directory the second is in, and nothing else in the torrent's directory.
+    let mut found: Vec<String> = Vec::new();
+    let mut pending = vec![out_dir.join("pack")];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(|e| format!("reading {:?}: {}", directory, e))? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.push(path.strip_prefix(out_dir.join("pack")).map_err(|e| e.to_string())?.to_string_lossy().into_owned());
+            }
+        }
+    }
+    found.sort();
+    if found != ["a.bin", "c.bin", "sub/b.bin"] {
+        return Err(format!("the files on disk are {:?}; the padding must not be among them", found));
+    }
+    if out_dir.join("pack/.pad").exists() {
+        return Err("a .pad directory was created".to_string());
+    }
+
+    let announces = swarm.announces.lock().unwrap().clone();
+    let started = announces.first().ok_or("the tracker saw no announce")?;
+    let port: u16 = announce_param(started, "port").and_then(|p| p.parse().ok()).ok_or_else(|| format!("no port in the announce: {}", started))?;
+    leech_everything(&fx, port)?;
+    Ok(format!("{} pieces with {} bytes of padding among them, downloaded with no padding on disk, listed without it, and served back whole to a leecher", fx.piece_count, fx.data.len() - files.iter().map(|(_, c)| c.len()).sum::<usize>()))
+}
+
+/// A magnet link with `so=1` (BEP 53) is for the second file only: after the metadata has come from the
+/// peer, the client fetches just the pieces that file touches, as `--only` would. A file number given on the
+/// command line is what is meant instead, if there is one.
+fn run_magnet_select_only(name: &str) -> Result<String, String> {
+    // The files and pieces of `selective-multi-file`: b.bin is bytes 300..600 of 900, touching pieces 1 and 2.
+    let fx = Fixture::build("multi", &[("a.bin", pattern(300, 1)), ("b.bin", pattern(300, 2)), ("c.bin", pattern(300, 3))], 256, false);
+    let dir = scratch_dir(name);
+    let mut ran = Vec::new();
+    for (label, extra, so, expected, file) in [("so=1", None, "&so=1", [1u32, 2], 1usize), ("so=1 overridden by --files 3", Some("3"), "&so=1", [2, 3], 2)] {
+        let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+        let (out_dir, log_path) = (dir.join(format!("out-{}", file)), dir.join(format!("client-{}.log", file)));
+        let mut cmd = client_command(format!("{}{}", fx.magnet_uri(swarm.tracker_addr), so), &out_dir, &log_path, 1);
+        cmd.arg("--no-dht").stdout(Stdio::null()).stderr(Stdio::null());
+        if let Some(number) = extra {
+            cmd.args(["--files", number]);
+        }
+        let mut child = cmd.spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+        let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+        if !status.success() {
+            return Err(format!("{}: download binary exited with {:?}", label, status.code()));
+        }
+        let requested = requested_set(&swarm.logs[0]);
+        let wanted: BTreeSet<u32> = expected.into_iter().collect();
+        if requested != wanted {
+            return Err(format!("{}: the client asked for pieces {:?}, expected exactly {:?}", label, requested, wanted));
+        }
+        let (path, content) = &fx.files[file];
+        check_file(&out_dir, path, content).map_err(|e| format!("{}: {}", label, e))?;
+        let log = fs::read_to_string(&log_path).map_err(|e| format!("reading client log {:?}: {}", log_path, e))?;
+        if !log.contains("selective download: 1 of 3 file(s), 2 piece(s)") {
+            return Err(format!("{}: the client log has no selective download notice", label));
+        }
+        if log.contains("(so=)") != extra.is_none() {
+            return Err(format!("{}: the log {} the link's selection, which it should{}", label, if extra.is_none() { "lacks" } else { "mentions" }, if extra.is_none() { "" } else { " not" }));
+        }
+        ran.push(format!("{} fetched pieces {:?}", label, requested));
+    }
+    Ok(ran.join("; "))
+}
+
+/// A peer the client connects to, and downloads from, is a downloader too: it has the pieces the client lacks and lacks the ones the
+/// client has, and it must be told what the client has, unchoked, and served what it asks for, all on the connection the client made.
+/// (A client that took what it was given and gave nothing back would be choked by every peer that reciprocates.)
+fn run_dialed_peer_is_served(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let count = fx.piece_count;
+    // The client already has the first three pieces, on disk; the peer has the rest, and wants piece 1.
+    let mine: BTreeSet<u32> = (0..3).collect();
+    let theirs: BTreeSet<u32> = (3..count as u32).collect();
+    let swarm = spawn_swarm(&fx, vec![Behavior::AlsoAsks { has: theirs, wants: 1 }]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let mut on_disk = vec![0u8; fx.data.len()];
+    let kept = 3 * fx.piece_len;
+    on_disk[..kept].copy_from_slice(&fx.data[..kept]);
+    fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    fs::write(out_dir.join("e2e.bin"), &on_disk).map_err(|e| e.to_string())?;
+
+    // Held to a few hundred bytes a second so that the client is still there, and downloading, when the peer asks: what the peer
+    // is asking for takes milliseconds, and what the client is downloading takes seconds.
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1).args(["--no-dht", "--max-down", "300"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("download binary exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+
+    let log = swarm.logs[0].lock().unwrap();
+    let requested: BTreeSet<u32> = log.requested.iter().copied().collect();
+    let wanted: BTreeSet<u32> = (3..count as u32).collect();
+    if requested != wanted {
+        return Err(format!("the client asked the peer for pieces {:?}; expected {:?}, the ones it lacked", requested, wanted));
+    }
+    let bitfield = log.client_bitfield.as_ref().ok_or("the client never told the peer what it has")?;
+    let advertised: BTreeSet<u32> = (0..count as u32).filter(|&i| bitfield.get(i as usize / 8).is_some_and(|byte| byte & (0x80 >> (i % 8)) != 0)).collect();
+    if advertised != mine {
+        return Err(format!("the client said it had pieces {:?}; it had {:?}", advertised, mine));
+    }
+    let asked = &fx.data[fx.piece_len..2 * fx.piece_len];
+    match log.received.as_slice() {
+        [(1, 0, block)] if block == asked => {}
+        other => return Err(format!("the peer should have been sent piece 1 ({} bytes) once, and got {} block(s): {:?}", asked.len(), other.len(), other.iter().map(|(i, b, d)| (*i, *b, d.len())).collect::<Vec<_>>())),
+    }
+    Ok(format!("downloaded pieces {:?} from a peer that took piece 1 from the client on the same connection", wanted))
+}
+
+/// A peer that connects to the client, and not the other way about, is a source of pieces as well as a taker of them. The client knows no
+/// peer to connect to (its tracker names one that is not there), so what it downloads it gets over a connection made to it: the peer
+/// has the pieces the client lacks and lacks the client's, and is served on the same connection while it is downloaded from.
+fn run_inbound_peer_is_downloaded_from(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let count = fx.piece_count;
+    let mine: BTreeSet<u32> = (0..3).collect();
+    let theirs: BTreeSet<u32> = (3..count as u32).collect();
+    let nobody = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?.local_addr().map_err(|e| e.to_string())?; // where nothing listens
+    let (tracker_addr, announces) = spawn_tracker(vec![nobody], TrackerMode::Answer);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(tracker_addr)).expect("write torrent file");
+    let mut on_disk = vec![0u8; fx.data.len()];
+    let kept = 3 * fx.piece_len;
+    on_disk[..kept].copy_from_slice(&fx.data[..kept]);
+    fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    fs::write(out_dir.join("e2e.bin"), &on_disk).map_err(|e| e.to_string())?;
+
+    // Held to a few hundred bytes a second, so that the client is still downloading when the peer has been let in.
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1).args(["--no-dht", "--max-down", "300", "--port", "0"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    // The port it listens on is the one it tells the tracker.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let port: u16 = loop {
+        if let Some(port) = announces.lock().unwrap().first().and_then(|line| announce_param(line, "port")).and_then(|p| p.parse().ok()) {
+            break port;
+        }
+        if Instant::now() >= deadline || child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            let _ = child.kill();
+            return Err("the client never announced its port".to_string());
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let log = Arc::new(Mutex::new(PeerLog::default()));
+    let cx = PeerContext { encryption: bittorrent_rs::peer::Encryption::Off, data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count, pieces: None };
+    let behavior = Behavior::AlsoAsks { has: theirs, wants: 1 };
+    let peer_log = Arc::clone(&log);
+    thread::spawn(move || dial_client(SocketAddr::from(([127, 0, 0, 1], port)), &cx, &behavior, &peer_log));
+
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("download binary exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+
+    let log = log.lock().unwrap();
+    let requested: BTreeSet<u32> = log.requested.iter().copied().collect();
+    let wanted: BTreeSet<u32> = (3..count as u32).collect();
+    if requested != wanted {
+        return Err(format!("the client asked the peer that connected to it for pieces {:?}; expected {:?}", requested, wanted));
+    }
+    let bitfield = log.client_bitfield.as_ref().ok_or("the client never told the peer what it has")?;
+    let advertised: BTreeSet<u32> = (0..count as u32).filter(|&i| bitfield.get(i as usize / 8).is_some_and(|byte| byte & (0x80 >> (i % 8)) != 0)).collect();
+    if advertised != mine {
+        return Err(format!("the client said it had pieces {:?}; it had {:?}", advertised, mine));
+    }
+    let asked = &fx.data[fx.piece_len..2 * fx.piece_len];
+    match log.received.as_slice() {
+        [(1, 0, block)] if block == asked => {}
+        other => return Err(format!("the peer should have been sent piece 1 once, and got {} block(s)", other.len())),
+    }
+    Ok(format!("pieces {:?} came over a connection the peer made, which took piece 1 from the client too", wanted))
+}
+
+/// `--scrape` asks each tracker of a torrent how it is doing, for a `.torrent` file and for a magnet link, and says what each answered;
+/// a tracker that is not there is told apart from one that is, and does not stop the others being heard. Nothing is downloaded.
+fn run_scrape(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir) = (dir.join("e2e.torrent"), dir.join("out"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let run = |source: &std::ffi::OsStr, extra: &[&str]| -> Result<(bool, String), String> {
+        let output = client_command(source, &out_dir, &dir.join("client.log"), 1).arg("--scrape").args(extra).output().map_err(|e| format!("running the client: {}", e))?;
+        Ok((output.status.success(), String::from_utf8_lossy(&output.stdout).into_owned()))
+    };
+
+    let (ok, text) = run(torrent.as_os_str(), &[])?;
+    if !ok || !text.contains("5 seeder(s), 2 leecher(s), 42 completed") || !text.contains(&format!("http://{}/announce", swarm.tracker_addr)) {
+        return Err(format!("--scrape of a torrent file said: {:?}", text));
+    }
+    // A magnet link with a second tracker that is not there: the first is heard and the run is a success.
+    let magnet = format!("{}&tr={}", fx.magnet_uri(swarm.tracker_addr), "http%3A%2F%2F127.0.0.1%3A1%2Fannounce");
+    let (ok, text) = run(std::ffi::OsStr::new(&magnet), &["--json"])?;
+    let events = json_lines(&text)?;
+    if !ok || event_kinds(&events) != ["scrape", "scrape", "done"] {
+        return Err(format!("--scrape --json of a magnet link should give a scrape event per tracker and done; ok={}, events {:?}", ok, event_kinds(&events)));
+    }
+    let (good, bad) = (&events[0], &events[1]);
+    if good["ok"].as_bool() != Some(true) || good["seeders"].as_f64() != Some(5.0) || good["leechers"].as_f64() != Some(2.0) || good["completed"].as_f64() != Some(42.0) {
+        return Err(format!("the tracker that answered is reported wrongly: {:?}", good));
+    }
+    if bad["ok"].as_bool() != Some(false) || bad["error"].as_str().is_none_or(str::is_empty) {
+        return Err(format!("the tracker that is not there should be reported with an error: {:?}", bad));
+    }
+    // With no tracker answering, it is a failure, and says so.
+    let nobody = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=http%3A%2F%2F127.0.0.1%3A1%2Fannounce";
+    let (ok, _) = run(std::ffi::OsStr::new(nobody), &[])?;
+    if ok {
+        return Err("a scrape that no tracker answered should fail".to_string());
+    }
+    if out_dir.join("e2e.bin").exists() {
+        return Err("--scrape downloaded something".to_string());
+    }
+    Ok("a torrent file's tracker answered 5 seeders, 2 leechers, 42 completed; a magnet link's dead tracker did not stop the live one being heard; all dead is a failure".to_string())
+}
+

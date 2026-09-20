@@ -1,12 +1,17 @@
 //! Magnet URI parsing (BEP 9). The fields needed to bootstrap a metadata
-//! exchange: `xt` (the v1 InfoHash, hex or base32; a `urn:btmh:` beside it,
-//! as in a hybrid v1/v2 link, is ignored), `dn` (display name), `tr`
+//! exchange: `xt` (the v1 InfoHash, hex or base32, or a BitTorrent v2 one as
+//! `urn:btmh:` and a SHA-256 multihash; a link with both is a hybrid, and its
+//! v1 hash is the one used), `dn` (display name), `tr`
 //! (tracker URLs), `x.pe` (peers to try directly) and `ws` (BEP 19 web
 //! seeds), each repeatable and each also accepted numbered (`tr.1`).
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MagnetLink {
+    /// The hash peers and trackers are asked for: the v1 one, or for a link with only a v2 one that hash's first
+    /// 20 bytes (BEP 52).
     pub info_hash: [u8; 20],
+    /// The whole SHA-256 info hash, from a `urn:btmh:` in the link. The metadata found is checked against it.
+    pub info_hash_v2: Option<[u8; 32]>,
     pub display_name: Option<String>,
     /// `tr` (or `tr.N`), each once, in the order given.
     pub trackers: Vec<String>,
@@ -16,6 +21,38 @@ pub struct MagnetLink {
     pub peers: Vec<std::net::SocketAddr>,
     /// `ws` (or `ws.N`): BEP 19 web seed URLs.
     pub web_seeds: Vec<String>,
+    /// `so` (BEP 53): the files to fetch, as their 0-based indices in the torrent's file list, sorted and
+    /// without repeats. Empty when the link does not say, which means all of them.
+    pub select_only: Vec<usize>,
+}
+
+/// The most files an `so` parameter may name. A range such as `0-4294967295` would otherwise be an
+/// instruction to allocate the address space; a link that names more than this has its `so` ignored, as
+/// one that does not parse does.
+const MAX_SELECTED_FILES: usize = 1 << 16;
+
+/// The indices of BEP 53's `so` value: numbers and `first-last` ranges, comma-separated (`0,2,4-6`). `None` if
+/// any part is not one of those, or the whole names too many files: a selection half understood would fetch
+/// something other than what was asked for, and one that is not understood at all falls back to everything.
+fn parse_select_only(value: &str) -> Option<Vec<usize>> {
+    let mut indices = Vec::new();
+    for part in value.split(',') {
+        let (first, last) = match part.split_once('-') {
+            Some((first, last)) => (first.parse::<usize>().ok()?, last.parse::<usize>().ok()?),
+            None => {
+                let index = part.parse::<usize>().ok()?;
+                (index, index)
+            }
+        };
+        // Before anything is allocated for it: a range may be as long as a usize is.
+        if first > last || last - first >= MAX_SELECTED_FILES - indices.len() {
+            return None;
+        }
+        indices.extend(first..=last);
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    Some(indices)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -54,10 +91,12 @@ pub fn parse_magnet_uri(uri: &str) -> Result<MagnetLink, MagnetError> {
     // An `xt` in some namespace other than BitTorrent v1's, seen while
     // looking for one (a hybrid link carries `urn:btmh:` beside `urn:btih:`).
     let mut other_xt: Option<String> = None;
+    let mut info_hash_v2: Option<[u8; 32]> = None;
     let mut display_name = None;
     let mut trackers: Vec<String> = Vec::new();
     let mut peers: Vec<std::net::SocketAddr> = Vec::new();
     let mut web_seeds: Vec<String> = Vec::new();
+    let mut select_only: Vec<usize> = Vec::new();
 
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -76,7 +115,11 @@ pub fn parse_magnet_uri(uri: &str) -> Result<MagnetLink, MagnetError> {
                     // The first BitTorrent v1 hash is the one used.
                     Some(hash_str) if info_hash.is_none() => info_hash = Some(decode_info_hash(hash_str)?),
                     Some(_) => {}
-                    None => other_xt = Some(value),
+                    None => match lower.strip_prefix("urn:btmh:").and_then(decode_multihash_sha256) {
+                        Some(hash) if info_hash_v2.is_none() => info_hash_v2 = Some(hash),
+                        Some(_) => {}
+                        None => other_xt = Some(value),
+                    },
                 }
             }
             "dn" => display_name = Some(value),
@@ -93,17 +136,38 @@ pub fn parse_magnet_uri(uri: &str) -> Result<MagnetLink, MagnetError> {
                 }
             }
             "ws" if (value.starts_with("http://") || value.starts_with("https://")) && !web_seeds.contains(&value) => web_seeds.push(value),
+            // The first `so` that parses is the one used.
+            "so" if select_only.is_empty() => select_only = parse_select_only(&value).unwrap_or_default(),
             _ => {} // ignore unrecognized params (kt, as, xs, ...)
         }
     }
 
-    let info_hash = match (info_hash, other_xt) {
-        (Some(hash), _) => hash,
+    let info_hash = match (info_hash, info_hash_v2, other_xt) {
+        (Some(hash), _, _) => hash,
+        // BitTorrent v2 alone: peers know the torrent by the first 20 bytes of its SHA-256 hash.
+        (None, Some(v2), _) => {
+            let mut short = [0u8; 20];
+            short.copy_from_slice(&v2[..20]);
+            short
+        }
         // Only a hash this client cannot use (BitTorrent v2 alone).
-        (None, Some(other)) => return Err(MagnetError::BadInfoHashEncoding(other)),
-        (None, None) => return Err(MagnetError::MissingInfoHash),
+        (None, None, Some(other)) => return Err(MagnetError::BadInfoHashEncoding(other)),
+        (None, None, None) => return Err(MagnetError::MissingInfoHash),
     };
-    Ok(MagnetLink { info_hash, display_name, trackers, peers, web_seeds })
+    Ok(MagnetLink { info_hash, info_hash_v2, display_name, trackers, peers, web_seeds, select_only })
+}
+
+/// A SHA-256 multihash in hex: `1220` (SHA2-256, 32 bytes) and the 32 bytes of the hash.
+fn decode_multihash_sha256(text: &str) -> Option<[u8; 32]> {
+    let digits = text.strip_prefix("1220")?;
+    if digits.len() != 64 || !digits.is_ascii() {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (byte, pair) in out.iter_mut().zip(digits.as_bytes().chunks(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(out)
 }
 
 fn decode_info_hash(s: &str) -> Result<[u8; 20], MagnetError> {
@@ -224,6 +288,35 @@ mod tests {
         assert_eq!(hash, [0xFFu8; 20]);
     }
 
+    const LINK_HASH: &str = "xt=urn:btih:AABBCCDDEEFF00112233445566778899AABBCCDD";
+
+    fn select_only(so: &str) -> Vec<usize> {
+        parse_magnet_uri(&format!("magnet:?{}&so={}", LINK_HASH, so)).unwrap().select_only
+    }
+
+    #[test]
+    fn so_names_files_by_number_and_range_from_zero() {
+        assert_eq!(select_only("0"), vec![0]);
+        assert_eq!(select_only("0,2,4-6"), vec![0, 2, 4, 5, 6], "BEP 53's own example");
+        assert_eq!(select_only("6,2,2-3,0"), vec![0, 2, 3, 6], "sorted, and each once");
+        assert_eq!(select_only("5-5"), vec![5]);
+        assert_eq!(select_only("%30%2C2"), vec![0, 2], "percent-encoded, as some clients write the commas");
+        assert!(parse_magnet_uri(&format!("magnet:?{}", LINK_HASH)).unwrap().select_only.is_empty(), "no `so`: no selection, which is everything");
+    }
+
+    #[test]
+    fn an_so_that_is_not_understood_selects_nothing_rather_than_something_else() {
+        for bad in ["", "a", "1,", ",1", "1,,2", "3-1", "-1", "1-", "1-2-3", "0x1", "-", "1;2", "99999999999999999999999"] {
+            assert!(select_only(bad).is_empty(), "so={:?}", bad);
+        }
+        assert!(select_only("0-4294967295").is_empty(), "a range is not a licence to allocate");
+        assert!(select_only("0-65535,65536").is_empty(), "nor is a list");
+        assert_eq!(select_only("0-65535").len(), 65536, "the most it takes");
+        // The first `so` that is understood is the one used.
+        let two = parse_magnet_uri(&format!("magnet:?{}&so=x&so=1&so=2", LINK_HASH)).unwrap();
+        assert_eq!(two.select_only, vec![1]);
+    }
+
     #[test]
     fn parses_display_name_and_trackers() {
         let uri = "magnet:?xt=urn:btih:AABBCCDDEEFF00112233445566778899AABBCCDD&dn=Some+File.iso&tr=http%3A%2F%2Ftracker.example.com%2Fannounce&tr=udp%3A%2F%2Ftracker2.example.com%3A6969";
@@ -273,13 +366,30 @@ mod tests {
             let link = parse_magnet_uri(&uri).expect(&uri);
             assert_eq!(link.info_hash[0], 0x01, "the v1 hash, whichever order they come in");
             assert_eq!(link.info_hash[19], 0x67);
+            assert_eq!(link.info_hash_v2.map(|h| (h[0], h[31])), Some((0xaa, 0x99)), "and the whole v2 one is kept, to check the metadata against");
         }
     }
 
     #[test]
-    fn a_link_with_only_a_v2_hash_says_it_cannot_be_used_rather_than_that_it_has_no_hash() {
-        let err = parse_magnet_uri("magnet:?xt=urn:btmh:1220aabb").unwrap_err();
-        assert!(matches!(err, MagnetError::BadInfoHashEncoding(ref v) if v.contains("btmh")), "{:?}", err);
+    fn a_link_with_only_a_v2_hash_is_known_to_peers_by_its_first_twenty_bytes() {
+        let v2 = "1220aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let link = parse_magnet_uri(&format!("magnet:?xt=urn:btmh:{}&dn=v2", v2)).unwrap();
+        assert_eq!(link.info_hash, <[u8; 20]>::try_from(&hex_bytes(&v2[4..44])[..]).unwrap());
+        assert_eq!(link.info_hash_v2.unwrap()[..], hex_bytes(&v2[4..])[..]);
+        assert!(parse_magnet_uri(&format!("magnet:?xt=urn:btmh:{}", v2.to_ascii_uppercase())).is_ok(), "in either case");
+        assert_eq!(parse_magnet_uri(&format!("magnet:?xt=urn:btih:{}", HASH)).unwrap().info_hash_v2, None, "a v1 link has none");
+    }
+
+    fn hex_bytes(text: &str) -> Vec<u8> {
+        (0..text.len() / 2).map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn a_link_with_a_multihash_that_is_not_a_sha256_of_thirty_two_bytes_says_it_cannot_be_used() {
+        for bad in ["1220aabb", "1120aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899", "1220zzbbccddeeff00112233445566778899aabbccddeeff00112233445566778899", "1220aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899ff"] {
+            let err = parse_magnet_uri(&format!("magnet:?xt=urn:btmh:{}", bad)).unwrap_err();
+            assert!(matches!(err, MagnetError::BadInfoHashEncoding(ref v) if v.contains("btmh")), "{}: {:?}", bad, err);
+        }
         assert_eq!(parse_magnet_uri("magnet:?dn=only-a-name").unwrap_err(), MagnetError::MissingInfoHash);
     }
 

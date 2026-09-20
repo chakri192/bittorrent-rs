@@ -15,6 +15,16 @@ const MSG_REQUEST: u8 = 6;
 const MSG_PIECE: u8 = 7;
 const MSG_CANCEL: u8 = 8;
 const MSG_PORT: u8 = 9;
+// BEP 6, the Fast Extension.
+const MSG_SUGGEST: u8 = 13;
+const MSG_HAVE_ALL: u8 = 14;
+const MSG_HAVE_NONE: u8 = 15;
+const MSG_REJECT_REQUEST: u8 = 16;
+const MSG_ALLOWED_FAST: u8 = 17;
+// BEP 52, the hash messages of BitTorrent v2.
+const MSG_HASH_REQUEST: u8 = 21;
+const MSG_HASHES: u8 = 22;
+const MSG_HASH_REJECT: u8 = 23;
 /// BEP 10 extension protocol messages all share id 20; the extension
 /// message id (ut_metadata, etc.) is negotiated separately and lives in
 /// the payload. Handled fully in Phase 4 -- carried here as an opaque
@@ -27,6 +37,42 @@ const MSG_EXTENDED: u8 = 20;
 /// largest legitimate message (a 16 KiB `piece` block plus its 8-byte
 /// header, with room to spare).
 const MAX_MESSAGE_LEN: u32 = 1 << 20;
+
+/// What a BEP 52 hash request asks for, and what the `hashes` and `hash reject` answers repeat: hashes of one layer of a
+/// file's merkle tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HashRequest {
+    /// The file, by its `pieces root`.
+    pub root: [u8; 32],
+    /// Which layer: 0 for the 16 KiB leaf hashes, counting up.
+    pub base_layer: u32,
+    /// Where in that layer to start, in hashes: a multiple of `length`.
+    pub index: u32,
+    /// How many hashes: a power of two, at least two.
+    pub length: u32,
+    /// How many layers of uncle hashes come after them.
+    pub proof_layers: u32,
+}
+
+const HASH_REQUEST_LEN: usize = 32 + 4 * 4;
+
+impl HashRequest {
+    fn write(&self, payload: &mut Vec<u8>) {
+        payload.extend_from_slice(&self.root);
+        for number in [self.base_layer, self.index, self.length, self.proof_layers] {
+            payload.extend_from_slice(&number.to_be_bytes());
+        }
+    }
+
+    fn read(payload: &[u8]) -> Result<HashRequest, WireError> {
+        if payload.len() < HASH_REQUEST_LEN {
+            return Err(WireError::Truncated { expected: HASH_REQUEST_LEN, got: payload.len() });
+        }
+        let mut root = [0u8; 32];
+        root.copy_from_slice(&payload[..32]);
+        Ok(HashRequest { root, base_layer: read_u32(payload, 32)?, index: read_u32(payload, 36)?, length: read_u32(payload, 40)?, proof_layers: read_u32(payload, 44)? })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -41,11 +87,28 @@ pub enum Message {
     Piece { index: u32, begin: u32, block: Vec<u8> },
     Cancel { index: u32, begin: u32, length: u32 },
     Port(u16),
+    /// BEP 6: a piece the sender suggests the receiver fetch from it.
+    Suggest { piece_index: u32 },
+    /// BEP 6: the sender has every piece (in place of a full bitfield).
+    HaveAll,
+    /// BEP 6: the sender has no piece (in place of an empty bitfield).
+    HaveNone,
+    /// BEP 6: the sender will not answer this request. Sent instead of
+    /// silence, so the requester need not wait to find out.
+    RejectRequest { index: u32, begin: u32, length: u32 },
+    /// BEP 6: the receiver may request this piece even while choked.
+    AllowedFast { piece_index: u32 },
     /// Raw BEP 10 extended message: `id` is the negotiated extended
     /// message id (0 = handshake), `payload` is the bencoded dict (+
     /// trailing raw bytes for ut_metadata data pieces). Parsed further in
     /// Phase 4.
     Extended { id: u8, payload: Vec<u8> },
+    /// BEP 52: asks for hashes from a file's merkle tree.
+    HashRequest(HashRequest),
+    /// BEP 52: the answer: the `length` hashes asked for, then the uncle hashes that carry them to the root.
+    Hashes { request: HashRequest, hashes: Vec<[u8; 32]> },
+    /// BEP 52: the peer will not answer that request.
+    HashReject(HashRequest),
 }
 
 #[derive(Debug)]
@@ -89,7 +152,15 @@ impl Message {
             Message::Piece { .. } => Some(MSG_PIECE),
             Message::Cancel { .. } => Some(MSG_CANCEL),
             Message::Port(_) => Some(MSG_PORT),
+            Message::Suggest { .. } => Some(MSG_SUGGEST),
+            Message::HaveAll => Some(MSG_HAVE_ALL),
+            Message::HaveNone => Some(MSG_HAVE_NONE),
+            Message::RejectRequest { .. } => Some(MSG_REJECT_REQUEST),
+            Message::AllowedFast { .. } => Some(MSG_ALLOWED_FAST),
             Message::Extended { .. } => Some(MSG_EXTENDED),
+            Message::HashRequest(_) => Some(MSG_HASH_REQUEST),
+            Message::Hashes { .. } => Some(MSG_HASHES),
+            Message::HashReject(_) => Some(MSG_HASH_REJECT),
         }
     }
 
@@ -101,9 +172,9 @@ impl Message {
 
         let mut payload = Vec::new();
         match self {
-            Message::Have { piece_index } => payload.extend_from_slice(&piece_index.to_be_bytes()),
+            Message::Have { piece_index } | Message::Suggest { piece_index } | Message::AllowedFast { piece_index } => payload.extend_from_slice(&piece_index.to_be_bytes()),
             Message::Bitfield(bits) => payload.extend_from_slice(bits),
-            Message::Request { index, begin, length } | Message::Cancel { index, begin, length } => {
+            Message::Request { index, begin, length } | Message::Cancel { index, begin, length } | Message::RejectRequest { index, begin, length } => {
                 payload.extend_from_slice(&index.to_be_bytes());
                 payload.extend_from_slice(&begin.to_be_bytes());
                 payload.extend_from_slice(&length.to_be_bytes());
@@ -118,8 +189,15 @@ impl Message {
                 payload.push(*ext_id);
                 payload.extend_from_slice(ext_payload);
             }
+            Message::HashRequest(request) | Message::HashReject(request) => request.write(&mut payload),
+            Message::Hashes { request, hashes } => {
+                request.write(&mut payload);
+                for hash in hashes {
+                    payload.extend_from_slice(hash);
+                }
+            }
             // No payload. (KeepAlive has no id and returned above.)
-            Message::Choke | Message::Unchoke | Message::Interested | Message::NotInterested | Message::KeepAlive => {}
+            Message::Choke | Message::Unchoke | Message::Interested | Message::NotInterested | Message::HaveAll | Message::HaveNone | Message::KeepAlive => {}
         }
 
         let len = 1 + payload.len() as u32; // +1 for the id byte
@@ -175,11 +253,26 @@ impl Message {
                 begin: read_u32(payload, 4)?,
                 length: read_u32(payload, 8)?,
             },
+            MSG_SUGGEST => Message::Suggest { piece_index: read_u32(payload, 0)? },
+            MSG_HAVE_ALL => Message::HaveAll,
+            MSG_HAVE_NONE => Message::HaveNone,
+            MSG_REJECT_REQUEST => Message::RejectRequest { index: read_u32(payload, 0)?, begin: read_u32(payload, 4)?, length: read_u32(payload, 8)? },
+            MSG_ALLOWED_FAST => Message::AllowedFast { piece_index: read_u32(payload, 0)? },
             MSG_PORT => {
                 if payload.len() < 2 {
                     return Err(WireError::Truncated { expected: 2, got: payload.len() });
                 }
                 Message::Port(u16::from_be_bytes([payload[0], payload[1]]))
+            }
+            MSG_HASH_REQUEST => Message::HashRequest(HashRequest::read(payload)?),
+            MSG_HASH_REJECT => Message::HashReject(HashRequest::read(payload)?),
+            MSG_HASHES => {
+                let request = HashRequest::read(payload)?;
+                let rest = &payload[HASH_REQUEST_LEN..];
+                if rest.len() & 31 != 0 {
+                    return Err(WireError::Truncated { expected: HASH_REQUEST_LEN + rest.len().div_ceil(32) * 32, got: payload.len() });
+                }
+                Message::Hashes { request, hashes: rest.as_chunks::<32>().0.to_vec() }
             }
             MSG_EXTENDED => {
                 if payload.is_empty() {
@@ -320,5 +413,62 @@ mod tests {
         let mut buf = Vec::new();
         msg.write_to(&mut buf).unwrap();
         assert_eq!(buf, msg.to_bytes());
+    }
+
+    #[test]
+    fn the_hash_messages_have_their_ids_and_layout_and_round_trip() {
+        let request = HashRequest { root: [7; 32], base_layer: 2, index: 4, length: 8, proof_layers: 3 };
+        let bytes = Message::HashRequest(request).to_bytes();
+        assert_eq!(bytes[..5], [0, 0, 0, 49, 21], "a length of 1 + 32 + 4 * 4, and id 21");
+        assert_eq!(bytes[5..37], [7u8; 32]);
+        assert_eq!(bytes[37..], [0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 8, 0, 0, 0, 3], "four big-endian numbers after the root");
+        assert_eq!(Message::HashReject(request).to_bytes()[4], 23);
+        let answer = Message::Hashes { request, hashes: vec![[1; 32], [2; 32], [3; 32]] };
+        let bytes = answer.to_bytes();
+        assert_eq!((bytes[4], bytes.len()), (22, 4 + 1 + 48 + 96));
+        for msg in [Message::HashRequest(request), Message::HashReject(request), answer, Message::Hashes { request, hashes: Vec::new() }, Message::HashRequest(HashRequest { root: [0xFF; 32], base_layer: u32::MAX, index: u32::MAX, length: u32::MAX, proof_layers: u32::MAX })] {
+            round_trip(msg);
+        }
+    }
+
+    #[test]
+    fn a_truncated_or_ragged_hash_message_is_an_error_not_a_panic() {
+        let request = HashRequest { root: [7; 32], base_layer: 0, index: 0, length: 2, proof_layers: 0 };
+        let bytes = Message::Hashes { request, hashes: vec![[1; 32]] }.to_bytes();
+        for cut in 5..bytes.len() {
+            let mut shortened = bytes[..cut].to_vec();
+            let len = (cut - 4) as u32;
+            shortened[..4].copy_from_slice(&len.to_be_bytes());
+            let read = Message::read_from(&mut Cursor::new(shortened));
+            assert!(read.is_err() || cut == bytes.len() - 32 || cut == bytes.len(), "cut at {}: {:?}", cut, read);
+        }
+        // A tail that is not a whole number of hashes.
+        let mut ragged = bytes.clone();
+        ragged.extend_from_slice(&[9; 5]);
+        let len = (ragged.len() - 4) as u32;
+        ragged[..4].copy_from_slice(&len.to_be_bytes());
+        assert!(matches!(Message::read_from(&mut Cursor::new(ragged)), Err(WireError::Truncated { .. })));
+    }
+
+    #[test]
+    fn the_fast_extension_messages_have_their_ids_and_round_trip() {
+        assert_eq!(Message::Suggest { piece_index: 7 }.to_bytes(), vec![0, 0, 0, 5, 13, 0, 0, 0, 7]);
+        assert_eq!(Message::HaveAll.to_bytes(), vec![0, 0, 0, 1, 14]);
+        assert_eq!(Message::HaveNone.to_bytes(), vec![0, 0, 0, 1, 15]);
+        assert_eq!(Message::RejectRequest { index: 1, begin: 2, length: 3 }.to_bytes(), vec![0, 0, 0, 13, 16, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3]);
+        assert_eq!(Message::AllowedFast { piece_index: 9 }.to_bytes(), vec![0, 0, 0, 5, 17, 0, 0, 0, 9]);
+        for msg in [Message::Suggest { piece_index: 1 }, Message::HaveAll, Message::HaveNone, Message::RejectRequest { index: u32::MAX, begin: 0, length: 16384 }, Message::AllowedFast { piece_index: 0 }] {
+            round_trip(msg);
+        }
+    }
+
+    #[test]
+    fn truncated_fast_extension_messages_are_errors_not_panics() {
+        for (id, payload_len) in [(13u8, 3usize), (16, 11), (17, 0)] {
+            let mut frame = ((1 + payload_len) as u32).to_be_bytes().to_vec();
+            frame.push(id);
+            frame.extend(vec![0u8; payload_len]);
+            assert!(matches!(Message::read_from(&mut Cursor::new(frame)), Err(WireError::Truncated { .. })), "id {}", id);
+        }
     }
 }

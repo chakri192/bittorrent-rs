@@ -21,13 +21,14 @@ mod tests;
 use crate::downloader::file_writer::{write_piece, FileSpan};
 use crate::downloader::queue::{PieceResult, Take, WorkQueue};
 use crate::ratelimit::RateLimiter;
-use crate::peer::{ConnectionError, WireError};
-use connect::establish;
-use messages::{absorb, is_read_timeout};
-use piece::{download_one_piece, Meter};
+use crate::peer::{ConnectionError, Message, WireError};
+use connect::{establish, Established};
+use messages::{is_read_timeout, keep_serving, take};
+use piece::{download_one_piece, Downloaded, Lookahead, Meter};
 pub use peer_stats::{Activity, PeerRegistry, PeerRow, PeerStat};
 use pipeline::Throughput;
 use crate::peer::{Closer, PeerStream};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::mpsc::Sender;
 use crate::sync::lock;
@@ -53,6 +54,14 @@ pub struct WorkerConfig {
     pub interrupt: Interrupt,
     /// What each connected peer is doing, for the dashboard.
     pub peers: PeerRegistry,
+    /// Whether outgoing connections use message stream encryption.
+    pub encryption: crate::peer::Encryption,
+    /// How outgoing connections are opened: TCP, uTP, or both.
+    pub transport: crate::peer::Transport,
+    /// What a peer connected to is given in return: the pieces already verified, on the connections this
+    /// worker makes as on those the seeder takes, if there is a listener for the torrent. A peer that is
+    /// asked for pieces and gives nothing is choked by every client that reciprocates (BEP 3's tit-for-tat).
+    pub upload: Option<Arc<crate::seeder::SeederShared>>,
 }
 
 /// A way to end workers that are blocked reading from a peer.
@@ -164,37 +173,115 @@ pub fn run_worker(
 ) -> Result<(), WorkerError> {
     // Listed on the dashboard for as long as the connection lasts.
     let entry = config.peers.enter(peer_addr, std::time::Instant::now());
-    let stat = &entry.stat;
     // The registration is held to the end of the run: dropping it is what lets the connection close.
-    let (mut stream, mut state, _registration) = establish(peer_addr, config, queue, pex_tx)?;
-    stat.set(Activity::Downloading);
+    let Established { mut stream, mut state, mut serving, registration: _registration } = establish(peer_addr, config, queue, pex_tx)?;
+    entry.stat.set(Activity::Downloading);
+    fetch_from(&mut stream, &mut state, &mut serving, &entry.stat, config, queue, spans, piece_length, results_tx, pex_tx)
+}
 
+/// A connection a peer made to us, and that is to be downloaded from as well as served because the peer has pieces we still need.
+pub struct Adopted {
+    pub stream: Box<dyn PeerStream>,
+    /// The upload side of the connection, begun: what we have has been said.
+    pub serving: crate::serving::Serving,
+    pub peer: SocketAddr,
+    pub their_handshake: crate::peer::handshake::Handshake,
+    /// What the peer has said it has so far (`have[i]` for piece `i`).
+    pub peer_has: Vec<bool>,
+}
+
+/// What became of a connection that was adopted.
+pub enum Adoption {
+    /// It is over: the queue was drained, or the connection failed.
+    Ended(Result<(), WorkerError>),
+    /// Downloading from the peer is over, but the peer is not: it is a leecher that has nothing more for us, or that
+    /// will not unchoke us. It is still to be served, on the same connection.
+    ServeOn(Box<dyn PeerStream>, crate::serving::Serving),
+}
+
+/// [`run_worker`] for a connection the peer made: the handshakes are done and our bitfield said, so it goes on from there. A peer
+/// that turns out to have nothing for us after all (it stays choked, or has no piece we lack) is not dropped, as one we dialed for
+/// the purpose would be: it came to be served, and is handed back to be.
+pub fn run_adopted(adopted: Adopted, config: &WorkerConfig, queue: &Arc<WorkQueue>, spans: &Arc<Vec<FileSpan>>, piece_length: u64, results_tx: &Sender<PieceResult>, pex_tx: Option<&PexSender>) -> Adoption {
+    let Adopted { mut stream, serving, peer, their_handshake, peer_has } = adopted;
+    let mut serving = Some(serving);
+    let entry = config.peers.enter(peer, std::time::Instant::now());
+    let _registration = config.interrupt.register(&*stream);
+    let result = (|| {
+        stream.set_read_timeout(Some(config.connect_timeout)).map_err(|e| WorkerError::Connection { stage: "set_read_timeout", error: ConnectionError::Io(e) })?;
+        let mut state = crate::peer::PeerState::for_torrent(queue.total_pieces());
+        state.supports_extensions = their_handshake.supports_extensions();
+        state.fast = their_handshake.supports_fast();
+        // What it has said, for as many pieces as the torrent has.
+        state.peer_has_pieces = peer_has;
+        state.peer_has_pieces.resize(queue.total_pieces(), false);
+        queue.note_bitfield(&state.peer_has_pieces);
+        crate::peer::connection::send_message(&mut stream, &Message::Interested).map_err(|e| WorkerError::Connection { stage: "send_interested", error: e })?;
+        state.am_interested = true;
+        connect::wait_for_unchoke(&mut *stream, &mut state, queue, pex_tx, &mut serving)?;
+        entry.stat.set(Activity::Downloading);
+        fetch_from(&mut stream, &mut state, &mut serving, &entry.stat, config, queue, spans, piece_length, results_tx, pex_tx)
+    })();
+    match (result, serving) {
+        // Nothing more to fetch from it, for now or ever: it still may want what we have.
+        (Ok(()), Some(serving)) => Adoption::ServeOn(stream, serving),
+        (Err(WorkerError::Connection { stage: "peer_never_unchoked" | "peer_has_no_needed_pieces" | "peer_choked_us_mid_piece", .. }), Some(serving)) => Adoption::ServeOn(stream, serving),
+        (result, _) => Adoption::Ended(result),
+    }
+}
+
+/// The loop of a worker's connection, once it is ready for block requests: take the rarest piece the peer has and will send, fetch it,
+/// write it, report it, and go on, until the queue is drained or the connection fails.
+#[allow(clippy::too_many_arguments)]
+fn fetch_from(
+    stream: &mut Box<dyn PeerStream>,
+    state: &mut crate::peer::PeerState,
+    serving: &mut Option<crate::serving::Serving>,
+    stat: &PeerStat,
+    config: &WorkerConfig,
+    queue: &Arc<WorkQueue>,
+    spans: &Arc<Vec<FileSpan>>,
+    piece_length: u64,
+    results_tx: &Sender<PieceResult>,
+    pex_tx: Option<&PexSender>,
+) -> Result<(), WorkerError> {
     let mut irrelevant_cycles = 0u32;
     // How fast this peer delivers, which sets how many requests to queue.
     let mut throughput = Throughput::default();
+    // Pieces this peer keeps refusing to send (BEP 6): not asked for again on this connection.
+    let mut refused: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+    // The piece taken while the last one was being fetched, so that the requests went on across the boundary.
+    let mut ahead: VecDeque<Lookahead> = VecDeque::new();
 
     loop {
-        // The rarest piece *this peer has*: one it lacks is no use to it.
-        let work = match queue.take_for(|piece| state.peer_has_pieces.get(piece as usize).copied().unwrap_or(false)) {
-            Take::Piece(work) => work,
-            Take::Done => break,
-            Take::NothingForThisPeer => {
-                stat.set(Activity::Idle);
-                wait_for_a_piece_it_has(&mut stream, &mut state, queue, pex_tx, &mut irrelevant_cycles)?;
-                continue;
-            }
+        keep_serving(serving, &mut **stream)?;
+        // The piece already looked ahead to, if there is one; else the rarest piece *this peer has* and will send now: one
+        // it lacks is no use to it, nor is one it will not send while it has us choked.
+        let (work, started) = match ahead.pop_front() {
+            Some(next) => (next.work.clone(), Some(next)),
+            None => match queue.take_for(|piece| state.peer_has_pieces.get(piece as usize).copied().unwrap_or(false) && state.may_request(piece) && !refused.contains(&piece)) {
+                Take::Piece(work) => (work, None),
+                Take::Done => break,
+                Take::NothingForThisPeer => {
+                    stat.set(Activity::Idle);
+                    wait_for_a_piece_it_has(&mut **stream, state, queue, pex_tx, serving, &mut irrelevant_cycles)?;
+                    continue;
+                }
+            },
         };
         irrelevant_cycles = 0;
         stat.set(Activity::Downloading);
         let piece_index = work.index;
 
-        match download_one_piece(&mut stream, &mut state, queue, work.clone(), config, Meter { throughput: &mut throughput, stat }, pex_tx) {
-            Ok(Some(data)) => {
+        match download_one_piece(&mut **stream, state, queue, work.clone(), started, &refused, &mut ahead, config, Meter { throughput: &mut throughput, stat }, pex_tx, serving) {
+            Ok(Downloaded::Verified(data)) => {
                 if let Err(e) = write_piece(spans, piece_index, piece_length, &data) {
                     // Disk failure isn't the peer's fault; requeue and bail
                     // out of this worker entirely rather than risk more
                     // writes to a broken filesystem.
                     queue.push_back(work);
+                    release_all(&mut ahead, queue);
                     return Err(WorkerError::Connection { stage: "write_piece_to_disk", error: ConnectionError::Io(e) });
                 }
                 // First completion wins (endgame duplicates lose the race
@@ -204,7 +291,13 @@ pub fn run_worker(
                     let _ = results_tx.send(PieceResult { index: piece_index, data });
                 }
             }
-            Ok(None) => {
+            Ok(Downloaded::Refused) => {
+                // Not this peer's to give: let someone else have the piece.
+                queue.push_back(work);
+                refused.insert(piece_index);
+                release_all(&mut ahead, queue);
+            }
+            Ok(Downloaded::Abandoned) => {
                 // Endgame: another worker finished this piece while we
                 // were mid-download; nothing to write, nothing to report.
             }
@@ -213,11 +306,19 @@ pub fn run_worker(
                 // peer a chance rather than trusting this connection
                 // further.
                 queue.push_back(work);
+                release_all(&mut ahead, queue);
                 return Err(e);
             }
         }
     }
     Ok(())
+}
+
+/// Gives back every piece that was taken ahead of time, for the connection has no more use for them.
+fn release_all(ahead: &mut VecDeque<Lookahead>, queue: &WorkQueue) {
+    for next in ahead.drain(..) {
+        next.release(queue);
+    }
 }
 
 /// Pieces remain, but this peer has none of them. Rather than
@@ -228,23 +329,31 @@ pub fn run_worker(
 /// connection is given up rather than holding its slot for good: a peer
 /// that is alive but useless (or silent without formally disconnecting)
 /// would otherwise never free it for the coordinator to try someone else.
-fn wait_for_a_piece_it_has(stream: &mut dyn PeerStream, state: &mut crate::peer::PeerState, queue: &WorkQueue, pex_tx: Option<&PexSender>, irrelevant_cycles: &mut u32) -> Result<(), WorkerError> {
+fn wait_for_a_piece_it_has(stream: &mut dyn PeerStream, state: &mut crate::peer::PeerState, queue: &WorkQueue, pex_tx: Option<&PexSender>, serving: &mut Option<crate::serving::Serving>, irrelevant_cycles: &mut u32) -> Result<(), WorkerError> {
     match crate::peer::connection::read_message(stream) {
         Ok(msg) => {
             // `absorb` returns true for any state-affecting message
             // (Choke/Unchoke/Have/Bitfield/...), an approximation of
             // "this peer is still doing something" that is good enough for
             // a stuck-connection safety net.
-            let peer_is_active = absorb(&msg, state, queue, pex_tx);
+            let peer_is_active = take(&msg, state, queue, pex_tx, serving, stream)?;
             *irrelevant_cycles = if peer_is_active { 0 } else { *irrelevant_cycles + 1 };
         }
         Err(ref e) if is_read_timeout(e) => {
             *irrelevant_cycles += 1;
+            // Waiting out a choke: show we are still here, as while waiting
+            // for the first unchoke, or the peer's idle timeout reaps us.
+            if state.peer_choking {
+                crate::peer::connection::send_message(stream, &Message::KeepAlive).map_err(|e| WorkerError::Connection { stage: "keepalive_while_choked", error: e })?;
+            }
         }
         Err(e) => return Err(WorkerError::Connection { stage: "wait_for_relevant_have", error: e }),
     }
 
-    if *irrelevant_cycles >= MAX_IRRELEVANT_CYCLES {
+    // A choke is waited out for as long as the first unchoke is; nothing
+    // else on offer is waited on for longer.
+    let budget = if state.peer_choking { connect::MAX_UNCHOKE_WAIT_TIMEOUTS } else { MAX_IRRELEVANT_CYCLES };
+    if *irrelevant_cycles >= budget {
         return Err(WorkerError::Connection {
             stage: "peer_has_no_needed_pieces",
             error: ConnectionError::Wire(WireError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "peer never offered a piece we still need"))),

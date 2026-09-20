@@ -2,15 +2,14 @@
 //! the file selection, resuming from disk, the listener and port mapping,
 //! the first tracker announce, and the workers.
 
-use crate::downloader::{any_data_on_disk, build_file_spans, create_empty_files, load_and_verify, progress_file_path, rewrite_compact, scan_all, Order, ResumeWriter, WorkQueue, WorkerConfig};
-use crate::ratelimit::RateLimiter;
+use crate::downloader::{any_data_on_disk, create_empty_files, load_and_verify, progress_file_path, rewrite_compact, scan_all, Order, ResumeWriter, WorkQueue, WorkerConfig};
+use crate::session::network::layered;
 use crate::seeder::{self, HaveMap};
 use crate::session::peer_pool::RetryPolicy;
 use crate::session::{Announcer, DownloadPlan, Log, Outstanding, PeerPool, Progress, ProgressSink, Services, Session, Setup, Workers};
 use crate::torrent::TorrentFile;
 use crate::tracker_discovery::TransferTotals;
 use crate::ui::format_bytes;
-use sha1::{Digest, Sha1};
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
@@ -42,6 +41,9 @@ pub fn has_ipv6_egress() -> bool {
     }
 }
 
+/// Why a BitTorrent v2 torrent that carries no piece layers is not downloaded.
+pub const NO_PIECE_LAYERS: &str = "this torrent is BitTorrent v2 only (BEP 52) and does not carry its piece layers, which are what its pieces are checked against; fetching them from peers is not implemented. It can be listed (--list) and verified (--verify)";
+
 /// How a session is set up. Everything the command line decides, and the
 /// two protocol constants the workers need.
 pub struct Options {
@@ -56,6 +58,9 @@ pub struct Options {
     pub ipv6: Ipv6Mode,
     pub no_portmap: bool,
     pub no_webseed: bool,
+    /// Announce on the local network and listen for others (BEP 14): where
+    /// to, or `None` for not at all. Never done for a private torrent.
+    pub lsd: Option<crate::lsd::LsdConfig>,
     /// Give up after this long (`--timeout`).
     pub timeout: Option<Duration>,
     /// Limit on the bytes downloaded per second across every connection
@@ -69,6 +74,15 @@ pub struct Options {
     /// on disk but no resume file, such as after a completed download or
     /// files copied in from elsewhere.
     pub recheck: bool,
+    /// How outgoing connections are made, and whether uTP is taken on the
+    /// listening side (`--transport`). A mode that wants uTP without a running
+    /// uTP socket falls back to TCP, and says so.
+    pub transport: crate::peer::TransportMode,
+    /// How the trackers are asked: by BEP 12's tiers, or all at once (`--tracker-mode`).
+    pub tracker_mode: crate::tracker_discovery::TrackerMode,
+    /// Message stream encryption (`--encryption`). `None` is the default:
+    /// outgoing connections are plain, incoming ones may be either.
+    pub encryption: Option<crate::peer::Encryption>,
     /// Fetch pieces in order instead of rarest first (`--sequential`).
     pub sequential: bool,
     /// Files whose pieces are fetched before the others (`--prefer`), as a
@@ -111,6 +125,7 @@ pub struct Prepared {
     display_total: u64,
     goal_pieces: usize,
     timeout: Option<Duration>,
+    partial_path: PathBuf,
     pub info: RunInfo,
 }
 
@@ -128,6 +143,7 @@ impl Prepared {
             display_total: self.display_total,
             goal_pieces: self.goal_pieces,
             timeout: self.timeout,
+            partial_path: Some(self.partial_path),
         })
     }
 }
@@ -147,6 +163,9 @@ fn shared_log(sink: &Arc<dyn ProgressSink>) -> Log {
 /// Fails, with a reason for the user, if the output directory or resume
 /// file cannot be used, or if there is nowhere at all to get peers from.
 pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<SocketAddr>, our_peer_id: [u8; 20], options: &Options, services: &mut Services, sink: &Arc<dyn ProgressSink>) -> Result<Prepared, String> {
+    if torrent.is_v2_only() && !torrent.v2_ready() {
+        return Err(NO_PIECE_LAYERS.to_string());
+    }
     let total_pieces = torrent.pieces.len();
     let total_length = torrent.total_length();
     let piece_length = torrent.piece_length as u64;
@@ -157,14 +176,14 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     let plan = DownloadPlan::new(torrent, mask);
     let (selective, display_total, goal_pieces) = (plan.is_selective(), plan.display_total(), plan.goal_pieces());
     if selective {
-        sink.log(format!("selective download: {} of {} file(s), {} piece(s), {}", mask.iter().filter(|&&b| b).count(), torrent.files.len(), goal_pieces, format_bytes(display_total)));
+        sink.log(format!("selective download: {} of {} file(s), {} piece(s), {}", mask.iter().filter(|&&b| b).count(), torrent.padding.iter().filter(|&&pad| !pad).count(), goal_pieces, format_bytes(display_total)));
     }
 
-    let tracker_urls = torrent.tracker_urls();
+    let tracker_tiers = crate::tracker_discovery::shuffled(torrent.tracker_tiers());
     // A multi-file torrent's name is the directory its files go under,
     // however many files it lists (one is legal and common).
     let base_dir = if torrent.multi_file { options.out_dir.join(&torrent.name) } else { options.out_dir.clone() };
-    let spans = Arc::new(build_file_spans(&base_dir, &torrent.files));
+    let spans = Arc::new(torrent.file_spans(&base_dir));
     // Empty files are in no piece, so nothing would ever create them.
     create_empty_files(&spans, |file| mask.get(file).copied().unwrap_or(false)).map_err(|e| format!("creating an empty file under {}: {}", base_dir.display(), e))?;
 
@@ -201,21 +220,53 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     for &idx in &confirmed_resumed {
         have.set(idx);
     }
-    let up_limit = options.max_up.map(|rate| Arc::new(RateLimiter::new(rate)));
-    let down_limit = options.max_down.map(|rate| Arc::new(RateLimiter::new(rate)));
+    // On a shared network its limits hold over every torrent together, and a rate of this torrent's
+    // own holds as well, as a part of them.
+    let shared = services.network();
+    let up_limit = layered(shared.and_then(|network| network.up_limit()), options.max_up);
+    let down_limit = layered(shared.and_then(|network| network.down_limit()), options.max_down);
     // The info dictionary is offered to peers that have only a magnet link
     // (BEP 9), but only if it re-encodes to what the hash was taken over.
     let info_bytes = crate::bencode::encode(&torrent.info);
-    let metadata = (Sha1::digest(&info_bytes).as_slice() == torrent.info_hash).then(|| Arc::new(info_bytes));
-    let seeder_options = seeder::SeederOptions { metadata, ..Default::default() };
-    match seeder::start_with(options.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options) {
+    let metadata = crate::torrent::info_hash_matches(&info_bytes, &torrent.info_hash).then(|| Arc::new(info_bytes));
+    // Whether IPv6 is in use at all: peers are dialed over it, and the listener takes it.
+    let allow_ipv6 = match options.ipv6 {
+        Ipv6Mode::Always => true,
+        Ipv6Mode::Never => false,
+        Ipv6Mode::Auto => has_ipv6_egress(),
+    };
+    let piece_lengths = (!torrent.v2_pieces.is_empty()).then(|| Arc::new(torrent.v2_pieces.iter().map(|p| p.length).collect::<Vec<u32>>()));
+    let hash_source = torrent.v2.as_ref().and_then(|meta| crate::v2::HashSource::new(&meta.files, &meta.layers, piece_length)).map(Arc::new);
+    let seeder_options = seeder::SeederOptions { metadata, encryption: options.encryption.unwrap_or(crate::peer::Encryption::Prefer), utp: services.utp(), piece_lengths, hash_source, ipv6: allow_ipv6, ..Default::default() };
+    let started = match services.network() {
+        // Peers reach this torrent on the port everyone's share.
+        Some(network) => Ok(network.register(torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options)),
+        None => seeder::start_with(options.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options),
+    };
+    let mut upload = None;
+    match started {
         Ok(handle) => {
-            sink.log(format!("listening for inbound peers on port {}", handle.port));
+            upload = Some(handle.upload());
+            sink.log(format!("listening for inbound peers on port {}{}", handle.port, if handle.ipv6 { " (IPv4 and IPv6)" } else { "" }));
+            if let Some(utp) = services.utp() {
+                let udp_port = utp.local_addr().map(|a| a.port()).unwrap_or(0);
+                if udp_port != handle.port {
+                    sink.log(format!("warning: uTP is on UDP port {} but TCP is on {}; peers will dial uTP at the port announced, so inbound uTP will not reach us", udp_port, handle.port));
+                }
+            }
             services.attach_seeder(handle);
         }
         Err(e) => sink.log(format!("warning: could not start listener (download-only): {}", e)),
     }
     let announce_port = services.announce_port(options.port);
+
+    // Local service discovery announces the info hash to the whole network,
+    // which a private torrent must not do; and it announces the listener's
+    // port, so it needs a listener.
+    if let (Some(config), false, true) = (&options.lsd, torrent.private, services.has_seeder()) {
+        let log = shared_log(sink);
+        services.start_lsd(config.clone(), torrent.info_hash, announce_port, move |m| log(m));
+    }
 
     // Best-effort port forwarding (UPnP/NAT-PMP) so inbound peers and DHT
     // queries reach us behind a home router. Runs on its own thread and
@@ -230,14 +281,23 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // *unwanted* pieces from a prior full run stay advertised for seeding
     // via `have` above, but don't count toward this run's goal.)
     let Outstanding { work, pieces_done, bytes_done: bytes_already_done } = plan.outstanding(torrent, &confirmed_resumed);
-    let preferred = if options.prefer.iter().any(|&p| p) { crate::selection::selected_pieces(&torrent.files, torrent.piece_length as u64, &options.prefer).0 } else { Default::default() };
+    let preferred = if options.prefer.iter().any(|&p| p) { crate::selection::selected_pieces_of(torrent, &options.prefer).0 } else { Default::default() };
     let queue = Arc::new(WorkQueue::new(work, total_pieces).with_order(if options.sequential { Order::Sequential } else { Order::RarestFirst }).with_preferred(preferred));
 
-    let allow_ipv6 = match options.ipv6 {
-        Ipv6Mode::Always => true,
-        Ipv6Mode::Never => false,
-        Ipv6Mode::Auto => has_ipv6_egress(),
-    };
+    // What a run that was stopped had received of pieces it did not finish.
+    let partial_path = crate::downloader::partial::partial_file_path(&options.out_dir, &torrent.info_hash);
+    let kept = crate::downloader::partial::load(&partial_path);
+    let mut resumed_blocks = 0;
+    for (index, partial) in kept.into_iter().filter(|(index, _)| queue.is_wanted(*index)) {
+        resumed_blocks += partial.blocks_held();
+        queue.stash_partial(index, partial);
+    }
+    // (Whatever this run leaves unfinished is written again as it ends.)
+    crate::downloader::resume::clear(&partial_path);
+    if resumed_blocks > 0 {
+        sink.log(format!("resuming: {} block(s) of unfinished pieces kept from the last run", resumed_blocks));
+    }
+
     sink.log(if allow_ipv6 {
         "IPv6 peers enabled".to_string()
     } else {
@@ -247,7 +307,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     pool.add(bootstrap_peers);
 
     // First real announce, now that the true size is known.
-    let mut announcer = Announcer::new(tracker_urls, torrent.info_hash, our_peer_id, announce_port, options.reannounce_override, Instant::now());
+    let mut announcer = Announcer::tiered(tracker_tiers, options.tracker_mode, torrent.info_hash, our_peer_id, announce_port, options.reannounce_override, Instant::now());
     let first_totals = TransferTotals { uploaded: services.uploaded_counter().map_or(0, |c| c.load(std::sync::atomic::Ordering::Relaxed)), downloaded: 0, left: display_total.saturating_sub(bytes_already_done) };
     pool.add(announcer.start(Instant::now(), first_totals, |m| sink.log(m)));
 
@@ -256,26 +316,42 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // alive.
     let web_seeds: Vec<String> = if options.no_webseed { Vec::new() } else { torrent.url_list.clone() };
 
-    if pool.known_count() == 0 && services.dht().is_none() && web_seeds.is_empty() {
-        return Err("no peers found from any tracker (and DHT + web seeds unavailable)".to_string());
+    // (With every wanted piece already on disk there is nothing to look for, and a client that has only
+    // to seed must start whether or not its trackers can be reached.)
+    if !queue.is_empty() && pool.known_count() == 0 && services.dht().is_none() && services.lsd().is_none() && web_seeds.is_empty() {
+        return Err("no peers found from any tracker (and DHT, local discovery + web seeds unavailable)".to_string());
     }
     sink.log(format!("{} peer(s) known; dialing up to {} concurrently", pool.known_count(), options.max_peers));
     if pool.skipped_ipv6() > 0 {
         sink.log(format!("skipped {} IPv6 peer(s) with no local route (pass --ipv6 to force)", pool.skipped_ipv6()));
     }
 
-    let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: options.pipeline_depth, connect_timeout: options.connect_timeout, down_limit, interrupt: Default::default(), peers: Default::default() });
+    let transport = match (options.transport.wants_utp(), services.utp()) {
+        (true, Some(utp)) => crate::peer::Transport { mode: options.transport, utp: Some(utp) },
+        (true, None) => {
+            sink.log("uTP is not running; connections will be made over TCP".to_string());
+            crate::peer::Transport::default()
+        }
+        (false, _) => crate::peer::Transport::default(),
+    };
+    let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: options.pipeline_depth, connect_timeout: options.connect_timeout, down_limit, interrupt: Default::default(), peers: Default::default(), encryption: options.encryption.unwrap_or_default(), transport: transport.clone(), upload });
     let mut workers = Workers::new(Arc::clone(&queue), Arc::clone(&spans), config, piece_length, options.max_peers, torrent.private, shared_log(sink));
+    // A peer that connects to us and has pieces we lack is downloaded from over that connection too.
+    if let Some(seeder) = services.seeder() {
+        seeder.set_adopter(Some(workers.adopter()));
+    }
 
     // Web-seed workers: one thread per url-list entry, draining the same
     // shared queue into the same verify-write-record pipeline as peers.
     if !web_seeds.is_empty() {
         sink.log(format!("web seed: {} url(s) from the torrent's url-list", web_seeds.len()));
-        workers.start_web_seeds(&web_seeds, &torrent.name, &torrent.files, torrent.multi_file, total_length);
+        // (A v2-only torrent's pieces are per file and checked by merkle root; a hybrid one is fetched as v1.)
+        let v2_pieces = torrent.is_v2_only().then(|| Arc::new(torrent.v2_pieces.clone()));
+        workers.start_web_seeds(&web_seeds, &torrent.name, &torrent.files, torrent.multi_file, total_length, v2_pieces);
     }
 
     let progress = Progress::new(have, resume_writer, goal_pieces, pieces_done, bytes_already_done);
-    Ok(Prepared { queue, workers, announcer, progress, pool, display_total, goal_pieces, timeout: options.timeout, info: RunInfo { base_dir, progress_path, selective, total_length, display_total, announce_port } })
+    Ok(Prepared { queue, workers, announcer, progress, pool, display_total, goal_pieces, timeout: options.timeout, partial_path, info: RunInfo { base_dir, progress_path, selective, total_length, display_total, announce_port } })
 }
 
 #[cfg(test)]
@@ -336,11 +412,15 @@ mod tests {
             ipv6: Ipv6Mode::Never,
             no_portmap: true, // nothing here may touch the LAN gateway
             no_webseed: false,
+            lsd: None,
             timeout: None,
             max_down: None,
             max_up: None,
             recheck: false,
             sequential: false,
+            encryption: None,
+            transport: Default::default(),
+            tracker_mode: Default::default(),
             prefer: Vec::new(),
             retry_delay: Duration::from_secs(15),
             pipeline_depth: 5,
@@ -434,7 +514,27 @@ mod tests {
         let dir = tmp_dir("nopeers");
         let mut services = Services::new();
         let (result, _) = run_prepare(&torrent(), &[true, true], Vec::new(), &options(&dir), &mut services);
-        assert_eq!(result.err().as_deref(), Some("no peers found from any tracker (and DHT + web seeds unavailable)"));
+        assert_eq!(result.err().as_deref(), Some("no peers found from any tracker (and DHT, local discovery + web seeds unavailable)"));
+    }
+
+    #[test]
+    fn a_torrent_already_whole_on_disk_starts_with_no_peers_to_be_had_since_it_has_only_to_seed() {
+        let dir = tmp_dir("whole-nopeers");
+        write_all_data(&dir);
+        let mut services = Services::new();
+        let (prepared, _) = run_prepare(&torrent(), &[true, true], Vec::new(), &options(&dir), &mut services);
+        assert_eq!(prepared.expect("nothing to fetch, so nobody to fetch it from").queue.len(), 0);
+        assert!(services.has_seeder(), "and it seeds");
+
+        // Missing even one piece, it is as before.
+        let dir = tmp_dir("nearly-whole-nopeers");
+        write_all_data(&dir);
+        let mut b = fs::read(dir.join("t/b")).unwrap();
+        b[250] ^= 0xFF;
+        fs::write(dir.join("t/b"), b).unwrap();
+        let mut services = Services::new();
+        let (result, _) = run_prepare(&torrent(), &[true, true], Vec::new(), &options(&dir), &mut services);
+        assert!(result.err().is_some_and(|e| e.starts_with("no peers found")));
     }
 
     #[test]
@@ -518,6 +618,172 @@ mod tests {
         let mut services = Services::new();
         let (prepared, _) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
         assert!(prepared.unwrap().workers.pex_enabled());
+    }
+
+    /// Local discovery on loopback, as a test can have it.
+    fn lsd_options(dir: &std::path::Path) -> Options {
+        let mut with = options(dir);
+        with.lsd = Some(crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen: SocketAddr::from(([127, 0, 0, 1], 0)), join: None, share_port: false, interval: Duration::from_secs(3600), reply_interval: Duration::from_secs(3600) });
+        with
+    }
+
+    #[test]
+    fn local_discovery_announces_the_port_the_listener_really_has() {
+        let dir = tmp_dir("lsd");
+        let mut services = Services::new();
+        let (prepared, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &lsd_options(&dir), &mut services);
+        assert!(prepared.is_ok());
+        let port = services.announce_port(0);
+        assert!(services.lsd().is_some());
+        assert!(log.logged(&format!("local service discovery running (announcing port {})", port)), "{:?}", log.lines.lock().unwrap());
+    }
+
+    #[test]
+    fn local_discovery_is_left_off_when_not_asked_for_and_for_a_private_torrent() {
+        let dir = tmp_dir("lsd-off");
+        let mut services = Services::new();
+        run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services).0.unwrap();
+        assert!(services.lsd().is_none(), "not asked for");
+
+        let private = parse_torrent_file(&torrent_bytes(None, None, true)).unwrap();
+        let mut services = Services::new();
+        run_prepare(&private, &[true, true], vec![dead_addr()], &lsd_options(&dir), &mut services).0.unwrap();
+        assert!(services.lsd().is_none(), "a private torrent's info hash is not shouted at the local network (BEP 27)");
+    }
+
+    #[test]
+    fn local_discovery_alone_is_reason_enough_to_wait_for_peers() {
+        let dir = tmp_dir("lsd-alone");
+        let mut services = Services::new();
+        let (prepared, _) = run_prepare(&torrent(), &[true, true], Vec::new(), &lsd_options(&dir), &mut services);
+        assert!(prepared.is_ok(), "no tracker, no DHT, no address -- but the local network may yet turn one up");
+    }
+
+    #[test]
+    fn with_a_utp_socket_the_listener_takes_utp_connections_too_and_warns_when_the_ports_differ() {
+        let dir = tmp_dir("utp");
+        let mut services = Services::new();
+        services.start_utp(0, |_| {});
+        let utp = services.utp().expect("running");
+        let mut with_utp = options(&dir);
+        with_utp.transport = crate::peer::TransportMode::Both;
+
+        let (prepared, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &with_utp, &mut services);
+        assert_eq!(prepared.unwrap().workers.transport_mode(), crate::peer::TransportMode::Both, "and the workers dial the way it says");
+
+        // A uTP peer connects and completes the BitTorrent handshake.
+        let client = crate::utp::UtpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let mut stream = client.connect(SocketAddr::from(([127, 0, 0, 1], utp.local_addr().unwrap().port())), Duration::from_secs(5)).expect("the listener takes uTP");
+        crate::peer::PeerStream::set_read_timeout(&stream, Some(Duration::from_secs(5))).unwrap();
+        std::io::Write::write_all(&mut stream, &crate::peer::Handshake::new(torrent().info_hash, [7; 20], false).to_bytes()).unwrap();
+        let mut answer = [0u8; crate::peer::handshake::HANDSHAKE_LEN];
+        std::io::Read::read_exact(&mut stream, &mut answer).unwrap();
+        assert_eq!(crate::peer::Handshake::from_bytes(&answer).unwrap().info_hash, torrent().info_hash);
+
+        // Both ports were left to be chosen, so they differ, and that is said.
+        assert!(log.logged("warning: uTP is on UDP port"), "{:?}", log.lines.lock().unwrap());
+    }
+
+    #[test]
+    fn a_transport_that_wants_utp_falls_back_to_tcp_when_there_is_no_socket() {
+        let dir = tmp_dir("utp-missing");
+        let mut services = Services::new();
+        let mut wants = options(&dir);
+        wants.transport = crate::peer::TransportMode::Utp;
+        let (prepared, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &wants, &mut services);
+        assert_eq!(prepared.unwrap().workers.transport_mode(), crate::peer::TransportMode::Tcp, "it still runs, over TCP");
+        assert!(log.logged("uTP is not running; connections will be made over TCP"));
+
+        let mut services = Services::new();
+        let (_, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        assert!(!log.logged("uTP is not running"), "and says nothing when TCP was asked for");
+    }
+
+    /// A v2-only torrent of two files, made by the creator (piece length 16 KiB), with its layers or without.
+    fn v2_torrent(with_layers: bool) -> TorrentFile {
+        // A directory for each, since tests run side by side.
+        let dir = tmp_dir(if with_layers { "v2-source-with" } else { "v2-source-without" });
+        fs::create_dir_all(dir.join("t")).unwrap();
+        fs::write(dir.join("t/a.bin"), vec![1u8; 40_000]).unwrap();
+        fs::write(dir.join("t/empty"), b"").unwrap();
+        fs::write(dir.join("t/b.bin"), vec![2u8; 100]).unwrap();
+        let made = crate::create::create(&dir.join("t"), &crate::create::CreateOptions { piece_length: Some(16384), v2: true, web_seeds: vec![format!("http://{}/", dead_addr())], ..Default::default() }, |_, _| {}).unwrap();
+        let mut bytes = made.bytes;
+        if !with_layers {
+            let mut top = crate::bencode::decode(&bytes).unwrap();
+            if let crate::bencode::Bencode::Dict(entries) = &mut top {
+                entries.remove(b"piece layers".as_slice());
+            }
+            bytes = crate::bencode::encode(&top);
+        }
+        parse_torrent_file(&bytes).unwrap()
+    }
+
+    #[test]
+    fn a_v2_torrent_is_prepared_over_its_aligned_layout() {
+        let dir = tmp_dir("v2-prepare");
+        let t = v2_torrent(true);
+        let mut services = Services::new();
+
+        let (prepared, log) = run_prepare(&t, &[true, true, true], vec![dead_addr()], &options(&dir), &mut services);
+        let prepared = prepared.expect("a v2 torrent with its layers can be downloaded");
+
+        assert_eq!(prepared.goal_pieces, 4, "a.bin's three pieces and b.bin's one");
+        assert_eq!(prepared.queue.len(), 4);
+        assert_eq!(prepared.display_total, 40_100);
+        assert!(dir.join("t/empty").exists(), "the empty file is made, as for any torrent");
+        assert!(t.url_list.len() == 1 && log.logged("web seed: 1 url(s)"), "the torrent names a web seed, which serves a v2 torrent's pieces by file and offset: {:?}", log.lines.lock().unwrap());
+    }
+
+    #[test]
+    fn a_v2_torrent_is_downloaded_from_a_web_seed_alone_by_a_whole_session() {
+        // Three files under a directory, the middle one empty; a mirror that has them; a torrent that names the mirror.
+        let source = tmp_dir("v2-webseed-source");
+        std::fs::create_dir_all(source.join("pack")).unwrap();
+        let files: Vec<(&str, Vec<u8>)> = vec![("a.bin", (0..70_000u32).map(|i| i.wrapping_mul(2654435761) as u8 ^ (i >> 9) as u8).collect()), ("empty", Vec::new()), ("b.bin", vec![0xAB; 20_000])];
+        for (path, content) in &files {
+            std::fs::write(source.join("pack").join(path), content).unwrap();
+        }
+        let mirror = crate::webseed::mirror::spawn_mirror(files.iter().map(|(path, content)| (Box::leak(format!("pack/{}", path).into_boxed_str()) as &str, content.clone())).collect(), crate::webseed::mirror::Mode::Serve);
+        let created = crate::create::create(&source.join("pack"), &crate::create::CreateOptions { v2: true, piece_length: Some(32768), web_seeds: vec![mirror.base.clone()], ..Default::default() }, |_, _| {}).unwrap();
+        let t = parse_torrent_file(&created.bytes).unwrap();
+        assert!(t.is_v2_only() && t.v2_ready());
+        let dir = tmp_dir("v2-webseed-download");
+        let mut services = Services::new();
+
+        let (prepared, recorder) = run_prepare(&t, &[true, true, true], Vec::new(), &options(&dir), &mut services);
+        let mut session = prepared.expect("the web seed is somewhere to get it from").into_session(&*recorder, &services);
+        let report = session.run(&AtomicBool::new(false));
+
+        assert!(report.complete, "{:?}", recorder.lines.lock().unwrap());
+        for (path, content) in &files {
+            if !content.is_empty() {
+                assert_eq!(&std::fs::read(dir.join("pack").join(path)).unwrap(), content, "{}", path);
+            }
+        }
+    }
+
+    #[test]
+    fn a_v2_torrent_with_a_web_seed_and_no_peer_at_all_can_still_be_prepared_but_not_with_web_seeds_off() {
+        let t = v2_torrent(true);
+        let mut services = Services::new();
+        let (with, _) = run_prepare(&t, &[true, true, true], Vec::new(), &options(&tmp_dir("v2-webseed")), &mut services);
+        assert!(with.is_ok(), "the web seed is somewhere to get it from");
+
+        let mut off = options(&tmp_dir("v2-webseed-off"));
+        off.no_webseed = true;
+        let (without, _) = run_prepare(&t, &[true, true, true], Vec::new(), &off, &mut services);
+        assert_eq!(without.err().as_deref(), Some("no peers found from any tracker (and DHT, local discovery + web seeds unavailable)"));
+    }
+
+    #[test]
+    fn a_v2_torrent_without_its_layers_is_not_prepared_and_the_reason_is_given() {
+        let dir = tmp_dir("v2-prepare-bare");
+        let t = v2_torrent(false);
+        assert!(t.is_v2_only() && !t.v2_ready());
+        let mut services = Services::new();
+        let (result, _) = run_prepare(&t, &[true, true, true], vec![dead_addr()], &options(&dir), &mut services);
+        assert_eq!(result.err().as_deref(), Some(NO_PIECE_LAYERS));
     }
 
     #[test]
@@ -694,5 +960,114 @@ mod tests {
         assert_eq!(first_taken(Vec::new()), 0, "no preference: the lowest index among equals");
         // The torrent's second file (bytes 256..600) is pieces 1 and 2.
         assert_eq!(first_taken(vec![false, true]), 1, "preferring it brings its first piece out ahead of piece 0");
+    }
+
+    #[test]
+    fn when_ipv6_is_in_use_the_listener_takes_it_and_the_log_says_so() {
+        let dir = tmp_dir("v6-listener");
+        let mut with6 = options(&dir);
+        with6.ipv6 = Ipv6Mode::Always;
+        let mut services = Services::new();
+        let (prepared, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &with6, &mut services);
+        assert!(prepared.is_ok());
+        let port = services.announce_port(0);
+        if std::net::TcpListener::bind("[::1]:0").is_ok() {
+            assert!(log.logged(&format!("listening for inbound peers on port {} (IPv4 and IPv6)", port)), "{:?}", log.lines.lock().unwrap());
+            assert!(std::net::TcpStream::connect(("::1", port)).is_ok(), "and it is reachable over IPv6");
+        }
+
+        let dir = tmp_dir("v4-listener");
+        let mut services = Services::new();
+        let (_, log) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        assert!(log.logged(&format!("listening for inbound peers on port {}", services.announce_port(0))) && !log.logged("(IPv4 and IPv6)"), "--no-ipv6 keeps it to IPv4");
+    }
+
+    #[test]
+    fn on_a_shared_network_a_torrent_is_served_on_the_networks_port_and_gets_no_listener_of_its_own() {
+        use crate::session::network::tests::{handshake, no_dht, quiet_network};
+        let dir = tmp_dir("shared");
+        let network = quiet_network(crate::session::NetworkConfig { max_up: Some(5000), max_down: Some(6000), ..no_dht() });
+        let mut services = Services::shared(Arc::clone(&network));
+        let t = torrent();
+
+        // (`options.port` is 0: a listener of its own would be on some other port.)
+        let (prepared, log) = run_prepare(&t, &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        let prepared = prepared.expect("prepared");
+
+        assert_eq!(prepared.info.announce_port, network.port, "trackers are told the shared port");
+        assert_eq!(network.torrent_count(), 1);
+        assert_eq!(handshake(network.port, t.info_hash), Some(t.info_hash), "peers reach it there");
+        assert!(log.logged(&format!("listening for inbound peers on port {}", network.port)));
+        assert!(services.uploaded_counter().is_some());
+        drop(services);
+        assert_eq!(network.torrent_count(), 0, "and it is off the port once its services are gone");
+        network.shutdown();
+    }
+
+    #[test]
+    fn on_a_shared_network_the_torrents_own_limits_hold_as_parts_of_the_networks() {
+        use crate::session::network::tests::{no_dht, quiet_network};
+        let dir = tmp_dir("shared-limits");
+        let network = quiet_network(crate::session::NetworkConfig { max_up: Some(5000), max_down: Some(6000), ..no_dht() });
+
+        // With none of its own, the network's.
+        let mut services = Services::shared(Arc::clone(&network));
+        let (prepared, _) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        let prepared = prepared.expect("prepared");
+        assert!(Arc::ptr_eq(&services.seeder_up_limit().unwrap(), &network.up_limit().unwrap()));
+        assert!(Arc::ptr_eq(&prepared.workers.down_limit().unwrap(), &network.down_limit().unwrap()), "the same limiter, so that the torrents share the rate");
+        drop(services);
+
+        // With some of its own, those, and under the network's.
+        let mut opts = options(&dir);
+        (opts.max_up, opts.max_down) = (Some(1), Some(2));
+        let mut services = Services::shared(Arc::clone(&network));
+        let (prepared, _) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &opts, &mut services);
+        let prepared = prepared.expect("prepared");
+        let (up, down) = (services.seeder_up_limit().unwrap(), prepared.workers.down_limit().unwrap());
+        assert_eq!((up.bytes_per_sec(), down.bytes_per_sec()), (1, 2));
+        assert!(!Arc::ptr_eq(&up, &network.up_limit().unwrap()) && !Arc::ptr_eq(&down, &network.down_limit().unwrap()));
+        drop(services);
+
+        // Alone, the options' are what there is.
+        let mut alone = Services::new();
+        let (prepared, _) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &opts, &mut alone);
+        assert_eq!(prepared.unwrap().workers.down_limit().map(|l| l.bytes_per_sec()), Some(2));
+        assert_eq!(alone.seeder_up_limit().map(|l| l.bytes_per_sec()), Some(1));
+        network.shutdown();
+    }
+
+    #[test]
+    fn the_blocks_a_stopped_run_kept_are_given_back_to_the_queue_and_the_file_is_cleared() {
+        use crate::downloader::partial;
+        let dir = tmp_dir("partial-kept");
+        let t = torrent();
+        let path = partial::partial_file_path(&dir, &t.info_hash);
+        // Piece 1 has 256 bytes: one block, received. Piece 7 does not exist. Piece 2 is 88 bytes.
+        let one_block = |len: usize| {
+            let mut a = crate::downloader::PieceAssembler::new(crate::downloader::PieceWork { index: 0, hash: [0; 20], length: len as u32, merkle: None });
+            a.record_block(0, &vec![9u8; len]).unwrap();
+            a.into_partial().unwrap()
+        };
+        partial::save(&path, &[(1, one_block(256)), (7, one_block(256))]).unwrap();
+        let mut services = Services::new();
+
+        let (prepared, log) = run_prepare(&t, &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        let prepared = prepared.unwrap();
+
+        assert!(log.logged("resuming: 1 block(s) of unfinished pieces kept from the last run"), "{:?}", log.lines.lock().unwrap());
+        assert_eq!(prepared.queue.partials().iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![1], "the piece that is wanted, and not one that is not there");
+        assert!(!path.exists(), "the file is taken up: the run that follows writes it again as it ends");
+    }
+
+    #[test]
+    fn a_partial_file_that_is_not_one_is_ignored() {
+        let dir = tmp_dir("partial-junk");
+        let t = torrent();
+        std::fs::write(crate::downloader::partial::partial_file_path(&dir, &t.info_hash), b"junk").unwrap();
+        let mut services = Services::new();
+        let (prepared, log) = run_prepare(&t, &[true, true], vec![dead_addr()], &options(&dir), &mut services);
+        assert!(prepared.unwrap().queue.partials().is_empty());
+        assert!(!log.logged("resuming: "), "nothing was resumed");
     }
 }

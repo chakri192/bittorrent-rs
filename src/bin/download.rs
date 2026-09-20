@@ -17,6 +17,7 @@
 
 use bittorrent_rs::config::Config;
 use bittorrent_rs::magnet::parse_magnet_uri;
+use bittorrent_rs::session::env::{dht_bootstrap, lsd_config};
 use bittorrent_rs::session::{prepare, resolve_magnet, seed_limits, Ipv6Mode, MetadataConfig, Options, ProgressSink, SeedEnd, SeedLimits, Services};
 use bittorrent_rs::torrent;
 use bittorrent_rs::tracker::generate_peer_id;
@@ -29,7 +30,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Conventional BitTorrent port: preferred TCP listen port for the
 /// seeder and UDP bind for the DHT node (both fall back to ephemeral if
@@ -62,6 +63,12 @@ struct Args {
     retry_delay: Duration,
     /// Verify every piece on disk instead of trusting the resume file.
     recheck: bool,
+    /// Message stream encryption, if chosen.
+    encryption: Option<bittorrent_rs::peer::Encryption>,
+    /// TCP, uTP, or TCP with uTP as the second try.
+    transport: bittorrent_rs::peer::TransportMode,
+    /// BEP 12 tiers, or every tracker at once.
+    tracker_mode: bittorrent_rs::tracker_discovery::TrackerMode,
     /// Fetch pieces in order rather than rarest first.
     sequential: bool,
     /// Case-insensitive path substrings of files to fetch first.
@@ -82,8 +89,11 @@ struct Args {
     /// When to stop seeding on its own; unset means only when told to.
     seed_limits: SeedLimits,
     no_dht: bool,
+    no_lsd: bool,
     no_portmap: bool,
     no_webseed: bool,
+    /// Peers to try, given as `HOST:PORT` (`--peer`), before any tracker or the DHT has named one.
+    peers_hint: Vec<std::net::SocketAddr>,
     ipv6: Ipv6Mode,
     /// Case-insensitive path substrings selecting which files to download.
     only: Vec<String>,
@@ -91,6 +101,8 @@ struct Args {
     files_sel: Vec<usize>,
     /// Print the torrent's file list (with selection marks) and exit.
     list: bool,
+    /// Ask its trackers how many seeders and leechers it has (BEP 48) and exit.
+    scrape: bool,
     /// Explicit log path; `None` uses `<out_dir>/bittorrent-rs.log`.
     log: Option<PathBuf>,
     no_log: bool,
@@ -140,6 +152,10 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
     let mut retry_delay = Duration::from_secs(15);
     let mut recheck = false;
     let mut sequential = false;
+    let mut peers_hint: Vec<std::net::SocketAddr> = Vec::new();
+    let mut tracker_mode = cfg.tracker_mode.as_deref().map(|t| bittorrent_rs::tracker_discovery::TrackerMode::parse(t).ok_or_else(|| format!("config tracker_mode: {:?} is not tiered or concurrent", t))).transpose()?.unwrap_or_default();
+    let mut transport = cfg.transport.as_deref().map(|t| bittorrent_rs::peer::TransportMode::parse(t).ok_or_else(|| format!("config transport: {:?} is not tcp, utp or both", t))).transpose()?.unwrap_or_default();
+    let mut encryption = cfg.encryption.as_deref().map(bittorrent_rs::peer::Encryption::parse).transpose().map_err(|e| format!("config encryption: {}", e))?;
     let mut prefer: Vec<String> = Vec::new();
     let mut save_torrent = None;
     let mut json = false;
@@ -156,6 +172,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
     };
     let mut no_seed_flag = false;
     let mut no_dht = !cfg.dht.unwrap_or(true);
+    let mut no_lsd = !cfg.lsd.unwrap_or(true);
     let mut no_portmap = !cfg.portmap.unwrap_or(true);
     let mut no_webseed = !cfg.webseed.unwrap_or(true);
     let mut ipv6 = match cfg.ipv6.as_deref() {
@@ -166,6 +183,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
     let mut only: Vec<String> = Vec::new();
     let mut files_sel: Vec<usize> = Vec::new();
     let mut list = false;
+    let mut scrape = false;
     let mut log = cfg.log.clone();
     let mut no_log = false;
     let mut no_tui = !cfg.tui.unwrap_or(true);
@@ -186,6 +204,18 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
             }
             "--recheck" => recheck = true,
             "--sequential" => sequential = true,
+            "--encryption" => {
+                let v = argv.next().ok_or("--encryption requires off, prefer or require")?;
+                encryption = Some(bittorrent_rs::peer::Encryption::parse(&v).map_err(|e| format!("--encryption: {}", e))?);
+            }
+            "--transport" => {
+                let v = argv.next().ok_or("--transport requires tcp, utp or both")?;
+                transport = bittorrent_rs::peer::TransportMode::parse(&v).ok_or_else(|| format!("--transport: {:?} is not tcp, utp or both", v))?;
+            }
+            "--tracker-mode" => {
+                let v = argv.next().ok_or("--tracker-mode requires tiered or concurrent")?;
+                tracker_mode = bittorrent_rs::tracker_discovery::TrackerMode::parse(&v).ok_or_else(|| format!("--tracker-mode: {:?} is not tiered or concurrent", v))?;
+            }
             "--prefer" => prefer.push(argv.next().ok_or("--prefer requires a path substring")?),
             "--json" => json = true,
             "--verify" => verify = true,
@@ -229,9 +259,15 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
             }
             "--no-dht" => no_dht = true,
             "--dht" => no_dht = false,
+            "--no-lsd" => no_lsd = true,
+            "--lsd" => no_lsd = false,
             "--no-portmap" => no_portmap = true,
             "--portmap" => no_portmap = false,
             "--no-webseed" => no_webseed = true,
+            "--peer" => {
+                let v = argv.next().ok_or("--peer requires an address such as 192.0.2.5:6881 or [2001:db8::1]:6881")?;
+                peers_hint.push(v.parse().map_err(|_| format!("--peer: {:?} is not ADDRESS:PORT", v))?);
+            }
             "--webseed" => no_webseed = false,
             "--tui" => no_tui = false,
             // Consumed in the pre-scan (`load_config_from_args`); accepted
@@ -254,6 +290,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
                 }
             }
             "--list" => list = true,
+            "--scrape" => scrape = true,
             "--quiet" | "-q" => {
                 if verbosity == Verbosity::Verbose {
                     return Err("--quiet and --verbose are mutually exclusive".to_string());
@@ -273,6 +310,9 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
     if verify && list {
         return Err("--verify and --list are mutually exclusive".to_string());
     }
+    if scrape && (verify || list) {
+        return Err("--scrape cannot be combined with --verify or --list".to_string());
+    }
     if verify && source.starts_with("magnet:?") {
         return Err("--verify needs a .torrent file: a magnet link has no file list until its metadata has been fetched from the network".to_string());
     }
@@ -288,11 +328,11 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
         seed = true;
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, sequential, prefer, save_torrent, json, verify, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_portmap, no_webseed, ipv6, only, files_sel, list, log, no_log, no_tui })
+    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, encryption, transport, tracker_mode, sequential, prefer, save_torrent, json, verify, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_lsd, no_portmap, no_webseed, peers_hint, ipv6, only, files_sel, list, scrape, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--portmap | --no-portmap] [--webseed | --no-webseed] [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--verify] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--lsd | --no-lsd] [--portmap | --no-portmap] [--webseed | --no-webseed] [--peer ADDRESS:PORT]... [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--scrape] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--encryption off|prefer|require] [--transport tcp|utp|both] [--tracker-mode tiered|concurrent] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--verify] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -338,7 +378,7 @@ fn main() -> ExitCode {
 
     // `--list` is a quick print-and-exit; never spin up the dashboard for it.
     let json = args.json;
-    let interactive = !quiet && !json && !args.no_tui && !args.list && !args.verify && std::io::stdout().is_terminal();
+    let interactive = !quiet && !json && !args.no_tui && !args.list && !args.verify && !args.scrape && std::io::stdout().is_terminal();
     let stop = Arc::new(AtomicBool::new(false));
     // Ctrl-C and `kill` wind the client down like the dashboard's `q`, even
     // with no terminal: the port mapping is removed, not left on the router.
@@ -386,22 +426,127 @@ fn main() -> ExitCode {
     }
 }
 
+/// How long `--scrape` waits for the trackers before saying which have not answered.
+const SCRAPE_WAIT: Duration = Duration::from_secs(20);
+
+/// `--scrape`: asks every tracker of the torrent (its `.torrent` file's, or its magnet link's) how many seeders and leechers it has for
+/// it, and how many times it has been finished, and prints what comes back. It looks for no peer and fetches no metadata: only the info
+/// hash and the tracker URLs are needed.
+fn scrape_trackers(args: &Args, ui: &Ui) -> Result<String, String> {
+    let (name, info_hash, trackers) = if args.source.starts_with("magnet:?") {
+        let magnet = parse_magnet_uri(&args.source).map_err(|e| finish_err(ui, format!("parsing magnet uri: {}", e)))?;
+        let name = magnet.display_name.clone().unwrap_or_else(|| torrent::info_hash_hex(&magnet.info_hash));
+        (name, magnet.info_hash, magnet.trackers)
+    } else {
+        let bytes = fs::read(&args.source).map_err(|e| finish_err(ui, format!("reading {}: {}", args.source, e)))?;
+        let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| finish_err(ui, format!("parsing {}: {}", args.source, e)))?;
+        let mut trackers: Vec<String> = Vec::new();
+        for url in torrent.tracker_tiers().into_iter().flatten() {
+            if !trackers.contains(&url) {
+                trackers.push(url);
+            }
+        }
+        (torrent.name.clone(), torrent.info_hash, trackers)
+    };
+    if trackers.is_empty() {
+        return Err(finish_err(ui, "the torrent names no tracker to ask".to_string()));
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    for url in &trackers {
+        let (url, tx) = (url.clone(), tx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((url.clone(), bittorrent_rs::tracker::scrape::scrape(&url, &info_hash).map_err(|e| e.to_string())));
+        });
+    }
+    drop(tx);
+    let deadline = Instant::now() + SCRAPE_WAIT;
+    let mut answers: Vec<(String, Result<bittorrent_rs::tracker::scrape::ScrapeStats, String>)> = Vec::new();
+    while answers.len() < trackers.len() {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
+        match rx.recv_timeout(left) {
+            Ok(answer) => answers.push(answer),
+            Err(_) => break,
+        }
+    }
+    // In the order the torrent lists them, with those that said nothing at the end of it.
+    let mut lines = Vec::new();
+    let mut answered = 0;
+    for url in &trackers {
+        let result = answers.iter().find(|(asked, _)| asked == url).map(|(_, result)| result.clone()).unwrap_or_else(|| Err(format!("no answer in {} seconds", SCRAPE_WAIT.as_secs())));
+        let line = match &result {
+            Ok(stats) => {
+                answered += 1;
+                bittorrent_rs::json::Object::new().string("event", "scrape").string("tracker", url).boolean("ok", true).uint("seeders", stats.complete.into()).uint("leechers", stats.incomplete.into()).uint("completed", stats.downloaded.into()).finish()
+            }
+            Err(why) => bittorrent_rs::json::Object::new().string("event", "scrape").string("tracker", url).boolean("ok", false).string("error", why).finish(),
+        };
+        lines.push((url.clone(), result, line));
+    }
+    let text = {
+        let mut out = format!("{} \u{2014} {} tracker(s) asked, {} answered:\n", name, trackers.len(), answered);
+        for (url, result, _) in &lines {
+            match result {
+                Ok(stats) => out.push_str(&format!("  {}  {} seeder(s), {} leecher(s), {} completed\n", url, stats.complete, stats.incomplete, stats.downloaded)),
+                Err(why) => out.push_str(&format!("  {}  {}\n", url, why)),
+            }
+        }
+        out
+    };
+    if args.json {
+        for (_, _, line) in lines {
+            ui.event(line);
+        }
+    }
+    if answered == 0 {
+        return Err(finish_err(ui, format!("no tracker answered:\n{}", text.trim_end())));
+    }
+    ui.finish(Ok(if args.json { format!("{} of {} tracker(s) answered", answered, trackers.len()) } else { text.clone() }));
+    Ok(text)
+}
+
+/// Whether the DHT gets an IPv6 node (BEP 32): when peers over IPv6 are wanted,
+/// as `--ipv6` and `--no-ipv6` and a probe for a route decide.
+fn dht_ipv6(args: &Args) -> bool {
+    match args.ipv6 {
+        bittorrent_rs::session::Ipv6Mode::Always => true,
+        bittorrent_rs::session::Ipv6Mode::Never => false,
+        bittorrent_rs::session::Ipv6Mode::Auto => bittorrent_rs::session::has_ipv6_egress(),
+    }
+}
+
+/// Asks peers for the piece layers a v2 torrent lacks (BEP 52), until it has them or gives up.
+fn fetch_layers_if_missing(torrent: &mut torrent::TorrentFile, bootstrap_peers: &[std::net::SocketAddr], services: &Services, args: &Args, our_peer_id: [u8; 20], ui: &Ui, stop: &AtomicBool) -> Result<(), String> {
+    use bittorrent_rs::session::layers::{complete_torrent, Discovery, LayerConfig, LAYER_BUDGET};
+    let transport = bittorrent_rs::peer::Transport { mode: if services.utp().is_some() { args.transport } else { Default::default() }, utp: services.utp() };
+    let config = LayerConfig { our_peer_id, timeout: CONNECT_TIMEOUT, encryption: args.encryption.unwrap_or_default(), transport };
+    let discovery = Discovery { bootstrap: bootstrap_peers.to_vec(), dht: services.dht(), trackers: torrent.tracker_tiers(), announce_port: args.port };
+    complete_torrent(torrent, discovery, &config, LAYER_BUDGET, stop, &|m| ui.log(m))
+}
+
 /// The whole download, start to finish, publishing to `ui`. Returns a
 /// human-readable completion summary (`Ok`) or a failure reason (`Err`);
 /// either way it also calls `ui.finish` so the dashboard can wind down
 /// (except in `--seed` mode, which keeps the UI live until the user
 /// quits via `stop`).
 fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String> {
+    if args.scrape {
+        return scrape_trackers(&args, ui);
+    }
     let our_peer_id = generate_peer_id();
 
     // Dropping `services` (including on any early `return Err`) stops the
     // DHT, the listener and the port mapping.
     let mut services = Services::new();
 
-    let (torrent, bootstrap_peers) = if args.source.starts_with("magnet:?") {
-        let magnet = parse_magnet_uri(&args.source).map_err(|e| finish_err(ui, format!("parsing magnet uri: {}", e)))?;
+    let (mut torrent, bootstrap_peers, link_selection) = if args.source.starts_with("magnet:?") {
+        let mut magnet = parse_magnet_uri(&args.source).map_err(|e| finish_err(ui, format!("parsing magnet uri: {}", e)))?;
+        magnet.peers.extend(args.peers_hint.iter().copied());
+        if args.transport.wants_utp() {
+            services.start_utp(args.port, |m| ui.log(m));
+        }
         if !args.no_dht {
-            services.start_dht(args.port, magnet.info_hash, |m| ui.log(m));
+            services.start_dht(args.port, magnet.info_hash, dht_ipv6(&args), dht_bootstrap(), |m| ui.log(m));
         }
         if magnet.trackers.is_empty() && magnet.peers.is_empty() && services.dht().is_none() {
             return Err(finish_err(ui, "magnet link has no trackers or peers and DHT is disabled (--no-dht) -- no way to find any peer".to_string()));
@@ -409,7 +554,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         if let Some(name) = &magnet.display_name {
             ui.set_title(name.clone());
         }
-        let metadata = MetadataConfig { budget: METADATA_RESOLVE_BUDGET, parallelism: METADATA_PARALLELISM, connect_timeout: CONNECT_TIMEOUT };
+        let metadata = MetadataConfig { budget: METADATA_RESOLVE_BUDGET, parallelism: METADATA_PARALLELISM, connect_timeout: CONNECT_TIMEOUT, encryption: args.encryption.unwrap_or_default(), transport: bittorrent_rs::peer::Transport { mode: if services.utp().is_some() { args.transport } else { Default::default() }, utp: services.utp() } };
         let (torrent, peers) = resolve_magnet(&magnet, our_peer_id, args.port, services.dht(), &metadata, ui, stop).map_err(|e| finish_err(ui, e))?;
         // The DHT had to run to fetch the metadata, since a magnet link
         // doesn't say whether the torrent is private until the info dict
@@ -418,17 +563,25 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         if torrent.private {
             services.stop_dht();
         }
-        (torrent, peers)
+        // BEP 53's `so`, counted from 1 as `--files` counts.
+        (torrent, peers, magnet.select_only.iter().map(|index| index + 1).collect::<Vec<usize>>())
     } else {
         let bytes = fs::read(&args.source).map_err(|e| finish_err(ui, format!("reading {}: {}", args.source, e)))?;
         let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| finish_err(ui, format!("parsing {}: {}", args.source, e)))?;
         // A `.torrent` already carries the file list, so `--list` needs no
         // network at all.
-        if !args.no_dht && !args.list && !args.verify && !torrent.private {
-            services.start_dht(args.port, torrent.info_hash, |m| ui.log(m));
+        if args.transport.wants_utp() && !args.list && !args.verify {
+            services.start_utp(args.port, |m| ui.log(m));
         }
-        (torrent, Vec::new())
+        if !args.no_dht && !args.list && !args.verify && !torrent.private {
+            services.start_dht(args.port, torrent.info_hash, dht_ipv6(&args), dht_bootstrap(), |m| ui.log(m));
+        }
+        (torrent, args.peers_hint.clone(), Vec::new())
     };
+    // A v2 torrent that does not carry its piece layers (a magnet link's never does) gets them from peers.
+    if torrent.is_v2_only() && !torrent.v2_ready() && !args.list && !args.verify {
+        fetch_layers_if_missing(&mut torrent, &bootstrap_peers, &services, &args, our_peer_id, ui, stop).map_err(|e| finish_err(ui, e))?;
+    }
     if let Some(path) = &args.save_torrent {
         bittorrent_rs::create::save_torrent(&torrent, path).map_err(|e| finish_err(ui, format!("--save-torrent: {}", e)))?;
         ui.log(format!("saved the torrent to {}", path.display()));
@@ -443,15 +596,23 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
 
     // File selection (--only / --files). `--list` prints the file table
     // and exits without downloading anything.
-    let mask = bittorrent_rs::selection::build_mask(&torrent.files, &args.files_sel, &args.only).map_err(|e| finish_err(ui, e))?;
+    // A magnet link's `so` (BEP 53) says which files it is for; what was asked for on the command line overrides it.
+    let files_sel = if args.files_sel.is_empty() && args.only.is_empty() && !link_selection.is_empty() {
+        ui.log(format!("the magnet link selects file(s) {} (so=)", link_selection.iter().map(usize::to_string).collect::<Vec<_>>().join(",")));
+        link_selection
+    } else {
+        args.files_sel.clone()
+    };
+    let mask = bittorrent_rs::selection::build_mask_for(&torrent, &files_sel, &args.only).map_err(|e| finish_err(ui, e))?;
     if args.list {
-        let listing = bittorrent_rs::selection::format_list(&torrent.name, &torrent.files, &mask);
+        let (visible, visible_mask) = (torrent.visible_files(), torrent.visible_mask(&mask));
+        let listing = bittorrent_rs::selection::format_list(&torrent.name, &visible, &visible_mask);
         services.shutdown();
         if args.json {
-            for line in bittorrent_rs::selection::list_events(&torrent.files, &mask) {
+            for line in bittorrent_rs::selection::list_events(&visible, &visible_mask) {
                 ui.event(line);
             }
-            ui.finish(Ok(format!("{} file(s)", torrent.files.len())));
+            ui.finish(Ok(format!("{} file(s)", visible.len())));
         } else {
             ui.finish(Ok(listing.clone()));
         }
@@ -468,13 +629,17 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         reannounce_override: args.reannounce_override.map(Duration::from_secs),
         retry_delay: args.retry_delay,
         recheck: args.recheck,
+        encryption: args.encryption,
+        transport: args.transport,
+        tracker_mode: args.tracker_mode,
         sequential: args.sequential,
-        prefer: bittorrent_rs::selection::build_prefer_mask(&torrent.files, &args.prefer).map_err(|e| finish_err(ui, e))?,
+        prefer: bittorrent_rs::selection::build_prefer_mask_for(&torrent, &args.prefer).map_err(|e| finish_err(ui, e))?,
         max_down: args.max_down,
         max_up: args.max_up,
         ipv6: args.ipv6,
         no_portmap: args.no_portmap,
         no_webseed: args.no_webseed,
+        lsd: (!args.no_lsd).then(lsd_config),
         timeout: args.timeout,
         pipeline_depth: PIPELINE_DEPTH,
         connect_timeout: CONNECT_TIMEOUT,
@@ -547,7 +712,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
 fn verify_files(torrent: &torrent::TorrentFile, mask: &[bool], args: &Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String> {
     use bittorrent_rs::ui::Snapshot;
     let base_dir = if torrent.multi_file { args.out_dir.join(&torrent.name) } else { args.out_dir.clone() };
-    let (_, wanted_bytes) = bittorrent_rs::selection::selected_pieces(&torrent.files, torrent.piece_length as u64, mask);
+    let (_, wanted_bytes) = bittorrent_rs::selection::selected_pieces_of(torrent, mask);
     ui.log(format!("verifying {} against {}", torrent.name, base_dir.display()));
     let mut last_shown = 0;
     let report = bittorrent_rs::session::verify::verify(torrent, mask, &base_dir, |checked, of| {
@@ -596,6 +761,74 @@ mod tests {
         assert!(parse(&Config::default(), &["x"]).unwrap().prefer.is_empty());
         assert_eq!(parse(&Config::default(), &["x", "--prefer", ".nfo", "--prefer", "ep1"]).unwrap().prefer, vec![".nfo".to_string(), "ep1".to_string()]);
         assert!(parse(&Config::default(), &["x", "--prefer"]).err().unwrap().contains("requires"));
+    }
+
+    #[test]
+    fn local_discovery_is_on_unless_the_flag_or_config_says_otherwise_and_the_flag_wins() {
+        assert!(!parse(&Config::default(), &["x"]).unwrap().no_lsd, "on by default");
+        assert!(parse(&Config::default(), &["x", "--no-lsd"]).unwrap().no_lsd);
+        let off = cfg_from("lsd = false");
+        assert!(parse(&off, &["x"]).unwrap().no_lsd);
+        assert!(!parse(&off, &["x", "--lsd"]).unwrap().no_lsd, "the flag wins over the config");
+        assert!(!parse(&cfg_from("lsd = true"), &["x"]).unwrap().no_lsd);
+        assert!(!parse(&Config::default(), &["x", "--no-dht"]).unwrap().no_lsd, "and it is not the same switch as the DHT's");
+    }
+
+    #[test]
+    fn transport_is_chosen_by_flag_or_config_and_the_flag_wins() {
+        use bittorrent_rs::peer::TransportMode;
+        assert_eq!(parse(&Config::default(), &["x"]).unwrap().transport, TransportMode::Tcp, "TCP unless asked");
+        assert_eq!(parse(&Config::default(), &["x", "--transport", "utp"]).unwrap().transport, TransportMode::Utp);
+        let cfg = cfg_from("transport = \"both\"");
+        assert_eq!(parse(&cfg, &["x"]).unwrap().transport, TransportMode::Both);
+        assert_eq!(parse(&cfg, &["x", "--transport", "tcp"]).unwrap().transport, TransportMode::Tcp);
+        assert!(parse(&Config::default(), &["x", "--transport", "udp"]).err().unwrap().starts_with("--transport:"));
+        assert!(parse(&Config::default(), &["x", "--transport"]).err().unwrap().contains("requires"));
+        assert!(parse(&cfg_from("transport = \"udp\""), &["x"]).err().unwrap().starts_with("config transport:"));
+    }
+
+    #[test]
+    fn trackers_are_asked_by_tier_unless_the_flag_or_config_says_concurrent_and_the_flag_wins() {
+        use bittorrent_rs::tracker_discovery::TrackerMode;
+        assert_eq!(parse(&Config::default(), &["x"]).unwrap().tracker_mode, TrackerMode::Tiered, "BEP 12 unless asked");
+        assert_eq!(parse(&Config::default(), &["x", "--tracker-mode", "concurrent"]).unwrap().tracker_mode, TrackerMode::Concurrent);
+        let cfg = cfg_from("tracker_mode = \"concurrent\"");
+        assert_eq!(parse(&cfg, &["x"]).unwrap().tracker_mode, TrackerMode::Concurrent);
+        assert_eq!(parse(&cfg, &["x", "--tracker-mode", "tiered"]).unwrap().tracker_mode, TrackerMode::Tiered);
+        assert!(parse(&Config::default(), &["x", "--tracker-mode", "all"]).err().unwrap().starts_with("--tracker-mode:"));
+        assert!(parse(&Config::default(), &["x", "--tracker-mode"]).err().unwrap().contains("requires"));
+        assert!(parse(&cfg_from("tracker_mode = \"all\""), &["x"]).err().unwrap().starts_with("config tracker_mode:"));
+    }
+
+    #[test]
+    fn peers_can_be_named_on_the_command_line() {
+        assert!(parse(&Config::default(), &["x"]).unwrap().peers_hint.is_empty());
+        let args = parse(&Config::default(), &["x", "--peer", "192.0.2.5:6881", "--peer", "[2001:db8::1]:7000"]).unwrap();
+        assert_eq!(args.peers_hint, vec!["192.0.2.5:6881".parse().unwrap(), "[2001:db8::1]:7000".parse().unwrap()]);
+        assert!(parse(&Config::default(), &["x", "--peer", "example.com:6881"]).err().unwrap().starts_with("--peer:"), "an address, not a name");
+        assert!(parse(&Config::default(), &["x", "--peer", "1.2.3.4"]).err().unwrap().starts_with("--peer:"), "with its port");
+        assert!(parse(&Config::default(), &["x", "--peer"]).err().unwrap().contains("requires"));
+    }
+
+    #[test]
+    fn encryption_is_chosen_by_flag_or_config_and_the_flag_wins() {
+        use bittorrent_rs::peer::Encryption;
+        assert_eq!(parse(&Config::default(), &["x"]).unwrap().encryption, None, "unset: plain out, either in");
+        assert_eq!(parse(&Config::default(), &["x", "--encryption", "require"]).unwrap().encryption, Some(Encryption::Require));
+        let cfg = cfg_from("encryption = \"prefer\"");
+        assert_eq!(parse(&cfg, &["x"]).unwrap().encryption, Some(Encryption::Prefer));
+        assert_eq!(parse(&cfg, &["x", "--encryption", "off"]).unwrap().encryption, Some(Encryption::Off));
+        assert!(parse(&Config::default(), &["x", "--encryption", "maybe"]).err().unwrap().starts_with("--encryption:"));
+        assert!(parse(&Config::default(), &["x", "--encryption"]).err().unwrap().contains("requires"));
+        assert!(parse(&cfg_from("encryption = \"maybe\""), &["x"]).err().unwrap().starts_with("config encryption:"));
+    }
+
+    #[test]
+    fn scrape_is_off_unless_asked_for_and_cannot_be_combined_with_list_or_verify() {
+        assert!(!parse(&Config::default(), &["x"]).unwrap().scrape);
+        assert!(parse(&Config::default(), &["x", "--scrape"]).unwrap().scrape);
+        assert!(parse(&Config::default(), &["x", "--scrape", "--list"]).err().unwrap().contains("--scrape"));
+        assert!(parse(&Config::default(), &["x", "--verify", "--scrape"]).err().unwrap().contains("--scrape"));
     }
 
     #[test]

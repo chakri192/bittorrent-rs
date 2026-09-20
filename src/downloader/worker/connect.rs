@@ -1,14 +1,28 @@
 //! Getting a connection ready to download from.
 
-use super::{absorb, is_read_timeout, PexSender, Registration, WorkerConfig, WorkerError};
+use super::messages::{keep_serving, take};
+use super::{is_read_timeout, PexSender, Registration, WorkerConfig, WorkerError};
+use crate::serving::Serving;
 use crate::downloader::queue::WorkQueue;
-use crate::peer::{connect_and_handshake, ConnectionError, ExtendedHandshake, Message, PeerState, WireError};
+use crate::peer::{connect_and_handshake_with, ConnectionError, ExtendedHandshake, Message, PeerState, WireError};
 use crate::peer::PeerStream;
 use std::net::SocketAddr;
 
 /// How many read timeouts in a row to sit through while waiting for the
 /// peer to unchoke us before giving up on it.
 pub(super) const MAX_UNCHOKE_WAIT_TIMEOUTS: u32 = 6;
+
+/// A connection that is ready for block requests, and what goes with it.
+#[derive(Debug)]
+pub(super) struct Established<'a> {
+    pub(super) stream: Box<dyn PeerStream>,
+    /// What is known of the peer.
+    pub(super) state: PeerState,
+    /// The upload side of the connection, if there is a listener to serve from.
+    pub(super) serving: Option<Serving>,
+    /// Held as long as the connection is used: dropping it is what lets the connection close.
+    pub(super) registration: Registration<'a>,
+}
 
 /// Connects to `peer_addr`, does the BitTorrent handshake and (if the peer
 /// supports it) the extended one, tells the peer we are interested, and
@@ -21,9 +35,9 @@ pub(super) const MAX_UNCHOKE_WAIT_TIMEOUTS: u32 = 6;
 /// The connection is registered with the config's interrupt, so stopping
 /// the client can end the wait; the returned [`Registration`] must be kept
 /// as long as the connection is used.
-pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, queue: &WorkQueue, pex_tx: Option<&PexSender>) -> Result<(Box<dyn PeerStream>, PeerState, Registration<'a>), WorkerError> {
-    let (mut stream, peer_handshake) =
-        connect_and_handshake(peer_addr, config.info_hash, config.our_peer_id, true, config.connect_timeout).map_err(|e| WorkerError::Connection { stage: "connect_and_handshake", error: e })?;
+pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, queue: &WorkQueue, pex_tx: Option<&PexSender>) -> Result<Established<'a>, WorkerError> {
+    let (mut stream, peer_handshake) = connect_and_handshake_with(peer_addr, config.info_hash, config.our_peer_id, true, true, config.connect_timeout, config.encryption, &config.transport)
+        .map_err(|e| WorkerError::Connection { stage: "connect_and_handshake", error: e })?;
 
     // Registered before anything else is read, so that stopping the client
     // ends a worker that is waiting on this peer instead of waiting it out.
@@ -31,36 +45,56 @@ pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, que
 
     let mut state = PeerState::for_torrent(queue.total_pieces());
     state.supports_extensions = peer_handshake.supports_extensions();
+    // We always offer the Fast Extension (BEP 6), so it is in use when the peer does.
+    state.fast = peer_handshake.supports_fast();
+
+    // What we have is the first thing said, as BEP 3 has it, when there is a listener to serve it from: the peer
+    // may then ask for pieces on this connection, and is served as on any other.
+    let mut serving = match &config.upload {
+        Some(upload) => Some(Serving::begin(upload, &peer_handshake, Some(peer_addr.ip()), &mut *stream, false).map_err(|e| WorkerError::Connection { stage: "greet_peer", error: ConnectionError::Io(e) })?),
+        None => None,
+    };
 
     if state.supports_extensions {
         // BEP 10 extended handshake, sent first thing after the BT
-        // handshake per convention. Advertises ut_pex (and ut_metadata,
-        // though piece workers never serve metadata) so peers know they
-        // can push us PEX updates -- but only when a `pex_tx` exists to
+        // handshake per convention. Advertises ut_pex (and ut_metadata, with
+        // its size when the info dictionary is being served) so peers know
+        // they can push us PEX updates -- but only when a `pex_tx` exists to
         // receive them. The caller passes `None` for private torrents
         // (BEP 27), and advertising PEX we'd then discard is pointless.
-        crate::peer::connection::send_message(&mut stream, &Message::Extended { id: 0, payload: ExtendedHandshake::build_with_pex(1, None, pex_tx.is_some()) })
+        let metadata_size = serving.as_ref().and_then(Serving::metadata_size);
+        crate::peer::connection::send_message(&mut stream, &Message::Extended { id: 0, payload: ExtendedHandshake::build_with_pex(1, metadata_size, pex_tx.is_some()) })
             .map_err(|e| WorkerError::Connection { stage: "send_extended_handshake", error: e })?;
     }
 
     crate::peer::connection::send_message(&mut stream, &Message::Interested).map_err(|e| WorkerError::Connection { stage: "send_interested", error: e })?;
     state.am_interested = true;
 
-    // Drain messages until unchoked or the peer disconnects. Bitfield/
-    // Have/Extended messages that arrive in the meantime update `state`
-    // (and the shared rarity tracker / PEX feed) as a side effect.
-    //
-    // Read timeouts here are NOT fatal: many clients unchoke lazily
-    // (choke-algorithm rounds run every 10-30s), so with a 10s read
-    // timeout the first read can legitimately time out several times in
-    // a row against a perfectly good peer. Bounded so a peer that never
-    // unchokes still frees its slot: with the default 10s read timeout
-    // this waits up to ~60s, roughly two choke-algorithm rounds.
+    wait_for_unchoke(&mut *stream, &mut state, queue, pex_tx, &mut serving)?;
+
+    Ok(Established { stream, state, serving, registration })
+}
+
+/// Drains messages until the peer unchokes us, or names a piece we may fetch while choked, or disconnects.
+/// Bitfield/Have/Extended messages that arrive in the meantime update `state` (and the shared rarity tracker / PEX feed) as a side
+/// effect, and what the peer asks of us is served.
+///
+/// Read timeouts here are NOT fatal: many clients unchoke lazily
+/// (choke-algorithm rounds run every 10-30s), so with a 10s read
+/// timeout the first read can legitimately time out several times in
+/// a row against a perfectly good peer. Bounded so a peer that never
+/// unchokes still frees its slot: with the default 10s read timeout
+/// this waits up to ~60s, roughly two choke-algorithm rounds.
+///
+/// With the Fast Extension the wait can end early: a peer that names a
+/// piece as allowed-fast is one we can start on while still choked.
+pub(super) fn wait_for_unchoke(stream: &mut dyn PeerStream, state: &mut PeerState, queue: &WorkQueue, pex_tx: Option<&PexSender>, serving: &mut Option<Serving>) -> Result<(), WorkerError> {
     let mut unchoke_timeouts = 0u32;
-    while state.peer_choking {
-        match crate::peer::connection::read_message(&mut stream) {
+    while state.peer_choking && !state.has_allowed_pieces() {
+        keep_serving(serving, &mut *stream)?;
+        match crate::peer::connection::read_message(&mut *stream) {
             Ok(msg) => {
-                absorb(&msg, &mut state, queue, pex_tx);
+                take(&msg, state, queue, pex_tx, serving, &mut *stream)?;
             }
             Err(ref e) if is_read_timeout(e) => {
                 unchoke_timeouts += 1;
@@ -72,13 +106,12 @@ pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, que
                 }
                 // Show liveness so the peer's own idle-timeout doesn't
                 // reap us while we politely wait out its choke round.
-                crate::peer::connection::send_message(&mut stream, &Message::KeepAlive).map_err(|e| WorkerError::Connection { stage: "keepalive_during_unchoke_wait", error: e })?;
+                crate::peer::connection::send_message(&mut *stream, &Message::KeepAlive).map_err(|e| WorkerError::Connection { stage: "keepalive_during_unchoke_wait", error: e })?;
             }
             Err(e) => return Err(WorkerError::Connection { stage: "wait_for_unchoke", error: e }),
         }
     }
-
-    Ok((stream, state, registration))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -96,11 +129,11 @@ mod tests {
     const INFO_HASH: [u8; 20] = [0x42; 20];
 
     fn config() -> WorkerConfig {
-        WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default() }
+        WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None }
     }
 
     fn queue(pieces: usize) -> WorkQueue {
-        WorkQueue::new((0..pieces).map(|i| PieceWork { index: i as u32, hash: [0; 20], length: 16 }).collect(), pieces)
+        WorkQueue::new((0..pieces).map(|i| PieceWork { index: i as u32, hash: [0; 20], length: 16, merkle: None }).collect(), pieces)
     }
 
     /// A peer that completes the handshake (advertising BEP 10 support or
@@ -140,7 +173,7 @@ mod tests {
         });
 
         let config = config();
-        let (_stream, state, _registration) = establish(addr, &config, &queue(1), None).expect("connected and unchoked");
+        let Established { state, .. } = establish(addr, &config, &queue(1), None).expect("connected and unchoked");
 
         seen_rx.try_recv().expect("the peer received Interested before it unchoked us");
         assert!(!state.peer_choking);
@@ -180,7 +213,7 @@ mod tests {
         });
 
         let config = config();
-        let (_stream, state, _registration) = establish(addr, &config, &queue(4), None).unwrap();
+        let Established { state, .. } = establish(addr, &config, &queue(4), None).unwrap();
 
         assert_eq!(&state.peer_has_pieces[..4], &[false, true, true, false], "the bitfield sent before the unchoke was kept");
     }
@@ -214,7 +247,7 @@ mod tests {
         });
 
         let config = config();
-        let (_stream, state, _registration) = establish(addr, &config, &queue(4), None).unwrap();
+        let Established { state, .. } = establish(addr, &config, &queue(4), None).unwrap();
 
         assert_eq!(state.peer_has_pieces.len(), 4, "the torrent has 4 pieces, whatever the peer claims");
     }

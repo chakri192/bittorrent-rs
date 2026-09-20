@@ -6,7 +6,7 @@
 //! backpressure: the peer's TCP window fills and it slows down.
 
 use crate::sync::lock;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,9 @@ pub struct RateLimiter {
     bytes_per_sec: f64,
     burst: f64,
     state: Mutex<State>,
+    /// A limiter this one answers to: what moves through this moves through that too, and
+    /// waits for whichever says longer.
+    parent: Option<Arc<RateLimiter>>,
 }
 
 impl RateLimiter {
@@ -30,7 +33,14 @@ impl RateLimiter {
     /// bucket.
     pub fn new(bytes_per_sec: u64) -> Self {
         let rate = bytes_per_sec.max(1) as f64;
-        RateLimiter { bytes_per_sec: rate, burst: rate, state: Mutex::new(State { tokens: rate, last: Instant::now() }) }
+        RateLimiter { bytes_per_sec: rate, burst: rate, state: Mutex::new(State { tokens: rate, last: Instant::now() }), parent: None }
+    }
+
+    /// A limiter of `bytes_per_sec` for part of what `parent` limits: one torrent's share of a
+    /// client-wide limit. Both hold, so the part is limited by its own rate and by whatever is
+    /// left of the whole's.
+    pub fn under(bytes_per_sec: u64, parent: Arc<RateLimiter>) -> Self {
+        RateLimiter { parent: Some(parent), ..RateLimiter::new(bytes_per_sec) }
     }
 
     /// The configured rate.
@@ -51,10 +61,11 @@ impl RateLimiter {
         state.last = state.last.max(now);
         state.tokens = (state.tokens + elapsed * self.bytes_per_sec).min(self.burst);
         state.tokens -= n as f64;
-        if state.tokens >= 0.0 {
-            Duration::ZERO
-        } else {
-            Duration::from_secs_f64(-state.tokens / self.bytes_per_sec)
+        let own = if state.tokens >= 0.0 { Duration::ZERO } else { Duration::from_secs_f64(-state.tokens / self.bytes_per_sec) };
+        drop(state);
+        match &self.parent {
+            Some(parent) => own.max(parent.reserve(n, now)),
+            None => own,
         }
     }
 
@@ -103,6 +114,40 @@ mod tests {
 
     fn secs(n: f64) -> Duration {
         Duration::from_secs_f64(n)
+    }
+
+    #[test]
+    fn a_part_of_a_limit_waits_for_the_longer_of_its_own_and_the_wholes() {
+        let t0 = Instant::now();
+        // The part is slower than the whole: its own rate rules.
+        let whole = Arc::new(RateLimiter::new(10_000));
+        let part = RateLimiter::under(1000, Arc::clone(&whole));
+        part.reserve(1000, t0);
+        let wait = part.reserve(500, t0);
+        assert!((wait.as_secs_f64() - 0.5).abs() < 1e-6, "{:?}", wait);
+
+        // The whole is slower than the part: it rules, though the part alone would let it through.
+        let whole = Arc::new(RateLimiter::new(1000));
+        let part = RateLimiter::under(10_000, Arc::clone(&whole));
+        part.reserve(1000, t0);
+        let wait = part.reserve(500, t0);
+        assert!((wait.as_secs_f64() - 0.5).abs() < 1e-6, "{:?}", wait);
+    }
+
+    #[test]
+    fn parts_of_a_limit_share_it_between_them() {
+        let t0 = Instant::now();
+        let whole = Arc::new(RateLimiter::new(1000));
+        let (a, b) = (RateLimiter::under(1000, Arc::clone(&whole)), RateLimiter::under(1000, Arc::clone(&whole)));
+        assert_eq!(a.reserve(1000, t0), Duration::ZERO, "the first has the whole burst");
+        let wait = b.reserve(500, t0);
+        assert!((wait.as_secs_f64() - 0.5).abs() < 1e-6, "the second finds it used: {:?}", wait);
+    }
+
+    #[test]
+    fn a_limit_with_no_parent_is_as_it_was() {
+        let l = RateLimiter::new(1000);
+        assert!(l.parent.is_none());
     }
 
     #[test]

@@ -231,6 +231,23 @@ impl PortMap {
     }
 }
 
+#[cfg(test)]
+impl PortMap {
+    /// A mapping that touches no router: it runs `on_stop` when it is stopped, which is when a real
+    /// one would take the mapping off the router.
+    pub(crate) fn fake(on_stop: impl FnOnce() + Send + 'static) -> PortMap {
+        let stop = Arc::new(AtomicBool::new(false));
+        let watching = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !watching.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            on_stop();
+        });
+        PortMap { stop, handle: Some(handle) }
+    }
+}
+
 /// Spawns the mapping thread and returns immediately (discovery can take a
 /// few seconds and must not stall startup). `log` receives human-readable
 /// progress/results. Returns `None` only if there's no usable LAN IPv4 at

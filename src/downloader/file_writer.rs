@@ -15,6 +15,9 @@ pub struct FileSpan {
     pub start: u64,
     /// Global byte offset (exclusive) where this file ends.
     pub end: u64,
+    /// A BEP 47 padding file: its bytes are zeros that count in the piece
+    /// hashes but are held by no file on disk.
+    pub padding: bool,
 }
 
 /// Builds the file-span table from `TorrentFile::files`, rooted at
@@ -22,13 +25,36 @@ pub struct FileSpan {
 /// torrents, or `base_dir/torrent.name` for single-file -- both cases are
 /// already expressed by `TorrentFile::files`' path components).
 pub fn build_file_spans(base_dir: &Path, files: &[(Vec<String>, i64)]) -> Vec<FileSpan> {
+    build_file_spans_padded(base_dir, files, &[])
+}
+
+/// [`build_file_spans`] for a torrent with BEP 47 padding files: `padding[i]`
+/// says the i-th file is one (a missing entry means it is not). A padding span
+/// takes its share of the byte space but is never read from or written to disk.
+pub fn build_file_spans_padded(base_dir: &Path, files: &[(Vec<String>, i64)], padding: &[bool]) -> Vec<FileSpan> {
+    let mut spans = Vec::with_capacity(files.len());
+    let mut cursor: u64 = 0;
+    for (index, (path_parts, length)) in files.iter().enumerate() {
+        let path = path_parts.iter().fold(base_dir.to_path_buf(), |p, part| p.join(part));
+        let len = *length as u64;
+        spans.push(FileSpan { path, start: cursor, end: cursor + len, padding: padding.get(index).copied().unwrap_or(false) });
+        cursor += len;
+    }
+    spans
+}
+
+/// [`build_file_spans`] for a BitTorrent v2 torrent (BEP 52), in which each
+/// file begins on a piece boundary of the torrent's flat byte space and the
+/// space between the end of one file and the next piece boundary belongs to no
+/// file. A piece never spans two files, so the gaps are never read or written.
+pub fn build_file_spans_aligned(base_dir: &Path, files: &[(Vec<String>, i64)], piece_length: u64) -> Vec<FileSpan> {
     let mut spans = Vec::with_capacity(files.len());
     let mut cursor: u64 = 0;
     for (path_parts, length) in files {
         let path = path_parts.iter().fold(base_dir.to_path_buf(), |p, part| p.join(part));
         let len = *length as u64;
-        spans.push(FileSpan { path, start: cursor, end: cursor + len });
-        cursor += len;
+        spans.push(FileSpan { path, start: cursor, end: cursor + len, padding: false });
+        cursor = (cursor + len).next_multiple_of(piece_length.max(1));
     }
     spans
 }
@@ -57,6 +83,12 @@ pub fn write_at_global_offset(spans: &[FileSpan], global_offset: u64, data: &[u8
         let available_in_file = span.end - offset;
         let chunk_len = (remaining.len() as u64).min(available_in_file) as usize;
 
+        if span.padding {
+            // Zeros no file holds: there is nothing to write, and no file to create.
+            offset += chunk_len as u64;
+            remaining = &remaining[chunk_len..];
+            continue;
+        }
         if let Some(parent) = span.path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -82,7 +114,7 @@ pub fn write_at_global_offset(spans: &[FileSpan], global_offset: u64, data: &[u8
 pub fn create_empty_files(spans: &[FileSpan], wanted: impl Fn(usize) -> bool) -> io::Result<usize> {
     let mut created = 0;
     for (index, span) in spans.iter().enumerate() {
-        if span.start != span.end || !wanted(index) || span.path.exists() {
+        if span.padding || span.start != span.end || !wanted(index) || span.path.exists() {
             continue;
         }
         if let Some(parent) = span.path.parent() {
@@ -120,6 +152,12 @@ pub fn read_at_global_offset(spans: &[FileSpan], global_offset: u64, len: usize)
         let available_in_file = span.end - offset;
         let chunk_len = (remaining as u64).min(available_in_file) as usize;
 
+        if span.padding {
+            out.resize(out.len() + chunk_len, 0);
+            offset += chunk_len as u64;
+            remaining -= chunk_len;
+            continue;
+        }
         let mut f = fs::File::open(&span.path)?;
         f.seek(SeekFrom::Start(file_offset))?;
         let mut chunk = vec![0u8; chunk_len];
@@ -282,7 +320,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, &len)| {
-                let span = FileSpan { path: std::path::PathBuf::from(format!("f{}", i)), start: cursor, end: cursor + len };
+                let span = FileSpan { path: std::path::PathBuf::from(format!("f{}", i)), start: cursor, end: cursor + len, padding: false };
                 cursor += len;
                 span
             })
@@ -353,5 +391,64 @@ mod tests {
         let spans = build_file_spans(&dir, &[(vec!["d".to_string(), "x".to_string()], 0i64)]);
 
         assert!(create_empty_files(&spans, |_| true).is_err());
+    }
+
+    #[test]
+    fn aligned_spans_start_every_file_on_a_piece_boundary_and_leave_the_gaps_to_nobody() {
+        let files = vec![(vec!["a".to_string()], 100i64), (vec!["empty".to_string()], 0), (vec!["b".to_string()], 256), (vec!["c".to_string()], 1)];
+        let spans = build_file_spans_aligned(Path::new("/base"), &files, 256);
+        assert_eq!(spans.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>(), vec![(0, 100), (256, 256), (256, 512), (512, 513)], "each file begins where the piece after the last one's end begins");
+        assert!(span_at(&spans, 100).is_none() && span_at(&spans, 255).is_none(), "the gap holds no file");
+        assert_eq!(span_at(&spans, 256).unwrap().path, Path::new("/base/b"));
+        assert_eq!(span_at(&spans, 512).unwrap().path, Path::new("/base/c"));
+        // Unaligned, the same files would run into one another.
+        let plain = build_file_spans(Path::new("/base"), &files);
+        assert_eq!(plain[2].start, 100);
+    }
+
+    #[test]
+    fn a_v2_piece_is_written_and_read_back_at_its_place_in_the_aligned_space() {
+        let dir = std::env::temp_dir().join(format!("bittorrent-rs-aligned-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let files = vec![(vec!["a".to_string()], 300i64), (vec!["b".to_string()], 100)];
+        let spans = build_file_spans_aligned(&dir, &files, 256);
+        // a: pieces 0 (256 bytes) and 1 (44); b: piece 2 (100).
+        write_piece(&spans, 0, 256, &[1u8; 256]).unwrap();
+        write_piece(&spans, 1, 256, &[2u8; 44]).unwrap();
+        write_piece(&spans, 2, 256, &[3u8; 100]).unwrap();
+        assert_eq!(fs::read(dir.join("a")).unwrap().len(), 300);
+        assert_eq!(fs::read(dir.join("b")).unwrap(), vec![3u8; 100], "b begins with its own first byte, not at 44 into the padding");
+        assert_eq!(read_at_global_offset(&spans, 512, 100).unwrap(), vec![3u8; 100]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_padding_span_is_never_written_and_reads_as_zeros() {
+        use crate::torrent::padded_fixture as fx;
+        let dir = tmp_dir("padding-rw");
+        let torrent = fx::torrent();
+        let spans = torrent.file_spans(&dir);
+        let content = fx::layout();
+        for (index, piece) in content.chunks(fx::PIECE_LENGTH).enumerate() {
+            write_piece(&spans, index as u32, fx::PIECE_LENGTH as u64, piece).unwrap();
+        }
+        let (a, b) = fx::real_files();
+        assert_eq!(fs::read(dir.join("a.bin")).unwrap(), a, "a.bin holds its own 3000 bytes and none of the padding after it");
+        assert_eq!(fs::read(dir.join("b.bin")).unwrap(), b);
+        assert!(!dir.join(".pad").exists(), "no file, no directory for the padding");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        assert_eq!(read_at_global_offset(&spans, 0, content.len()).unwrap(), content, "the whole layout reads back, padding as zeros");
+        assert_eq!(read_block(&spans, 0, fx::PIECE_LENGTH as u64, 2900, 300).unwrap(), content[2900..3200], "a block across the end of a file and the padding after it");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_padding_file_is_not_created_when_empty_files_are() {
+        let dir = tmp_dir("padding-empty");
+        let files = vec![(vec![".pad".to_string(), "0".to_string()], 0i64), (vec!["empty".to_string()], 0)];
+        let spans = build_file_spans_padded(&dir, &files, &[true, false]);
+        assert_eq!(create_empty_files(&spans, |_| true).unwrap(), 1);
+        assert!(dir.join("empty").exists() && !dir.join(".pad").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

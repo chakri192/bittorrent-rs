@@ -12,6 +12,9 @@
 //! port = 51413
 //! seed = true
 //! dht = true
+//! lsd = true         # find peers on the local network (BEP 14)
+//! transport = "tcp"  # "tcp" | "utp" | "both"
+//! tracker_mode = "tiered"  # "tiered" (BEP 12) | "concurrent" (every tracker at once)
 //! ipv6 = "auto"      # "auto" | "always" | "never"
 //! reannounce = 900
 //! seed_ratio = 2.0   # stop seeding at this ratio ...
@@ -31,6 +34,8 @@ pub struct Config {
     pub seed: Option<bool>,
     /// DHT on/off (default on). `false` is equivalent to `--no-dht`.
     pub dht: Option<bool>,
+    /// Local service discovery (BEP 14) on/off (default on). `false` == `--no-lsd`.
+    pub lsd: Option<bool>,
     /// UPnP/NAT-PMP port mapping on/off (default on). `false` == `--no-portmap`.
     pub portmap: Option<bool>,
     /// BEP 19 web seeds on/off (default on). `false` == `--no-webseed`.
@@ -46,6 +51,13 @@ pub struct Config {
     pub log: Option<PathBuf>,
     /// Live dashboard on/off (default on). `false` is equivalent to `--no-tui`.
     pub tui: Option<bool>,
+    /// `"off"` | `"prefer"` | `"require"`: message stream encryption
+    /// (`--encryption`).
+    pub encryption: Option<String>,
+    /// `"tcp"` | `"utp"` | `"both"`: how peers are dialed (`--transport`).
+    pub transport: Option<String>,
+    /// `"tiered"` | `"concurrent"`: how the trackers are asked (`--tracker-mode`).
+    pub tracker_mode: Option<String>,
 }
 
 impl Config {

@@ -1,19 +1,20 @@
-//! Who the seeder unchokes.
+//! Who is unchoked: who we upload to.
 //!
 //! Serving every interested peer at once splits the upload bandwidth into
 //! many thin streams, so each peer downloads slowly and none is worth much
 //! to the swarm. BitTorrent's answer is to *choke*: serve only a few peers
 //! at a time -- here [`DEFAULT_SLOTS`] -- and change who now and then.
 //!
-//! The choice is made in rounds. Most slots go to the peers taking the most
-//! from us in the last round, so bandwidth goes where it is used. One slot
-//! is *optimistic*: it goes to a peer picked without regard to speed and
-//! changes every [`OPTIMISTIC_EVERY`] rounds, so a new peer, which has had
-//! nothing yet and so ranks last, is still tried.
+//! The choice is made in rounds. Most slots go to the best peers of the last
+//! round, and one is *optimistic*: it goes to a peer picked without regard to
+//! how it did and changes every [`OPTIMISTIC_EVERY`] rounds, so a new peer,
+//! which has had nothing yet and so ranks last, is still tried.
 //!
-//! This is the seeding half of the standard algorithm. The other half --
-//! favouring peers that upload to us -- has nothing to work on here, since
-//! inbound peers are only ever served, not downloaded from.
+//! What makes a peer best depends on what we are doing. While downloading it
+//! is what the peer sent us: that is tit-for-tat, the reason to upload at all,
+//! and the peers that give us the most are the ones served the most. A peer
+//! that gave nothing is ranked by what it took, and a seed, which is given
+//! nothing by anyone, ranks by that alone: bandwidth goes where it is used.
 
 use crate::sync::lock;
 use std::collections::{BTreeMap, HashSet};
@@ -33,18 +34,21 @@ pub struct Candidate {
     pub interested: bool,
     /// Bytes sent to it since the last round.
     pub uploaded: u64,
+    /// Bytes it sent to us since the last round.
+    pub downloaded: u64,
 }
 
 /// The peers to serve for a round: up to `slots` interested ones, the
-/// fastest `slots - 1` and then `optimistic`, if it is interested and not
-/// already among them (else the next fastest). Ties go to the lower id, so
-/// the answer does not depend on the order `peers` came in.
+/// best `slots - 1` (those that gave us the most, then those that took the most)
+/// and then `optimistic`, if it is interested and not already among them (else
+/// the next best). Ties go to the lower id, so the answer does not depend on
+/// the order `peers` came in.
 pub fn choose(peers: &[Candidate], slots: usize, optimistic: Option<PeerId>) -> HashSet<PeerId> {
     if slots == 0 {
         return HashSet::new();
     }
     let mut interested: Vec<Candidate> = peers.iter().copied().filter(|p| p.interested).collect();
-    interested.sort_by(|a, b| b.uploaded.cmp(&a.uploaded).then(a.id.cmp(&b.id)));
+    interested.sort_by(|a, b| b.downloaded.cmp(&a.downloaded).then(b.uploaded.cmp(&a.uploaded)).then(a.id.cmp(&b.id)));
 
     // With a single slot there is no room for both kinds; speed wins.
     let regular = if slots == 1 { 1 } else { slots - 1 };
@@ -72,6 +76,8 @@ struct Slot {
     unchoked: bool,
     /// Bytes sent to it since the last round.
     uploaded: u64,
+    /// Bytes it sent to us since the last round.
+    downloaded: u64,
 }
 
 #[derive(Debug, Default)]
@@ -99,7 +105,7 @@ impl Choker {
         let mut state = lock(&self.state);
         let id = state.next_id;
         state.next_id += 1;
-        state.peers.insert(id, Slot { interested: false, unchoked: false, uploaded: 0 });
+        state.peers.insert(id, Slot { interested: false, unchoked: false, uploaded: 0, downloaded: 0 });
         id
     }
 
@@ -150,6 +156,13 @@ impl Choker {
         }
     }
 
+    /// Counts `bytes` received from the peer, for the next round's ranking: what a peer gives is what earns it a slot.
+    pub fn record_download(&self, id: PeerId, bytes: u64) {
+        if let Some(slot) = lock(&self.state).peers.get_mut(&id) {
+            slot.downloaded += bytes;
+        }
+    }
+
     /// Whether the peer is to be served now.
     pub fn is_unchoked(&self, id: PeerId) -> bool {
         lock(&self.state).peers.get(&id).is_some_and(|p| p.unchoked)
@@ -172,11 +185,12 @@ impl Choker {
             let candidates: Vec<PeerId> = state.peers.iter().filter(|(_, p)| p.interested).map(|(id, _)| *id).collect();
             state.optimistic = candidates.iter().copied().find(|id| after.is_none_or(|a| *id > a)).or_else(|| candidates.first().copied());
         }
-        let candidates: Vec<Candidate> = state.peers.iter().map(|(id, p)| Candidate { id: *id, interested: p.interested, uploaded: p.uploaded }).collect();
+        let candidates: Vec<Candidate> = state.peers.iter().map(|(id, p)| Candidate { id: *id, interested: p.interested, uploaded: p.uploaded, downloaded: p.downloaded }).collect();
         let chosen = choose(&candidates, self.slots, state.optimistic);
         for (id, slot) in state.peers.iter_mut() {
             slot.unchoked = chosen.contains(id);
             slot.uploaded = 0;
+            slot.downloaded = 0;
         }
     }
 }
@@ -186,7 +200,7 @@ mod tests {
     use super::*;
 
     fn peer(id: PeerId, interested: bool, uploaded: u64) -> Candidate {
-        Candidate { id, interested, uploaded }
+        Candidate { id, interested, uploaded, downloaded: 0 }
     }
 
     fn ids(set: &HashSet<PeerId>) -> Vec<PeerId> {
@@ -329,5 +343,36 @@ mod tests {
         assert_eq!(choker.unchoked_count(), 0);
         Choker::new(4).rechoke();
         Choker::new(0).rechoke();
+    }
+
+    #[test]
+    fn a_peer_that_gave_us_data_is_served_before_one_that_only_took_it() {
+        // 0 took the most from us and gave nothing; 1 and 2 gave, and 2 the more.
+        let mut peers = vec![peer(0, true, 900), peer(1, true, 0), peer(2, true, 0), peer(3, true, 500)];
+        peers[1].downloaded = 10;
+        peers[2].downloaded = 30;
+        assert_eq!(ids(&choose(&peers, 3, None)), vec![0, 1, 2], "the two that gave lead, then the one that took most (3 is left out)");
+        assert_eq!(ids(&choose(&peers, 2, None)), vec![1, 2], "a slot for what was given comes before one for what was taken");
+        // What was taken breaks a tie in what was given.
+        peers[1].downloaded = 30;
+        peers[1].uploaded = 5;
+        assert_eq!(ids(&choose(&peers, 1, None)), vec![1], "each gave 30, and 1 took the more");
+    }
+
+    #[test]
+    fn what_a_peer_gave_this_round_is_what_counts_and_the_next_round_starts_from_nothing() {
+        let choker = Choker::new(1); // one slot, by rank alone
+        let ids: Vec<PeerId> = (0..3).map(|_| choker.register()).collect();
+        for &id in &ids {
+            choker.set_interested(id, true);
+        }
+        choker.record_upload(ids[0], 9000); // took a lot
+        choker.record_download(ids[2], 100); // but this one gave
+
+        choker.rechoke();
+        assert!(choker.is_unchoked(ids[2]) && choker.unchoked_count() == 1, "the peer that gave takes the slot, not the one that took");
+
+        choker.rechoke();
+        assert!(choker.is_unchoked(ids[0]) && choker.unchoked_count() == 1, "last round's giving is forgotten: with nothing to tell them apart the lowest id leads");
     }
 }

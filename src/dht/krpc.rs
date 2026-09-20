@@ -2,22 +2,27 @@
 //! (BEP 5). Three message kinds -- query, response, error -- correlated
 //! by a transaction id (`t`) chosen by the querier and echoed back.
 //!
-//! IPv4 only: compact node info is the 26-byte `(20-byte id, 4-byte IP,
-//! 2-byte port)` form and compact peer info the 6-byte form. BEP 32
-//! (IPv6 DHT) is a separate, materially different encoding and is out of
-//! scope, matching the UDP tracker's IPv4-only stance elsewhere in this
-//! crate.
+//! Both address families (BEP 32). IPv4 compact node info is the 26-byte
+//! `(20-byte id, 4-byte IP, 2-byte port)` form, sent under `nodes`; IPv6 is
+//! the 38-byte form (a 16-byte IP), under `nodes6`. Compact peer info in
+//! `values` is 6 bytes for IPv4 and 18 for IPv6, and a list may hold both.
+//! A response can carry `nodes` and `nodes6` together, and they are read
+//! into one list, told apart by their addresses.
+//!
+//! BEP 32's `want` parameter (which families a querier would like nodes of)
+//! is not read: a node answers with nodes of the family the query came in on,
+//! which is what the BEP says to do without it.
 
 use crate::bencode::{self, Bencode};
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 pub type NodeId = [u8; 20];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactNode {
     pub id: NodeId,
-    pub addr: SocketAddrV4,
+    pub addr: SocketAddr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +58,7 @@ impl Query {
 pub struct Response {
     pub id: NodeId,
     pub nodes: Vec<CompactNode>,
-    pub values: Vec<SocketAddrV4>,
+    pub values: Vec<SocketAddr>,
     pub token: Option<Vec<u8>>,
 }
 
@@ -94,52 +99,107 @@ fn bytes20(value: Option<&Bencode>, field: &'static str) -> Result<NodeId, KrpcE
     b.try_into().map_err(|_| KrpcError::MalformedCompact("id/hash not 20 bytes"))
 }
 
+/// Bytes in one compact IPv4 node (`nodes`) and one compact IPv6 node (`nodes6`).
+pub const NODE4_LEN: usize = 26;
+pub const NODE6_LEN: usize = 38;
+
 /// 26 bytes per node: 20-byte id, 4-byte IPv4, 2-byte big-endian port.
 // `is_multiple_of` needs a very recent stdlib; keep buildable on older
 // toolchains (same stance as tracker::parse_compact_peers).
 #[allow(clippy::manual_is_multiple_of)]
 pub fn parse_compact_nodes(data: &[u8]) -> Result<Vec<CompactNode>, KrpcError> {
-    if data.len() % 26 != 0 {
+    if data.len() % NODE4_LEN != 0 {
         return Err(KrpcError::MalformedCompact("nodes length not a multiple of 26"));
     }
     Ok(data
-        .chunks_exact(26)
+        .as_chunks::<NODE4_LEN>()
+        .0
+        .iter()
         .map(|c| {
             let mut id = [0u8; 20];
             id.copy_from_slice(&c[..20]);
             let ip = Ipv4Addr::new(c[20], c[21], c[22], c[23]);
             let port = u16::from_be_bytes([c[24], c[25]]);
-            CompactNode { id, addr: SocketAddrV4::new(ip, port) }
+            CompactNode { id, addr: SocketAddr::V4(SocketAddrV4::new(ip, port)) }
         })
         .collect())
 }
 
+/// 38 bytes per node: 20-byte id, 16-byte IPv6, 2-byte big-endian port (BEP 32).
+#[allow(clippy::manual_is_multiple_of)]
+pub fn parse_compact_nodes6(data: &[u8]) -> Result<Vec<CompactNode>, KrpcError> {
+    if data.len() % NODE6_LEN != 0 {
+        return Err(KrpcError::MalformedCompact("nodes6 length not a multiple of 38"));
+    }
+    Ok(data
+        .as_chunks::<NODE6_LEN>()
+        .0
+        .iter()
+        .map(|c| {
+            let mut id = [0u8; 20];
+            id.copy_from_slice(&c[..20]);
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&c[20..36]);
+            let port = u16::from_be_bytes([c[36], c[37]]);
+            CompactNode { id, addr: SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(octets), port, 0, 0)) }
+        })
+        .collect())
+}
+
+/// The IPv4 nodes among `nodes`, in the 26-byte form. IPv6 ones have their
+/// own encoding and are left out.
 pub fn encode_compact_nodes(nodes: &[CompactNode]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(nodes.len() * 26);
+    let mut out = Vec::with_capacity(nodes.len() * NODE4_LEN);
     for n in nodes {
-        out.extend_from_slice(&n.id);
-        out.extend_from_slice(&n.addr.ip().octets());
-        out.extend_from_slice(&n.addr.port().to_be_bytes());
+        if let SocketAddr::V4(addr) = n.addr {
+            out.extend_from_slice(&n.id);
+            out.extend_from_slice(&addr.ip().octets());
+            out.extend_from_slice(&addr.port().to_be_bytes());
+        }
     }
     out
 }
 
-fn parse_values(list: &[Bencode]) -> Vec<SocketAddrV4> {
-    // Each value is a 6-byte compact peer; entries that aren't get
-    // skipped rather than failing the whole response (lenient in what we
-    // accept -- some nodes pad or mix garbage in).
+/// The IPv6 nodes among `nodes`, in the 38-byte form.
+pub fn encode_compact_nodes6(nodes: &[CompactNode]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nodes.len() * NODE6_LEN);
+    for n in nodes {
+        if let SocketAddr::V6(addr) = n.addr {
+            out.extend_from_slice(&n.id);
+            out.extend_from_slice(&addr.ip().octets());
+            out.extend_from_slice(&addr.port().to_be_bytes());
+        }
+    }
+    out
+}
+
+/// One compact peer: 6 bytes for IPv4, 18 for IPv6.
+fn encode_peer(peer: &SocketAddr) -> Vec<u8> {
+    let mut out = match peer {
+        SocketAddr::V4(p) => p.ip().octets().to_vec(),
+        SocketAddr::V6(p) => p.ip().octets().to_vec(),
+    };
+    out.extend_from_slice(&peer.port().to_be_bytes());
+    out
+}
+
+fn parse_values(list: &[Bencode]) -> Vec<SocketAddr> {
+    // Each value is a compact peer, 6 bytes (IPv4) or 18 (IPv6); entries that
+    // are neither get skipped rather than failing the whole response (lenient
+    // in what we accept -- some nodes pad or mix garbage in).
     list.iter()
         .filter_map(|v| {
             let b = v.as_bytes()?;
-            if b.len() != 6 {
-                return None;
-            }
-            let ip = Ipv4Addr::new(b[0], b[1], b[2], b[3]);
-            let port = u16::from_be_bytes([b[4], b[5]]);
-            if port == 0 {
-                return None;
-            }
-            Some(SocketAddrV4::new(ip, port))
+            let peer = match b.len() {
+                6 => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(b[0], b[1], b[2], b[3]), u16::from_be_bytes([b[4], b[5]]))),
+                18 => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&b[..16]);
+                    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(octets), u16::from_be_bytes([b[16], b[17]]), 0, 0))
+                }
+                _ => return None,
+            };
+            (peer.port() != 0).then_some(peer)
         })
         .collect()
 }
@@ -174,23 +234,18 @@ impl KrpcMessage {
             KrpcMessage::Response { t, response } => {
                 let mut r: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
                 r.insert(b"id".to_vec(), Bencode::Bytes(response.id.to_vec()));
-                if !response.nodes.is_empty() {
-                    r.insert(b"nodes".to_vec(), Bencode::Bytes(encode_compact_nodes(&response.nodes)));
+                let (nodes, nodes6) = (encode_compact_nodes(&response.nodes), encode_compact_nodes6(&response.nodes));
+                if !nodes.is_empty() {
+                    r.insert(b"nodes".to_vec(), Bencode::Bytes(nodes));
+                }
+                if !nodes6.is_empty() {
+                    r.insert(b"nodes6".to_vec(), Bencode::Bytes(nodes6));
                 }
                 if let Some(token) = &response.token {
                     r.insert(b"token".to_vec(), Bencode::Bytes(token.clone()));
                 }
                 if !response.values.is_empty() {
-                    let vals = response
-                        .values
-                        .iter()
-                        .map(|p| {
-                            let mut b = Vec::with_capacity(6);
-                            b.extend_from_slice(&p.ip().octets());
-                            b.extend_from_slice(&p.port().to_be_bytes());
-                            Bencode::Bytes(b)
-                        })
-                        .collect();
+                    let vals = response.values.iter().map(|p| Bencode::Bytes(encode_peer(p))).collect();
                     r.insert(b"values".to_vec(), Bencode::List(vals));
                 }
                 top.insert(b"r".to_vec(), Bencode::Dict(r));
@@ -237,10 +292,13 @@ impl KrpcMessage {
             b"r" => {
                 let r = dict.get(b"r".as_slice()).and_then(Bencode::as_dict).ok_or(KrpcError::MissingField("r"))?;
                 let id = bytes20(r.get(b"id".as_slice()), "r.id")?;
-                let nodes = match r.get(b"nodes".as_slice()).and_then(Bencode::as_bytes) {
+                let mut nodes = match r.get(b"nodes".as_slice()).and_then(Bencode::as_bytes) {
                     Some(raw) => parse_compact_nodes(raw)?,
                     None => Vec::new(),
                 };
+                if let Some(raw) = r.get(b"nodes6".as_slice()).and_then(Bencode::as_bytes) {
+                    nodes.extend(parse_compact_nodes6(raw)?);
+                }
                 let values = r.get(b"values".as_slice()).and_then(Bencode::as_list).map(parse_values).unwrap_or_default();
                 let token = r.get(b"token".as_slice()).and_then(Bencode::as_bytes).map(<[u8]>::to_vec);
                 Ok(KrpcMessage::Response { t, response: Response { id, nodes, values, token } })
@@ -393,6 +451,95 @@ mod tests {
                 assert_eq!(&id, b"abcdefghij0123456789");
             }
             other => panic!("expected ping, got {:?}", other),
+        }
+    }
+
+    // ---- BEP 32: IPv6 ----
+
+    fn node6(byte: u8, ip: &str, port: u16) -> CompactNode {
+        CompactNode { id: [byte; 20], addr: SocketAddr::new(ip.parse().unwrap(), port) }
+    }
+
+    #[test]
+    fn a_compact_ipv6_node_is_38_bytes_id_then_sixteen_bytes_of_address_then_the_port() {
+        let node = node6(0x11, "2001:db8::1", 6881);
+        let raw = encode_compact_nodes6(std::slice::from_ref(&node));
+        let mut expected = vec![0x11u8; 20];
+        expected.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
+        expected.extend_from_slice(&[0x1a, 0xe1]);
+        assert_eq!(raw, expected);
+        assert_eq!(raw.len(), NODE6_LEN);
+        assert_eq!(parse_compact_nodes6(&raw).unwrap(), vec![node]);
+    }
+
+    #[test]
+    fn each_family_is_encoded_in_its_own_form_and_the_other_left_out_of_it() {
+        let both = [node6(1, "10.0.0.1", 1), node6(2, "2001:db8::2", 2), node6(3, "10.0.0.3", 3)];
+        assert_eq!(encode_compact_nodes(&both).len(), 2 * NODE4_LEN);
+        assert_eq!(encode_compact_nodes6(&both).len(), NODE6_LEN);
+        assert_eq!(parse_compact_nodes(&encode_compact_nodes(&both)).unwrap(), vec![both[0].clone(), both[2].clone()]);
+    }
+
+    #[test]
+    fn a_response_with_nodes_of_both_families_carries_nodes_and_nodes6_and_reads_back_as_one_list() {
+        let nodes = vec![node6(1, "10.0.0.1", 6881), node6(2, "2001:db8::2", 6882)];
+        let msg = KrpcMessage::Response { t: b"aa".to_vec(), response: Response { id: [9; 20], nodes: nodes.clone(), ..Default::default() } };
+        let encoded = msg.encode();
+        let text = String::from_utf8_lossy(&encoded);
+        assert!(text.contains("5:nodes26:") && text.contains("6:nodes638:"), "{}", text);
+        assert_eq!(KrpcMessage::decode(&encoded).unwrap(), msg, "the two lists come back as the one, IPv4 first");
+    }
+
+    #[test]
+    fn a_response_from_another_client_with_only_nodes6_is_read() {
+        let mut raw = b"d1:rd2:id20:abcdefghij01234567896:nodes638:".to_vec();
+        raw.extend_from_slice(&[0x22; 20]);
+        raw.extend_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x00, 0x50]);
+        raw.extend_from_slice(b"e1:t2:aa1:y1:re");
+        match KrpcMessage::decode(&raw).unwrap() {
+            KrpcMessage::Response { response, .. } => assert_eq!(response.nodes, vec![node6(0x22, "fe80::1", 80)]),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn peers_in_values_are_six_bytes_for_ipv4_or_eighteen_for_ipv6_and_may_be_mixed() {
+        let peers: Vec<SocketAddr> = vec!["1.2.3.4:5678".parse().unwrap(), "[2001:db8::5]:6881".parse().unwrap()];
+        let msg = KrpcMessage::Response { t: b"aa".to_vec(), response: Response { id: [9; 20], values: peers.clone(), token: Some(b"tk".to_vec()), ..Default::default() } };
+        let encoded = msg.encode();
+        assert!(encoded.windows(5).any(|w| w == b"6:\x01\x02\x03"), "the IPv4 one is 6 bytes");
+        assert!(String::from_utf8_lossy(&encoded).contains("18:"), "and the IPv6 one is 18");
+        assert_eq!(KrpcMessage::decode(&encoded).unwrap(), msg);
+    }
+
+    #[test]
+    fn values_of_any_other_size_or_with_port_zero_are_skipped_not_fatal() {
+        let mut raw = b"d1:rd2:id20:abcdefghij01234567895:token2:tk6:valuesl6:".to_vec();
+        raw.extend_from_slice(&[1, 2, 3, 4, 0, 0]); // port 0
+        raw.extend_from_slice(b"5:abcde"); // neither size
+        raw.extend_from_slice(b"18:");
+        raw.extend_from_slice(&[0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0x1a, 0xe1]);
+        raw.extend_from_slice(b"ee1:t2:aa1:y1:re");
+        match KrpcMessage::decode(&raw).unwrap() {
+            KrpcMessage::Response { response, .. } => assert_eq!(response.values, vec!["[2001:db8::7]:6881".parse::<SocketAddr>().unwrap()]),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_nodes6_field_that_is_not_a_whole_number_of_nodes_is_refused() {
+        assert!(matches!(parse_compact_nodes6(&[0u8; 39]), Err(KrpcError::MalformedCompact(_))));
+        let raw = b"d1:rd2:id20:abcdefghij01234567896:nodes65:xxxxxe1:t2:aa1:y1:re";
+        assert!(KrpcMessage::decode(raw).is_err());
+    }
+
+    #[test]
+    fn a_query_with_a_want_list_is_still_a_query() {
+        // BEP 32's `want` says which families a querier wants nodes of; it is read past, not refused.
+        let raw = b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz1234564:wantl2:n42:n6ee1:q9:get_peers1:t2:aa1:y1:qe";
+        match KrpcMessage::decode(raw).unwrap() {
+            KrpcMessage::Query { query: Query::GetPeers { info_hash, .. }, .. } => assert_eq!(&info_hash, b"mnopqrstuvwxyz123456"),
+            other => panic!("{:?}", other),
         }
     }
 }

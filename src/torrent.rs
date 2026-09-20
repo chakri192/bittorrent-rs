@@ -15,6 +15,11 @@ pub struct TorrentFile {
     /// (path_components, length) for each file. Single-file torrents get
     /// one entry whose path is just [name].
     pub files: Vec<(Vec<String>, i64)>,
+    /// Parallel to `files`: whether the entry is a BEP 47 padding file (`attr`
+    /// contains `p`). Its bytes are in the torrent's flat byte space, so the
+    /// piece hashes cover them, but they are zeros that no file on disk
+    /// holds: never written, never read from a file, never listed.
+    pub padding: Vec<bool>,
     /// Whether the info dict is in the multi-file form (a `files` list),
     /// in which case `name` is the directory the files go under, even if
     /// the list has only one entry. A single-file torrent's `name` is the
@@ -26,6 +31,13 @@ pub struct TorrentFile {
     /// BEP 27 `private` flag. A private torrent's peers must come only
     /// from its tracker: no DHT, no PEX, no local discovery.
     pub private: bool,
+    /// The BitTorrent v2 side of the metadata (BEP 52), for a v2 or hybrid
+    /// torrent. For a torrent that is v2 only, `pieces` is empty and
+    /// `info_hash` is the first 20 bytes of the SHA-256 one.
+    pub v2: Option<crate::v2::V2Meta>,
+    /// For a v2-only torrent whose piece layers are all present: its pieces,
+    /// with what each must hash to. Empty otherwise.
+    pub v2_pieces: Vec<crate::v2::V2Piece>,
 }
 
 #[derive(Debug)]
@@ -44,6 +56,10 @@ pub enum TorrentError {
     PieceCountMismatch { pieces: usize, expected: u64 },
     /// A length beyond what is sane to handle (or that overflows).
     TooLarge(&'static str),
+    /// The BitTorrent v2 part of the metadata (BEP 52) is malformed.
+    V2(crate::v2::V2Error),
+    /// A `meta version` this client does not know.
+    UnsupportedVersion(i64),
 }
 
 impl From<DecodeError> for TorrentError {
@@ -65,6 +81,8 @@ impl std::fmt::Display for TorrentError {
             TorrentError::UnsafePath(p) => write!(f, "unsafe path in torrent ({:?}): it could write outside the download directory", p),
             TorrentError::PieceCountMismatch { pieces, expected } => write!(f, "torrent lists {} piece hashes but its length needs {}", pieces, expected),
             TorrentError::TooLarge(what) => write!(f, "'{}' is unreasonably large", what),
+            TorrentError::V2(e) => write!(f, "BitTorrent v2 metadata: {}", e),
+            TorrentError::UnsupportedVersion(v) => write!(f, "meta version {} is not supported", v),
         }
     }
 }
@@ -169,7 +187,7 @@ pub fn parse_torrent_file(data: &[u8]) -> Result<TorrentFile, TorrentError> {
         _ => Vec::new(),
     };
 
-    build_torrent_from_info(info, raw_info, announce, announce_list, url_list)
+    build_torrent_from_info(info, raw_info, announce, announce_list, url_list, dict.get(b"piece layers".as_slice()))
 }
 
 /// Builds a `TorrentFile` from a magnet link's assembled+verified info
@@ -183,10 +201,7 @@ pub fn parse_torrent_file(data: &[u8]) -> Result<TorrentFile, TorrentError> {
 /// `assemble_and_verify` -- cheap, and this function has no other way to
 /// know the hash wasn't tampered with between that check and this call.
 pub fn from_info_dict_bytes(raw_info: &[u8], expected_info_hash: [u8; 20], announce: Option<String>, announce_list: Vec<Vec<String>>) -> Result<TorrentFile, TorrentError> {
-    let mut hasher = Sha1::new();
-    hasher.update(raw_info);
-    let actual: [u8; 20] = hasher.finalize().into();
-    if actual != expected_info_hash {
+    if !info_hash_matches(raw_info, &expected_info_hash) {
         return Err(TorrentError::InfoHashMismatch);
     }
 
@@ -194,14 +209,34 @@ pub fn from_info_dict_bytes(raw_info: &[u8], expected_info_hash: [u8; 20], annou
     // Magnet metadata (BEP 9) transfers only the info dict, which never
     // contains `url-list`; web seeds, if any, would arrive via the magnet
     // `ws=` param (not currently parsed).
-    build_torrent_from_info(info, raw_info, announce, announce_list, Vec::new())
+    build_torrent_from_info(info, raw_info, announce, announce_list, Vec::new(), None)
+}
+
+/// Whether `raw_info` is the info dictionary that `expected` names: its SHA-1 (BitTorrent v1), or the first 20 bytes of
+/// its SHA-256, which is how peers and trackers know a v2 torrent (BEP 52).
+pub fn info_hash_matches(raw_info: &[u8], expected: &[u8; 20]) -> bool {
+    let sha1: [u8; 20] = Sha1::digest(raw_info).into();
+    let sha256 = crate::sha256::sha256(raw_info);
+    &sha1 == expected || sha256[..20] == expected[..]
 }
 
 /// Shared construction logic: given a parsed info dict value and the raw
 /// bytes it was decoded from (for the InfoHash), builds the rest of
 /// `TorrentFile`'s fields identically regardless of whether the info dict
 /// came from a `.torrent` file or a magnet metadata exchange.
-fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<String>, announce_list: Vec<Vec<String>>, url_list: Vec<String>) -> Result<TorrentFile, TorrentError> {
+fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<String>, announce_list: Vec<Vec<String>>, url_list: Vec<String>, layers: Option<&Bencode>) -> Result<TorrentFile, TorrentError> {
+    // BitTorrent v2 (BEP 52): a torrent with a file tree and no v1 piece hashes
+    // is v2 only; one with both is a hybrid, which this reads as v1.
+    let version = info.get("meta version").and_then(Bencode::as_int);
+    if let Some(version) = version.filter(|&v| v != 2) {
+        return Err(TorrentError::UnsupportedVersion(version));
+    }
+    let file_tree = info.get("file tree").filter(|_| version == Some(2));
+    if let (Some(tree), None) = (file_tree, info.get("pieces")) {
+        return build_v2_only_torrent(info.clone(), tree, raw_info, announce, announce_list, url_list, layers);
+    }
+    let v2 = file_tree.and_then(|tree| v2_meta(&info, tree, raw_info, layers).ok());
+
     let mut hasher = Sha1::new();
     hasher.update(raw_info);
     let info_hash: [u8; 20] = hasher.finalize().into();
@@ -221,14 +256,8 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
     if pieces_raw.len() % 20 != 0 {
         return Err(TorrentError::PiecesLengthNotMultipleOf20);
     }
-    let pieces: Vec<[u8; 20]> = pieces_raw
-        .chunks_exact(20)
-        .map(|c| {
-            let mut h = [0u8; 20];
-            h.copy_from_slice(c);
-            h
-        })
-        .collect();
+    // (No remainder: the length was checked to be a multiple of 20.)
+    let pieces: Vec<[u8; 20]> = pieces_raw.as_chunks::<20>().0.to_vec();
 
     if piece_length > MAX_PIECE_LENGTH {
         return Err(TorrentError::TooLarge("piece length"));
@@ -241,17 +270,20 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
     }
 
     let multi_file = info.get("length").and_then(Bencode::as_int).is_none() && info.get("files").is_some();
+    let mut padding = Vec::new();
     let files = if let Some(len) = info.get("length").and_then(Bencode::as_int) {
         // Single-file torrent.
         if len < 0 {
             return Err(TorrentError::InvalidLength("length"));
         }
+        padding.push(false);
         vec![(vec![name.clone()], len)]
     } else if let Some(file_list) = info.get("files").and_then(Bencode::as_list) {
         // Multi-file torrent.
         file_list
             .iter()
             .map(|f| {
+                let is_padding = f.get("attr").and_then(Bencode::as_str).is_some_and(|attr| attr.contains('p'));
                 let length = f.get("length").and_then(Bencode::as_int).ok_or(TorrentError::MissingKey("length"))?;
                 if length < 0 {
                     return Err(TorrentError::InvalidLength("length"));
@@ -269,9 +301,15 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
                 if let Some(bad) = path.iter().find(|part| !is_safe_component(part)) {
                     return Err(TorrentError::UnsafePath(bad.clone()));
                 }
-                Ok::<_, TorrentError>((path, length))
+                Ok::<_, TorrentError>(((path, length), is_padding))
             })
             .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(file, is_padding)| {
+                padding.push(is_padding);
+                file
+            })
+            .collect()
     } else {
         return Err(TorrentError::MissingKey("length|files"));
     };
@@ -301,10 +339,57 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
         pieces,
         name,
         files,
+        padding,
         multi_file,
         url_list,
         private,
+        v2,
+        v2_pieces: Vec::new(),
     })
+}
+
+/// The v2 metadata of an info dictionary: its files, the layers the
+/// `.torrent` carries, and the SHA-256 of the dictionary. The layers are
+/// checked against the files.
+fn v2_meta(info: &Bencode, tree: &Bencode, raw_info: &[u8], layers: Option<&Bencode>) -> Result<crate::v2::V2Meta, TorrentError> {
+    let files = crate::v2::parse_file_tree(tree).map_err(TorrentError::V2)?;
+    let layers = crate::v2::parse_layers(layers).map_err(TorrentError::V2)?;
+    let piece_length = info.get("piece length").and_then(Bencode::as_int).ok_or(TorrentError::MissingKey("piece length"))?;
+    crate::v2::validate_layers(&files, &layers, piece_length).map_err(TorrentError::V2)?;
+    Ok(crate::v2::V2Meta { files, layers, info_hash: crate::sha256::sha256(raw_info) })
+}
+
+/// A torrent that is BitTorrent v2 only. It has no piece hashes of the v1
+/// kind, so `pieces` is empty; what a piece must hash to is in the layers.
+fn build_v2_only_torrent(info: Bencode, tree: &Bencode, raw_info: &[u8], announce: Option<String>, announce_list: Vec<Vec<String>>, url_list: Vec<String>, layers: Option<&Bencode>) -> Result<TorrentFile, TorrentError> {
+    let piece_length = info.get("piece length").and_then(Bencode::as_int).ok_or(TorrentError::MissingKey("piece length"))?;
+    if !crate::v2::valid_piece_length(piece_length) {
+        return Err(TorrentError::V2(crate::v2::V2Error::BadPieceLength));
+    }
+    if piece_length > MAX_PIECE_LENGTH {
+        return Err(TorrentError::TooLarge("piece length"));
+    }
+    let name = info.get("name").and_then(Bencode::as_str).ok_or(TorrentError::MissingKey("name"))?.to_string();
+    if !is_safe_component(&name) {
+        return Err(TorrentError::UnsafePath(name));
+    }
+    let meta = v2_meta(&info, tree, raw_info, layers)?;
+    let mut files = Vec::with_capacity(meta.files.len());
+    let mut total = 0u64;
+    for file in &meta.files {
+        total = total.checked_add(file.length).ok_or(TorrentError::TooLarge("total length"))?;
+        files.push((file.path.clone(), i64::try_from(file.length).map_err(|_| TorrentError::TooLarge("length"))?));
+    }
+    // A single file is a tree of one entry named as the torrent is.
+    let multi_file = !(meta.files.len() == 1 && meta.files[0].path == [name.clone()]);
+    let private = info.get("private").and_then(Bencode::as_int).is_some_and(|v| v != 0);
+    let info_hash = meta.short_hash();
+    // With the layers, every piece has something to be checked against and can be
+    // fetched like a v1 piece (`pieces` then holds the first 20 bytes of each
+    // expected hash, so that the counts everything works from are right).
+    let v2_pieces = crate::v2::plan_pieces(&meta.files, &meta.layers, piece_length as u64).unwrap_or_default();
+    let pieces = v2_pieces.iter().map(|p| <[u8; 20]>::try_from(&p.root[..20]).unwrap_or([0; 20])).collect();
+    Ok(TorrentFile { announce, announce_list, info, info_hash, piece_length, pieces, name, padding: vec![false; files.len()], files, multi_file, url_list, private, v2: Some(meta), v2_pieces })
 }
 
 pub fn info_hash_hex(hash: &[u8; 20]) -> String {
@@ -324,6 +409,87 @@ impl TorrentFile {
         urls
     }
 
+    /// Gives a v2-only torrent the piece layers it lacked (fetched from peers with hash requests, BEP 52), which
+    /// makes every piece something to check against, so that it can be downloaded. Layers are checked against the
+    /// files' roots first; on `Err` the torrent is as it was.
+    pub fn install_layers(&mut self, layers: std::collections::BTreeMap<crate::v2::Hash, Vec<crate::v2::Hash>>) -> Result<(), crate::v2::V2Error> {
+        let Some(meta) = &mut self.v2 else { return Err(crate::v2::V2Error::BadLayer) };
+        crate::v2::validate_layers(&meta.files, &layers, self.piece_length)?;
+        let mut combined = meta.layers.clone();
+        combined.extend(layers);
+        let v2_pieces = crate::v2::plan_pieces(&meta.files, &combined, self.piece_length as u64).ok_or(crate::v2::V2Error::BadLayer)?;
+        meta.layers = combined;
+        self.pieces = v2_pieces.iter().map(|p| <[u8; 20]>::try_from(&p.root[..20]).unwrap_or([0; 20])).collect();
+        self.v2_pieces = v2_pieces;
+        Ok(())
+    }
+
+    /// The `pieces root` of each file longer than a piece for which this v2 torrent has no piece layer yet.
+    pub fn missing_layers(&self) -> Vec<(crate::v2::Hash, u64)> {
+        let Some(meta) = &self.v2 else { return Vec::new() };
+        meta.files.iter().filter(|f| f.length > self.piece_length as u64).filter_map(|f| f.root.filter(|root| !meta.layers.contains_key(root)).map(|root| (root, f.length))).collect()
+    }
+
+    /// The trackers as BEP 12 has them: the tiers of `announce-list`, most preferred first (empty tiers left out),
+    /// or, with no list, `announce` as a tier of its own. A torrent whose list does not include its `announce` gets
+    /// that too, as a tier before the rest, since a client that ignored it would be ignoring a tracker the maker named.
+    pub fn tracker_tiers(&self) -> Vec<Vec<String>> {
+        let mut tiers: Vec<Vec<String>> = self.announce_list.iter().filter(|tier| !tier.is_empty()).cloned().collect();
+        if let Some(announce) = &self.announce {
+            if !tiers.iter().any(|tier| tier.contains(announce)) {
+                tiers.insert(0, vec![announce.clone()]);
+            }
+        }
+        tiers
+    }
+
+    /// Whether the torrent is BitTorrent v2 only (BEP 52), with no v1 piece
+    /// hashes: it can be read, listed and verified, but not yet downloaded.
+    pub fn is_v2_only(&self) -> bool {
+        self.v2.is_some() && self.info.get("pieces").is_none()
+    }
+
+    /// Whether a v2-only torrent has what it takes to be downloaded: every piece
+    /// has a hash to be checked against (the `.torrent` carried the piece layers).
+    pub fn v2_ready(&self) -> bool {
+        self.is_v2_only() && (!self.v2_pieces.is_empty() || self.total_length() == 0)
+    }
+
+    /// Where each file lies in the torrent's flat byte space, under `base_dir`.
+    /// In a v2 torrent every file begins on a piece boundary, so the gaps
+    /// between files hold no piece.
+    pub fn file_spans(&self, base_dir: &std::path::Path) -> Vec<crate::downloader::file_writer::FileSpan> {
+        if self.is_v2_only() {
+            crate::downloader::file_writer::build_file_spans_aligned(base_dir, &self.files, self.piece_length as u64)
+        } else {
+            crate::downloader::file_writer::build_file_spans_padded(base_dir, &self.files, &self.padding)
+        }
+    }
+
+    /// The files a person would see: `files` without the BEP 47 padding
+    /// entries. What `--list` numbers and `--only` matches against.
+    pub fn visible_files(&self) -> Vec<(Vec<String>, i64)> {
+        self.files.iter().zip(&self.padding).filter(|(_, pad)| !**pad).map(|(file, _)| file.clone()).collect()
+    }
+
+    /// A selection made over [`Self::visible_files`] as one over `files`: a
+    /// padding file is never selected in its own right. A piece is wanted
+    /// because a real file has bytes in it, and the padding in it comes along.
+    pub fn layout_mask(&self, visible: &[bool]) -> Vec<bool> {
+        let mut visible = visible.iter().copied();
+        self.padding.iter().map(|&pad| !pad && visible.next().unwrap_or(false)).collect()
+    }
+
+    /// The inverse of [`Self::layout_mask`]: the selection of the visible files.
+    pub fn visible_mask(&self, layout: &[bool]) -> Vec<bool> {
+        self.padding.iter().enumerate().filter(|(_, pad)| !**pad).map(|(i, _)| layout.get(i).copied().unwrap_or(false)).collect()
+    }
+
+    /// Whether `layout` (a mask over `files`) selects every file that is not padding.
+    pub fn selects_everything(&self, layout: &[bool]) -> bool {
+        self.padding.iter().enumerate().all(|(i, &pad)| pad || layout.get(i).copied().unwrap_or(false))
+    }
+
     /// Sum of every file's length -- the total number of bytes the torrent
     /// contains, which the last piece's length is derived from.
     pub fn total_length(&self) -> u64 {
@@ -334,6 +500,10 @@ impl TorrentFile {
     /// except the last, which is whatever remains
     /// (`total_length - piece_length * (num_pieces - 1)`).
     pub fn piece_len(&self, index: usize) -> u64 {
+        // A v2 piece is part of one file, so a file's last piece is short.
+        if !self.v2_pieces.is_empty() {
+            return self.v2_pieces.get(index).map_or(0, |p| p.length as u64);
+        }
         let num_pieces = self.pieces.len() as u64;
         let last_index = num_pieces.saturating_sub(1);
         if index as u64 == last_index {
@@ -341,6 +511,52 @@ impl TorrentFile {
         } else {
             self.piece_length as u64
         }
+    }
+}
+
+/// A torrent with BEP 47 padding files, and its content, for the tests of the
+/// modules that must treat the padding as zeros no file holds.
+#[cfg(test)]
+pub(crate) mod padded_fixture {
+    use super::*;
+
+    /// The layout, in 4096-byte pieces: `a.bin` (3000 bytes), 1096 bytes of padding that
+    /// bring `b.bin` (5000) to the start of the second piece. Three pieces, the last short.
+    pub(crate) const PIECE_LENGTH: usize = 4096;
+
+    /// The bytes of `a.bin` and `b.bin`.
+    pub(crate) fn real_files() -> (Vec<u8>, Vec<u8>) {
+        ((0..3000u32).map(|i| (i % 251) as u8 + 1).collect(), (0..5000u32).map(|i| (i % 241) as u8 + 3).collect())
+    }
+
+    /// All of the torrent's bytes as its pieces are hashed: the files with the padding as zeros.
+    pub(crate) fn layout() -> Vec<u8> {
+        let (a, b) = real_files();
+        let mut all = a;
+        all.resize(4096, 0);
+        all.extend_from_slice(&b);
+        all
+    }
+
+    pub(crate) fn torrent() -> TorrentFile {
+        let content = layout();
+        let mut info = b"d5:filesl".to_vec();
+        for (attr, length, path) in [("", 3000, "5:a.bin"), ("1:p", 1096, "4:.pad4:1096"), ("", 5000, "5:b.bin")] {
+            info.extend_from_slice(b"d");
+            if !attr.is_empty() {
+                info.extend_from_slice(b"4:attr");
+                info.extend_from_slice(attr.as_bytes());
+            }
+            info.extend_from_slice(format!("6:lengthi{}e4:pathl{}ee", length, path).as_bytes());
+        }
+        let hashes: Vec<u8> = content.chunks(PIECE_LENGTH).flat_map(|piece| Sha1::digest(piece).to_vec()).collect();
+        info.extend_from_slice(format!("e4:name3:pad12:piece lengthi{}e6:pieces{}:", PIECE_LENGTH, hashes.len()).as_bytes());
+        info.extend_from_slice(&hashes);
+        info.push(b'e');
+        let mut file = b"d4:info".to_vec();
+        file.extend_from_slice(&info);
+        file.push(b'e');
+        parse_torrent_file(&file).expect("the padded fixture is a valid torrent")
     }
 }
 
@@ -695,5 +911,229 @@ mod tests {
             parse_torrent_file(&multi(b"dir", one, 16384, 1)).unwrap().multi_file,
             "a `files` list with a single entry is still the multi-file form, and its name is a directory"
         );
+    }
+
+    // ---- BitTorrent v2 (BEP 52) ----
+    // The torrents below were built by a Python script that shares nothing with this code.
+
+    fn unhex(text: &str) -> Vec<u8> {
+        (0..text.len() / 2).map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    const V2_ONLY: &str = "64383a616e6e6f756e636531383a687474703a2f2f742e6578616d706c652f61343a696e666f64393a66696c65207472656564353a662e62696e64303a64363a6c656e6774686934303030306531313a70696563657320726f6f7433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68265656531323a6d6574612076657273696f6e693265343a6e616d65353a662e62696e31323a7069656365206c656e677468693136333834656531323a7069656365206c61796572736433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68239363acfa57d60545ac82e09b63df067e2396f9377bac5311c3b159e50a61a2275876be25b78513a631bd38a5cc26875de9b787f1250a16ec6ad92f880fb37bfe5fa62eebf7c92de9855ef3886236a4378a7054258749ace85d10875991b9f13a6abab6565";
+    const V2_ONLY_SHA256: &str = "73ec1349d7abba4a6808971cc642ddc3ed620191741baf40cb10f26bdcfbc1f7";
+    const V2_ROOT: &str = "b01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa682";
+    const HYBRID: &str = "64343a696e666f64393a66696c65207472656564353a662e62696e64303a64363a6c656e6774686934303030306531313a70696563657320726f6f7433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa682656565363a6c656e6774686934303030306531323a6d6574612076657273696f6e693265343a6e616d65353a662e62696e31323a7069656365206c656e67746869313633383465363a70696563657336303a6ab462cc165379d368dc9206fc25f8546e894131fd1d4adde2a16bf56c84129d6902e8d056d38311218898aa5c30e0ed9d2e1f9451b673dda2498a366531323a7069656365206c61796572736433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68239363acfa57d60545ac82e09b63df067e2396f9377bac5311c3b159e50a61a2275876be25b78513a631bd38a5cc26875de9b787f1250a16ec6ad92f880fb37bfe5fa62eebf7c92de9855ef3886236a4378a7054258749ace85d10875991b9f13a6abab6565";
+    const HYBRID_SHA1: &str = "f7ad704f94c56d10621e59ff6e562e0cacb0f7f4";
+    const HYBRID_SHA256: &str = "9d3ff85840fcbf09db7a59d6246a7d35118f4c5b732c40a506a06e5f5d343d70";
+    const V2_TAMPERED_LAYER: &str = "64343a696e666f64393a66696c65207472656564353a662e62696e64303a64363a6c656e6774686934303030306531313a70696563657320726f6f7433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68265656531323a6d6574612076657273696f6e693265343a6e616d65353a662e62696e31323a7069656365206c656e677468693136333834656531323a7069656365206c61796572736433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68239363acea57d60545ac82e09b63df067e2396f9377bac5311c3b159e50a61a2275876be25b78513a631bd38a5cc26875de9b787f1250a16ec6ad92f880fb37bfe5fa62eebf7c92de9855ef3886236a4378a7054258749ace85d10875991b9f13a6abab6565";
+    const META_VERSION_3: &str = "64343a696e666f64393a66696c65207472656564353a662e62696e64303a64363a6c656e6774686934303030306531313a70696563657320726f6f7433323ab01c2fe631bd8f28d2c5161725cc5630755231ea794c7d087f36f4161abfa68265656531323a6d6574612076657273696f6e693365343a6e616d65353a662e62696e31323a7069656365206c656e677468693136333834656565";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    #[test]
+    fn a_v2_only_torrent_is_read_with_its_files_and_the_short_form_of_its_sha256_hash() {
+        let t = parse_torrent_file(&unhex(V2_ONLY)).unwrap();
+        assert!(t.is_v2_only());
+        assert_eq!((t.name.as_str(), t.piece_length, t.multi_file), ("f.bin", 16384, false), "one file named as the torrent is: a single-file torrent");
+        assert_eq!(t.files, vec![(vec!["f.bin".to_string()], 40_000)]);
+        assert!(t.info.get("pieces").is_none(), "there are no v1 hashes");
+        assert!(t.v2_ready());
+        assert_eq!(t.v2_pieces.iter().map(|p| (p.file, p.offset, p.length)).collect::<Vec<_>>(), vec![(0, 0, 16384), (0, 16384, 16384), (0, 32768, 7232)], "three pieces, the last short");
+        assert_eq!(t.pieces.len(), 3, "so the counts everything works from are right");
+        assert_eq!(t.piece_len(2), 7232);
+        assert_eq!(hex(&t.v2.as_ref().unwrap().info_hash), V2_ONLY_SHA256);
+        assert_eq!(hex(&t.info_hash), &V2_ONLY_SHA256[..40], "what the handshake, trackers and the DHT know it by");
+        assert_eq!(hex(&t.v2.as_ref().unwrap().files[0].root.unwrap()), V2_ROOT);
+        assert_eq!(t.announce.as_deref(), Some("http://t.example/a"));
+        assert_eq!(t.total_length(), 40_000);
+    }
+
+    #[test]
+    fn a_hybrid_torrent_is_read_as_v1_and_also_carries_its_v2_side() {
+        let t = parse_torrent_file(&unhex(HYBRID)).unwrap();
+        assert!(!t.is_v2_only());
+        assert_eq!(hex(&t.info_hash), HYBRID_SHA1, "the v1 hash, as before");
+        assert_eq!(t.pieces.len(), 3);
+        let v2 = t.v2.as_ref().expect("and the v2 side");
+        assert_eq!(hex(&v2.info_hash), HYBRID_SHA256, "over the same info dictionary, with SHA-256");
+        assert_eq!(hex(&v2.files[0].root.unwrap()), V2_ROOT);
+    }
+
+    #[test]
+    fn a_v1_torrent_has_no_v2_side() {
+        let t = parse_torrent_file(b"d4:infod6:lengthi10e4:name1:a12:piece lengthi16384e6:pieces20:00000000000000000000ee").unwrap();
+        assert!(t.v2.is_none() && !t.is_v2_only());
+    }
+
+    #[test]
+    fn a_v2_torrent_whose_layer_does_not_add_up_to_the_root_is_refused() {
+        let err = parse_torrent_file(&unhex(V2_TAMPERED_LAYER)).unwrap_err();
+        assert!(matches!(err, TorrentError::V2(crate::v2::V2Error::BadLayer)), "{:?}", err);
+    }
+
+    #[test]
+    fn a_meta_version_this_client_does_not_know_is_refused_not_misread() {
+        let err = parse_torrent_file(&unhex(META_VERSION_3)).unwrap_err();
+        assert!(matches!(err, TorrentError::UnsupportedVersion(3)), "{:?}", err);
+    }
+
+    #[test]
+    fn a_v2_torrent_without_its_layers_is_still_read_they_can_come_from_peers() {
+        // The same torrent with the piece layers removed from the outer dictionary.
+        let mut top = crate::bencode::decode(&unhex(V2_ONLY)).unwrap();
+        if let Bencode::Dict(entries) = &mut top {
+            entries.remove(b"piece layers".as_slice());
+        }
+        let bytes = crate::bencode::encode(&top);
+        let t = parse_torrent_file(&bytes).unwrap();
+        assert!(t.is_v2_only() && t.v2.as_ref().unwrap().layers.is_empty());
+        assert_eq!(hex(&t.v2.as_ref().unwrap().info_hash), V2_ONLY_SHA256, "the info dictionary was not touched, so neither is its hash");
+    }
+
+    #[test]
+    fn a_v2_torrent_with_an_unsafe_name_or_path_is_refused() {
+        let mut top = crate::bencode::decode(&unhex(V2_ONLY)).unwrap();
+        if let Bencode::Dict(entries) = &mut top {
+            if let Some(Bencode::Dict(info)) = entries.get_mut(b"info".as_slice()) {
+                info.insert(b"name".to_vec(), Bencode::Bytes(b"..".to_vec()));
+            }
+        }
+        assert!(matches!(parse_torrent_file(&crate::bencode::encode(&top)).unwrap_err(), TorrentError::UnsafePath(_)));
+    }
+
+    #[test]
+    fn a_v2_torrent_needs_a_valid_piece_length() {
+        let mut top = crate::bencode::decode(&unhex(V2_ONLY)).unwrap();
+        if let Bencode::Dict(entries) = &mut top {
+            if let Some(Bencode::Dict(info)) = entries.get_mut(b"info".as_slice()) {
+                info.insert(b"piece length".to_vec(), Bencode::Int(20_000));
+            }
+        }
+        assert!(matches!(parse_torrent_file(&crate::bencode::encode(&top)).unwrap_err(), TorrentError::V2(crate::v2::V2Error::BadPieceLength)));
+    }
+
+    // ---- BEP 12 ------------------------------------------------------------
+
+    fn with_trackers(announce: Option<&str>, list: &[&[&str]]) -> TorrentFile {
+        let mut torrent = parse_torrent_file(b"d4:infod6:lengthi10e4:name1:f12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee").unwrap();
+        torrent.announce = announce.map(str::to_string);
+        torrent.announce_list = list.iter().map(|tier| tier.iter().map(|u| u.to_string()).collect()).collect();
+        torrent
+    }
+
+    #[test]
+    fn the_tiers_are_the_announce_list_and_announce_alone_is_a_tier_of_one() {
+        assert_eq!(with_trackers(Some("http://a/"), &[]).tracker_tiers(), vec![vec!["http://a/".to_string()]]);
+        assert!(with_trackers(None, &[]).tracker_tiers().is_empty());
+        let both = with_trackers(Some("http://a/"), &[&["http://a/", "http://b/"], &["http://c/"]]);
+        assert_eq!(both.tracker_tiers(), vec![vec!["http://a/".to_string(), "http://b/".to_string()], vec!["http://c/".to_string()]], "as listed, `announce` being in it already");
+    }
+
+    #[test]
+    fn an_announce_the_list_leaves_out_is_a_tier_before_the_rest_and_empty_tiers_are_dropped() {
+        let torrent = with_trackers(Some("http://main/"), &[&[], &["http://b/"], &[]]);
+        assert_eq!(torrent.tracker_tiers(), vec![vec!["http://main/".to_string()], vec!["http://b/".to_string()]]);
+    }
+
+    #[test]
+    fn an_info_dictionary_is_named_by_its_sha1_or_by_the_first_twenty_bytes_of_its_sha256() {
+        let info = b"d6:lengthi5e4:name1:f12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
+        let sha1: [u8; 20] = Sha1::digest(info).into();
+        let mut sha256_short = [0u8; 20];
+        sha256_short.copy_from_slice(&crate::sha256::sha256(info)[..20]);
+        assert!(info_hash_matches(info, &sha1));
+        assert!(info_hash_matches(info, &sha256_short), "how a v2 torrent is known to peers");
+        assert!(!info_hash_matches(info, &[0; 20]));
+        assert!(!info_hash_matches(b"something else", &sha1) && !info_hash_matches(b"something else", &sha256_short));
+    }
+
+    #[test]
+    fn the_info_dictionary_of_a_v2_torrent_builds_a_torrent_when_given_its_short_sha256_hash() {
+        let dir = std::env::temp_dir().join(format!("bt-torrent-v2meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.bin"), vec![7u8; 40000]).unwrap();
+        let created = crate::create::create(&dir.join("f.bin"), &crate::create::CreateOptions { v2: true, piece_length: Some(16384), ..Default::default() }, |_, _| {}).unwrap();
+        let raw_info = bencode::encode(&bencode::decode(&created.bytes).unwrap().get("info").unwrap().clone());
+        let torrent = from_info_dict_bytes(&raw_info, created.info_hash, None, Vec::new()).expect("what a magnet link's metadata exchange gives");
+        assert!(torrent.is_v2_only() && !torrent.v2_ready(), "with no layers: they were not in the info dictionary");
+        assert_eq!(torrent.missing_layers().len(), 1);
+        assert!(matches!(from_info_dict_bytes(&raw_info, [0x11; 20], None, Vec::new()), Err(TorrentError::InfoHashMismatch)));
+    }
+
+    /// A file of a test torrent: path components, length, and `attr` if it has one.
+    type AttrFile<'a> = (&'a [&'a [u8]], i64, Option<&'a [u8]>);
+
+    /// A multi-file `.torrent` whose files carry an `attr` string where the
+    /// third element of the tuple is `Some`.
+    fn multi_attr(name: &[u8], files: &[AttrFile], piece_length: i64, pieces: usize) -> Vec<u8> {
+        let mut v = b"d4:infod5:filesl".to_vec();
+        for (path, length, attr) in files {
+            v.extend_from_slice(b"d");
+            if let Some(attr) = attr {
+                v.extend_from_slice(b"4:attr");
+                v.extend_from_slice(&bstr(attr));
+            }
+            v.extend_from_slice(format!("6:lengthi{}e4:pathl", length).as_bytes());
+            for part in *path {
+                v.extend_from_slice(&bstr(part));
+            }
+            v.extend_from_slice(b"ee");
+        }
+        v.extend_from_slice(b"e4:name");
+        v.extend_from_slice(&bstr(name));
+        v.extend_from_slice(format!("12:piece lengthi{}e6:pieces{}:", piece_length, pieces * 20).as_bytes());
+        v.extend_from_slice(&vec![0xAB; pieces * 20]);
+        v.extend_from_slice(b"ee");
+        v
+    }
+
+    /// Two real files, each followed by the padding that brings the next to a
+    /// piece boundary (`.pad/N` as libtorrent names them): 3000 + 1096 + 5000 + 3288
+    /// bytes with 4096-byte pieces, which is three pieces.
+    fn padded() -> TorrentFile {
+        let files: &[AttrFile] = &[(&[b"a.bin"], 3000, None), (&[b".pad", b"1096"], 1096, Some(b"p")), (&[b"b.bin"], 5000, Some(b"x")), (&[b".pad", b"3288"], 3288, Some(b"px"))];
+        parse_torrent_file(&multi_attr(b"t", files, 4096, 4)).unwrap()
+    }
+
+    #[test]
+    fn a_file_whose_attr_holds_p_is_a_padding_file_and_no_other_is() {
+        let t = padded();
+        assert_eq!(t.padding, vec![false, true, false, true], "`x` alone is an executable, `px` still padding, no attr is a file");
+        assert_eq!(t.files.len(), 4, "the padding is still in the layout: the piece hashes cover it");
+        assert_eq!(t.total_length(), 12384);
+        let single_file = parse_torrent_file(&single(b"f", 100, 16384, 1)).unwrap();
+        assert_eq!(single_file.padding, vec![false]);
+    }
+
+    #[test]
+    fn the_visible_files_leave_out_the_padding() {
+        let t = padded();
+        assert_eq!(t.visible_files(), vec![(vec!["a.bin".to_string()], 3000), (vec!["b.bin".to_string()], 5000)]);
+        let plain = parse_torrent_file(&multi(b"t", &[(&[b"a"], 1), (&[b"b"], 2)], 16384, 1)).unwrap();
+        assert_eq!(plain.visible_files(), plain.files, "no padding, nothing left out");
+    }
+
+    #[test]
+    fn a_selection_of_the_visible_files_is_one_of_the_layout_with_no_padding_selected() {
+        let t = padded();
+        assert_eq!(t.layout_mask(&[true, false]), vec![true, false, false, false]);
+        assert_eq!(t.layout_mask(&[false, true]), vec![false, false, true, false]);
+        assert_eq!(t.layout_mask(&[true, true]), vec![true, false, true, false], "padding is not selected even when every file is");
+        assert_eq!(t.visible_mask(&[true, false, false, false]), vec![true, false]);
+        assert_eq!(t.visible_mask(&t.layout_mask(&[false, true])), vec![false, true], "the two are inverses");
+        assert!(t.selects_everything(&[true, false, true, false]), "every file that is not padding");
+        assert!(!t.selects_everything(&[true, false, false, false]));
+        assert!(!t.selects_everything(&[]));
+    }
+
+    #[test]
+    fn the_spans_of_a_padded_torrent_mark_the_padding() {
+        let spans = padded().file_spans(std::path::Path::new("/out/t"));
+        let marked: Vec<(u64, u64, bool)> = spans.iter().map(|s| (s.start, s.end, s.padding)).collect();
+        assert_eq!(marked, vec![(0, 3000, false), (3000, 4096, true), (4096, 9096, false), (9096, 12384, true)]);
     }
 }

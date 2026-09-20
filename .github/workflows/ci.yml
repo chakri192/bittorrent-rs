@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Lets a branch be checked on Linux by hand (Actions > CI > Run workflow), without a pull request.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -55,6 +57,6 @@ jobs:
       - name: Fuzz targets compile and run against seed inputs
         working-directory: fuzz
         run: |
-          for target in bencode_decode magnet_parse torrent_parse krpc_decode peer_message extension_handshake metadata_message pex_parse; do
+          for target in bencode_decode magnet_parse torrent_parse krpc_decode peer_message extension_handshake metadata_message pex_parse lsd_announcement utp_packet control_request state_entries flat_json; do
             cargo +nightly fuzz run "$target" -- -runs=1000
           done

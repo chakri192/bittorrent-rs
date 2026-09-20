@@ -76,6 +76,28 @@ pub fn build_prefer_mask(files: &Files, patterns: &[String]) -> Result<Vec<bool>
     Ok(mask)
 }
 
+/// A list of file numbers as `--files` and the daemon's `files` write it: `1,3,5`. Empty text is no numbers.
+pub fn parse_indices(text: &str) -> Result<Vec<usize>, String> {
+    text.split(',').map(str::trim).filter(|part| !part.is_empty()).map(|part| part.parse::<usize>().map_err(|_| format!("not a file number: {:?}", part))).collect()
+}
+
+/// The inverse of [`parse_indices`].
+pub fn format_indices(indices: &[usize]) -> String {
+    indices.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
+}
+
+/// [`build_mask`] for a torrent: the indices and patterns are those of the
+/// files a person sees, which leaves out the BEP 47 padding files, and the mask
+/// is over all of `TorrentFile::files`, in which a padding file is never selected.
+pub fn build_mask_for(torrent: &crate::torrent::TorrentFile, indices: &[usize], patterns: &[String]) -> Result<Vec<bool>, String> {
+    build_mask(&torrent.visible_files(), indices, patterns).map(|visible| torrent.layout_mask(&visible))
+}
+
+/// [`build_prefer_mask`] for a torrent, over all of `TorrentFile::files` like [`build_mask_for`].
+pub fn build_prefer_mask_for(torrent: &crate::torrent::TorrentFile, patterns: &[String]) -> Result<Vec<bool>, String> {
+    build_prefer_mask(&torrent.visible_files(), patterns).map(|visible| torrent.layout_mask(&visible))
+}
+
 /// True when every file is selected (the common, non-selective case --
 /// lets callers skip all the filtering work).
 pub fn selects_everything(mask: &[bool]) -> bool {
@@ -124,6 +146,23 @@ pub fn selected_pieces(files: &Files, piece_length: u64, mask: &[bool]) -> (Hash
         let s = p as u64 * piece_length;
         let e = (s + piece_length).min(torrent_len);
         bytes += e.saturating_sub(s);
+    }
+    (pieces, bytes)
+}
+
+/// [`selected_pieces`] for a torrent: for a v2 one, whose pieces each belong to
+/// one file, that is the pieces of the selected files.
+pub fn selected_pieces_of(torrent: &crate::torrent::TorrentFile, mask: &[bool]) -> (HashSet<u32>, u64) {
+    if torrent.v2_pieces.is_empty() {
+        return selected_pieces(&torrent.files, torrent.piece_length as u64, mask);
+    }
+    let mut pieces = HashSet::new();
+    let mut bytes = 0u64;
+    for (index, piece) in torrent.v2_pieces.iter().enumerate() {
+        if mask.get(piece.file).copied().unwrap_or(false) {
+            pieces.insert(index as u32);
+            bytes += piece.length as u64;
+        }
     }
     (pieces, bytes)
 }
@@ -295,5 +334,54 @@ mod tests {
         let mut got: Vec<u32> = pieces.into_iter().collect();
         got.sort_unstable();
         assert_eq!(got, vec![3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn a_v2_torrents_selected_pieces_are_those_of_the_selected_files_and_nothing_between() {
+        use crate::create::{create, CreateOptions};
+        let dir = std::env::temp_dir().join(format!("bittorrent-rs-select-v2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("t")).unwrap();
+        std::fs::write(dir.join("t/a"), vec![1u8; 20_000]).unwrap(); // two pieces (16384 + 3616)
+        std::fs::write(dir.join("t/b"), vec![2u8; 100]).unwrap(); // one
+        std::fs::write(dir.join("t/c"), vec![3u8; 16_384 * 2]).unwrap(); // two
+        let made = create(&dir.join("t"), &CreateOptions { piece_length: Some(16_384), v2: true, ..Default::default() }, |_, _| {}).unwrap();
+        let torrent = crate::torrent::parse_torrent_file(&made.bytes).unwrap();
+
+        let (pieces, bytes) = selected_pieces_of(&torrent, &[false, true, true]);
+        let mut sorted: Vec<u32> = pieces.into_iter().collect();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![2, 3, 4], "b is piece 2 and c is 3 and 4, though a's last piece is short and b begins on a boundary");
+        assert_eq!(bytes, 100 + 32_768);
+        let (all, all_bytes) = selected_pieces_of(&torrent, &[true, true, true]);
+        assert_eq!((all.len(), all_bytes), (5, 20_000 + 100 + 32_768));
+        // A v1 torrent is worked out as before.
+        let v1 = crate::torrent::parse_torrent_file(b"d4:infod6:lengthi40000e4:name1:a12:piece lengthi16384e6:pieces60:000000000000000000001111111111111111111122222222222222222222ee").unwrap();
+        assert_eq!(selected_pieces_of(&v1, &[true]).0.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_selection_by_index_or_name_sees_only_the_files_that_are_not_padding() {
+        use crate::torrent::padded_fixture as fx;
+        let torrent = fx::torrent();
+        assert_eq!(build_mask_for(&torrent, &[], &[]).unwrap(), vec![true, false, true], "everything is the two real files; the padding is never selected");
+        assert_eq!(build_mask_for(&torrent, &[2], &[]).unwrap(), vec![false, false, true], "the second file is b.bin, however many padding files come before it");
+        assert!(build_mask_for(&torrent, &[3], &[]).is_err(), "there are two files to number");
+        assert_eq!(build_mask_for(&torrent, &[], &["A.BIN".to_string()]).unwrap(), vec![true, false, false]);
+        assert!(build_mask_for(&torrent, &[], &["pad".to_string()]).is_err(), "a pattern does not reach the padding files, whose names are libtorrent's");
+        assert_eq!(build_prefer_mask_for(&torrent, &["b.bin".to_string()]).unwrap(), vec![false, false, true]);
+        assert!(build_prefer_mask_for(&torrent, &[".pad".to_string()]).is_err());
+    }
+
+    #[test]
+    fn the_pieces_of_a_selection_are_those_the_real_files_have_bytes_in() {
+        use crate::torrent::padded_fixture as fx;
+        let torrent = fx::torrent();
+        // Piece 0 is a.bin and the padding after it; b.bin begins the second piece.
+        let (a_only, a_bytes) = selected_pieces_of(&torrent, &build_mask_for(&torrent, &[1], &[]).unwrap());
+        assert_eq!((a_only, a_bytes), (HashSet::from([0]), 4096), "the padding after a.bin is in its piece and is carried with it");
+        let (b_only, b_bytes) = selected_pieces_of(&torrent, &build_mask_for(&torrent, &[2], &[]).unwrap());
+        assert_eq!((b_only, b_bytes), (HashSet::from([1, 2]), 4096 + 904), "b.bin alone does not need the piece a.bin ends in");
     }
 }
