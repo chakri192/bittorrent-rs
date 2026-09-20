@@ -58,6 +58,9 @@ impl Request {
         match self {
             Request::Add { source, out, options } => {
                 let mut object = Object::new().string("cmd", "add").string("source", source).string("out", &out.to_string_lossy());
+                if !options.files.is_empty() {
+                    object = object.string("files", &crate::selection::format_indices(&options.files));
+                }
                 if !options.only.is_empty() {
                     object = object.string("only", &options.only.join("\n"));
                 }
@@ -111,7 +114,12 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 Some(Value::Bool(b)) => *b,
                 Some(_) => return Err("\"sequential\" must be true or false".to_string()),
             };
-            let options = JobOptions { only: list("only")?, prefer: list("prefer")?, sequential, max_up: rate("max_up")?, max_down: rate("max_down")? };
+            let files = match fields.get("files") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::String(s)) => crate::selection::parse_indices(s).map_err(|e| format!("\"files\": {}", e))?,
+                Some(_) => return Err("\"files\" must be a string of file numbers, such as \"1,3\"".to_string()),
+            };
+            let options = JobOptions { files, only: list("only")?, prefer: list("prefer")?, sequential, max_up: rate("max_up")?, max_down: rate("max_down")? };
             Ok(Request::Add { source: text("source")?, out: PathBuf::from(text("out")?), options })
         }
         Some("list") => Ok(Request::List),
@@ -361,7 +369,7 @@ mod tests {
     #[test]
     fn every_request_is_read_back_as_it_was_written() {
         for r in [
-            Request::Add { source: "magnet:?xt=urn:btih:00&dn=a b".into(), out: PathBuf::from("/d/with \"quotes\" and \\ and é"), options: JobOptions { only: vec![".mkv".into(), "a b".into()], prefer: vec!["nfo".into()], sequential: true, max_up: Some(50_000), max_down: Some(1_000_000) } },
+            Request::Add { source: "magnet:?xt=urn:btih:00&dn=a b".into(), out: PathBuf::from("/d/with \"quotes\" and \\ and é"), options: JobOptions { files: vec![1, 3], only: vec![".mkv".into(), "a b".into()], prefer: vec!["nfo".into()], sequential: true, max_up: Some(50_000), max_down: Some(1_000_000) } },
             Request::Add { source: "/x/y z.torrent".into(), out: PathBuf::from("/d"), options: JobOptions::default() },
             Request::List,
             Request::Status { id: "ab12".into() },
@@ -385,6 +393,8 @@ mod tests {
             (r#"{"cmd":"add","out":"/d"}"#, "\"source\""),
             (r#"{"cmd":"add","source":"s"}"#, "\"out\""),
             (r#"{"cmd":"add","source":7,"out":"/d"}"#, "\"source\""),
+            (r#"{"cmd":"add","source":"s","out":"/d","files":"1,x"}"#, "\"files\": not a file number"),
+            (r#"{"cmd":"add","source":"s","out":"/d","files":1}"#, "\"files\" must be a string"),
             (r#"{"cmd":"status"}"#, "\"id\""),
             (r#"{"cmd":"remove"}"#, "\"id\""),
         ] {

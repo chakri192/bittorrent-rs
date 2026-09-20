@@ -111,6 +111,9 @@ impl Default for JobDefaults {
 /// What is asked of one torrent beyond where it goes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JobOptions {
+    /// Only the files with these numbers, counted from 1 as `--list` shows them, and those `only` matches;
+    /// all of them if neither says. A magnet link's `so` (BEP 53) is put here when the link is added.
+    pub files: Vec<usize>,
     /// Only the files whose path contains one of these (case-insensitive); all of them if empty.
     pub only: Vec<String>,
     /// Files whose pieces are fetched before the others.
@@ -377,7 +380,7 @@ fn run(shared: &Arc<JobShared>, spec: &JobSpec, context: &JobContext) -> Result<
 /// daemon's network does the port mapping and holds the daemon-wide limits; what is the torrent's
 /// own comes from `spec`.
 fn session_options(spec: &JobSpec, torrent: &TorrentFile, defaults: &JobDefaults, port: u16) -> Result<(Options, Vec<bool>), String> {
-    let mask = crate::selection::build_mask_for(torrent, &[], &spec.options.only)?;
+    let mask = crate::selection::build_mask_for(torrent, &spec.options.files, &spec.options.only)?;
     let prefer = if spec.options.prefer.is_empty() { Vec::new() } else { crate::selection::build_prefer_mask_for(torrent, &spec.options.prefer)? };
     let options = Options {
         out_dir: spec.out_dir.clone(),
@@ -432,11 +435,21 @@ mod tests {
 
     #[test]
     fn a_torrents_own_options_reach_its_session() {
-        let own = JobOptions { only: vec![".MKV".into()], prefer: vec!["nfo".into()], sequential: true, max_up: Some(10), max_down: Some(20) };
+        let own = JobOptions { files: Vec::new(), only: vec![".MKV".into()], prefer: vec!["nfo".into()], sequential: true, max_up: Some(10), max_down: Some(20) };
         let (options, mask) = session_options(&spec(own), &torrent(), &JobDefaults::default(), 1).unwrap();
         assert_eq!(mask, vec![true, false], "only the file that matches, whatever the case");
         assert_eq!(options.prefer, vec![false, true]);
         assert_eq!((options.sequential, options.max_up, options.max_down), (true, Some(10), Some(20)));
+    }
+
+    #[test]
+    fn file_numbers_select_files_as_list_numbers_them_and_add_to_what_the_patterns_match() {
+        let numbered = JobOptions { files: vec![2], ..Default::default() };
+        assert_eq!(session_options(&spec(numbered), &torrent(), &JobDefaults::default(), 1).unwrap().1, vec![false, true]);
+        let both = JobOptions { files: vec![2], only: vec!["mkv".into()], ..Default::default() };
+        assert_eq!(session_options(&spec(both), &torrent(), &JobDefaults::default(), 1).unwrap().1, vec![true, true]);
+        let past_the_end = JobOptions { files: vec![3], ..Default::default() };
+        assert!(session_options(&spec(past_the_end), &torrent(), &JobDefaults::default(), 1).is_err(), "there are two files");
     }
 
     #[test]

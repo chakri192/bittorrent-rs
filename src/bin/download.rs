@@ -450,7 +450,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
     // DHT, the listener and the port mapping.
     let mut services = Services::new();
 
-    let (mut torrent, bootstrap_peers) = if args.source.starts_with("magnet:?") {
+    let (mut torrent, bootstrap_peers, link_selection) = if args.source.starts_with("magnet:?") {
         let mut magnet = parse_magnet_uri(&args.source).map_err(|e| finish_err(ui, format!("parsing magnet uri: {}", e)))?;
         magnet.peers.extend(args.peers_hint.iter().copied());
         if args.transport.wants_utp() {
@@ -474,7 +474,8 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         if torrent.private {
             services.stop_dht();
         }
-        (torrent, peers)
+        // BEP 53's `so`, counted from 1 as `--files` counts.
+        (torrent, peers, magnet.select_only.iter().map(|index| index + 1).collect::<Vec<usize>>())
     } else {
         let bytes = fs::read(&args.source).map_err(|e| finish_err(ui, format!("reading {}: {}", args.source, e)))?;
         let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| finish_err(ui, format!("parsing {}: {}", args.source, e)))?;
@@ -486,7 +487,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         if !args.no_dht && !args.list && !args.verify && !torrent.private {
             services.start_dht(args.port, torrent.info_hash, dht_ipv6(&args), dht_bootstrap(), |m| ui.log(m));
         }
-        (torrent, args.peers_hint.clone())
+        (torrent, args.peers_hint.clone(), Vec::new())
     };
     // A v2 torrent that does not carry its piece layers (a magnet link's never does) gets them from peers.
     if torrent.is_v2_only() && !torrent.v2_ready() && !args.list && !args.verify {
@@ -506,7 +507,14 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
 
     // File selection (--only / --files). `--list` prints the file table
     // and exits without downloading anything.
-    let mask = bittorrent_rs::selection::build_mask_for(&torrent, &args.files_sel, &args.only).map_err(|e| finish_err(ui, e))?;
+    // A magnet link's `so` (BEP 53) says which files it is for; what was asked for on the command line overrides it.
+    let files_sel = if args.files_sel.is_empty() && args.only.is_empty() && !link_selection.is_empty() {
+        ui.log(format!("the magnet link selects file(s) {} (so=)", link_selection.iter().map(usize::to_string).collect::<Vec<_>>().join(",")));
+        link_selection
+    } else {
+        args.files_sel.clone()
+    };
+    let mask = bittorrent_rs::selection::build_mask_for(&torrent, &files_sel, &args.only).map_err(|e| finish_err(ui, e))?;
     if args.list {
         let (visible, visible_mask) = (torrent.visible_files(), torrent.visible_mask(&mask));
         let listing = bittorrent_rs::selection::format_list(&torrent.name, &visible, &visible_mask);

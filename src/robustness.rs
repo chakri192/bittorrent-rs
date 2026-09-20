@@ -446,7 +446,7 @@ fn control_requests_survive_hostile_input_and_round_trip_what_they_accept() {
     use crate::daemon::control::{parse_request, Request};
     let seeds: Vec<Vec<u8>> = [
         Request::Add { source: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=a%20b".into(), out: "/downloads/a b".into(), options: Default::default() },
-        Request::Add { source: "/tmp/x \"quoted\".torrent".into(), out: "/o".into(), options: crate::daemon::JobOptions { only: vec!["a".into(), "b c".into()], prefer: vec!["x".into()], sequential: true, max_up: Some(5), max_down: Some(6) } },
+        Request::Add { source: "/tmp/x \"quoted\".torrent".into(), out: "/o".into(), options: crate::daemon::JobOptions { files: vec![1, 3], only: vec!["a".into(), "b c".into()], prefer: vec!["x".into()], sequential: true, max_up: Some(5), max_down: Some(6) } },
         Request::Pause { id: "ab12".into() },
         Request::Resume { id: "ab12".into() },
         Request::List,
@@ -472,7 +472,7 @@ fn the_daemons_state_file_survives_hostile_input_and_round_trips_what_it_accepts
     use crate::daemon::state::Dormant;
     use crate::daemon::JobOptions;
     let mut with_options = Entry::new([2; 20], Source::File("/state/torrents/y.torrent".into()), "/o".into());
-    with_options.options = JobOptions { only: vec!["a b".into(), ".mkv".into()], prefer: vec!["\"q\"".into()], sequential: true, max_up: Some(1000), max_down: Some(2_000_000) };
+    with_options.options = JobOptions { files: vec![2, 4], only: vec!["a b".into(), ".mkv".into()], prefer: vec!["\"q\"".into()], sequential: true, max_up: Some(1000), max_down: Some(2_000_000) };
     with_options.dormant = Some(Dormant::Finished("seed ratio 1.00 reached".into()));
     let mut paused = Entry::new([3; 20], Source::Magnet("magnet:?xt=urn:btih:0303".into()), "/o".into());
     paused.dormant = Some(Dormant::Paused);

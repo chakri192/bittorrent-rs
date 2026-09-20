@@ -64,6 +64,9 @@ impl Entry {
             Source::File(path) => object.string("file", &path.to_string_lossy()),
         };
         let options = &self.options;
+        if !options.files.is_empty() {
+            object = object.string("files", &crate::selection::format_indices(&options.files));
+        }
         if !options.only.is_empty() {
             object = object.string("only", &join_lines(&options.only));
         }
@@ -118,7 +121,7 @@ impl Entry {
             (None, Some(path)) => Source::File(PathBuf::from(path)),
             _ => return Err("it needs exactly one of \"magnet\" and \"file\"".to_string()),
         };
-        let options = JobOptions { only: split_lines(text("only")?.unwrap_or("")), prefer: split_lines(text("prefer")?.unwrap_or("")), sequential: flag("sequential")?, max_up: rate("max_up")?, max_down: rate("max_down")? };
+        let options = JobOptions { files: crate::selection::parse_indices(text("files")?.unwrap_or("")).map_err(|e| format!("\"files\": {}", e))?, only: split_lines(text("only")?.unwrap_or("")), prefer: split_lines(text("prefer")?.unwrap_or("")), sequential: flag("sequential")?, max_up: rate("max_up")?, max_down: rate("max_down")? };
         let dormant = match (flag("paused")?, text("finished")?) {
             (false, None) => None,
             (true, None) => Some(Dormant::Paused),
@@ -283,7 +286,7 @@ mod tests {
     #[test]
     fn options_and_a_dormant_state_are_kept_with_the_torrent() {
         let mut full = entry(7, Source::File(PathBuf::from("/s/x.torrent")));
-        full.options = JobOptions { only: vec!["a b".into(), ".mkv".into()], prefer: vec!["nfo".into()], sequential: true, max_up: Some(1000), max_down: Some(2_000_000) };
+        full.options = JobOptions { files: vec![2, 3], only: vec!["a b".into(), ".mkv".into()], prefer: vec!["nfo".into()], sequential: true, max_up: Some(1000), max_down: Some(2_000_000) };
         full.dormant = Some(Dormant::Finished("seed ratio 1.00 reached".into()));
         let mut paused = entry(8, Source::Magnet("m".into()));
         paused.dormant = Some(Dormant::Paused);
@@ -304,6 +307,8 @@ mod tests {
             (",\"paused\":\"yes\"", "paused"),
             (",\"sequential\":1", "sequential"),
             (",\"only\":5", "only"),
+            (",\"files\":5", "files"),
+            (",\"files\":\"1,two\"", "files"),
             (",\"max_up\":0", "max_up"),
             (",\"max_up\":-5", "max_up"),
             (",\"max_down\":1.5", "max_down"),

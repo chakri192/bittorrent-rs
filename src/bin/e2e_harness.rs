@@ -166,6 +166,7 @@ enum Kind {
     /// blocks it lacks, of that piece and of the others.
     ResumePartialPiece,
     PaddedTorrent,
+    MagnetSelectOnly,
     /// BEP 12: a torrent whose announce list is [[a dead tracker, one that works], [another]] is
     /// announced to the first tier's working tracker and to no other, and that tracker alone hears
     /// `stopped`; with `--tracker-mode concurrent` every tracker is asked.
@@ -223,6 +224,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "second-signal-forces-exit", kind: Kind::SecondSignalForcesExit },
     Scenario { name: "resume-partial-piece", kind: Kind::ResumePartialPiece },
     Scenario { name: "padded-torrent", kind: Kind::PaddedTorrent },
+    Scenario { name: "magnet-select-only", kind: Kind::MagnetSelectOnly },
     Scenario { name: "tracker-tiers", kind: Kind::TrackerTiers },
     Scenario { name: "daemon-two-torrents", kind: Kind::Daemon },
 ];
@@ -277,6 +279,7 @@ fn main() {
             Kind::SecondSignalForcesExit => run_second_signal_forces_exit(scenario.name),
             Kind::ResumePartialPiece => run_resume_partial_piece(scenario.name),
             Kind::PaddedTorrent => run_padded_torrent(scenario.name),
+            Kind::MagnetSelectOnly => run_magnet_select_only(scenario.name),
             Kind::TrackerTiers => run_tracker_tiers(scenario.name),
             Kind::Daemon => run_daemon(scenario.name),
         };
@@ -3746,4 +3749,44 @@ fn run_padded_torrent(name: &str) -> Result<String, String> {
     let port: u16 = announce_param(started, "port").and_then(|p| p.parse().ok()).ok_or_else(|| format!("no port in the announce: {}", started))?;
     leech_everything(&fx, port)?;
     Ok(format!("{} pieces with {} bytes of padding among them, downloaded with no padding on disk, listed without it, and served back whole to a leecher", fx.piece_count, fx.data.len() - files.iter().map(|(_, c)| c.len()).sum::<usize>()))
+}
+
+/// A magnet link with `so=1` (BEP 53) is for the second file only: after the metadata has come from the
+/// peer, the client fetches just the pieces that file touches, as `--only` would. A file number given on the
+/// command line is what is meant instead, if there is one.
+fn run_magnet_select_only(name: &str) -> Result<String, String> {
+    // The files and pieces of `selective-multi-file`: b.bin is bytes 300..600 of 900, touching pieces 1 and 2.
+    let fx = Fixture::build("multi", &[("a.bin", pattern(300, 1)), ("b.bin", pattern(300, 2)), ("c.bin", pattern(300, 3))], 256, false);
+    let dir = scratch_dir(name);
+    let mut ran = Vec::new();
+    for (label, extra, so, expected, file) in [("so=1", None, "&so=1", [1u32, 2], 1usize), ("so=1 overridden by --files 3", Some("3"), "&so=1", [2, 3], 2)] {
+        let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+        let (out_dir, log_path) = (dir.join(format!("out-{}", file)), dir.join(format!("client-{}.log", file)));
+        let mut cmd = client_command(format!("{}{}", fx.magnet_uri(swarm.tracker_addr), so), &out_dir, &log_path, 1);
+        cmd.arg("--no-dht").stdout(Stdio::null()).stderr(Stdio::null());
+        if let Some(number) = extra {
+            cmd.args(["--files", number]);
+        }
+        let mut child = cmd.spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+        let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+        if !status.success() {
+            return Err(format!("{}: download binary exited with {:?}", label, status.code()));
+        }
+        let requested = requested_set(&swarm.logs[0]);
+        let wanted: BTreeSet<u32> = expected.into_iter().collect();
+        if requested != wanted {
+            return Err(format!("{}: the client asked for pieces {:?}, expected exactly {:?}", label, requested, wanted));
+        }
+        let (path, content) = &fx.files[file];
+        check_file(&out_dir, path, content).map_err(|e| format!("{}: {}", label, e))?;
+        let log = fs::read_to_string(&log_path).map_err(|e| format!("reading client log {:?}: {}", log_path, e))?;
+        if !log.contains("selective download: 1 of 3 file(s), 2 piece(s)") {
+            return Err(format!("{}: the client log has no selective download notice", label));
+        }
+        if log.contains("(so=)") != extra.is_none() {
+            return Err(format!("{}: the log {} the link's selection, which it should{}", label, if extra.is_none() { "lacks" } else { "mentions" }, if extra.is_none() { "" } else { " not" }));
+        }
+        ran.push(format!("{} fetched pieces {:?}", label, requested));
+    }
+    Ok(ran.join("; "))
 }

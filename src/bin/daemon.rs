@@ -29,6 +29,7 @@ mod unix {
     use bittorrent_rs::json::Value;
     use bittorrent_rs::peer::{Encryption, TransportMode};
     use bittorrent_rs::ratelimit::parse_rate;
+    use bittorrent_rs::selection::parse_indices;
     use bittorrent_rs::session::env::{dht_bootstrap, lsd_config};
     use bittorrent_rs::tracker_discovery::TrackerMode;
     use bittorrent_rs::session::{has_ipv6_egress, seed_limits, Ipv6Mode, NetworkConfig, SeedLimits, SharedNetwork};
@@ -109,6 +110,7 @@ mod unix {
                 "--socket" => args.socket = Some(PathBuf::from(value("a path")?)),
                 "--json" => args.json = true,
                 "--out" | "-o" => out = Some(PathBuf::from(value("a directory")?)),
+                "--files" => job.files.extend(parse_indices(&value("file numbers such as 1,3,5")?).map_err(|e| format!("--files: {}", e))?),
                 "--only" => job.only.push(value("part of a file's path")?),
                 "--prefer" => job.prefer.push(value("part of a file's path")?),
                 "--sequential" => job.sequential = true,
@@ -138,8 +140,8 @@ mod unix {
         // (`--max-up` and `--max-down` are the daemon's for `run` and the torrent's for `add`.)
         job.max_up = run.max_up;
         job.max_down = run.max_down;
-        if command != "add" && (!job.only.is_empty() || !job.prefer.is_empty() || job.sequential) {
-            return Err(format!("--only, --prefer and --sequential are for `add`, not {}", command));
+        if command != "add" && (!job.files.is_empty() || !job.only.is_empty() || !job.prefer.is_empty() || job.sequential) {
+            return Err(format!("--files, --only, --prefer and --sequential are for `add`, not {}", command));
         }
         let need = |what: &str, given: Option<String>| given.ok_or_else(|| format!("{} needs {}", command, what));
         args.command = match command.as_str() {
@@ -366,8 +368,8 @@ mod unix {
         fn the_client_commands_take_what_they_need() {
             assert_eq!(parse(&["add", "a.torrent", "--out", "/d"]).unwrap().command, Command::Add { source: "a.torrent".into(), out: Some(PathBuf::from("/d")), options: JobOptions::default() });
             assert_eq!(parse(&["add", "--out", "/d", "magnet:?xt=urn:btih:00"]).unwrap().command, Command::Add { source: "magnet:?xt=urn:btih:00".into(), out: Some(PathBuf::from("/d")), options: JobOptions::default() }, "in either order");
-            let Command::Add { options, .. } = parse(&["add", "a.torrent", "--only", ".mkv", "--only", "x y", "--prefer", "nfo", "--sequential", "--max-up", "100K", "--max-down", "1M"]).unwrap().command else { panic!("add") };
-            assert_eq!(options, JobOptions { only: vec![".mkv".into(), "x y".into()], prefer: vec!["nfo".into()], sequential: true, max_up: Some(102_400), max_down: Some(1 << 20) });
+            let Command::Add { options, .. } = parse(&["add", "a.torrent", "--files", "2,4", "--files", "5", "--only", ".mkv", "--only", "x y", "--prefer", "nfo", "--sequential", "--max-up", "100K", "--max-down", "1M"]).unwrap().command else { panic!("add") };
+            assert_eq!(options, JobOptions { files: vec![2, 4, 5], only: vec![".mkv".into(), "x y".into()], prefer: vec!["nfo".into()], sequential: true, max_up: Some(102_400), max_down: Some(1 << 20) });
             assert_eq!(parse(&["pause", "ab12"]).unwrap().command, Command::Pause { id: "ab12".into() });
             assert_eq!(parse(&["resume", "ab12"]).unwrap().command, Command::Resume { id: "ab12".into() });
             assert!(parse(&["list", "--json"]).unwrap().json);

@@ -76,6 +76,16 @@ pub fn build_prefer_mask(files: &Files, patterns: &[String]) -> Result<Vec<bool>
     Ok(mask)
 }
 
+/// A list of file numbers as `--files` and the daemon's `files` write it: `1,3,5`. Empty text is no numbers.
+pub fn parse_indices(text: &str) -> Result<Vec<usize>, String> {
+    text.split(',').map(str::trim).filter(|part| !part.is_empty()).map(|part| part.parse::<usize>().map_err(|_| format!("not a file number: {:?}", part))).collect()
+}
+
+/// The inverse of [`parse_indices`].
+pub fn format_indices(indices: &[usize]) -> String {
+    indices.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
+}
+
 /// [`build_mask`] for a torrent: the indices and patterns are those of the
 /// files a person sees, which leaves out the BEP 47 padding files, and the mask
 /// is over all of `TorrentFile::files`, in which a padding file is never selected.

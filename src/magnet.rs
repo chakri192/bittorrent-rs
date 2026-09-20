@@ -21,6 +21,38 @@ pub struct MagnetLink {
     pub peers: Vec<std::net::SocketAddr>,
     /// `ws` (or `ws.N`): BEP 19 web seed URLs.
     pub web_seeds: Vec<String>,
+    /// `so` (BEP 53): the files to fetch, as their 0-based indices in the torrent's file list, sorted and
+    /// without repeats. Empty when the link does not say, which means all of them.
+    pub select_only: Vec<usize>,
+}
+
+/// The most files an `so` parameter may name. A range such as `0-4294967295` would otherwise be an
+/// instruction to allocate the address space; a link that names more than this has its `so` ignored, as
+/// one that does not parse does.
+const MAX_SELECTED_FILES: usize = 1 << 16;
+
+/// The indices of BEP 53's `so` value: numbers and `first-last` ranges, comma-separated (`0,2,4-6`). `None` if
+/// any part is not one of those, or the whole names too many files: a selection half understood would fetch
+/// something other than what was asked for, and one that is not understood at all falls back to everything.
+fn parse_select_only(value: &str) -> Option<Vec<usize>> {
+    let mut indices = Vec::new();
+    for part in value.split(',') {
+        let (first, last) = match part.split_once('-') {
+            Some((first, last)) => (first.parse::<usize>().ok()?, last.parse::<usize>().ok()?),
+            None => {
+                let index = part.parse::<usize>().ok()?;
+                (index, index)
+            }
+        };
+        // Before anything is allocated for it: a range may be as long as a usize is.
+        if first > last || last - first >= MAX_SELECTED_FILES - indices.len() {
+            return None;
+        }
+        indices.extend(first..=last);
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    Some(indices)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,6 +96,7 @@ pub fn parse_magnet_uri(uri: &str) -> Result<MagnetLink, MagnetError> {
     let mut trackers: Vec<String> = Vec::new();
     let mut peers: Vec<std::net::SocketAddr> = Vec::new();
     let mut web_seeds: Vec<String> = Vec::new();
+    let mut select_only: Vec<usize> = Vec::new();
 
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -103,6 +136,8 @@ pub fn parse_magnet_uri(uri: &str) -> Result<MagnetLink, MagnetError> {
                 }
             }
             "ws" if (value.starts_with("http://") || value.starts_with("https://")) && !web_seeds.contains(&value) => web_seeds.push(value),
+            // The first `so` that parses is the one used.
+            "so" if select_only.is_empty() => select_only = parse_select_only(&value).unwrap_or_default(),
             _ => {} // ignore unrecognized params (kt, as, xs, ...)
         }
     }
@@ -119,7 +154,7 @@ pub fn parse_magnet_uri(uri: &str) -> Result<MagnetLink, MagnetError> {
         (None, None, Some(other)) => return Err(MagnetError::BadInfoHashEncoding(other)),
         (None, None, None) => return Err(MagnetError::MissingInfoHash),
     };
-    Ok(MagnetLink { info_hash, info_hash_v2, display_name, trackers, peers, web_seeds })
+    Ok(MagnetLink { info_hash, info_hash_v2, display_name, trackers, peers, web_seeds, select_only })
 }
 
 /// A SHA-256 multihash in hex: `1220` (SHA2-256, 32 bytes) and the 32 bytes of the hash.
@@ -251,6 +286,35 @@ mod tests {
         // (0b11111 = 31 = '7', and 160 bits of all-1s is exactly 32 groups of 11111).
         let hash = decode_base32_20(&"7".repeat(32)).unwrap();
         assert_eq!(hash, [0xFFu8; 20]);
+    }
+
+    const LINK_HASH: &str = "xt=urn:btih:AABBCCDDEEFF00112233445566778899AABBCCDD";
+
+    fn select_only(so: &str) -> Vec<usize> {
+        parse_magnet_uri(&format!("magnet:?{}&so={}", LINK_HASH, so)).unwrap().select_only
+    }
+
+    #[test]
+    fn so_names_files_by_number_and_range_from_zero() {
+        assert_eq!(select_only("0"), vec![0]);
+        assert_eq!(select_only("0,2,4-6"), vec![0, 2, 4, 5, 6], "BEP 53's own example");
+        assert_eq!(select_only("6,2,2-3,0"), vec![0, 2, 3, 6], "sorted, and each once");
+        assert_eq!(select_only("5-5"), vec![5]);
+        assert_eq!(select_only("%30%2C2"), vec![0, 2], "percent-encoded, as some clients write the commas");
+        assert!(parse_magnet_uri(&format!("magnet:?{}", LINK_HASH)).unwrap().select_only.is_empty(), "no `so`: no selection, which is everything");
+    }
+
+    #[test]
+    fn an_so_that_is_not_understood_selects_nothing_rather_than_something_else() {
+        for bad in ["", "a", "1,", ",1", "1,,2", "3-1", "-1", "1-", "1-2-3", "0x1", "-", "1;2", "99999999999999999999999"] {
+            assert!(select_only(bad).is_empty(), "so={:?}", bad);
+        }
+        assert!(select_only("0-4294967295").is_empty(), "a range is not a licence to allocate");
+        assert!(select_only("0-65535,65536").is_empty(), "nor is a list");
+        assert_eq!(select_only("0-65535").len(), 65536, "the most it takes");
+        // The first `so` that is understood is the one used.
+        let two = parse_magnet_uri(&format!("magnet:?{}&so=x&so=1&so=2", LINK_HASH)).unwrap();
+        assert_eq!(two.select_only, vec![1]);
     }
 
     #[test]

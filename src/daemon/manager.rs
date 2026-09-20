@@ -71,14 +71,19 @@ impl Manager {
     /// Adds a torrent, given as a magnet link or as the path of a `.torrent` file, to be
     /// downloaded into `out_dir` (a torrent of several files goes in a directory of its name
     /// under it) and then seeded. Both paths must be absolute: the daemon does not share its
-    /// working directory with whoever is asking. A pattern in `options` that matches none of a
+    /// working directory with whoever is asking. A file number or pattern in `options` that matches none of a
     /// `.torrent`'s files is refused here; for a magnet link it is found out when the torrent is.
-    pub fn add(&self, source: &str, out_dir: PathBuf, options: JobOptions) -> Result<JobStatus, String> {
+    pub fn add(&self, source: &str, out_dir: PathBuf, mut options: JobOptions) -> Result<JobStatus, String> {
         if !out_dir.is_absolute() {
             return Err(format!("the output directory must be an absolute path: {}", out_dir.display()));
         }
         let (info_hash, source) = if source.starts_with("magnet:?") {
             let magnet = parse_magnet_uri(source).map_err(|e| format!("parsing the magnet link: {}", e))?;
+            // BEP 53: what the link says to fetch, unless the one who added it said. It is put with the
+            // options, which are kept, because the link itself is replaced by the torrent once that is known.
+            if options.files.is_empty() && options.only.is_empty() {
+                options.files = magnet.select_only.iter().map(|index| index + 1).collect();
+            }
             (magnet.info_hash, Source::Magnet(source.to_string()))
         } else {
             let path = PathBuf::from(source);
@@ -87,7 +92,7 @@ impl Manager {
             }
             let bytes = fs::read(&path).map_err(|e| format!("reading {}: {}", path.display(), e))?;
             let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| format!("parsing {}: {}", path.display(), e))?;
-            crate::selection::build_mask_for(&torrent, &[], &options.only)?;
+            crate::selection::build_mask_for(&torrent, &options.files, &options.only)?;
             if !options.prefer.is_empty() {
                 crate::selection::build_prefer_mask_for(&torrent, &options.prefer)?;
             }
@@ -466,6 +471,30 @@ mod tests {
         network.shutdown();
         s.manager.shutdown();
         s.network.shutdown();
+    }
+
+    #[test]
+    fn what_a_magnet_link_selects_is_kept_with_the_torrent_unless_the_one_who_added_it_chose() {
+        let network = quiet_network(no_dht());
+        let root = dir("magnet-so");
+        let state = root.join("state");
+        let manager = manager_on(&network, Some(Store::open(&state).unwrap()));
+        let link = |hash: char, so: &str| format!("magnet:?xt=urn:btih:{}{}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce", hash.to_string().repeat(40), so);
+        manager.add(&link('1', "&so=0,2-3"), root.clone(), JobOptions::default()).unwrap();
+        manager.add(&link('2', "&so=0"), root.clone(), JobOptions { only: vec!["mkv".into()], ..Default::default() }).unwrap();
+        manager.add(&link('3', "&so=0"), root.clone(), JobOptions { files: vec![5], ..Default::default() }).unwrap();
+        manager.add(&link('4', ""), root.clone(), JobOptions::default()).unwrap();
+
+        let (entries, warnings) = Store::open(&state).unwrap().load();
+        assert!(warnings.is_empty());
+        let files_of = |hash: char| entries.iter().find(|e| e.info_hash == [(hash as u8 - b'0') << 4 | (hash as u8 - b'0'); 20]).unwrap().options.files.clone();
+        assert_eq!(files_of('1'), vec![1, 3, 4], "counted from 1 here, as `--list` counts, though the link counts from 0");
+        assert!(files_of('2').is_empty(), "the pattern given is what is wanted, not the link's selection as well");
+        assert_eq!(files_of('3'), vec![5]);
+        assert!(files_of('4').is_empty(), "a link that selects nothing is for everything");
+
+        manager.shutdown();
+        network.shutdown();
     }
 
     #[test]
