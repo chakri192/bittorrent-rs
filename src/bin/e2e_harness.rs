@@ -880,6 +880,11 @@ fn serve_stream(stream: Box<dyn bittorrent_rs::peer::PeerStream>, over_utp: bool
                             dropped.open();
                         });
                     }
+                    // Closes as a peer that shuts a connection down properly does: what the client has already sent is read (and
+                    // ignored) first. Closing with requests unread makes Linux send a reset, which throws away what this peer sent
+                    // and the client has not read yet -- the block that was to arrive before the connection ended.
+                    let _ = bittorrent_rs::peer::PeerStream::set_read_timeout(&stream, Some(Duration::from_millis(150)));
+                    while Message::read_from(&mut stream).is_ok() {}
                     return; // the stream closes with the piece half-sent
                 }
                 if matches!(behavior, Behavior::DropFirstConnection) && nth_connection == 1 {
