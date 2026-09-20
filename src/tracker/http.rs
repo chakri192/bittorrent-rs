@@ -208,16 +208,28 @@ pub fn announce(tracker_url: &str, req: &AnnounceRequest) -> Result<AnnounceResp
 /// stream in `tracker::https`. Both schemes speak identical HTTP/1.1 once
 /// the transport is set up; only `parse_*_url` and the transport differ.
 pub(crate) fn perform_request_and_parse<S: Read + Write>(stream: &mut S, url: &ParsedUrl, req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
-    let query = build_query(req);
+    let body = get_body(stream, url, &build_query(req))?;
+    parse_announce_body(&body)
+}
+
+/// Sends `GET <path>?<query>` over `stream` and returns the body of the answer.
+pub(crate) fn get_body<S: Read + Write>(stream: &mut S, url: &ParsedUrl, query: &str) -> Result<Vec<u8>, TrackerError> {
     let separator = if url.path_and_query.contains('?') { "&" } else { "?" };
     let request = format!(
         "GET {}{}{} HTTP/1.1\r\nHost: {}\r\nUser-Agent: bittorrent-rs/0.1\r\nConnection: close\r\nAccept: */*\r\n\r\n",
         url.path_and_query, separator, query, url.authority
     );
     stream.write_all(request.as_bytes())?;
+    read_http_response_body(stream)
+}
 
-    let body = read_http_response_body(stream)?;
-    parse_announce_body(&body)
+/// A GET of `tracker_url` with `query`, over plain HTTP: what a scrape is.
+pub fn get(tracker_url: &str, query: &str) -> Result<Vec<u8>, TrackerError> {
+    let url = parse_http_url(tracker_url)?;
+    let mut stream = TcpStream::connect((url.host.as_str(), url.port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+    get_body(&mut stream, &url, query)
 }
 
 fn parse_announce_body(body: &[u8]) -> Result<AnnounceResponse, TrackerError> {

@@ -169,6 +169,7 @@ enum Kind {
     MagnetSelectOnly,
     DialedPeerIsServed,
     InboundPeerIsDownloadedFrom,
+    Scrape,
     /// BEP 12: a torrent whose announce list is [[a dead tracker, one that works], [another]] is
     /// announced to the first tier's working tracker and to no other, and that tracker alone hears
     /// `stopped`; with `--tracker-mode concurrent` every tracker is asked.
@@ -229,6 +230,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "magnet-select-only", kind: Kind::MagnetSelectOnly },
     Scenario { name: "dialed-peer-is-served", kind: Kind::DialedPeerIsServed },
     Scenario { name: "inbound-peer-is-downloaded-from", kind: Kind::InboundPeerIsDownloadedFrom },
+    Scenario { name: "scrape", kind: Kind::Scrape },
     Scenario { name: "tracker-tiers", kind: Kind::TrackerTiers },
     Scenario { name: "daemon-two-torrents", kind: Kind::Daemon },
 ];
@@ -286,6 +288,7 @@ fn main() {
             Kind::MagnetSelectOnly => run_magnet_select_only(scenario.name),
             Kind::DialedPeerIsServed => run_dialed_peer_is_served(scenario.name),
             Kind::InboundPeerIsDownloadedFrom => run_inbound_peer_is_downloaded_from(scenario.name),
+            Kind::Scrape => run_scrape(scenario.name),
             Kind::TrackerTiers => run_tracker_tiers(scenario.name),
             Kind::Daemon => run_daemon(scenario.name),
         };
@@ -687,6 +690,25 @@ struct PeerContext {
 /// Starts a fake tracker (answers every announce with the full peer list,
 /// and records it) and one fake peer per entry of `behaviors`, all on
 /// loopback.
+/// The bytes of query parameter `key` in a request line, with its percent-encoding undone (an info hash is 20 bytes that are not text).
+fn percent_decoded_param(request_line: &str, key: &str) -> Option<Vec<u8>> {
+    let query = request_line.split_once('?')?.1.split(' ').next()?;
+    let value = query.split('&').find_map(|pair| pair.strip_prefix(&format!("{}=", key)))?;
+    let bytes = value.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            out.push(u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
 fn spawn_swarm(fx: &Fixture, behaviors: Vec<Behavior>) -> Swarm {
     spawn_swarm_with_tracker(fx, behaviors, TrackerMode::Answer)
 }
@@ -722,6 +744,7 @@ fn spawn_tracker(peer_addrs: Vec<SocketAddr>, mode: TrackerMode) -> (SocketAddr,
     let tracker_addr = tracker_listener.local_addr().unwrap();
     let announces = Arc::new(Mutex::new(Vec::new()));
     let tracker_announces = Arc::clone(&announces);
+    let tracker_scrapes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     thread::spawn(move || {
         let mut peers_bin = Vec::new();
         for addr in &peer_addrs {
@@ -748,6 +771,17 @@ fn spawn_tracker(peer_addrs: Vec<SocketAddr>, mode: TrackerMode) -> (SocketAddr,
             let request_line = request.lines().next().unwrap_or("").to_string();
             let ignored = mode == TrackerMode::IgnoreStopped && announce_param(&request_line, "event").as_deref() == Some("stopped");
             let redirected = mode == TrackerMode::Redirect && request_line.starts_with("GET /announce?");
+            // A scrape (BEP 48) is not an announce and is not counted as one: it says 5 seeders, 2 leechers and 42 completed for the hash asked about.
+            if request_line.starts_with("GET /scrape?") {
+                let hash = percent_decoded_param(&request_line, "info_hash").unwrap_or_default();
+                let mut scrape_body = format!("d5:filesd{}:", hash.len()).into_bytes();
+                scrape_body.extend_from_slice(&hash);
+                scrape_body.extend_from_slice(b"d8:completei5e10:downloadedi42e10:incompletei2eeee");
+                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", scrape_body.len()).as_bytes());
+                let _ = stream.write_all(&scrape_body);
+                tracker_scrapes.lock().unwrap().push(request_line);
+                continue;
+            }
             tracker_announces.lock().unwrap().push(request_line);
             if ignored {
                 hung.push(stream);
@@ -3954,5 +3988,48 @@ fn run_inbound_peer_is_downloaded_from(name: &str) -> Result<String, String> {
         other => return Err(format!("the peer should have been sent piece 1 once, and got {} block(s)", other.len())),
     }
     Ok(format!("pieces {:?} came over a connection the peer made, which took piece 1 from the client too", wanted))
+}
+
+/// `--scrape` asks each tracker of a torrent how it is doing, for a `.torrent` file and for a magnet link, and says what each answered;
+/// a tracker that is not there is told apart from one that is, and does not stop the others being heard. Nothing is downloaded.
+fn run_scrape(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let swarm = spawn_swarm(&fx, vec![]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir) = (dir.join("e2e.torrent"), dir.join("out"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let run = |source: &std::ffi::OsStr, extra: &[&str]| -> Result<(bool, String), String> {
+        let output = client_command(source, &out_dir, &dir.join("client.log"), 1).arg("--scrape").args(extra).output().map_err(|e| format!("running the client: {}", e))?;
+        Ok((output.status.success(), String::from_utf8_lossy(&output.stdout).into_owned()))
+    };
+
+    let (ok, text) = run(torrent.as_os_str(), &[])?;
+    if !ok || !text.contains("5 seeder(s), 2 leecher(s), 42 completed") || !text.contains(&format!("http://{}/announce", swarm.tracker_addr)) {
+        return Err(format!("--scrape of a torrent file said: {:?}", text));
+    }
+    // A magnet link with a second tracker that is not there: the first is heard and the run is a success.
+    let magnet = format!("{}&tr={}", fx.magnet_uri(swarm.tracker_addr), "http%3A%2F%2F127.0.0.1%3A1%2Fannounce");
+    let (ok, text) = run(std::ffi::OsStr::new(&magnet), &["--json"])?;
+    let events = json_lines(&text)?;
+    if !ok || event_kinds(&events) != ["scrape", "scrape", "done"] {
+        return Err(format!("--scrape --json of a magnet link should give a scrape event per tracker and done; ok={}, events {:?}", ok, event_kinds(&events)));
+    }
+    let (good, bad) = (&events[0], &events[1]);
+    if good["ok"].as_bool() != Some(true) || good["seeders"].as_f64() != Some(5.0) || good["leechers"].as_f64() != Some(2.0) || good["completed"].as_f64() != Some(42.0) {
+        return Err(format!("the tracker that answered is reported wrongly: {:?}", good));
+    }
+    if bad["ok"].as_bool() != Some(false) || bad["error"].as_str().is_none_or(str::is_empty) {
+        return Err(format!("the tracker that is not there should be reported with an error: {:?}", bad));
+    }
+    // With no tracker answering, it is a failure, and says so.
+    let nobody = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=http%3A%2F%2F127.0.0.1%3A1%2Fannounce";
+    let (ok, _) = run(std::ffi::OsStr::new(nobody), &[])?;
+    if ok {
+        return Err("a scrape that no tracker answered should fail".to_string());
+    }
+    if out_dir.join("e2e.bin").exists() {
+        return Err("--scrape downloaded something".to_string());
+    }
+    Ok("a torrent file's tracker answered 5 seeders, 2 leechers, 42 completed; a magnet link's dead tracker did not stop the live one being heard; all dead is a failure".to_string())
 }
 

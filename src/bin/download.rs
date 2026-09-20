@@ -30,7 +30,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Conventional BitTorrent port: preferred TCP listen port for the
 /// seeder and UDP bind for the DHT node (both fall back to ephemeral if
@@ -101,6 +101,8 @@ struct Args {
     files_sel: Vec<usize>,
     /// Print the torrent's file list (with selection marks) and exit.
     list: bool,
+    /// Ask its trackers how many seeders and leechers it has (BEP 48) and exit.
+    scrape: bool,
     /// Explicit log path; `None` uses `<out_dir>/bittorrent-rs.log`.
     log: Option<PathBuf>,
     no_log: bool,
@@ -181,6 +183,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
     let mut only: Vec<String> = Vec::new();
     let mut files_sel: Vec<usize> = Vec::new();
     let mut list = false;
+    let mut scrape = false;
     let mut log = cfg.log.clone();
     let mut no_log = false;
     let mut no_tui = !cfg.tui.unwrap_or(true);
@@ -287,6 +290,7 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
                 }
             }
             "--list" => list = true,
+            "--scrape" => scrape = true,
             "--quiet" | "-q" => {
                 if verbosity == Verbosity::Verbose {
                     return Err("--quiet and --verbose are mutually exclusive".to_string());
@@ -306,6 +310,9 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
     if verify && list {
         return Err("--verify and --list are mutually exclusive".to_string());
     }
+    if scrape && (verify || list) {
+        return Err("--scrape cannot be combined with --verify or --list".to_string());
+    }
     if verify && source.starts_with("magnet:?") {
         return Err("--verify needs a .torrent file: a magnet link has no file list until its metadata has been fetched from the network".to_string());
     }
@@ -321,11 +328,11 @@ fn parse_args_from(cfg: &Config, mut argv: impl Iterator<Item = String>) -> Resu
         seed = true;
     }
 
-    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, encryption, transport, tracker_mode, sequential, prefer, save_torrent, json, verify, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_lsd, no_portmap, no_webseed, peers_hint, ipv6, only, files_sel, list, log, no_log, no_tui })
+    Ok(Args { source, out_dir, max_peers, reannounce_override, retry_delay, recheck, encryption, transport, tracker_mode, sequential, prefer, save_torrent, json, verify, max_down, max_up, verbosity, timeout, port, seed, seed_limits, no_dht, no_lsd, no_portmap, no_webseed, peers_hint, ipv6, only, files_sel, list, scrape, log, no_log, no_tui })
 }
 
 fn usage() -> String {
-    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--lsd | --no-lsd] [--portmap | --no-portmap] [--webseed | --no-webseed] [--peer ADDRESS:PORT]... [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--encryption off|prefer|require] [--transport tcp|utp|both] [--tracker-mode tiered|concurrent] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--verify] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
+    "usage: download <file.torrent | magnet:?xt=urn:btih:...> [--out DIR] [--peers N] [--port PORT] [--seed | --no-seed] [--seed-ratio RATIO] [--seed-time DURATION] [--dht | --no-dht] [--lsd | --no-lsd] [--portmap | --no-portmap] [--webseed | --no-webseed] [--peer ADDRESS:PORT]... [--ipv6 | --no-ipv6] [--only SUBSTR]... [--files 1,3,5] [--list] [--scrape] [--reannounce SECONDS] [--retry-delay SECONDS] [--recheck] [--encryption off|prefer|require] [--transport tcp|utp|both] [--tracker-mode tiered|concurrent] [--sequential] [--prefer SUBSTR]... [--save-torrent FILE] [--json] [--verify] [--max-down RATE] [--max-up RATE] [--timeout SECONDS] [--config FILE | --no-config] [--log FILE | --no-log] [--tui | --no-tui] [--quiet | --verbose]".to_string()
 }
 
 fn default_downloads_dir() -> PathBuf {
@@ -371,7 +378,7 @@ fn main() -> ExitCode {
 
     // `--list` is a quick print-and-exit; never spin up the dashboard for it.
     let json = args.json;
-    let interactive = !quiet && !json && !args.no_tui && !args.list && !args.verify && std::io::stdout().is_terminal();
+    let interactive = !quiet && !json && !args.no_tui && !args.list && !args.verify && !args.scrape && std::io::stdout().is_terminal();
     let stop = Arc::new(AtomicBool::new(false));
     // Ctrl-C and `kill` wind the client down like the dashboard's `q`, even
     // with no terminal: the port mapping is removed, not left on the router.
@@ -419,6 +426,85 @@ fn main() -> ExitCode {
     }
 }
 
+/// How long `--scrape` waits for the trackers before saying which have not answered.
+const SCRAPE_WAIT: Duration = Duration::from_secs(20);
+
+/// `--scrape`: asks every tracker of the torrent (its `.torrent` file's, or its magnet link's) how many seeders and leechers it has for
+/// it, and how many times it has been finished, and prints what comes back. It looks for no peer and fetches no metadata: only the info
+/// hash and the tracker URLs are needed.
+fn scrape_trackers(args: &Args, ui: &Ui) -> Result<String, String> {
+    let (name, info_hash, trackers) = if args.source.starts_with("magnet:?") {
+        let magnet = parse_magnet_uri(&args.source).map_err(|e| finish_err(ui, format!("parsing magnet uri: {}", e)))?;
+        let name = magnet.display_name.clone().unwrap_or_else(|| torrent::info_hash_hex(&magnet.info_hash));
+        (name, magnet.info_hash, magnet.trackers)
+    } else {
+        let bytes = fs::read(&args.source).map_err(|e| finish_err(ui, format!("reading {}: {}", args.source, e)))?;
+        let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| finish_err(ui, format!("parsing {}: {}", args.source, e)))?;
+        let mut trackers: Vec<String> = Vec::new();
+        for url in torrent.tracker_tiers().into_iter().flatten() {
+            if !trackers.contains(&url) {
+                trackers.push(url);
+            }
+        }
+        (torrent.name.clone(), torrent.info_hash, trackers)
+    };
+    if trackers.is_empty() {
+        return Err(finish_err(ui, "the torrent names no tracker to ask".to_string()));
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    for url in &trackers {
+        let (url, tx) = (url.clone(), tx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((url.clone(), bittorrent_rs::tracker::scrape::scrape(&url, &info_hash).map_err(|e| e.to_string())));
+        });
+    }
+    drop(tx);
+    let deadline = Instant::now() + SCRAPE_WAIT;
+    let mut answers: Vec<(String, Result<bittorrent_rs::tracker::scrape::ScrapeStats, String>)> = Vec::new();
+    while answers.len() < trackers.len() {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
+        match rx.recv_timeout(left) {
+            Ok(answer) => answers.push(answer),
+            Err(_) => break,
+        }
+    }
+    // In the order the torrent lists them, with those that said nothing at the end of it.
+    let mut lines = Vec::new();
+    let mut answered = 0;
+    for url in &trackers {
+        let result = answers.iter().find(|(asked, _)| asked == url).map(|(_, result)| result.clone()).unwrap_or_else(|| Err(format!("no answer in {} seconds", SCRAPE_WAIT.as_secs())));
+        let line = match &result {
+            Ok(stats) => {
+                answered += 1;
+                bittorrent_rs::json::Object::new().string("event", "scrape").string("tracker", url).boolean("ok", true).uint("seeders", stats.complete.into()).uint("leechers", stats.incomplete.into()).uint("completed", stats.downloaded.into()).finish()
+            }
+            Err(why) => bittorrent_rs::json::Object::new().string("event", "scrape").string("tracker", url).boolean("ok", false).string("error", why).finish(),
+        };
+        lines.push((url.clone(), result, line));
+    }
+    let text = {
+        let mut out = format!("{} \u{2014} {} tracker(s) asked, {} answered:\n", name, trackers.len(), answered);
+        for (url, result, _) in &lines {
+            match result {
+                Ok(stats) => out.push_str(&format!("  {}  {} seeder(s), {} leecher(s), {} completed\n", url, stats.complete, stats.incomplete, stats.downloaded)),
+                Err(why) => out.push_str(&format!("  {}  {}\n", url, why)),
+            }
+        }
+        out
+    };
+    if args.json {
+        for (_, _, line) in lines {
+            ui.event(line);
+        }
+    }
+    if answered == 0 {
+        return Err(finish_err(ui, format!("no tracker answered:\n{}", text.trim_end())));
+    }
+    ui.finish(Ok(if args.json { format!("{} of {} tracker(s) answered", answered, trackers.len()) } else { text.clone() }));
+    Ok(text)
+}
+
 /// Whether the DHT gets an IPv6 node (BEP 32): when peers over IPv6 are wanted,
 /// as `--ipv6` and `--no-ipv6` and a probe for a route decide.
 fn dht_ipv6(args: &Args) -> bool {
@@ -444,6 +530,9 @@ fn fetch_layers_if_missing(torrent: &mut torrent::TorrentFile, bootstrap_peers: 
 /// (except in `--seed` mode, which keeps the UI live until the user
 /// quits via `stop`).
 fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String> {
+    if args.scrape {
+        return scrape_trackers(&args, ui);
+    }
     let our_peer_id = generate_peer_id();
 
     // Dropping `services` (including on any early `return Err`) stops the
@@ -732,6 +821,14 @@ mod tests {
         assert!(parse(&Config::default(), &["x", "--encryption", "maybe"]).err().unwrap().starts_with("--encryption:"));
         assert!(parse(&Config::default(), &["x", "--encryption"]).err().unwrap().contains("requires"));
         assert!(parse(&cfg_from("encryption = \"maybe\""), &["x"]).err().unwrap().starts_with("config encryption:"));
+    }
+
+    #[test]
+    fn scrape_is_off_unless_asked_for_and_cannot_be_combined_with_list_or_verify() {
+        assert!(!parse(&Config::default(), &["x"]).unwrap().scrape);
+        assert!(parse(&Config::default(), &["x", "--scrape"]).unwrap().scrape);
+        assert!(parse(&Config::default(), &["x", "--scrape", "--list"]).err().unwrap().contains("--scrape"));
+        assert!(parse(&Config::default(), &["x", "--verify", "--scrape"]).err().unwrap().contains("--scrape"));
     }
 
     #[test]
