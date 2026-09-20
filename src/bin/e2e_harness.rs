@@ -168,6 +168,7 @@ enum Kind {
     PaddedTorrent,
     MagnetSelectOnly,
     DialedPeerIsServed,
+    InboundPeerIsDownloadedFrom,
     /// BEP 12: a torrent whose announce list is [[a dead tracker, one that works], [another]] is
     /// announced to the first tier's working tracker and to no other, and that tracker alone hears
     /// `stopped`; with `--tracker-mode concurrent` every tracker is asked.
@@ -227,6 +228,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "padded-torrent", kind: Kind::PaddedTorrent },
     Scenario { name: "magnet-select-only", kind: Kind::MagnetSelectOnly },
     Scenario { name: "dialed-peer-is-served", kind: Kind::DialedPeerIsServed },
+    Scenario { name: "inbound-peer-is-downloaded-from", kind: Kind::InboundPeerIsDownloadedFrom },
     Scenario { name: "tracker-tiers", kind: Kind::TrackerTiers },
     Scenario { name: "daemon-two-torrents", kind: Kind::Daemon },
 ];
@@ -283,6 +285,7 @@ fn main() {
             Kind::PaddedTorrent => run_padded_torrent(scenario.name),
             Kind::MagnetSelectOnly => run_magnet_select_only(scenario.name),
             Kind::DialedPeerIsServed => run_dialed_peer_is_served(scenario.name),
+            Kind::InboundPeerIsDownloadedFrom => run_inbound_peer_is_downloaded_from(scenario.name),
             Kind::TrackerTiers => run_tracker_tiers(scenario.name),
             Kind::Daemon => run_daemon(scenario.name),
         };
@@ -829,6 +832,31 @@ fn serve_stream(stream: Box<dyn bittorrent_rs::peer::PeerStream>, over_utp: bool
     if stream.write_all(&our_hs.to_bytes()).is_err() {
         return;
     }
+    converse(stream, &their_hs, encrypted, over_utp, cx, behavior, log);
+}
+
+/// A fake peer that connects to the client, at `addr`, instead of being connected to: it sends its handshake first, and then does
+/// what it does on any connection.
+fn dial_client(addr: SocketAddr, cx: &PeerContext, behavior: &Behavior, log: &Mutex<PeerLog>) {
+    let Ok(tcp) = TcpStream::connect(addr) else { return };
+    let mut stream = bittorrent_rs::peer::mse::MseStream::plain(Box::new(tcp));
+    let fast = matches!(behavior, Behavior::Fast(_));
+    if stream.write_all(&Handshake::new(cx.info_hash, [0x98; 20], true).with_fast(fast).to_bytes()).is_err() {
+        return;
+    }
+    let mut hs_buf = [0u8; 68];
+    if stream.read_exact(&mut hs_buf).is_err() {
+        return;
+    }
+    let Ok(their_hs) = Handshake::from_bytes(&hs_buf) else { return };
+    if their_hs.info_hash != cx.info_hash {
+        return;
+    }
+    converse(stream, &their_hs, false, false, cx, behavior, log);
+}
+
+/// What a fake peer says and does on a connection whose handshakes are done, until it ends.
+fn converse(mut stream: bittorrent_rs::peer::mse::MseStream, their_hs: &Handshake, encrypted: bool, over_utp: bool, cx: &PeerContext, behavior: &Behavior, log: &Mutex<PeerLog>) {
     {
         let mut log = log.lock().unwrap();
         log.fast_offered = Some(their_hs.supports_fast());
@@ -3862,5 +3890,69 @@ fn run_dialed_peer_is_served(name: &str) -> Result<String, String> {
         other => return Err(format!("the peer should have been sent piece 1 ({} bytes) once, and got {} block(s): {:?}", asked.len(), other.len(), other.iter().map(|(i, b, d)| (*i, *b, d.len())).collect::<Vec<_>>())),
     }
     Ok(format!("downloaded pieces {:?} from a peer that took piece 1 from the client on the same connection", wanted))
+}
+
+/// A peer that connects to the client, and not the other way about, is a source of pieces as well as a taker of them. The client knows no
+/// peer to connect to (its tracker names one that is not there), so what it downloads it gets over a connection made to it: the peer
+/// has the pieces the client lacks and lacks the client's, and is served on the same connection while it is downloaded from.
+fn run_inbound_peer_is_downloaded_from(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let count = fx.piece_count;
+    let mine: BTreeSet<u32> = (0..3).collect();
+    let theirs: BTreeSet<u32> = (3..count as u32).collect();
+    let nobody = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?.local_addr().map_err(|e| e.to_string())?; // where nothing listens
+    let (tracker_addr, announces) = spawn_tracker(vec![nobody], TrackerMode::Answer);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(tracker_addr)).expect("write torrent file");
+    let mut on_disk = vec![0u8; fx.data.len()];
+    let kept = 3 * fx.piece_len;
+    on_disk[..kept].copy_from_slice(&fx.data[..kept]);
+    fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    fs::write(out_dir.join("e2e.bin"), &on_disk).map_err(|e| e.to_string())?;
+
+    // Held to a few hundred bytes a second, so that the client is still downloading when the peer has been let in.
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1).args(["--no-dht", "--max-down", "300", "--port", "0"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    // The port it listens on is the one it tells the tracker.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let port: u16 = loop {
+        if let Some(port) = announces.lock().unwrap().first().and_then(|line| announce_param(line, "port")).and_then(|p| p.parse().ok()) {
+            break port;
+        }
+        if Instant::now() >= deadline || child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            let _ = child.kill();
+            return Err("the client never announced its port".to_string());
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let log = Arc::new(Mutex::new(PeerLog::default()));
+    let cx = PeerContext { encryption: bittorrent_rs::peer::Encryption::Off, data: fx.data.clone(), info_bytes: fx.info_bytes.clone(), info_hash: fx.info_hash, piece_len: fx.piece_len, piece_count: fx.piece_count, pieces: None };
+    let behavior = Behavior::AlsoAsks { has: theirs, wants: 1 };
+    let peer_log = Arc::clone(&log);
+    thread::spawn(move || dial_client(SocketAddr::from(([127, 0, 0, 1], port)), &cx, &behavior, &peer_log));
+
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("download binary exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+
+    let log = log.lock().unwrap();
+    let requested: BTreeSet<u32> = log.requested.iter().copied().collect();
+    let wanted: BTreeSet<u32> = (3..count as u32).collect();
+    if requested != wanted {
+        return Err(format!("the client asked the peer that connected to it for pieces {:?}; expected {:?}", requested, wanted));
+    }
+    let bitfield = log.client_bitfield.as_ref().ok_or("the client never told the peer what it has")?;
+    let advertised: BTreeSet<u32> = (0..count as u32).filter(|&i| bitfield.get(i as usize / 8).is_some_and(|byte| byte & (0x80 >> (i % 8)) != 0)).collect();
+    if advertised != mine {
+        return Err(format!("the client said it had pieces {:?}; it had {:?}", advertised, mine));
+    }
+    let asked = &fx.data[fx.piece_len..2 * fx.piece_len];
+    match log.received.as_slice() {
+        [(1, 0, block)] if block == asked => {}
+        other => return Err(format!("the peer should have been sent piece 1 once, and got {} block(s)", other.len())),
+    }
+    Ok(format!("pieces {:?} came over a connection the peer made, which took piece 1 from the client too", wanted))
 }
 

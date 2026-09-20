@@ -1,13 +1,14 @@
 //! The threads that fetch pieces: one per connected peer, one per web
 //! seed, all draining the same work queue.
 
-use crate::downloader::{run_worker, FileSpan, PexSender, PieceResult, WorkQueue, WorkerConfig, WorkerError};
+use crate::downloader::{run_adopted, run_worker, Adopted, Adoption, FileSpan, PexSender, PieceResult, WorkQueue, WorkerConfig, WorkerError};
+use crate::seeder::Adopter;
 use crate::session::peer_pool::Outcome;
 use crate::session::PeerPool;
 use crate::sync::lock;
 use crate::webseed::{run_web_worker, WebEnd};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -26,6 +27,31 @@ pub fn classify(result: &Result<(), WorkerError>) -> Outcome {
         // Our disk failed; the peer did nothing wrong.
         Err(WorkerError::Connection { stage: "write_piece_to_disk", .. }) => Outcome::Local,
         Err(WorkerError::Connection { .. }) => Outcome::Dropped,
+    }
+}
+
+/// Takes the connections that peers made to us and that turn out to be of use to the download: it asks the peer's pieces of the queue, and
+/// hands the connection over to [`Workers::take_adopted`] on a channel.
+struct Adoptions {
+    queue: Arc<WorkQueue>,
+    tx: Mutex<Sender<Adopted>>,
+    /// Adopted connections that are running, and the most there are to be.
+    running: AtomicUsize,
+    max: usize,
+    /// Set when the workers are stopped: nothing more is taken.
+    closed: AtomicBool,
+}
+
+impl Adopter for Adoptions {
+    fn wants(&self, has: &[bool]) -> bool {
+        !self.closed.load(Ordering::SeqCst) && self.running.load(Ordering::SeqCst) < self.max && self.queue.any_wanted_in(has)
+    }
+
+    fn adopt(&self, connection: Adopted) {
+        self.running.fetch_add(1, Ordering::SeqCst);
+        if lock(&self.tx).send(connection).is_err() {
+            self.running.fetch_sub(1, Ordering::SeqCst); // the workers are gone: the connection closes
+        }
     }
 }
 
@@ -54,6 +80,9 @@ pub struct Workers {
     /// Why writing to disk failed, once it has: with nothing to write to,
     /// no peer can help, and the run cannot go on.
     disk_failure: Arc<Mutex<Option<String>>>,
+    /// Connections that peers made and the download is to take over, and where they wait to be started.
+    adoptions: Arc<Adoptions>,
+    adopted_rx: Receiver<Adopted>,
 }
 
 impl Workers {
@@ -75,7 +104,47 @@ impl Workers {
         let (results_tx, results_rx) = mpsc::channel();
         let (pex_tx, pex_rx) = mpsc::channel();
         let (outcomes_tx, outcomes_rx) = mpsc::channel();
-        Workers { queue, spans, config, piece_length, max_peers, log, results_tx, results_rx, pex_tx: (!private).then_some(pex_tx), pex_rx, outcomes_tx, outcomes_rx, peers: Vec::new(), web_seeds: Vec::new(), web_stop: Arc::new(AtomicBool::new(false)), disk_failure: Arc::new(Mutex::new(None)) }
+        let (adopted_tx, adopted_rx) = mpsc::channel();
+        let adoptions = Arc::new(Adoptions { queue: Arc::clone(&queue), tx: Mutex::new(adopted_tx), running: AtomicUsize::new(0), max: max_peers, closed: AtomicBool::new(false) });
+        Workers { queue, spans, config, piece_length, max_peers, log, results_tx, results_rx, pex_tx: (!private).then_some(pex_tx), pex_rx, outcomes_tx, outcomes_rx, peers: Vec::new(), web_seeds: Vec::new(), web_stop: Arc::new(AtomicBool::new(false)), disk_failure: Arc::new(Mutex::new(None)), adoptions, adopted_rx }
+    }
+
+    /// What lets the listener give this download the connections of peers that have pieces it lacks (see [`crate::seeder::SeederHandle::set_adopter`]).
+    pub fn adopter(&self) -> Arc<dyn Adopter> {
+        Arc::clone(&self.adoptions) as Arc<dyn Adopter>
+    }
+
+    /// Starts a worker on each connection that has been adopted since the last call. What a worker does with one that has nothing
+    /// more to give is to serve it on, on a thread of its own, so that its slot is free for a peer that has.
+    pub fn take_adopted(&mut self) {
+        let adopted: Vec<Adopted> = self.adopted_rx.try_iter().collect();
+        for connection in adopted {
+            let (queue, spans, config) = (Arc::clone(&self.queue), Arc::clone(&self.spans), Arc::clone(&self.config));
+            let (tx, pex_tx, log) = (self.results_tx.clone(), self.pex_tx.clone(), Arc::clone(&self.log));
+            let disk_failure = Arc::clone(&self.disk_failure);
+            let (adoptions, piece_length) = (Arc::clone(&self.adoptions), self.piece_length);
+            self.peers.push(thread::spawn(move || {
+                let peer = connection.peer;
+                let result = match run_adopted(connection, &config, &queue, &spans, piece_length, &tx, pex_tx.as_ref()) {
+                    Adoption::ServeOn(stream, serving) => {
+                        if let Some(upload) = config.upload.clone() {
+                            thread::spawn(move || {
+                                let _ = crate::seeder::serve_adopted(stream, serving, &upload);
+                            });
+                        }
+                        Ok(())
+                    }
+                    Adoption::Ended(result) => result,
+                };
+                adoptions.running.fetch_sub(1, Ordering::SeqCst);
+                if let Err(e) = &result {
+                    log(format!("peer {} (connected to us) disconnected: {:?}", peer, e));
+                    if let WorkerError::Connection { stage: "write_piece_to_disk", error } = e {
+                        lock(&disk_failure).get_or_insert(error.to_string());
+                    }
+                }
+            }));
+        }
     }
 
     /// Starts one worker per BEP 19 web seed, each dialing nobody: they
@@ -101,6 +170,7 @@ impl Workers {
     /// waiting retry is due) until `max_peers` are connected or there is
     /// nothing left to dial or fetch.
     pub fn spawn_peers(&mut self, pool: &mut PeerPool, now: Instant) {
+        self.take_adopted();
         while self.peers.len() < self.max_peers && !self.queue.is_empty() {
             let Some(addr) = pool.next_to_dial(now) else { break };
             let (queue, spans, config) = (Arc::clone(&self.queue), Arc::clone(&self.spans), Arc::clone(&self.config));
@@ -188,6 +258,7 @@ impl Workers {
     /// the pieces they completed that nobody had collected yet.
     pub fn shutdown(&mut self) -> Vec<PieceResult> {
         self.web_stop.store(true, Ordering::SeqCst);
+        self.adoptions.closed.store(true, Ordering::SeqCst);
         // Workers blocked on a silent peer would otherwise be waited for
         // until their read timeout.
         self.config.interrupt.trigger();
@@ -390,5 +461,46 @@ mod tests {
 
         wait_until("the disk failure to be reported", || w.disk_failure().is_some());
         w.shutdown();
+    }
+
+    // ---- connections peers made ----
+
+    fn adoptions_for(pieces: usize, max: usize) -> (Workers, Arc<dyn Adopter>) {
+        let workers = Workers::new(queue_with(pieces), Arc::new(Vec::new()), Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None }), 16, max, false, recording_log().0);
+        let adopter = workers.adopter();
+        (workers, adopter)
+    }
+
+    #[test]
+    fn a_peer_is_wanted_when_it_has_a_piece_still_to_fetch_and_only_then() {
+        let (_workers, adopter) = adoptions_for(3, 4);
+        assert!(adopter.wants(&[false, false, true]));
+        assert!(adopter.wants(&[true, false, false]));
+        assert!(!adopter.wants(&[false, false, false]), "it has nothing");
+        assert!(!adopter.wants(&[]), "it has said nothing");
+        assert!(!adopter.wants(&[false, false, false, true]), "a piece the torrent does not have is nothing to want");
+    }
+
+    #[test]
+    fn a_piece_that_has_been_fetched_is_no_reason_to_want_a_peer() {
+        let (workers, adopter) = adoptions_for(2, 4);
+        let (a, b) = (workers.queue.pop().unwrap(), workers.queue.pop().unwrap());
+        // Both are claimed by workers, not yet done: the peer might yet be the one to give them.
+        assert!(adopter.wants(&[true, true]));
+        workers.queue.mark_done(a.index);
+        workers.queue.mark_done(b.index);
+        assert!(!adopter.wants(&[true, true]), "the download has everything");
+    }
+
+    #[test]
+    fn no_more_connections_are_taken_than_the_limit_and_none_once_the_workers_are_stopped() {
+        let (mut workers, adopter) = adoptions_for(3, 1);
+        assert!(adopter.wants(&[true, true, true]));
+        workers.adoptions.running.store(1, Ordering::SeqCst);
+        assert!(!adopter.wants(&[true, true, true]), "the one allowed is running");
+        workers.adoptions.running.store(0, Ordering::SeqCst);
+        assert!(adopter.wants(&[true, true, true]));
+        workers.shutdown();
+        assert!(!adopter.wants(&[true, true, true]), "nothing is taken by workers that are stopping");
     }
 }

@@ -2007,3 +2007,120 @@ fn a_peer_that_gives_the_worker_data_is_unchoked_ahead_of_one_that_gives_nothing
     seeder.stop();
 }
 
+// ---- a connection the peer made ---------------------------------------------------------------------------------------
+
+/// What a worker is given for a peer that connected: `ours` is its end of a connection, on which our bitfield has been said.
+fn adopt_from(name: &str, info_hash: [u8; 20], pieces: &[Vec<u8>], have: &[u32], peer_has: Vec<bool>, read_timeout: Duration) -> (Adopted, TcpStream, crate::seeder::SeederHandle, Arc<WorkQueue>, Arc<Vec<crate::downloader::FileSpan>>, WorkerConfig) {
+    let (seeder, _) = upload_for(name, info_hash, pieces, have);
+    let upload = seeder.upload();
+    let (theirs, mut ours) = socket_pair();
+    let their_handshake = Handshake::new(info_hash, [0x99; 20], false);
+    let serving = crate::serving::Serving::begin(&upload, &their_handshake, None, &mut ours, false).unwrap();
+    let piece_len = pieces[0].len();
+    let want: Vec<usize> = (0..pieces.len()).filter(|&i| !have.contains(&(i as u32))).collect();
+    let work = want.iter().map(|&i| PieceWork { index: i as u32, hash: sha1_of(&pieces[i]), length: piece_len as u32, merkle: None }).collect();
+    let queue = Arc::new(WorkQueue::new(work, pieces.len()));
+    let dir = tmp_dir(&format!("{}-out", name));
+    let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], (pieces.len() * piece_len) as i64)]));
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: read_timeout, down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: Some(upload) };
+    let adopted = Adopted { stream: Box::new(ours), serving, peer: theirs.local_addr().unwrap(), their_handshake, peer_has };
+    (adopted, theirs, seeder, queue, spans, config)
+}
+
+#[test]
+fn a_connection_a_peer_made_is_downloaded_from_and_then_served_on_when_there_is_nothing_more_to_fetch() {
+    let info_hash = [0x58; 20];
+    let pieces = vec![vec![0x8Eu8; 16384], vec![0x9Fu8; 16384]];
+    // We have piece 0 and want piece 1, which the peer says it has; the peer wants piece 0.
+    let (adopted, mut theirs, mut seeder, queue, spans, config) = adopt_from("adopt-worker", info_hash, &pieces, &[0], vec![false, true], Duration::from_secs(5));
+    let served = pieces.clone();
+    let peer = thread::spawn(move || {
+        theirs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let WireMessage::Bitfield(bits) = next_message(&mut theirs) else { panic!("our bitfield was said first") };
+        assert_eq!(bits[0] & 0b1100_0000, 0b1000_0000);
+        // The worker is interested (in what the peer said it has) as soon as it has the connection.
+        assert_eq!(next_message(&mut theirs), WireMessage::Interested);
+        WireMessage::Interested.write_to(&mut theirs).unwrap();
+        WireMessage::Unchoke.write_to(&mut theirs).unwrap();
+        let mut asked_for_ours = false;
+        let mut got = 0;
+        loop {
+            match WireMessage::read_from(&mut theirs) {
+                Ok(WireMessage::Unchoke) if !asked_for_ours => {
+                    asked_for_ours = true;
+                    WireMessage::Request { index: 0, begin: 0, length: 16384 }.write_to(&mut theirs).unwrap();
+                }
+                Ok(WireMessage::Piece { index: 0, block, .. }) => {
+                    assert_eq!(block, served[0]);
+                    got += 1;
+                    if got == 2 {
+                        return; // asked twice: once while it was downloading, once after
+                    }
+                    // The worker has what it wanted by now; this second ask is answered by whoever serves the connection then.
+                    thread::sleep(Duration::from_millis(300));
+                    WireMessage::Request { index: 0, begin: 0, length: 16384 }.write_to(&mut theirs).unwrap();
+                }
+                Ok(WireMessage::Request { index: 1, begin, length }) => {
+                    let block = served[1][begin as usize..(begin + length) as usize].to_vec();
+                    WireMessage::Piece { index: 1, begin, block }.write_to(&mut theirs).unwrap();
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    });
+    let (tx, rx) = mpsc::channel();
+    let outcome = run_adopted(adopted, &config, &queue, &spans, 16384, &tx, None);
+    let (stream, serving) = match outcome {
+        Adoption::ServeOn(stream, serving) => (stream, serving),
+        Adoption::Ended(result) => panic!("with the queue drained the peer is still to be served, not {:?}", result),
+    };
+    assert_eq!(rx.try_iter().count(), 1, "piece 1 was fetched over the connection the peer made");
+    assert!(queue.is_empty());
+    let upload = config.upload.clone().unwrap();
+    let server = thread::spawn(move || crate::seeder::serve_adopted(stream, serving, &upload));
+    peer.join().expect("the peer was served piece 0 twice: while the worker had it, and after");
+    seeder.stop();
+    let _ = server.join();
+}
+
+#[test]
+fn an_adopted_peer_that_never_unchokes_is_served_on_not_dropped() {
+    let info_hash = [0x59; 20];
+    let pieces = vec![vec![0xA0u8; 16384], vec![0xB1u8; 16384]];
+    let (adopted, mut theirs, mut seeder, queue, spans, config) = adopt_from("adopt-choked", info_hash, &pieces, &[0], vec![false, true], Duration::from_millis(50));
+    let peer = thread::spawn(move || {
+        theirs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        // It is a leecher: interested in us, and never unchokes the worker.
+        WireMessage::Interested.write_to(&mut theirs).unwrap();
+        loop {
+            match WireMessage::read_from(&mut theirs) {
+                Ok(WireMessage::Unchoke) => break,
+                Ok(_) => {}
+                Err(e) => panic!("the connection ended before it was unchoked: {:?}", e),
+            }
+        }
+        theirs
+    });
+    let (tx, _rx) = mpsc::channel();
+    let outcome = run_adopted(adopted, &config, &queue, &spans, 16384, &tx, None);
+    assert!(matches!(outcome, Adoption::ServeOn(..)), "given up on for downloading, kept for serving");
+    assert_eq!(queue.len(), 1, "and what it was to be fetched from is still to be fetched");
+    assert_eq!(queue.availability(), vec![0, 1], "what the peer said it has counts towards how rare a piece is");
+    let _theirs = peer.join().unwrap();
+    seeder.stop();
+}
+
+#[test]
+fn an_adopted_connection_that_fails_is_over() {
+    let info_hash = [0x5A; 20];
+    let pieces = vec![vec![0xC2u8; 16384], vec![0xD3u8; 16384]];
+    let (adopted, theirs, mut seeder, queue, spans, config) = adopt_from("adopt-fails", info_hash, &pieces, &[0], vec![false, true], Duration::from_secs(5));
+    drop(theirs); // hangs up at once
+    let (tx, _rx) = mpsc::channel();
+    let outcome = run_adopted(adopted, &config, &queue, &spans, 16384, &tx, None);
+    assert!(matches!(outcome, Adoption::Ended(Err(_))), "nothing to serve on");
+    assert_eq!(queue.len(), 1, "the piece is back for another peer");
+    seeder.stop();
+}
+

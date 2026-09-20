@@ -22,6 +22,7 @@
 //! simplification).
 
 use crate::choker::{Choker, DEFAULT_SLOTS};
+use crate::downloader::worker::Adopted;
 use crate::serving::{wire_to_io, Serving};
 use crate::downloader::file_writer::FileSpan;
 use crate::peer::handshake::{Handshake, HANDSHAKE_LEN};
@@ -106,6 +107,15 @@ impl HaveMap {
     }
 }
 
+/// What a download that is still going offers the listener: to take over the connection of a peer that came to be served, if the
+/// peer turns out to have a piece the download lacks. It is then downloaded from as well as served, over the connection it made.
+pub trait Adopter: Send + Sync {
+    /// Whether a peer that has these pieces (`has[i]` for piece `i`) is wanted: there is a piece among them still to be fetched, and room for it.
+    fn wants(&self, has: &[bool]) -> bool;
+    /// Takes the connection.
+    fn adopt(&self, connection: Adopted);
+}
+
 /// Everything the serve loop needs, shared across all the threads that serve a torrent's peers: the
 /// seeder's own connections and the download workers' (see [`crate::serving`]).
 pub struct SeederShared {
@@ -127,6 +137,8 @@ pub struct SeederShared {
     pub(crate) piece_lengths: Option<Arc<Vec<u32>>>,
     /// What hash requests (BEP 52) are answered from, for a v2 torrent.
     pub(crate) hash_source: Option<Arc<crate::v2::HashSource>>,
+    /// Who takes the connections of peers that have pieces the download lacks, while there is one.
+    pub(crate) adopter: Mutex<Option<Arc<dyn Adopter>>>,
 }
 
 impl SeederShared {
@@ -232,8 +244,8 @@ impl Listener {
             threads.push(thread::spawn(move || {
                 while accepting.running.load(Ordering::SeqCst) {
                     let Some(stream) = utp.accept(Duration::from_millis(200)) else { continue };
-                    let peer_ip = Some(stream.peer_addr().ip());
-                    admit(&accepting, Box::new(stream), peer_ip);
+                    let peer = Some(stream.peer_addr());
+                    admit(&accepting, Box::new(stream), peer);
                 }
             }));
         }
@@ -262,6 +274,7 @@ impl Listener {
             metadata: options.metadata.clone(),
             piece_lengths: options.piece_lengths.clone(),
             hash_source: options.hash_source.clone(),
+            adopter: Mutex::new(None),
         });
 
         // The rounds: who is served changes here, and each connection notices
@@ -347,6 +360,12 @@ impl SeederHandle {
     /// What is served of this torrent, for a download's own connections to serve from too (see [`crate::serving`]).
     pub fn upload(&self) -> Arc<SeederShared> {
         Arc::clone(&self.torrent)
+    }
+
+    /// Has the download take over the connections of peers that come to be served and turn out to have pieces it lacks (`None` for no
+    /// longer). Only connections made from now on are looked at.
+    pub fn set_adopter(&self, adopter: Option<Arc<dyn Adopter>>) {
+        *lock(&self.torrent.adopter) = adopter;
     }
 
     /// How many peers this side has dialed and is still connected to (or connecting to).
@@ -467,8 +486,8 @@ fn accept_loop(listener: TcpListener, registry: Arc<Registry>) {
         match listener.accept() {
             Ok((stream, _addr)) => {
                 let Some(stream) = prepare_accepted(stream) else { continue };
-                let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
-                admit(&registry, Box::new(stream), peer_ip);
+                let peer = stream.peer_addr().ok();
+                admit(&registry, Box::new(stream), peer);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(200));
@@ -479,14 +498,14 @@ fn accept_loop(listener: TcpListener, registry: Arc<Registry>) {
 }
 
 /// Serves `stream` on a thread of its own, unless too many are being served.
-fn admit(registry: &Arc<Registry>, stream: Box<dyn PeerStream>, peer_ip: Option<std::net::IpAddr>) {
+fn admit(registry: &Arc<Registry>, stream: Box<dyn PeerStream>, peer: Option<std::net::SocketAddr>) {
     if registry.active_conns.load(Ordering::SeqCst) >= MAX_INBOUND_PEERS {
         return; // over cap: dropped, which closes it
     }
     registry.active_conns.fetch_add(1, Ordering::SeqCst);
     let registry = Arc::clone(registry);
     thread::spawn(move || {
-        let _ = serve_peer(stream, peer_ip, &registry);
+        let _ = serve_peer(stream, peer, &registry);
         registry.active_conns.fetch_sub(1, Ordering::SeqCst);
     });
 }
@@ -536,7 +555,7 @@ fn bind_tcp_v6_only(port: u16) -> std::io::Result<TcpListener> {
 
 /// Serves one inbound peer: handshake, bitfield, then Request/Piece until
 /// the peer leaves, goes idle too long, or the seeder shuts down.
-fn serve_peer(stream: Box<dyn PeerStream>, peer_ip: Option<std::net::IpAddr>, registry: &Registry) -> std::io::Result<()> {
+fn serve_peer(stream: Box<dyn PeerStream>, peer: Option<std::net::SocketAddr>, registry: &Registry) -> std::io::Result<()> {
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
 
@@ -558,7 +577,7 @@ fn serve_peer(stream: Box<dyn PeerStream>, peer_ip: Option<std::net::IpAddr>, re
     // them: the info dictionary, for a peer that has only a magnet link.
     let ours = Handshake::new(shared.info_hash, shared.our_peer_id, shared.metadata.is_some()).with_fast(true);
     stream.write_all(&ours.to_bytes())?;
-    serve_connection(stream, peer_ip, &shared, &their_hs, false)
+    serve_connection(stream, peer, &shared, &their_hs, false)
 }
 
 /// The dialing side of a connection to a peer that is to be served: connect, handshake first, then serve.
@@ -584,19 +603,34 @@ fn serve_dialed(addr: std::net::SocketAddr, transport: &crate::peer::Transport, 
     if their_hs.peer_id == shared.our_peer_id {
         return Ok(()); // ourselves, listed by a tracker
     }
-    serve_connection(stream, Some(addr.ip()), shared, &their_hs, true)
+    serve_connection(stream, Some(addr), shared, &their_hs, true)
 }
 
 /// Serves a peer whose handshake has been exchanged, until either side ends it. `dialed` says this
 /// side made the connection, in which case a peer that turns out to have every piece is let go of at
-/// once: two seeds have nothing to give each other.
-fn serve_connection(mut stream: MseStream, peer_ip: Option<std::net::IpAddr>, shared: &Arc<SeederShared>, their_hs: &Handshake, dialed: bool) -> std::io::Result<()> {
+/// once: two seeds have nothing to give each other. One that made the connection, and turns out to have a
+/// piece the download still lacks, is handed to the download (see [`Adopter`]).
+fn serve_connection(mut stream: MseStream, peer: Option<std::net::SocketAddr>, shared: &Arc<SeederShared>, their_hs: &Handshake, dialed: bool) -> std::io::Result<()> {
     // From here the loop wakes often to check for a stop, new pieces and a
     // change of choke.
     stream.set_read_timeout(Some(SERVE_READ_TIMEOUT))?;
-    let mut serving = Serving::begin(shared, their_hs, peer_ip, &mut stream, true)?;
+    let serving = Serving::begin(shared, their_hs, peer.map(|addr| addr.ip()), &mut stream, true)?;
+    let adoption = peer.filter(|_| !dialed).map(|addr| (addr, their_hs.clone()));
+    serve_loop(Box::new(stream), serving, shared, dialed, adoption)
+}
 
+/// Serves on a connection whose download is over, a peer that came to be served (see [`crate::downloader::worker::Adoption`]).
+pub fn serve_adopted(stream: Box<dyn PeerStream>, serving: Serving, shared: &Arc<SeederShared>) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(SERVE_READ_TIMEOUT))?;
+    serve_loop(stream, serving, shared, false, None)
+}
+
+/// The serve loop. With `adoption` (where the peer is, and what its handshake said), it watches what the peer says it has, and if
+/// that is a piece the download lacks, gives the connection to the download's [`Adopter`] and ends.
+fn serve_loop(mut stream: Box<dyn PeerStream>, mut serving: Serving, shared: &Arc<SeederShared>, dialed: bool, adoption: Option<(std::net::SocketAddr, Handshake)>) -> std::io::Result<()> {
     let mut last_heard = Instant::now();
+    // What the peer has said it has, kept only while there is a chance that the download will want it.
+    let mut peer_has = adoption.as_ref().map(|_| vec![false; shared.have.total()]);
     loop {
         if !shared.running.load(Ordering::SeqCst) {
             return Ok(()); // seeder shutting down
@@ -608,7 +642,7 @@ fn serve_connection(mut stream: MseStream, peer_ip: Option<std::net::IpAddr>, sh
             Message::KeepAlive.write_to(&mut stream).map_err(wire_to_io)?;
             serving.last_sent = Instant::now();
         }
-        serving.tick(&mut stream)?;
+        serving.tick(&mut *stream)?;
 
         let msg = match Message::read_from(&mut stream) {
             Ok(m) => m,
@@ -620,8 +654,38 @@ fn serve_connection(mut stream: MseStream, peer_ip: Option<std::net::IpAddr>, sh
         };
         last_heard = Instant::now();
 
-        if serving.handle(&msg, &mut stream)? {
+        if serving.handle(&msg, &mut *stream)? {
             continue;
+        }
+        if let Some(has) = peer_has.as_mut() {
+            let said = match &msg {
+                Message::Bitfield(bits) => {
+                    for (index, held) in has.iter_mut().enumerate() {
+                        *held |= bits.get(index / 8).is_some_and(|byte| byte & (0x80 >> (index % 8)) != 0);
+                    }
+                    true
+                }
+                Message::HaveAll => {
+                    has.iter_mut().for_each(|held| *held = true);
+                    true
+                }
+                Message::Have { piece_index } => {
+                    if let Some(held) = has.get_mut(*piece_index as usize) {
+                        *held = true;
+                    }
+                    true
+                }
+                _ => false,
+            };
+            if said {
+                let adopter = lock(&shared.adopter).clone();
+                if let (Some(adopter), Some((peer, their_handshake))) = (adopter, adoption.as_ref()) {
+                    if adopter.wants(has) {
+                        adopter.adopt(Adopted { stream, serving, peer: *peer, their_handshake: their_handshake.clone(), peer_has: std::mem::take(has) });
+                        return Ok(()); // it is the download's now
+                    }
+                }
+            }
         }
         match msg {
             // A peer this side dialed that has everything has no use for us: let it go.
@@ -2117,5 +2181,136 @@ mod tests {
         let (mut stream, _) = leech_connect(plain.port, plain_hash);
         assert_eq!(ask(&mut stream, request), Message::HashReject(request));
         plain.stop();
+    }
+
+    // ---- connections handed to the download ------------------------------------------------------------------------
+
+    /// An adopter that wants a peer with piece `wants`, and keeps what it is given.
+    struct TestAdopter {
+        wants: usize,
+        adopted: Mutex<Vec<Adopted>>,
+    }
+
+    impl Adopter for TestAdopter {
+        fn wants(&self, has: &[bool]) -> bool {
+            has.get(self.wants).copied().unwrap_or(false)
+        }
+
+        fn adopt(&self, connection: Adopted) {
+            lock(&self.adopted).push(connection);
+        }
+    }
+
+    /// A seeder of two pieces (it has piece 0) with an adopter that wants piece 1, and a leecher connected to it.
+    fn seeder_with_adopter(name: &str) -> (SeederHandle, Arc<TestAdopter>, TcpStream) {
+        let dir = tmp_dir(name);
+        let (handle, info_hash) = start_test_seeder(&dir, &[vec![1u8; 256], vec![2u8; 256]], 256, &[0]);
+        let adopter = Arc::new(TestAdopter { wants: 1, adopted: Mutex::new(Vec::new()) });
+        handle.set_adopter(Some(Arc::clone(&adopter) as Arc<dyn Adopter>));
+        let (stream, _) = leech_connect(handle.port, info_hash);
+        (handle, adopter, stream)
+    }
+
+    fn wait_for_adoption(adopter: &TestAdopter) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if !lock(&adopter.adopted).is_empty() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn a_peer_that_connects_and_has_a_piece_the_download_lacks_is_handed_to_the_download() {
+        let (mut handle, adopter, mut stream) = seeder_with_adopter("adopt-bitfield");
+        Message::Bitfield(vec![0b0100_0000]).write_to(&mut stream).unwrap(); // it has piece 1
+        assert!(wait_for_adoption(&adopter), "the connection went to the download");
+        let taken = lock(&adopter.adopted).pop().unwrap();
+        assert_eq!(&taken.peer_has[..2], &[false, true], "with what the peer has said it has");
+        assert_eq!(taken.peer.ip(), std::net::IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(taken.their_handshake.info_hash, [0x66; 20]);
+        // The serve loop has let go of it: what the peer asks now is the download's to answer, not the seeder's.
+        Message::Interested.write_to(&mut stream).unwrap();
+        stream.set_read_timeout(Some(Duration::from_millis(800))).unwrap();
+        assert!(!matches!(Message::read_from(&mut stream), Ok(Message::Unchoke)), "no unchoke from the seeder's loop");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_peer_with_nothing_the_download_lacks_stays_with_the_seeder_and_is_served() {
+        let (mut handle, adopter, mut stream) = seeder_with_adopter("adopt-not-wanted");
+        Message::Bitfield(vec![0b1000_0000]).write_to(&mut stream).unwrap(); // piece 0, which we have
+        Message::Interested.write_to(&mut stream).unwrap();
+        loop {
+            if matches!(Message::read_from(&mut stream).unwrap(), Message::Unchoke) {
+                break;
+            }
+        }
+        Message::Request { index: 0, begin: 0, length: 256 }.write_to(&mut stream).unwrap();
+        let block = loop {
+            if let Message::Piece { index: 0, block, .. } = Message::read_from(&mut stream).unwrap() {
+                break block;
+            }
+        };
+        assert_eq!(block, vec![1u8; 256]);
+        assert!(lock(&adopter.adopted).is_empty(), "nothing it has is wanted");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_peer_that_is_given_a_piece_the_download_lacks_later_is_handed_over_then() {
+        let (mut handle, adopter, mut stream) = seeder_with_adopter("adopt-have");
+        Message::HaveNone.write_to(&mut stream).unwrap();
+        Message::Have { piece_index: 0 }.write_to(&mut stream).unwrap();
+        thread::sleep(Duration::from_millis(700));
+        assert!(lock(&adopter.adopted).is_empty(), "so far it has nothing that is wanted");
+        Message::Have { piece_index: 1 }.write_to(&mut stream).unwrap();
+        assert!(wait_for_adoption(&adopter), "the Have of piece 1 does it");
+        assert_eq!(&lock(&adopter.adopted)[0].peer_has[..2], &[true, true]);
+        handle.stop();
+    }
+
+    #[test]
+    fn with_no_adopter_a_peer_is_served_whatever_it_has() {
+        let dir = tmp_dir("adopt-none");
+        let (mut handle, info_hash) = start_test_seeder(&dir, &[vec![1u8; 256], vec![2u8; 256]], 256, &[0]);
+        let (mut stream, _) = leech_connect(handle.port, info_hash);
+        Message::Bitfield(vec![0b0100_0000]).write_to(&mut stream).unwrap();
+        Message::Interested.write_to(&mut stream).unwrap();
+        loop {
+            if matches!(Message::read_from(&mut stream).unwrap(), Message::Unchoke) {
+                break;
+            }
+        }
+        handle.stop();
+    }
+
+    #[test]
+    fn a_connection_whose_download_is_over_is_served_on() {
+        let (mut handle, adopter, mut stream) = seeder_with_adopter("adopt-serve-on");
+        Message::Bitfield(vec![0b0100_0000]).write_to(&mut stream).unwrap();
+        assert!(wait_for_adoption(&adopter));
+        let taken = lock(&adopter.adopted).pop().unwrap();
+        // The download has no more use for it and gives it back, to be served as any inbound peer is.
+        let shared = Arc::clone(&handle.torrent);
+        let server = thread::spawn(move || serve_adopted(taken.stream, taken.serving, &shared));
+        Message::Interested.write_to(&mut stream).unwrap();
+        loop {
+            if matches!(Message::read_from(&mut stream).unwrap(), Message::Unchoke) {
+                break;
+            }
+        }
+        Message::Request { index: 0, begin: 0, length: 256 }.write_to(&mut stream).unwrap();
+        loop {
+            if let Message::Piece { index: 0, block, .. } = Message::read_from(&mut stream).unwrap() {
+                assert_eq!(block, vec![1u8; 256]);
+                break;
+            }
+        }
+        drop(stream);
+        handle.stop();
+        let _ = server.join();
     }
 }

@@ -101,7 +101,7 @@ ours_stop
 # ---- both ways on one connection -------------------------------------------------------------------------------------
 # Each side has one half of the torrent and wants the other. This client dials libtorrent, which makes no connection itself, and does
 # not seed: it leaves the moment it has what it wants (its download is held to 1 MiB/s so that this is not before libtorrent has had
-# time to fetch its half). What libtorrent gets from this client it gets over the connection this client made, on which this client
+# time to fetch its half; libtorrent stays a few seconds once it has everything, for this client to finish from it). What libtorrent gets from this client it gets over the connection this client made, on which this client
 # both downloads and uploads, or not at all.
 HALF=$((6 * 256 * 1024))
 python3 - "$WORK/data.bin" "$WORK/half-lt.bin" "$WORK/half-ours.bin" "$HALF" <<'PY'
@@ -112,13 +112,26 @@ open(sys.argv[3], 'wb').write(bytes(half) + data[half:])               # this cl
 PY
 rm -rf "$WORK/x-lt" "$WORK/x-ours"; mkdir -p "$WORK/x-lt" "$WORK/x-ours"
 cp "$WORK/half-lt.bin" "$WORK/x-lt/data.bin"; cp "$WORK/half-ours.bin" "$WORK/x-ours/data.bin"
-LT_TRANSPORT=tcp timeout 60 "$LT_PYTHON" "$ROOT/scripts/lt_peer.py" wait "$WORK/v1.torrent" "$WORK/x-lt" "$LT_PORT" >/dev/null 2>&1 &
+LT_LINGER=8 LT_TRANSPORT=tcp timeout 70 "$LT_PYTHON" "$ROOT/scripts/lt_peer.py" wait "$WORK/v1.torrent" "$WORK/x-lt" "$LT_PORT" >/dev/null 2>&1 &
 LT_WAIT=$!; PIDS+=($LT_WAIT); sleep 3
 timeout 60 "$BIN/download" "$WORK/v1.torrent" --peer "127.0.0.1:$LT_PORT" --out "$WORK/x-ours" --no-dht --no-lsd --no-portmap --no-tui --no-config --no-log --max-down 1M --port "$OURS_PORT" >/dev/null 2>&1
 OURS_STATUS=$?
 wait "$LT_WAIT"; LT_STATUS=$?
 both_complete() { [ "$OURS_STATUS" -eq 0 ] && [ "$LT_STATUS" -eq 0 ] && same "$WORK/x-lt/data.bin" "$WORK/data.bin" && same "$WORK/x-ours/data.bin" "$WORK/data.bin"; }
 check "both ways: each of this client and libtorrent has half and gets the other's over the one connection this client made" both_complete
+
+# The same, the other way about: libtorrent connects to this client, which knows of no peer (the only one it is given is not there), so
+# that everything it downloads comes over the connection libtorrent made, on which libtorrent is served as well. (This client stays
+# to seed, so that the end of its download does not close the connection before libtorrent has what it wants.)
+rm -rf "$WORK/y-lt" "$WORK/y-ours"; mkdir -p "$WORK/y-lt" "$WORK/y-ours"
+cp "$WORK/half-lt.bin" "$WORK/y-lt/data.bin"; cp "$WORK/half-ours.bin" "$WORK/y-ours/data.bin"
+"$BIN/download" "$WORK/v1.torrent" --peer "127.0.0.1:9" --out "$WORK/y-ours" --no-dht --no-lsd --no-portmap --no-tui --no-config --no-log --seed --port "$OURS_PORT" >/dev/null 2>&1 &
+OURS_PID=$!; PIDS+=($OURS_PID); sleep 2
+LT_LINGER=8 LT_TRANSPORT=tcp timeout 70 "$LT_PYTHON" "$ROOT/scripts/lt_peer.py" leech "$WORK/v1.torrent" "$WORK/y-lt" "$LT_PORT" "$OURS_PORT" >/dev/null 2>&1
+LT_STATUS=$?
+sleep 1; ours_stop
+both_complete_inbound() { [ "$LT_STATUS" -eq 0 ] && same "$WORK/y-lt/data.bin" "$WORK/data.bin" && same "$WORK/y-ours/data.bin" "$WORK/data.bin"; }
+check "both ways, inbound: libtorrent connects to this client, and each gets the other's half over that connection" both_complete_inbound
 
 echo "interop: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

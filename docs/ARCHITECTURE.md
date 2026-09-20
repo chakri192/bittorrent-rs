@@ -115,6 +115,20 @@ side first and then to the download side's bookkeeping, and `keep_serving`
 runs between messages. What a peer gives the worker is counted in the same
 `choker` that ranks who is unchoked, which is what makes it tit-for-tat.
 
+**A connection a peer made** starts in the seeder's serve loop (it is the
+listener's), and stays there unless the peer says it has a piece the download
+still lacks. The loop keeps what the peer has said (`bitfield`, `have all`,
+`have`) and asks the torrent's `Adopter` (`session/workers.rs`: the queue's
+`any_wanted_in`, and room) whether it is wanted; if so, the stream and its
+`Serving` go over a channel to the session, which starts a worker on them
+(`run_adopted`). That worker is the one for a dialed connection from the point
+where the handshakes are done: it says it is interested, waits to be unchoked,
+and fetches. When there is nothing more to fetch from the peer, because the
+queue is drained or the peer never unchokes or has nothing new, the connection
+is not dropped, as one dialed for downloading would be: the peer came to be
+served, so the worker hands the stream and `Serving` back and a thread of the
+seeder's runs `serve_adopted`, the same loop.
+
 **Connections are `PeerStream`s** (`peer/stream.rs`): anything that reads and
 writes and can be shut down from another thread. A worker or the seeder does
 not know whether it has a plain socket or an encrypted one (`peer/mse.rs`), so
@@ -242,6 +256,6 @@ Four layers, each catching what the one below cannot.
 
 Deliberate, and the README's Limitations lists them: one thread per
 connection (fine for tens of peers, not thousands); choking is only the
-tit-for-tat on the connections this client makes and not on those made to it (inbound peers are served, never downloaded from);
+choking that rewards what a peer gives is tested against one other client (libtorrent) and not on a real swarm;
 a magnet link's trackers are asked concurrently, having no tiers, and `--tracker-mode concurrent` does the same for a torrent's; a piece
 interrupted part-way is handed to the next peer, and kept across a clean stop but not a crash (`downloader/partial.rs`); a connection fetches one piece at a time but asks ahead for up to eight more once the one in hand is fully asked for, and the queue it keeps full is bounded by the peer's `reqq` (so a piece is not a round trip on its own, and no more than that is held by one peer); local discovery is IPv4 only.

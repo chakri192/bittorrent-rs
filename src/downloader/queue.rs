@@ -253,6 +253,13 @@ impl WorkQueue {
         !inner.done.contains(&index) && (inner.claimed.contains_key(&index) || inner.pending.iter().any(|w| w.index == index))
     }
 
+    /// Whether a piece is still to be fetched that `has` says a peer has (`has[i]` for piece `i`).
+    pub fn any_wanted_in(&self, has: &[bool]) -> bool {
+        let inner = lock(&self.inner);
+        let held = |index: u32| has.get(index as usize).copied().unwrap_or(false);
+        inner.pending.iter().any(|w| held(w.index)) || inner.claimed.keys().any(|&index| !inner.done.contains(&index) && held(index))
+    }
+
     /// Retires a piece everywhere after it has been verified and written.
     /// Returns `true` if this call was the first to mark it done (callers
     /// use this to avoid double-counting duplicate endgame completions).

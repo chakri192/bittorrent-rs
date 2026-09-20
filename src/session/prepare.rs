@@ -336,6 +336,10 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     };
     let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: options.pipeline_depth, connect_timeout: options.connect_timeout, down_limit, interrupt: Default::default(), peers: Default::default(), encryption: options.encryption.unwrap_or_default(), transport: transport.clone(), upload });
     let mut workers = Workers::new(Arc::clone(&queue), Arc::clone(&spans), config, piece_length, options.max_peers, torrent.private, shared_log(sink));
+    // A peer that connects to us and has pieces we lack is downloaded from over that connection too.
+    if let Some(seeder) = services.seeder() {
+        seeder.set_adopter(Some(workers.adopter()));
+    }
 
     // Web-seed workers: one thread per url-list entry, draining the same
     // shared queue into the same verify-write-record pipeline as peers.

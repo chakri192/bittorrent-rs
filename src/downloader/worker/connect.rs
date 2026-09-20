@@ -70,25 +70,31 @@ pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, que
     crate::peer::connection::send_message(&mut stream, &Message::Interested).map_err(|e| WorkerError::Connection { stage: "send_interested", error: e })?;
     state.am_interested = true;
 
-    // Drain messages until unchoked or the peer disconnects. Bitfield/
-    // Have/Extended messages that arrive in the meantime update `state`
-    // (and the shared rarity tracker / PEX feed) as a side effect.
-    //
-    // Read timeouts here are NOT fatal: many clients unchoke lazily
-    // (choke-algorithm rounds run every 10-30s), so with a 10s read
-    // timeout the first read can legitimately time out several times in
-    // a row against a perfectly good peer. Bounded so a peer that never
-    // unchokes still frees its slot: with the default 10s read timeout
-    // this waits up to ~60s, roughly two choke-algorithm rounds.
-    //
-    // With the Fast Extension the wait can end early: a peer that names a
-    // piece as allowed-fast is one we can start on while still choked.
+    wait_for_unchoke(&mut *stream, &mut state, queue, pex_tx, &mut serving)?;
+
+    Ok(Established { stream, state, serving, registration })
+}
+
+/// Drains messages until the peer unchokes us, or names a piece we may fetch while choked, or disconnects.
+/// Bitfield/Have/Extended messages that arrive in the meantime update `state` (and the shared rarity tracker / PEX feed) as a side
+/// effect, and what the peer asks of us is served.
+///
+/// Read timeouts here are NOT fatal: many clients unchoke lazily
+/// (choke-algorithm rounds run every 10-30s), so with a 10s read
+/// timeout the first read can legitimately time out several times in
+/// a row against a perfectly good peer. Bounded so a peer that never
+/// unchokes still frees its slot: with the default 10s read timeout
+/// this waits up to ~60s, roughly two choke-algorithm rounds.
+///
+/// With the Fast Extension the wait can end early: a peer that names a
+/// piece as allowed-fast is one we can start on while still choked.
+pub(super) fn wait_for_unchoke(stream: &mut dyn PeerStream, state: &mut PeerState, queue: &WorkQueue, pex_tx: Option<&PexSender>, serving: &mut Option<Serving>) -> Result<(), WorkerError> {
     let mut unchoke_timeouts = 0u32;
     while state.peer_choking && !state.has_allowed_pieces() {
-        keep_serving(&mut serving, &mut *stream)?;
-        match crate::peer::connection::read_message(&mut stream) {
+        keep_serving(serving, &mut *stream)?;
+        match crate::peer::connection::read_message(&mut *stream) {
             Ok(msg) => {
-                take(&msg, &mut state, queue, pex_tx, &mut serving, &mut *stream)?;
+                take(&msg, state, queue, pex_tx, serving, &mut *stream)?;
             }
             Err(ref e) if is_read_timeout(e) => {
                 unchoke_timeouts += 1;
@@ -100,13 +106,12 @@ pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, que
                 }
                 // Show liveness so the peer's own idle-timeout doesn't
                 // reap us while we politely wait out its choke round.
-                crate::peer::connection::send_message(&mut stream, &Message::KeepAlive).map_err(|e| WorkerError::Connection { stage: "keepalive_during_unchoke_wait", error: e })?;
+                crate::peer::connection::send_message(&mut *stream, &Message::KeepAlive).map_err(|e| WorkerError::Connection { stage: "keepalive_during_unchoke_wait", error: e })?;
             }
             Err(e) => return Err(WorkerError::Connection { stage: "wait_for_unchoke", error: e }),
         }
     }
-
-    Ok(Established { stream, state, serving, registration })
+    Ok(())
 }
 
 #[cfg(test)]

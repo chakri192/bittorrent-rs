@@ -63,6 +63,8 @@ def main():
             status = handle.status()
             if status.is_seeding or (status.state == lt.torrent_status.seeding):
                 print("lt: complete")
+                # LT_LINGER=N keeps a peer that has finished serving for N more seconds, for one that has not to finish from it.
+                time.sleep(float(os.environ.get("LT_LINGER", "0")))
                 return 0
         time.sleep(0.25)
     if mode in ("leech", "wait"):
