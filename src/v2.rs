@@ -413,10 +413,11 @@ impl HashSource {
     pub fn new(files: &[V2File], layers: &BTreeMap<Hash, Vec<Hash>>, piece_length: u64) -> Option<HashSource> {
         let mut sources = BTreeMap::new();
         let mut next_piece = 0u32;
+        let no_layer: Vec<Hash> = Vec::new(); // (a named value: a borrow of a temporary here is refused by the minimum supported compiler)
         for file in files {
             let Some(root) = file.root else { continue };
             let pieces = file.length.div_ceil(piece_length) as u32;
-            let layer = if file.length > piece_length { layers.get(&root) } else { Some(&Vec::new()) };
+            let layer = if file.length > piece_length { layers.get(&root) } else { Some(&no_layer) };
             if let Some(layer) = layer {
                 sources.insert(root, SourceFile { length: file.length, first_piece: next_piece, layer: layer.clone() });
             }
