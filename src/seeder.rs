@@ -753,7 +753,19 @@ fn serve_connection(mut stream: MseStream, peer_ip: Option<std::net::IpAddr>, sh
             }
             Message::HashRequest(request) => {
                 // Answered with the hashes, and the uncles after them, or refused: a request must always be answered.
-                let answer = shared.hash_source.as_ref().and_then(|source| source.answer(&request.root, request.base_layer, request.index, request.length, request.proof_layers));
+                let answer = shared.hash_source.as_ref().and_then(|source| {
+                    // From the piece layers if that is where the layer is; the 16 KiB leaves are worked out from the pieces.
+                    source.answer(&request.root, request.base_layer, request.index, request.length, request.proof_layers).or_else(|| {
+                        (request.base_layer == 0)
+                            .then(|| {
+                                source.answer_leaves(&request.root, request.index, request.length, request.proof_layers, |piece| {
+                                    let held = shared.have.get(piece);
+                                    held.then(|| read_block(&shared.spans, piece, shared.piece_length, 0, shared.piece_len(piece) as u32).ok()).flatten()
+                                })
+                            })
+                            .flatten()
+                    })
+                });
                 let reply = match answer {
                     Some(range) => Message::Hashes { request, hashes: range.hashes.into_iter().chain(range.uncles).collect() },
                     None => Message::HashReject(request),
@@ -2239,9 +2251,17 @@ mod tests {
         let height = file_height(file.length, piece_length as u64);
 
         let dir = tmp_dir("hash-requests");
-        let spans = Arc::new(build_file_spans(&dir, &[(vec!["seed.bin".to_string()], 16384i64)]));
+        // The file itself on disk, with every piece had but the last, so that the 16 KiB leaves can be worked out from it.
+        let spans = Arc::new(build_file_spans(&dir, &[(vec!["seed.bin".to_string()], bytes.len() as i64)]));
+        let piece_lengths: Vec<u32> = bytes.chunks(piece_length).map(|c| c.len() as u32).collect();
+        for (i, chunk) in bytes.chunks(piece_length).enumerate() {
+            write_piece(&spans, i as u32, piece_length as u64, chunk).unwrap();
+        }
+        let have = Arc::new(HaveMap::new(piece_lengths.len()));
+        (0..piece_lengths.len() as u32 - 1).for_each(|i| have.set(i));
         let info_hash = [0x77; 20];
-        let mut handle = start_with(0, info_hash, [0x20; 20], spans, 16384, 16384, Arc::new(HaveMap::new(1)), None, SeederOptions { hash_source: Some(Arc::new(source)), ..Default::default() }).unwrap();
+        let options = SeederOptions { hash_source: Some(Arc::new(source)), piece_lengths: Some(Arc::new(piece_lengths)), ..Default::default() };
+        let mut handle = start_with(0, info_hash, [0x20; 20], spans, piece_length as u64, bytes.len() as u64, Arc::clone(&have), None, options).unwrap();
         let (mut stream, _) = leech_connect(handle.port, info_hash);
         let ask = |stream: &mut TcpStream, request: HashRequest| -> Message {
             Message::HashRequest(request).write_to(stream).unwrap();
@@ -2253,9 +2273,15 @@ mod tests {
             }
         };
 
+        // The leaves of a piece it has (blocks 4 and 5, the third piece): worked out from the data, and proving themselves.
+        let leaves = HashRequest { root, base_layer: 0, index: 4, length: 2, proof_layers: height - 1 };
+        let Message::Hashes { hashes: answer, .. } = ask(&mut stream, leaves) else { panic!("the leaves of a piece it has were refused") };
+        assert_eq!(&answer[..2], &crate::v2::block_hashes(&bytes[4 * 16384..6 * 16384])[..]);
+        assert!(verify_range(&root, 0, height, 4, &answer[..2], &answer[2..], leaves.proof_layers));
+        // The last piece is not had: no leaves for it, though the layer above still answers.
+        let last = HashRequest { index: 14, ..leaves };
+        assert_eq!(ask(&mut stream, last), Message::HashReject(last), "leaves of a piece it does not have are refused");
         // Asked for the whole piece layer with the proof that reaches the root: answered, and the answer proves itself.
-        let request = HashRequest { root, base_layer: 0, index: 0, length: 8, proof_layers: 0 };
-        assert_eq!(ask(&mut stream, request), Message::HashReject(request), "the 16 KiB leaves are not kept, so they are refused");
         let request = HashRequest { root, base_layer: crate::v2::piece_layer(piece_length as u64), index: 4, length: 4, proof_layers: height - 2 };
         let Message::Hashes { request: echoed, hashes: answer } = ask(&mut stream, request) else { panic!("refused") };
         assert_eq!(echoed, request, "the answer repeats the request");

@@ -312,8 +312,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // BEP 19 web seeds (from the torrent's url-list). These can carry the
     // whole download even with zero peers, so their presence keeps the run
     // alive.
-    // Web seeds serve v1 pieces, which a v2-only torrent has none of.
-    let web_seeds: Vec<String> = if options.no_webseed || torrent.is_v2_only() { Vec::new() } else { torrent.url_list.clone() };
+    let web_seeds: Vec<String> = if options.no_webseed { Vec::new() } else { torrent.url_list.clone() };
 
     // (With every wanted piece already on disk there is nothing to look for, and a client that has only
     // to seed must start whether or not its trackers can be reached.)
@@ -340,7 +339,9 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // shared queue into the same verify-write-record pipeline as peers.
     if !web_seeds.is_empty() {
         sink.log(format!("web seed: {} url(s) from the torrent's url-list", web_seeds.len()));
-        workers.start_web_seeds(&web_seeds, &torrent.name, &torrent.files, torrent.multi_file, total_length);
+        // (A v2-only torrent's pieces are per file and checked by merkle root; a hybrid one is fetched as v1.)
+        let v2_pieces = torrent.is_v2_only().then(|| Arc::new(torrent.v2_pieces.clone()));
+        workers.start_web_seeds(&web_seeds, &torrent.name, &torrent.files, torrent.multi_file, total_length, v2_pieces);
     }
 
     let progress = Progress::new(have, resume_writer, goal_pieces, pieces_done, bytes_already_done);
@@ -725,7 +726,48 @@ mod tests {
         assert_eq!(prepared.queue.len(), 4);
         assert_eq!(prepared.display_total, 40_100);
         assert!(dir.join("t/empty").exists(), "the empty file is made, as for any torrent");
-        assert!(t.url_list.len() == 1 && !log.logged("web seed:"), "the torrent names a web seed, but a v2 torrent has no v1 pieces for it to serve");
+        assert!(t.url_list.len() == 1 && log.logged("web seed: 1 url(s)"), "the torrent names a web seed, which serves a v2 torrent's pieces by file and offset: {:?}", log.lines.lock().unwrap());
+    }
+
+    #[test]
+    fn a_v2_torrent_is_downloaded_from_a_web_seed_alone_by_a_whole_session() {
+        // Three files under a directory, the middle one empty; a mirror that has them; a torrent that names the mirror.
+        let source = tmp_dir("v2-webseed-source");
+        std::fs::create_dir_all(source.join("pack")).unwrap();
+        let files: Vec<(&str, Vec<u8>)> = vec![("a.bin", (0..70_000u32).map(|i| i.wrapping_mul(2654435761) as u8 ^ (i >> 9) as u8).collect()), ("empty", Vec::new()), ("b.bin", vec![0xAB; 20_000])];
+        for (path, content) in &files {
+            std::fs::write(source.join("pack").join(path), content).unwrap();
+        }
+        let mirror = crate::webseed::mirror::spawn_mirror(files.iter().map(|(path, content)| (Box::leak(format!("pack/{}", path).into_boxed_str()) as &str, content.clone())).collect(), crate::webseed::mirror::Mode::Serve);
+        let created = crate::create::create(&source.join("pack"), &crate::create::CreateOptions { v2: true, piece_length: Some(32768), web_seeds: vec![mirror.base.clone()], ..Default::default() }, |_, _| {}).unwrap();
+        let t = parse_torrent_file(&created.bytes).unwrap();
+        assert!(t.is_v2_only() && t.v2_ready());
+        let dir = tmp_dir("v2-webseed-download");
+        let mut services = Services::new();
+
+        let (prepared, recorder) = run_prepare(&t, &[true, true, true], Vec::new(), &options(&dir), &mut services);
+        let mut session = prepared.expect("the web seed is somewhere to get it from").into_session(&*recorder, &services);
+        let report = session.run(&AtomicBool::new(false));
+
+        assert!(report.complete, "{:?}", recorder.lines.lock().unwrap());
+        for (path, content) in &files {
+            if !content.is_empty() {
+                assert_eq!(&std::fs::read(dir.join("pack").join(path)).unwrap(), content, "{}", path);
+            }
+        }
+    }
+
+    #[test]
+    fn a_v2_torrent_with_a_web_seed_and_no_peer_at_all_can_still_be_prepared_but_not_with_web_seeds_off() {
+        let t = v2_torrent(true);
+        let mut services = Services::new();
+        let (with, _) = run_prepare(&t, &[true, true, true], Vec::new(), &options(&tmp_dir("v2-webseed")), &mut services);
+        assert!(with.is_ok(), "the web seed is somewhere to get it from");
+
+        let mut off = options(&tmp_dir("v2-webseed-off"));
+        off.no_webseed = true;
+        let (without, _) = run_prepare(&t, &[true, true, true], Vec::new(), &off, &mut services);
+        assert_eq!(without.err().as_deref(), Some("no peers found from any tracker (and DHT, local discovery + web seeds unavailable)"));
     }
 
     #[test]

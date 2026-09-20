@@ -389,35 +389,108 @@ pub fn hash_range(layer: &[Hash], layer_number: u32, height: u32, index: u32, le
 /// The most hashes one hash request may ask for (BEP 52 says a requester should not ask for more).
 pub const MAX_HASHES_PER_REQUEST: u32 = 512;
 
-/// What a seeder answers hash requests from: the piece layer of each file longer than a piece.
+/// One file a seeder can answer hash requests for.
+#[derive(Debug, Clone)]
+struct SourceFile {
+    length: u64,
+    /// The piece index (in the torrent's flat numbering, which is the order of [`plan_pieces`]) of the file's first piece.
+    first_piece: u32,
+    /// The file's piece layer; empty for a file no longer than a piece, whose root is its one piece's hash.
+    layer: Vec<Hash>,
+}
+
+/// What a seeder answers hash requests from: the piece layer of each file longer than a piece, and, to answer for the 16 KiB
+/// leaves, a way to read the pieces themselves.
 #[derive(Debug, Clone, Default)]
 pub struct HashSource {
     piece_length: u64,
-    /// By `pieces root`: the file's length, and its piece layer.
-    files: BTreeMap<Hash, (u64, Vec<Hash>)>,
+    /// By `pieces root`.
+    files: BTreeMap<Hash, SourceFile>,
 }
 
 impl HashSource {
-    /// A source from a torrent's files and the piece layers it has; none for a torrent with no layer to answer from.
+    /// A source from a torrent's files (in order) and the piece layers it has; none for a torrent with nothing to answer from.
     pub fn new(files: &[V2File], layers: &BTreeMap<Hash, Vec<Hash>>, piece_length: u64) -> Option<HashSource> {
-        let files: BTreeMap<Hash, (u64, Vec<Hash>)> = files.iter().filter(|f| f.length > piece_length).filter_map(|f| Some((f.root?, (f.length, layers.get(&f.root?)?.clone())))).collect();
-        (!files.is_empty()).then_some(HashSource { piece_length, files })
+        let mut sources = BTreeMap::new();
+        let mut next_piece = 0u32;
+        for file in files {
+            let Some(root) = file.root else { continue };
+            let pieces = file.length.div_ceil(piece_length) as u32;
+            let layer = if file.length > piece_length { layers.get(&root) } else { Some(&Vec::new()) };
+            if let Some(layer) = layer {
+                sources.insert(root, SourceFile { length: file.length, first_piece: next_piece, layer: layer.clone() });
+            }
+            next_piece += pieces;
+        }
+        (!sources.is_empty()).then_some(HashSource { piece_length, files: sources })
     }
 
     /// The answer to a request for `length` hashes from `index` of layer `base_layer` of the file with `root`, with
-    /// `proof_layers` of uncles; `None` (to be rejected) for a file it does not know, a layer below the pieces (the
-    /// 16 KiB leaves are not kept), or a request not allowed.
+    /// `proof_layers` of uncles: for the piece layer and those above it, from the piece layers; `None` (to be rejected) for a
+    /// file it does not know, a layer below the pieces (see [`answer_leaves`](Self::answer_leaves)), or a request not allowed.
     pub fn answer(&self, root: &Hash, base_layer: u32, index: u32, length: u32, proof_layers: u32) -> Option<HashRange> {
-        let (file_length, layer) = self.files.get(root)?;
-        let (height, pieces_at) = (file_height(*file_length, self.piece_length), piece_layer(self.piece_length));
+        let file = self.files.get(root)?;
+        if file.layer.is_empty() {
+            return None; // a file of one piece: its root is that piece's hash, and there is no layer of pieces
+        }
+        let (height, pieces_at) = (file_height(file.length, self.piece_length), piece_layer(self.piece_length));
         if base_layer < pieces_at || length > MAX_HASHES_PER_REQUEST || base_layer >= height {
             return None;
         }
         if base_layer == pieces_at {
-            return hash_range(layer, base_layer, height, index, length, proof_layers);
+            return hash_range(&file.layer, base_layer, height, index, length, proof_layers);
         }
-        let above = upper_layers(layer, pieces_at, height).swap_remove((base_layer - pieces_at) as usize);
+        let above = upper_layers(&file.layer, pieces_at, height).swap_remove((base_layer - pieces_at) as usize);
         hash_range(&above, base_layer, height, index, length, proof_layers)
+    }
+
+    /// The answer to a request for `length` of the 16 KiB leaf hashes (layer 0) from `index`, which has to be worked out from
+    /// the data: `read_piece` is given a piece's number in the torrent and returns its bytes if they are to be had.
+    /// `None` (to be rejected) if the file is not known, the request is not allowed, or a piece it needs is not there.
+    pub fn answer_leaves(&self, root: &Hash, index: u32, length: u32, proof_layers: u32, mut read_piece: impl FnMut(u32) -> Option<Vec<u8>>) -> Option<HashRange> {
+        let file = self.files.get(root)?;
+        let blocks = file.length.div_ceil(BLOCK as u64);
+        let blocks_per_piece = self.piece_length / BLOCK as u64;
+        let (single_piece, pieces_at) = (file.layer.is_empty(), piece_layer(self.piece_length));
+        let height = if single_piece { blocks.next_power_of_two().trailing_zeros() } else { file_height(file.length, self.piece_length) };
+        if height == 0 || length < 2 || !length.is_power_of_two() || length > MAX_HASHES_PER_REQUEST || index & (length - 1) != 0 || u64::from(index) + u64::from(length) > 1u64 << height {
+            return None;
+        }
+        // The hash of block `block`: from the piece that holds it (kept, as the uncles below the pieces are in the same one), or the
+        // padding that follows the last block.
+        let mut cache: Option<(u64, Vec<Hash>)> = None;
+        let mut leaf = |block: u64| -> Option<Hash> {
+            if block >= blocks {
+                return Some([0u8; 32]);
+            }
+            let piece = block / blocks_per_piece;
+            if cache.as_ref().map(|(held, _)| *held) != Some(piece) {
+                let data = read_piece(file.first_piece + piece as u32)?;
+                cache = Some((piece, block_hashes(&data)));
+            }
+            cache.as_ref()?.1.get((block % blocks_per_piece) as usize).copied()
+        };
+        let hashes: Vec<Hash> = (u64::from(index)..u64::from(index) + u64::from(length)).map(&mut leaf).collect::<Option<_>>()?;
+        let below = length.trailing_zeros();
+        // Above the pieces the uncles come from the piece layer; below them (or in a file of one piece) from the leaves.
+        let pieces_tree = (!single_piece).then(|| upper_layers(&file.layer, pieces_at, height));
+        let mut uncles = Vec::new();
+        for j in below..=proof_layers {
+            if j >= height {
+                break;
+            }
+            let sibling = u64::from((index >> j) ^ 1);
+            let uncle = match &pieces_tree {
+                Some(tree) if j >= pieces_at => tree[(j - pieces_at) as usize][sibling as usize],
+                _ => {
+                    let first = sibling << j;
+                    let leaves: Vec<Hash> = (first..first + (1u64 << j)).map(&mut leaf).collect::<Option<_>>()?;
+                    merkle_root(&leaves, leaves.len(), [0u8; 32])
+                }
+            };
+            uncles.push(uncle);
+        }
+        Some(HashRange { hashes, uncles })
     }
 }
 
@@ -867,6 +940,103 @@ mod tests {
         assert!(source.answer(&root, height, 0, 2, 0).is_none(), "nor is there a layer at or above the root's");
         assert!(source.answer(&[0xEE; 32], 2, 0, 2, 0).is_none(), "another file's");
         assert!(source.answer(&root, 2, 0, 1024, 0).is_none(), "and no more than 512 hashes at once");
-        assert!(HashSource::new(&[V2File { length: 1000, ..file }], &BTreeMap::new(), 65536).is_none(), "a torrent of files a piece long or less has no layers to answer from");
+        // A file no longer than a piece has no layer of pieces to answer from (its root is its one piece's hash) but does have leaves.
+        let small = HashSource::new(&[V2File { length: 40000, ..file.clone() }], &BTreeMap::new(), 65536).expect("it can answer for its leaves");
+        assert!(small.answer(&root, 1, 0, 2, 0).is_none() && small.answer(&root, 0, 0, 2, 0).is_none(), "but not from layers");
+        assert!(HashSource::new(&[V2File { root: None, ..file }], &BTreeMap::new(), 65536).is_none(), "and an empty file has nothing at all");
+        assert!(HashSource::new(&[], &BTreeMap::new(), 65536).is_none());
+    }
+
+    // ---- leaf hashes, from the data ---------------------------------------------
+
+    /// Three files of pieces of 64 KiB (four blocks): five pieces and a bit, one of two blocks and a bit, and three; with the
+    /// torrent's flat piece numbers (0-5, 6, 7-9) and the bytes of each.
+    type ThreeFiles = (Vec<V2File>, BTreeMap<Hash, Vec<Hash>>, Vec<Vec<u8>>);
+
+    fn three_files() -> ThreeFiles {
+        let mut state = 21u64;
+        let mut bytes = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (state >> 56) as u8
+                })
+                .collect()
+        };
+        let contents = vec![bytes(5 * 65536 + 3000), bytes(2 * 16384 + 100), bytes(3 * 65536)];
+        let mut files = Vec::new();
+        let mut layers = BTreeMap::new();
+        for (n, content) in contents.iter().enumerate() {
+            let hashes = hash_file(&mut &content[..], content.len() as u64, 65536).unwrap();
+            let root = hashes.root.unwrap();
+            files.push(V2File { path: vec![format!("f{}", n)], length: content.len() as u64, root: Some(root) });
+            if !hashes.layer.is_empty() {
+                layers.insert(root, hashes.layer);
+            }
+        }
+        (files, layers, contents)
+    }
+
+    /// A reader of pieces for the files of [`three_files`], by the torrent's flat numbering.
+    fn pieces_of(contents: &[Vec<u8>]) -> impl Fn(u32) -> Option<Vec<u8>> + '_ {
+        move |number| {
+            let (mut first, piece_length) = (0u32, 65536usize);
+            for content in contents {
+                let count = content.len().div_ceil(piece_length) as u32;
+                if number < first + count {
+                    let start = (number - first) as usize * piece_length;
+                    return Some(content[start..(start + piece_length).min(content.len())].to_vec());
+                }
+                first += count;
+            }
+            None
+        }
+    }
+
+    #[test]
+    fn leaf_hashes_worked_out_from_the_data_agree_with_the_whole_tree_for_every_range_of_every_file() {
+        let (files, layers, contents) = three_files();
+        let source = HashSource::new(&files, &layers, 65536).unwrap();
+        let read = pieces_of(&contents);
+        for (file, content) in files.iter().zip(&contents) {
+            let root = file.root.unwrap();
+            // The whole leaf layer, which the source does not have: what the answer must be the same as.
+            let leaves = block_hashes(content);
+            let height = if file.length > 65536 { file_height(file.length, 65536) } else { leaves.len().next_power_of_two().trailing_zeros() };
+            let width = 1u32 << height;
+            let mut asked = 0;
+            for length in (1..=height.min(9)).map(|k| 1u32 << k) {
+                for index in (0..width).step_by(length as usize) {
+                    for proof_layers in [0, height - 1, height + 3] {
+                        let wanted = hash_range(&leaves, 0, height, index, length, proof_layers);
+                        let got = source.answer_leaves(&root, index, length, proof_layers, &read);
+                        assert_eq!(got, wanted, "file of {} bytes: {} leaves from {}, {} proof layers", file.length, length, index, proof_layers);
+                        asked += 1;
+                    }
+                }
+            }
+            assert!(asked > 3, "the file has ranges to ask for");
+            // ... and the whole layer's worth verifies to the root.
+            if let Some(range) = source.answer_leaves(&root, 0, width.min(512), height.saturating_sub(1), &read) {
+                assert!(verify_range(&root, 0, height, 0, &range.hashes, &range.uncles, height - 1));
+            }
+        }
+    }
+
+    #[test]
+    fn a_leaf_request_that_is_not_allowed_or_cannot_be_served_is_none() {
+        let (files, layers, contents) = three_files();
+        let source = HashSource::new(&files, &layers, 65536).unwrap();
+        let read = pieces_of(&contents);
+        let root = files[0].root.unwrap(); // 6 pieces, 24 blocks, a tree of height 5 (32 blocks wide)
+        for (index, length) in [(0, 1), (0, 3), (2, 4), (32, 2), (0, 64), (0, 0)] {
+            assert!(source.answer_leaves(&root, index, length, 0, &read).is_none(), "{} {}", index, length);
+        }
+        assert!(source.answer_leaves(&[7; 32], 0, 2, 0, &read).is_none(), "another file");
+        // A piece it does not have: the second piece, blocks 4-7.
+        let missing = |piece: u32| if piece == 1 { None } else { read(piece) };
+        assert!(source.answer_leaves(&root, 4, 4, 0, missing).is_none(), "the blocks of a piece it lacks");
+        assert!(source.answer_leaves(&root, 0, 4, 0, missing).is_some(), "but the ones it has");
+        assert!(source.answer_leaves(&root, 8, 8, 0, |_| None).is_none(), "and none at all without data");
     }
 }

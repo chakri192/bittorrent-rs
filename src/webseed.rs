@@ -8,6 +8,7 @@
 
 use crate::downloader::file_writer::{write_piece, FileSpan};
 use crate::downloader::queue::{PieceResult, WorkQueue};
+#[cfg(test)]
 use sha1::{Digest, Sha1};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -119,8 +120,17 @@ pub fn piece_requests(targets: &[FileTarget], piece_index: u32, piece_length: u6
     reqs
 }
 
-fn fetch_piece(agent: &ureq::Agent, targets: &[FileTarget], piece_index: u32, piece_length: u64, total_length: u64) -> Result<Vec<u8>, String> {
-    let reqs = piece_requests(targets, piece_index, piece_length, total_length);
+/// The HTTP request for piece `piece_index` of a v2 torrent (BEP 52, whose pieces never span files): `(url, file_offset,
+/// length)` of the one file it is part of, or nothing for a piece there is no file for.
+pub fn v2_piece_requests(targets: &[FileTarget], pieces: &[crate::v2::V2Piece], piece_index: u32) -> Vec<(String, u64, u64)> {
+    let Some(piece) = pieces.get(piece_index as usize) else { return Vec::new() };
+    match targets.get(piece.file) {
+        Some(target) => vec![(target.url.clone(), piece.offset, u64::from(piece.length))],
+        None => Vec::new(),
+    }
+}
+
+fn fetch_piece(agent: &ureq::Agent, targets: &[FileTarget], reqs: Vec<(String, u64, u64)>) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     for (url, offset, len) in reqs {
         let range = format!("bytes={}-{}", offset, offset + len - 1);
@@ -162,11 +172,11 @@ fn fetch_piece(agent: &ureq::Agent, targets: &[FileTarget], piece_index: u32, pi
 /// read timeout; without this, stopping the client waited that out.
 /// Returns `None` if `stop` was set first, leaving the fetch to finish (or
 /// time out) unwatched.
-fn fetch_piece_or_stop(agent: &ureq::Agent, targets: &Arc<Vec<FileTarget>>, piece_index: u32, piece_length: u64, total_length: u64, stop: &AtomicBool) -> Option<Result<Vec<u8>, String>> {
+fn fetch_piece_or_stop(agent: &ureq::Agent, targets: &Arc<Vec<FileTarget>>, reqs: Vec<(String, u64, u64)>, stop: &AtomicBool) -> Option<Result<Vec<u8>, String>> {
     let (tx, rx) = mpsc::channel();
     let (agent, targets) = (agent.clone(), Arc::clone(targets));
     thread::spawn(move || {
-        let _ = tx.send(fetch_piece(&agent, &targets, piece_index, piece_length, total_length));
+        let _ = tx.send(fetch_piece(&agent, &targets, reqs));
     });
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -184,6 +194,9 @@ fn fetch_piece_or_stop(agent: &ureq::Agent, targets: &Arc<Vec<FileTarget>>, piec
 /// Runs one web seed against the shared work queue until the queue drains,
 /// the seed fails too many times, or `stop` is set, and says which. `log`
 /// receives human-readable progress/errors (routed to the dashboard log).
+///
+/// For a v2-only torrent, `v2_pieces` says which file and offset each piece is (they are not laid end to end as v1's are), and
+/// a piece is checked against its merkle root, not a SHA-1.
 #[allow(clippy::too_many_arguments)]
 pub fn run_web_worker<L: Fn(String)>(
     base_url: &str,
@@ -195,6 +208,7 @@ pub fn run_web_worker<L: Fn(String)>(
     spans: &Arc<Vec<FileSpan>>,
     piece_length: u64,
     total_length: u64,
+    v2_pieces: Option<&[crate::v2::V2Piece]>,
     results_tx: &Sender<PieceResult>,
     stop: &AtomicBool,
     log: L,
@@ -212,7 +226,11 @@ pub fn run_web_worker<L: Fn(String)>(
             continue; // finished elsewhere (endgame duplicate)
         }
 
-        let Some(fetched) = fetch_piece_or_stop(&agent, &targets, idx, piece_length, total_length, stop) else {
+        let requests = match v2_pieces {
+            Some(pieces) => v2_piece_requests(&targets, pieces, idx),
+            None => piece_requests(&targets, idx, piece_length, total_length),
+        };
+        let Some(fetched) = fetch_piece_or_stop(&agent, &targets, requests, stop) else {
             queue.push_back(work);
             return WebEnd::Stopped; // told to stop while waiting on the mirror
         };
@@ -225,10 +243,7 @@ pub fn run_web_worker<L: Fn(String)>(
                         return WebEnd::Stopped; // told to stop while held back by --max-down
                     }
                 }
-                let mut h = Sha1::new();
-                h.update(&data);
-                let got: [u8; 20] = h.finalize().into();
-                if got != work.hash {
+                if !work.matches(&data) {
                     queue.push_back(work);
                     consecutive_failures += 1;
                     log(format!("web seed {}: piece {} failed hash check", base_url, idx));
@@ -490,7 +505,7 @@ mod tests {
 
         fn run(&self, base: &str, name: &str, files: &[(Vec<String>, i64)], multi: bool, limiter: Option<&crate::ratelimit::RateLimiter>, stop: &AtomicBool) -> WebEnd {
             let logs = Arc::clone(&self.logs);
-            run_web_worker(base, name, files, multi, limiter, &self.queue, &self.spans, self.piece_length, self.data.len() as u64, &self.tx, stop, move |m| logs.lock().unwrap().push(m))
+            run_web_worker(base, name, files, multi, limiter, &self.queue, &self.spans, self.piece_length, self.data.len() as u64, None, &self.tx, stop, move |m| logs.lock().unwrap().push(m))
         }
 
         fn logged(&self, needle: &str) -> bool {
@@ -724,5 +739,89 @@ mod tests {
         }
         assert_eq!(requests, 100_000);
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
+    // ---- a v2 torrent (BEP 52) ----------------------------------------------
+
+    /// A v2 torrent of three files (the middle one empty) under `name`, made by `create_torrent`'s own builder, with the pieces
+    /// of the first (three, the last short) and the last (one, short), and a mirror that serves them.
+    struct V2Rig {
+        torrent: crate::torrent::TorrentFile,
+        files: Vec<(String, Vec<u8>)>,
+        queue: Arc<WorkQueue>,
+        spans: Arc<Vec<FileSpan>>,
+        dir: std::path::PathBuf,
+        rx: mpsc::Receiver<PieceResult>,
+        tx: Sender<PieceResult>,
+    }
+
+    impl V2Rig {
+        fn new(name: &str) -> V2Rig {
+            let source = std::env::temp_dir().join(format!("bittorrent-rs-webseed-v2-src-{}-{}", name, std::process::id()));
+            let _ = std::fs::remove_dir_all(&source);
+            std::fs::create_dir_all(source.join("pack/sub")).unwrap();
+            let bytes = |n: usize, salt: u8| -> Vec<u8> { (0..n).map(|i| (i as u32).wrapping_mul(2654435761).wrapping_add(u32::from(salt) * 977) as u8 ^ (i >> 11) as u8).collect() };
+            let files = vec![("a.bin".to_string(), bytes(2 * 32768 + 5000, 1)), ("empty".to_string(), Vec::new()), ("sub/b.bin".to_string(), bytes(20000, 2))];
+            for (path, content) in &files {
+                std::fs::write(source.join("pack").join(path), content).unwrap();
+            }
+            let created = crate::create::create(&source.join("pack"), &crate::create::CreateOptions { v2: true, piece_length: Some(32768), ..Default::default() }, |_, _| {}).unwrap();
+            let torrent = crate::torrent::parse_torrent_file(&created.bytes).unwrap();
+            assert!(torrent.is_v2_only() && torrent.v2_ready());
+            let dir = tmp_dir(name);
+            let spans = Arc::new(torrent.file_spans(&dir));
+            let work = crate::downloader::build_work_queue(&torrent);
+            let count = work.len();
+            let (tx, rx) = mpsc::channel();
+            V2Rig { torrent, files, queue: Arc::new(WorkQueue::new(work, count)), spans, dir, rx, tx }
+        }
+
+        fn mirror(&self, mode: Mode) -> mirror::Mirror {
+            spawn_mirror(self.files.iter().map(|(path, content)| (Box::leak(format!("pack/{}", path).into_boxed_str()) as &str, content.clone())).collect(), mode)
+        }
+
+        fn run(&self, base: &str) -> WebEnd {
+            run_web_worker(base, &self.torrent.name, &self.torrent.files, self.torrent.multi_file, None, &self.queue, &self.spans, self.torrent.piece_length as u64, self.torrent.total_length(), Some(&self.torrent.v2_pieces), &self.tx, &AtomicBool::new(false), |_| {})
+        }
+    }
+
+    #[test]
+    fn a_v2_pieces_request_is_one_range_of_the_file_it_is_part_of_and_never_more() {
+        let targets: Vec<FileTarget> = ["http://m/a", "http://m/b"].iter().map(|u| FileTarget { url: u.to_string(), start: 0, end: 0 }).collect();
+        let pieces = vec![crate::v2::V2Piece { file: 0, offset: 0, length: 32768, root: [0; 32], width: 2 }, crate::v2::V2Piece { file: 0, offset: 32768, length: 100, root: [0; 32], width: 2 }, crate::v2::V2Piece { file: 1, offset: 0, length: 7, root: [0; 32], width: 1 }];
+        assert_eq!(v2_piece_requests(&targets, &pieces, 0), vec![("http://m/a".to_string(), 0, 32768)]);
+        assert_eq!(v2_piece_requests(&targets, &pieces, 1), vec![("http://m/a".to_string(), 32768, 100)], "a file's short last piece, from where it begins in the file");
+        assert_eq!(v2_piece_requests(&targets, &pieces, 2), vec![("http://m/b".to_string(), 0, 7)], "the next file's first piece is not the end of this one's");
+        assert!(v2_piece_requests(&targets, &pieces, 3).is_empty(), "no such piece");
+        assert!(v2_piece_requests(&targets[..1], &pieces, 2).is_empty(), "nor a file that is not listed");
+    }
+
+    #[test]
+    fn a_web_seed_serves_a_v2_torrent_piece_by_piece_and_each_is_checked_by_its_merkle_root() {
+        let rig = V2Rig::new("v2-serves");
+        let mirror = rig.mirror(Mode::Serve);
+
+        let end = rig.run(&mirror.base);
+
+        assert_eq!(end, WebEnd::Drained);
+        let mut got: Vec<u32> = rig.rx.try_iter().map(|r| r.index).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2, 3], "three pieces of the first file and one of the last (the empty one has none)");
+        assert!(rig.queue.is_empty());
+        for (path, content) in &rig.files {
+            if !content.is_empty() {
+                assert_eq!(&std::fs::read(rig.dir.join(path)).unwrap(), content, "{} is on disk, every byte", path);
+            }
+        }
+        assert_eq!(mirror.requests.load(Ordering::SeqCst), 4, "one ranged request a piece, none spanning a file");
+    }
+
+    #[test]
+    fn a_mirror_that_serves_a_v2_torrent_wrong_bytes_is_caught_and_given_up_on() {
+        let rig = V2Rig::new("v2-corrupt");
+        let mirror = rig.mirror(Mode::Corrupt);
+        assert_eq!(rig.run(&mirror.base), WebEnd::Disabled);
+        assert_eq!(rig.rx.try_iter().count(), 0, "nothing unverified was accepted");
+        assert_eq!(rig.queue.len(), 4);
     }
 }

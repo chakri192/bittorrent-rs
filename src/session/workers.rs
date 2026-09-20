@@ -80,16 +80,16 @@ impl Workers {
 
     /// Starts one worker per BEP 19 web seed, each dialing nobody: they
     /// fetch ranges over HTTP into the same queue.
-    pub fn start_web_seeds(&mut self, urls: &[String], name: &str, files: &[(Vec<String>, i64)], multi_file: bool, total_length: u64) {
+    pub fn start_web_seeds(&mut self, urls: &[String], name: &str, files: &[(Vec<String>, i64)], multi_file: bool, total_length: u64, v2_pieces: Option<Arc<Vec<crate::v2::V2Piece>>>) {
         let files = Arc::new(files.to_vec());
         for url in urls {
-            let (url, name, files) = (url.clone(), name.to_string(), Arc::clone(&files));
+            let (url, name, files, v2_pieces) = (url.clone(), name.to_string(), Arc::clone(&files), v2_pieces.clone());
             let (queue, spans, tx, stop, log) = (Arc::clone(&self.queue), Arc::clone(&self.spans), self.results_tx.clone(), Arc::clone(&self.web_stop), Arc::clone(&self.log));
             let limiter = self.config.down_limit.clone();
             let piece_length = self.piece_length;
             let disk_failure = Arc::clone(&self.disk_failure);
             self.web_seeds.push(thread::spawn(move || {
-                let end = run_web_worker(&url, &name, &files, multi_file, limiter.as_deref(), &queue, &spans, piece_length, total_length, &tx, &stop, move |m| log(m));
+                let end = run_web_worker(&url, &name, &files, multi_file, limiter.as_deref(), &queue, &spans, piece_length, total_length, v2_pieces.as_deref().map(Vec::as_slice), &tx, &stop, move |m| log(m));
                 if let WebEnd::DiskFailed(why) = end {
                     lock(&disk_failure).get_or_insert(why);
                 }
@@ -324,7 +324,7 @@ mod tests {
         let url = format!("http://{}/", dead_addr());
         let files = vec![(vec!["a.bin".to_string()], 16)];
 
-        w.start_web_seeds(&[url], "t", &files, false, 16);
+        w.start_web_seeds(&[url], "t", &files, false, 16, None);
         wait_until("the web seed to give up", || !w.web_active());
         w.shutdown();
 
@@ -386,7 +386,7 @@ mod tests {
         let mut w = Workers::new(queue, spans, config, 1024, 1, false, log);
         assert_eq!(w.disk_failure(), None, "nothing has failed yet");
 
-        w.start_web_seeds(std::slice::from_ref(&mirror.base), "file.bin", &files, false, 3000);
+        w.start_web_seeds(std::slice::from_ref(&mirror.base), "file.bin", &files, false, 3000, None);
 
         wait_until("the disk failure to be reported", || w.disk_failure().is_some());
         w.shutdown();
