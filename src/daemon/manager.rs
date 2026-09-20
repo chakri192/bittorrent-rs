@@ -87,9 +87,9 @@ impl Manager {
             }
             let bytes = fs::read(&path).map_err(|e| format!("reading {}: {}", path.display(), e))?;
             let torrent = torrent::parse_torrent_file(&bytes).map_err(|e| format!("parsing {}: {}", path.display(), e))?;
-            crate::selection::build_mask(&torrent.files, &[], &options.only)?;
+            crate::selection::build_mask_for(&torrent, &[], &options.only)?;
             if !options.prefer.is_empty() {
-                crate::selection::build_prefer_mask(&torrent.files, &options.prefer)?;
+                crate::selection::build_prefer_mask_for(&torrent, &options.prefer)?;
             }
             // Kept, so that the torrent does not depend on the file staying where it was.
             let kept = match &self.store {

@@ -34,8 +34,13 @@ fn main() -> ExitCode {
             println!("piece_len:   {}", t.piece_length);
             println!("num_pieces:  {}", t.pieces.len());
             println!("files:");
-            for (path, len) in &t.files {
+            for (path, len) in t.visible_files() {
                 println!("  {} ({} bytes)", path.join("/"), len);
+            }
+            // BEP 47 padding files hold no data; say so rather than list them as files.
+            let padding: i64 = t.files.iter().zip(&t.padding).filter(|(_, pad)| **pad).map(|(file, _)| file.1).sum();
+            if padding > 0 {
+                println!("padding:     {} bytes in {} padding file(s), not written to disk", padding, t.padding.iter().filter(|&&pad| pad).count());
             }
             ExitCode::SUCCESS
         }

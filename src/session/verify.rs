@@ -85,7 +85,7 @@ pub fn verify(torrent: &TorrentFile, mask: &[bool], base_dir: &Path, mut progres
     if torrent.is_v2_only() {
         return verify_v2(torrent, mask, base_dir, progress);
     }
-    let spans = build_file_spans(base_dir, &torrent.files);
+    let spans = torrent.file_spans(base_dir);
     let piece_length = torrent.piece_length as u64;
     let (wanted, wanted_bytes) = selection::selected_pieces(&torrent.files, piece_length, mask);
 
@@ -463,5 +463,27 @@ mod tests {
 
         assert!(report.is_whole(), "{}", report.describe("t", true));
         assert_eq!((report.wanted_pieces, report.verified_pieces), (1 + 3, 4));
+    }
+
+    #[test]
+    fn a_padded_torrent_verifies_with_only_its_real_files_and_reports_only_them() {
+        use crate::torrent::padded_fixture as fx;
+        let dir = tmp_dir("padded");
+        let torrent = fx::torrent();
+        let (a, b) = fx::real_files();
+        fs::write(dir.join("a.bin"), &a).unwrap();
+        fs::write(dir.join("b.bin"), &b).unwrap();
+        let mask = torrent.layout_mask(&[true, true]);
+        let report = verify(&torrent, &mask, &dir, |_, _| true).unwrap();
+        assert!(report.is_whole(), "{}", report.describe("pad", true));
+        assert_eq!(states(&report), vec![("a.bin", FileState::Whole), ("b.bin", FileState::Whole)], "no padding file in the report, and none needed on disk");
+        assert_eq!((report.wanted_pieces, report.verified_pieces), (3, 3));
+
+        let mut damaged = b.clone();
+        damaged[4500] ^= 1; // in b's second piece of the torrent
+        fs::write(dir.join("b.bin"), damaged).unwrap();
+        let report = verify(&torrent, &mask, &dir, |_, _| true).unwrap();
+        assert_eq!(states(&report), vec![("a.bin", FileState::Whole), ("b.bin", FileState::Damaged)]);
+        assert_eq!(report.verified_pieces, 2);
     }
 }

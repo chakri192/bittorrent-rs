@@ -54,7 +54,7 @@ pub fn piece_is_on_disk(spans: &[FileSpan], torrent: &TorrentFile, index: u32) -
 
 /// Whether any of the torrent's files already exists with some content.
 pub fn any_data_on_disk(spans: &[FileSpan]) -> bool {
-    spans.iter().any(|s| fs::metadata(&s.path).is_ok_and(|m| m.is_file() && m.len() > 0))
+    spans.iter().any(|s| !s.padding && fs::metadata(&s.path).is_ok_and(|m| m.is_file() && m.len() > 0))
 }
 
 /// Hashes **every** piece of the torrent that is present on disk and
@@ -98,9 +98,12 @@ fn read_piece_bytes(spans: &[FileSpan], piece_index: u32, piece_stride: u64, pie
         let available = (span.end - offset) as usize;
         let to_read = (buf.len() - filled).min(available);
 
-        let mut f = File::open(&span.path)?;
-        f.seek(SeekFrom::Start(file_offset))?;
-        f.read_exact(&mut buf[filled..filled + to_read])?;
+        // Padding is zeros, which the buffer already is.
+        if !span.padding {
+            let mut f = File::open(&span.path)?;
+            f.seek(SeekFrom::Start(file_offset))?;
+            f.read_exact(&mut buf[filled..filled + to_read])?;
+        }
 
         filled += to_read;
         offset += to_read as u64;
@@ -433,5 +436,38 @@ mod tests {
         stdfs::write(root.join("b"), &b[..50]).unwrap();
         stdfs::remove_file(root.join("a")).unwrap();
         assert!(scan_all(&spans, &torrent, |_, _| {}).is_empty());
+    }
+
+    #[test]
+    fn the_pieces_of_a_padded_torrent_are_confirmed_from_the_real_files_alone() {
+        use crate::torrent::padded_fixture as fx;
+        let dir = tmp_dir("padded");
+        let torrent = fx::torrent();
+        let spans = torrent.file_spans(&dir);
+        let (a, b) = fx::real_files();
+        stdfs::write(dir.join("a.bin"), &a).unwrap();
+        stdfs::write(dir.join("b.bin"), &b).unwrap();
+        assert_eq!(scan_all(&spans, &torrent, |_, _| {}), HashSet::from([0, 1, 2]), "piece 0 ends in padding, which hashes as the zeros it is");
+        // Padding files that exist on disk hold nothing anyone reads.
+        stdfs::create_dir_all(dir.join(".pad")).unwrap();
+        stdfs::write(dir.join(".pad/1096"), vec![0xFFu8; 1096]).unwrap();
+        assert_eq!(scan_all(&spans, &torrent, |_, _| {}), HashSet::from([0, 1, 2]), "whatever is in a padding file, the piece is what the torrent says");
+        // A byte of a.bin changed: piece 0 falls out, the others do not.
+        let mut damaged = a.clone();
+        damaged[10] ^= 1;
+        stdfs::write(dir.join("a.bin"), damaged).unwrap();
+        assert_eq!(scan_all(&spans, &torrent, |_, _| {}), HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn a_padding_file_on_disk_is_not_data() {
+        use crate::torrent::padded_fixture as fx;
+        let dir = tmp_dir("padded-data");
+        let spans = fx::torrent().file_spans(&dir);
+        stdfs::create_dir_all(dir.join(".pad")).unwrap();
+        stdfs::write(dir.join(".pad/1096"), vec![0u8; 1096]).unwrap();
+        assert!(!any_data_on_disk(&spans), "only a padding file: nothing of the torrent is there");
+        stdfs::write(dir.join("a.bin"), b"x").unwrap();
+        assert!(any_data_on_disk(&spans));
     }
 }

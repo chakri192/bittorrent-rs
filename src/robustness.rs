@@ -187,6 +187,7 @@ fn torrent_parsing_survives_hostile_input_and_only_yields_safe_torrents() {
 
         // Nothing that gets past the parser can escape the download directory.
         assert!(is_plain_component(&t.name), "name {:?}", t.name);
+        assert_eq!(t.padding.len(), t.files.len(), "the padding flags are one per file");
         for (path, _) in &t.files {
             assert!(!path.is_empty(), "a file with no path");
             for part in path {

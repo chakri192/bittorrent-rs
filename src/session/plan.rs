@@ -33,7 +33,7 @@ pub struct Outstanding {
 impl DownloadPlan {
     /// `mask[i]` says whether file `i` is selected.
     pub fn new(torrent: &TorrentFile, mask: &[bool]) -> Self {
-        let selective = !selection::selects_everything(mask);
+        let selective = !torrent.selects_everything(mask);
         let (selected, selected_bytes) = selection::selected_pieces_of(torrent, mask);
         DownloadPlan {
             selective,
@@ -172,5 +172,18 @@ mod tests {
         assert_eq!(indices(&out.work), vec![0]);
         assert_eq!(out.pieces_done, 1);
         assert_eq!(out.bytes_done, 256);
+    }
+
+    #[test]
+    fn a_torrent_with_padding_is_downloaded_whole_when_every_real_file_is_selected() {
+        use crate::torrent::padded_fixture as fx;
+        let t = fx::torrent();
+        let everything = crate::selection::build_mask_for(&t, &[], &[]).unwrap();
+        let plan = DownloadPlan::new(&t, &everything);
+        assert!(!plan.is_selective(), "the padding is not a file that was left out");
+        assert_eq!((plan.display_total(), plan.goal_pieces()), (9096, 3));
+        let plan = DownloadPlan::new(&t, &crate::selection::build_mask_for(&t, &[2], &[]).unwrap());
+        assert!(plan.is_selective());
+        assert_eq!(plan.goal_pieces(), 2);
     }
 }

@@ -176,7 +176,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     let plan = DownloadPlan::new(torrent, mask);
     let (selective, display_total, goal_pieces) = (plan.is_selective(), plan.display_total(), plan.goal_pieces());
     if selective {
-        sink.log(format!("selective download: {} of {} file(s), {} piece(s), {}", mask.iter().filter(|&&b| b).count(), torrent.files.len(), goal_pieces, format_bytes(display_total)));
+        sink.log(format!("selective download: {} of {} file(s), {} piece(s), {}", mask.iter().filter(|&&b| b).count(), torrent.padding.iter().filter(|&&pad| !pad).count(), goal_pieces, format_bytes(display_total)));
     }
 
     let tracker_tiers = crate::tracker_discovery::shuffled(torrent.tracker_tiers());

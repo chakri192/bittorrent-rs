@@ -377,8 +377,8 @@ fn run(shared: &Arc<JobShared>, spec: &JobSpec, context: &JobContext) -> Result<
 /// daemon's network does the port mapping and holds the daemon-wide limits; what is the torrent's
 /// own comes from `spec`.
 fn session_options(spec: &JobSpec, torrent: &TorrentFile, defaults: &JobDefaults, port: u16) -> Result<(Options, Vec<bool>), String> {
-    let mask = crate::selection::build_mask(&torrent.files, &[], &spec.options.only)?;
-    let prefer = if spec.options.prefer.is_empty() { Vec::new() } else { crate::selection::build_prefer_mask(&torrent.files, &spec.options.prefer)? };
+    let mask = crate::selection::build_mask_for(torrent, &[], &spec.options.only)?;
+    let prefer = if spec.options.prefer.is_empty() { Vec::new() } else { crate::selection::build_prefer_mask_for(torrent, &spec.options.prefer)? };
     let options = Options {
         out_dir: spec.out_dir.clone(),
         port,

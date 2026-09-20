@@ -43,6 +43,8 @@ pub struct FileTarget {
     pub url: String,
     pub start: u64,
     pub end: u64,
+    /// A BEP 47 padding file: no mirror has it, and its bytes are zeros.
+    pub padding: bool,
 }
 
 /// Percent-encodes a single path segment (everything but the RFC 3986
@@ -91,15 +93,16 @@ pub fn build_targets(base_url: &str, name: &str, files: &[(Vec<String>, i64)], m
         } else {
             base_url.to_string()
         };
-        targets.push(FileTarget { url, start: cursor, end: cursor + length });
+        targets.push(FileTarget { url, start: cursor, end: cursor + length, padding: false });
         cursor += length;
     }
     targets
 }
 
 /// The HTTP requests needed to fetch piece `piece_index`: `(url,
-/// file_offset, length)` for each file the piece overlaps, in order. Pure
-/// (no I/O) so the piece-to-file mapping is unit-testable.
+/// file_offset, length)` for each file the piece overlaps, in order. A padding
+/// file's stretch is not a request: its URL is empty, and it stands for that
+/// many zeros. Pure (no I/O) so the piece-to-file mapping is unit-testable.
 pub fn piece_requests(targets: &[FileTarget], piece_index: u32, piece_length: u64, total_length: u64) -> Vec<(String, u64, u64)> {
     let ps = piece_index as u64 * piece_length;
     let pe = (ps + piece_length).min(total_length);
@@ -115,7 +118,8 @@ pub fn piece_requests(targets: &[FileTarget], piece_index: u32, piece_length: u6
         if seg_start >= seg_end {
             continue;
         }
-        reqs.push((t.url.clone(), seg_start - t.start, seg_end - seg_start));
+        let url = if t.padding { String::new() } else { t.url.clone() };
+        reqs.push((url, seg_start - t.start, seg_end - seg_start));
     }
     reqs
 }
@@ -133,6 +137,10 @@ pub fn v2_piece_requests(targets: &[FileTarget], pieces: &[crate::v2::V2Piece], 
 fn fetch_piece(agent: &ureq::Agent, targets: &[FileTarget], reqs: Vec<(String, u64, u64)>) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     for (url, offset, len) in reqs {
+        if url.is_empty() {
+            out.resize(out.len() + len as usize, 0); // padding: nothing to ask a mirror for
+            continue;
+        }
         let range = format!("bytes={}-{}", offset, offset + len - 1);
         let resp = agent.get(&url).set("Range", &range).call().map_err(|e| format!("GET {}: {}", url, e))?;
         let status = resp.status();
@@ -213,7 +221,11 @@ pub fn run_web_worker<L: Fn(String)>(
     stop: &AtomicBool,
     log: L,
 ) -> WebEnd {
-    let targets = Arc::new(build_targets(base_url, name, files, multi_file));
+    let mut targets = build_targets(base_url, name, files, multi_file);
+    for (target, span) in targets.iter_mut().zip(spans.iter()) {
+        target.padding = span.padding;
+    }
+    let targets = Arc::new(targets);
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build();
     let mut consecutive_failures = 0u32;
 
@@ -708,7 +720,7 @@ mod tests {
     fn targets_of(lengths: &[u64]) -> Vec<FileTarget> {
         let mut cursor = 0;
         lengths.iter().enumerate().map(|(i, &len)| {
-            let t = FileTarget { url: format!("http://m/{}", i), start: cursor, end: cursor + len };
+            let t = FileTarget { url: format!("http://m/{}", i), start: cursor, end: cursor + len, padding: false };
             cursor += len;
             t
         }).collect()
@@ -787,7 +799,7 @@ mod tests {
 
     #[test]
     fn a_v2_pieces_request_is_one_range_of_the_file_it_is_part_of_and_never_more() {
-        let targets: Vec<FileTarget> = ["http://m/a", "http://m/b"].iter().map(|u| FileTarget { url: u.to_string(), start: 0, end: 0 }).collect();
+        let targets: Vec<FileTarget> = ["http://m/a", "http://m/b"].iter().map(|u| FileTarget { url: u.to_string(), start: 0, end: 0, padding: false }).collect();
         let pieces = vec![crate::v2::V2Piece { file: 0, offset: 0, length: 32768, root: [0; 32], width: 2 }, crate::v2::V2Piece { file: 0, offset: 32768, length: 100, root: [0; 32], width: 2 }, crate::v2::V2Piece { file: 1, offset: 0, length: 7, root: [0; 32], width: 1 }];
         assert_eq!(v2_piece_requests(&targets, &pieces, 0), vec![("http://m/a".to_string(), 0, 32768)]);
         assert_eq!(v2_piece_requests(&targets, &pieces, 1), vec![("http://m/a".to_string(), 32768, 100)], "a file's short last piece, from where it begins in the file");
@@ -823,5 +835,39 @@ mod tests {
         assert_eq!(rig.run(&mirror.base), WebEnd::Disabled);
         assert_eq!(rig.rx.try_iter().count(), 0, "nothing unverified was accepted");
         assert_eq!(rig.queue.len(), 4);
+    }
+
+    // ---- BEP 47 padding files --------------------------------------------------
+
+    #[test]
+    fn the_stretch_of_a_piece_in_a_padding_file_is_zeros_not_a_request() {
+        let t = |url: &str, start, end, padding| FileTarget { url: url.to_string(), start, end, padding };
+        let targets = vec![t("http://m/a", 0, 3000, false), t("http://m/.pad/1096", 3000, 4096, true), t("http://m/b", 4096, 9096, false)];
+        assert_eq!(piece_requests(&targets, 0, 4096, 9096), vec![("http://m/a".to_string(), 0, 3000), (String::new(), 0, 1096)], "the padding is an empty URL, for its whole length");
+        assert_eq!(piece_requests(&targets, 1, 4096, 9096), vec![("http://m/b".to_string(), 0, 4096)]);
+    }
+
+    #[test]
+    fn a_web_seed_serves_a_padded_torrent_without_asking_for_the_padding() {
+        use crate::torrent::padded_fixture as fx;
+        let torrent = fx::torrent();
+        let (a, b) = fx::real_files();
+        // The mirror has the two real files and, as any would, no padding file.
+        let mirror = spawn_mirror(vec![("pad/a.bin", a.clone()), ("pad/b.bin", b.clone())], Mode::Serve);
+        let dir = tmp_dir("padded");
+        let spans = Arc::new(torrent.file_spans(&dir));
+        let work = crate::downloader::build_work_queue(&torrent);
+        let count = work.len();
+        let queue = Arc::new(WorkQueue::new(work, count));
+        let (tx, rx) = mpsc::channel();
+
+        let end = run_web_worker(&mirror.base, &torrent.name, &torrent.files, torrent.multi_file, None, &queue, &spans, torrent.piece_length as u64, torrent.total_length(), None, &tx, &AtomicBool::new(false), |_| {});
+
+        assert_eq!(end, WebEnd::Drained);
+        assert_eq!(rx.try_iter().count(), 3, "the piece that is part padding was accepted: its hash covers the zeros");
+        assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), a);
+        assert_eq!(std::fs::read(dir.join("b.bin")).unwrap(), b);
+        assert!(!dir.join(".pad").exists(), "and nothing was written for the padding");
+        assert_eq!(mirror.requests.load(Ordering::SeqCst), 3, "one request a piece: the padding was never asked for");
     }
 }

@@ -76,6 +76,18 @@ pub fn build_prefer_mask(files: &Files, patterns: &[String]) -> Result<Vec<bool>
     Ok(mask)
 }
 
+/// [`build_mask`] for a torrent: the indices and patterns are those of the
+/// files a person sees, which leaves out the BEP 47 padding files, and the mask
+/// is over all of `TorrentFile::files`, in which a padding file is never selected.
+pub fn build_mask_for(torrent: &crate::torrent::TorrentFile, indices: &[usize], patterns: &[String]) -> Result<Vec<bool>, String> {
+    build_mask(&torrent.visible_files(), indices, patterns).map(|visible| torrent.layout_mask(&visible))
+}
+
+/// [`build_prefer_mask`] for a torrent, over all of `TorrentFile::files` like [`build_mask_for`].
+pub fn build_prefer_mask_for(torrent: &crate::torrent::TorrentFile, patterns: &[String]) -> Result<Vec<bool>, String> {
+    build_prefer_mask(&torrent.visible_files(), patterns).map(|visible| torrent.layout_mask(&visible))
+}
+
 /// True when every file is selected (the common, non-selective case --
 /// lets callers skip all the filtering work).
 pub fn selects_everything(mask: &[bool]) -> bool {
@@ -337,5 +349,29 @@ mod tests {
         let v1 = crate::torrent::parse_torrent_file(b"d4:infod6:lengthi40000e4:name1:a12:piece lengthi16384e6:pieces60:000000000000000000001111111111111111111122222222222222222222ee").unwrap();
         assert_eq!(selected_pieces_of(&v1, &[true]).0.len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_selection_by_index_or_name_sees_only_the_files_that_are_not_padding() {
+        use crate::torrent::padded_fixture as fx;
+        let torrent = fx::torrent();
+        assert_eq!(build_mask_for(&torrent, &[], &[]).unwrap(), vec![true, false, true], "everything is the two real files; the padding is never selected");
+        assert_eq!(build_mask_for(&torrent, &[2], &[]).unwrap(), vec![false, false, true], "the second file is b.bin, however many padding files come before it");
+        assert!(build_mask_for(&torrent, &[3], &[]).is_err(), "there are two files to number");
+        assert_eq!(build_mask_for(&torrent, &[], &["A.BIN".to_string()]).unwrap(), vec![true, false, false]);
+        assert!(build_mask_for(&torrent, &[], &["pad".to_string()]).is_err(), "a pattern does not reach the padding files, whose names are libtorrent's");
+        assert_eq!(build_prefer_mask_for(&torrent, &["b.bin".to_string()]).unwrap(), vec![false, false, true]);
+        assert!(build_prefer_mask_for(&torrent, &[".pad".to_string()]).is_err());
+    }
+
+    #[test]
+    fn the_pieces_of_a_selection_are_those_the_real_files_have_bytes_in() {
+        use crate::torrent::padded_fixture as fx;
+        let torrent = fx::torrent();
+        // Piece 0 is a.bin and the padding after it; b.bin begins the second piece.
+        let (a_only, a_bytes) = selected_pieces_of(&torrent, &build_mask_for(&torrent, &[1], &[]).unwrap());
+        assert_eq!((a_only, a_bytes), (HashSet::from([0]), 4096), "the padding after a.bin is in its piece and is carried with it");
+        let (b_only, b_bytes) = selected_pieces_of(&torrent, &build_mask_for(&torrent, &[2], &[]).unwrap());
+        assert_eq!((b_only, b_bytes), (HashSet::from([1, 2]), 4096 + 904), "b.bin alone does not need the piece a.bin ends in");
     }
 }

@@ -506,15 +506,16 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
 
     // File selection (--only / --files). `--list` prints the file table
     // and exits without downloading anything.
-    let mask = bittorrent_rs::selection::build_mask(&torrent.files, &args.files_sel, &args.only).map_err(|e| finish_err(ui, e))?;
+    let mask = bittorrent_rs::selection::build_mask_for(&torrent, &args.files_sel, &args.only).map_err(|e| finish_err(ui, e))?;
     if args.list {
-        let listing = bittorrent_rs::selection::format_list(&torrent.name, &torrent.files, &mask);
+        let (visible, visible_mask) = (torrent.visible_files(), torrent.visible_mask(&mask));
+        let listing = bittorrent_rs::selection::format_list(&torrent.name, &visible, &visible_mask);
         services.shutdown();
         if args.json {
-            for line in bittorrent_rs::selection::list_events(&torrent.files, &mask) {
+            for line in bittorrent_rs::selection::list_events(&visible, &visible_mask) {
                 ui.event(line);
             }
-            ui.finish(Ok(format!("{} file(s)", torrent.files.len())));
+            ui.finish(Ok(format!("{} file(s)", visible.len())));
         } else {
             ui.finish(Ok(listing.clone()));
         }
@@ -535,7 +536,7 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         transport: args.transport,
         tracker_mode: args.tracker_mode,
         sequential: args.sequential,
-        prefer: bittorrent_rs::selection::build_prefer_mask(&torrent.files, &args.prefer).map_err(|e| finish_err(ui, e))?,
+        prefer: bittorrent_rs::selection::build_prefer_mask_for(&torrent, &args.prefer).map_err(|e| finish_err(ui, e))?,
         max_down: args.max_down,
         max_up: args.max_up,
         ipv6: args.ipv6,

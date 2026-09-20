@@ -127,6 +127,18 @@ beside the SHA-1 slot, and `PieceWork::matches` picks the check. Everything
 downstream (queue, workers, seeder, resume) is unchanged apart from asking the
 torrent for a piece's length and how to verify it.
 
+**Padding files** (BEP 47) are handled where bytes meet files and nowhere
+else. A v1 file list may hold entries whose `attr` says `p`: zeros that the
+piece hashes cover and no file holds. They stay in `TorrentFile::files` (the
+piece arithmetic needs their length) and are flagged in a parallel `padding`
+vector; `file_spans` carries the flag into each `FileSpan`, and the span
+functions do the rest: writing skips it, reading returns zeros, creating empty
+files and looking for data on disk pass it by, and a web seed's request for it
+is that many zeros rather than a GET. What a person sees is `visible_files`, and
+a selection made over those becomes a mask over all the entries
+(`layout_mask`) in which padding is never selected on its own, since a piece is
+wanted because a real file has bytes in it.
+
 Piece data reaches disk only after its hash has matched. Everything before
 that is untrusted bytes in a buffer.
 

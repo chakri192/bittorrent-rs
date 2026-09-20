@@ -76,5 +76,27 @@ ours_seed "$WORK/v2.torrent"; lt_leech "$WORK/v2-bare.torrent" tcp; check "v2: l
 ours_seed "$WORK/v2.torrent"; lt_leech "$MAGNET_V2" tcp; check "v2: libtorrent downloads from a v2 magnet link, the metadata and the layers from this client" same "$WORK/lt-leech/data.bin" "$WORK/data.bin"; ours_stop
 ours_seed "$WORK/v2.torrent" --transport utp; lt_leech "$WORK/v2.torrent" utp; check "v2: libtorrent downloads from this client over uTP" same "$WORK/lt-leech/data.bin" "$WORK/data.bin"; ours_stop
 
+# ---- padding files (BEP 47) ----------------------------------------------------
+# libtorrent lays a hybrid torrent out with `.pad/N` filler files between the real ones. They are in the pieces and on no disk:
+# what comes off the wire and goes on it has the zeros in it, and neither side may write them out.
+mkdir -p "$WORK/pack/sub"
+for f in a.bin:300000 sub/b.bin:400000 c.bin:150000; do python3 -c "import os; open('$WORK/pack/${f%%:*}', 'wb').write(os.urandom(${f##*:}))"; done
+"$LT_PYTHON" "$ROOT/scripts/mk_hybrid.py" "$WORK/pack" "$WORK/pad.torrent"
+same_tree() { diff -r "$1" "$2" >/dev/null 2>&1; }
+rm -rf "$WORK/lt-pack"; mkdir -p "$WORK/lt-pack"; cp -R "$WORK/pack" "$WORK/lt-pack/"
+LT_TRANSPORT=tcp "$LT_PYTHON" "$ROOT/scripts/lt_peer.py" seed "$WORK/pad.torrent" "$WORK/lt-pack" "$LT_PORT" >/dev/null 2>&1 &
+LT_PID=$!; PIDS+=($LT_PID); sleep 3
+rm -rf "$WORK/out-pack"; mkdir -p "$WORK/out-pack"
+timeout 90 "$BIN/download" "$WORK/pad.torrent" --peer "127.0.0.1:$LT_PORT" --out "$WORK/out-pack" --no-dht --no-lsd --no-portmap --no-tui --no-config --no-log --port "$OURS_PORT" >/dev/null 2>&1
+check "padding: downloads a libtorrent hybrid torrent with padding files, writing none of them" same_tree "$WORK/out-pack/pack" "$WORK/pack"
+lt_stop
+rm -rf "$WORK/ours-pack"; mkdir -p "$WORK/ours-pack"; cp -R "$WORK/pack" "$WORK/ours-pack/"
+"$BIN/download" "$WORK/pad.torrent" --out "$WORK/ours-pack" --no-dht --no-lsd --no-portmap --no-tui --no-config --no-log --seed --port "$OURS_PORT" >/dev/null 2>&1 &
+OURS_PID=$!; PIDS+=($OURS_PID); sleep 3
+rm -rf "$WORK/lt-leech"; mkdir -p "$WORK/lt-leech"
+LT_TRANSPORT=tcp timeout 120 "$LT_PYTHON" "$ROOT/scripts/lt_peer.py" leech "$WORK/pad.torrent" "$WORK/lt-leech" "$LT_PORT" "$OURS_PORT" >/dev/null 2>&1
+check "padding: libtorrent downloads such a torrent from this client, the padding's zeros served in the pieces" same_tree "$WORK/lt-leech/pack" "$WORK/pack"
+ours_stop
+
 echo "interop: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

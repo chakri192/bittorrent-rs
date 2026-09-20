@@ -165,6 +165,7 @@ enum Kind {
     /// A run stopped with a piece half fetched keeps its blocks: the next run asks only for the
     /// blocks it lacks, of that piece and of the others.
     ResumePartialPiece,
+    PaddedTorrent,
     /// BEP 12: a torrent whose announce list is [[a dead tracker, one that works], [another]] is
     /// announced to the first tier's working tracker and to no other, and that tracker alone hears
     /// `stopped`; with `--tracker-mode concurrent` every tracker is asked.
@@ -221,6 +222,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "stopped-announce-is-bounded", kind: Kind::StoppedAnnounceIsBounded },
     Scenario { name: "second-signal-forces-exit", kind: Kind::SecondSignalForcesExit },
     Scenario { name: "resume-partial-piece", kind: Kind::ResumePartialPiece },
+    Scenario { name: "padded-torrent", kind: Kind::PaddedTorrent },
     Scenario { name: "tracker-tiers", kind: Kind::TrackerTiers },
     Scenario { name: "daemon-two-torrents", kind: Kind::Daemon },
 ];
@@ -274,6 +276,7 @@ fn main() {
             Kind::StoppedAnnounceIsBounded => run_stopped_announce_is_bounded(scenario.name),
             Kind::SecondSignalForcesExit => run_second_signal_forces_exit(scenario.name),
             Kind::ResumePartialPiece => run_resume_partial_piece(scenario.name),
+            Kind::PaddedTorrent => run_padded_torrent(scenario.name),
             Kind::TrackerTiers => run_tracker_tiers(scenario.name),
             Kind::Daemon => run_daemon(scenario.name),
         };
@@ -372,6 +375,46 @@ impl Fixture {
             .iter()
             .map(|(path, content)| (if single { path.join("/") } else { format!("{}/{}", name, path.join("/")) }, content.clone()))
             .collect();
+        Fixture { files, piece_count: pieces_concat.len() / 20, data, piece_len, info_bytes: v, info_hash, v2_pieces: None, torrent_extra: Vec::new() }
+    }
+
+    /// A multi-file torrent as libtorrent and qBittorrent lay it out (BEP 47): after each file
+    /// that does not end on a piece boundary comes a padding file (`.pad/N`, `attr` `p`) of
+    /// zeros, so that the next one begins on one. The pieces cover the padding; `files` (what
+    /// is on disk) does not have it, and `data` (what the pieces hash) does.
+    fn build_padded(name: &str, files: &[(Vec<&str>, Vec<u8>)], piece_len: usize) -> Self {
+        let mut layout: Vec<(Vec<String>, usize, bool)> = Vec::new();
+        let mut data = Vec::new();
+        for (index, (path, content)) in files.iter().enumerate() {
+            layout.push((path.iter().map(|part| part.to_string()).collect(), content.len(), false));
+            data.extend_from_slice(content);
+            let gap = data.len().next_multiple_of(piece_len) - data.len();
+            if index + 1 < files.len() && gap > 0 {
+                layout.push((vec![".pad".to_string(), gap.to_string()], gap, true));
+                data.resize(data.len() + gap, 0);
+            }
+        }
+        let mut pieces_concat = Vec::new();
+        for chunk in data.chunks(piece_len) {
+            pieces_concat.extend_from_slice(&Sha1::digest(chunk));
+        }
+        let mut v = b"d5:filesl".to_vec();
+        for (path, length, padding) in &layout {
+            v.extend_from_slice(b"d");
+            if *padding {
+                v.extend_from_slice(b"4:attr1:p");
+            }
+            v.extend_from_slice(format!("6:lengthi{}e4:pathl", length).as_bytes());
+            for part in path {
+                v.extend_from_slice(format!("{}:{}", part.len(), part).as_bytes());
+            }
+            v.extend_from_slice(b"ee");
+        }
+        v.extend_from_slice(format!("e4:name{}:{}12:piece lengthi{}e6:pieces{}:", name.len(), name, piece_len, pieces_concat.len()).as_bytes());
+        v.extend_from_slice(&pieces_concat);
+        v.extend_from_slice(b"e");
+        let info_hash: [u8; 20] = Sha1::digest(&v).into();
+        let files = files.iter().map(|(path, content)| (format!("{}/{}", name, path.join("/")), content.clone())).collect();
         Fixture { files, piece_count: pieces_concat.len() / 20, data, piece_len, info_bytes: v, info_hash, v2_pieces: None, torrent_extra: Vec::new() }
     }
 
@@ -3637,4 +3680,70 @@ fn run_resume_partial_piece(name: &str) -> Result<String, String> {
         return Err(format!("the second run's log does not say it resumed two blocks: {}", log2));
     }
     Ok("a run stopped with two blocks of a piece fetched kept them; the next asked only for the other two of that piece and for the pieces it had none of, and cleared them once it was done".to_string())
+}
+
+/// A torrent with padding files (BEP 47), as libtorrent and qBittorrent make them. The client
+/// downloads it from a peer that serves the padding as the zeros it is, and must leave no
+/// padding on disk and no trace of it in what it lists; then, seeding it, must serve the
+/// pieces the padding is part of with the zeros in them, or a leecher's hash check fails.
+fn run_padded_torrent(name: &str) -> Result<String, String> {
+    let files = [(vec!["a.bin"], pattern(600, 1)), (vec!["sub", "b.bin"], pattern(500, 2)), (vec!["c.bin"], pattern(300, 3))];
+    let fx = Fixture::build_padded("pack", &files, 256);
+    if fx.data.len() <= files.iter().map(|(_, c)| c.len()).sum::<usize>() {
+        return Err("the fixture has no padding in it".to_string());
+    }
+    let swarm = spawn_swarm(&fx, vec![Behavior::Serve]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+
+    // What --list shows: the three files, numbered 1 to 3, and none of the padding.
+    let listed = client_command(&torrent, &out_dir, &dir.join("list.log"), 1).args(["--no-dht", "--json", "--list"]).output().map_err(|e| format!("running the client: {}", e))?;
+    let list_events = json_lines(&String::from_utf8_lossy(&listed.stdout))?;
+    if !listed.status.success() || event_kinds(&list_events) != ["file", "file", "file", "done"] {
+        return Err(format!("--list should give three file events then done; exit {:?}, events {:?}", listed.status.code(), event_kinds(&list_events)));
+    }
+    let paths: Vec<&str> = list_events.iter().filter_map(|e| e.get("path").and_then(|p| p.as_str())).collect();
+    if paths != ["a.bin", "sub/b.bin", "c.bin"] {
+        return Err(format!("--list names the wrong files: {:?}", paths));
+    }
+
+    let child = client_command(&torrent, &out_dir, &log_path, 1)
+        .arg("--no-dht")
+        .arg("--seed")
+        .args(["--port", "0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let mut client = KillOnDrop(child);
+    wait_for_log(&log_path, "seeding pack on port", Duration::from_secs(20), &mut client.0)?;
+    check_downloaded(&fx, &out_dir)?;
+
+    // On disk: the three files and the directory the second is in, and nothing else in the torrent's directory.
+    let mut found: Vec<String> = Vec::new();
+    let mut pending = vec![out_dir.join("pack")];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(|e| format!("reading {:?}: {}", directory, e))? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.push(path.strip_prefix(out_dir.join("pack")).map_err(|e| e.to_string())?.to_string_lossy().into_owned());
+            }
+        }
+    }
+    found.sort();
+    if found != ["a.bin", "c.bin", "sub/b.bin"] {
+        return Err(format!("the files on disk are {:?}; the padding must not be among them", found));
+    }
+    if out_dir.join("pack/.pad").exists() {
+        return Err("a .pad directory was created".to_string());
+    }
+
+    let announces = swarm.announces.lock().unwrap().clone();
+    let started = announces.first().ok_or("the tracker saw no announce")?;
+    let port: u16 = announce_param(started, "port").and_then(|p| p.parse().ok()).ok_or_else(|| format!("no port in the announce: {}", started))?;
+    leech_everything(&fx, port)?;
+    Ok(format!("{} pieces with {} bytes of padding among them, downloaded with no padding on disk, listed without it, and served back whole to a leecher", fx.piece_count, fx.data.len() - files.iter().map(|(_, c)| c.len()).sum::<usize>()))
 }

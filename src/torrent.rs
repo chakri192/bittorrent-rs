@@ -15,6 +15,11 @@ pub struct TorrentFile {
     /// (path_components, length) for each file. Single-file torrents get
     /// one entry whose path is just [name].
     pub files: Vec<(Vec<String>, i64)>,
+    /// Parallel to `files`: whether the entry is a BEP 47 padding file (`attr`
+    /// contains `p`). Its bytes are in the torrent's flat byte space, so the
+    /// piece hashes cover them, but they are zeros that no file on disk
+    /// holds: never written, never read from a file, never listed.
+    pub padding: Vec<bool>,
     /// Whether the info dict is in the multi-file form (a `files` list),
     /// in which case `name` is the directory the files go under, even if
     /// the list has only one entry. A single-file torrent's `name` is the
@@ -265,17 +270,20 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
     }
 
     let multi_file = info.get("length").and_then(Bencode::as_int).is_none() && info.get("files").is_some();
+    let mut padding = Vec::new();
     let files = if let Some(len) = info.get("length").and_then(Bencode::as_int) {
         // Single-file torrent.
         if len < 0 {
             return Err(TorrentError::InvalidLength("length"));
         }
+        padding.push(false);
         vec![(vec![name.clone()], len)]
     } else if let Some(file_list) = info.get("files").and_then(Bencode::as_list) {
         // Multi-file torrent.
         file_list
             .iter()
             .map(|f| {
+                let is_padding = f.get("attr").and_then(Bencode::as_str).is_some_and(|attr| attr.contains('p'));
                 let length = f.get("length").and_then(Bencode::as_int).ok_or(TorrentError::MissingKey("length"))?;
                 if length < 0 {
                     return Err(TorrentError::InvalidLength("length"));
@@ -293,9 +301,15 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
                 if let Some(bad) = path.iter().find(|part| !is_safe_component(part)) {
                     return Err(TorrentError::UnsafePath(bad.clone()));
                 }
-                Ok::<_, TorrentError>((path, length))
+                Ok::<_, TorrentError>(((path, length), is_padding))
             })
             .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(file, is_padding)| {
+                padding.push(is_padding);
+                file
+            })
+            .collect()
     } else {
         return Err(TorrentError::MissingKey("length|files"));
     };
@@ -325,6 +339,7 @@ fn build_torrent_from_info(info: Bencode, raw_info: &[u8], announce: Option<Stri
         pieces,
         name,
         files,
+        padding,
         multi_file,
         url_list,
         private,
@@ -374,7 +389,7 @@ fn build_v2_only_torrent(info: Bencode, tree: &Bencode, raw_info: &[u8], announc
     // expected hash, so that the counts everything works from are right).
     let v2_pieces = crate::v2::plan_pieces(&meta.files, &meta.layers, piece_length as u64).unwrap_or_default();
     let pieces = v2_pieces.iter().map(|p| <[u8; 20]>::try_from(&p.root[..20]).unwrap_or([0; 20])).collect();
-    Ok(TorrentFile { announce, announce_list, info, info_hash, piece_length, pieces, name, files, multi_file, url_list, private, v2: Some(meta), v2_pieces })
+    Ok(TorrentFile { announce, announce_list, info, info_hash, piece_length, pieces, name, padding: vec![false; files.len()], files, multi_file, url_list, private, v2: Some(meta), v2_pieces })
 }
 
 pub fn info_hash_hex(hash: &[u8; 20]) -> String {
@@ -447,8 +462,32 @@ impl TorrentFile {
         if self.is_v2_only() {
             crate::downloader::file_writer::build_file_spans_aligned(base_dir, &self.files, self.piece_length as u64)
         } else {
-            crate::downloader::file_writer::build_file_spans(base_dir, &self.files)
+            crate::downloader::file_writer::build_file_spans_padded(base_dir, &self.files, &self.padding)
         }
+    }
+
+    /// The files a person would see: `files` without the BEP 47 padding
+    /// entries. What `--list` numbers and `--only` matches against.
+    pub fn visible_files(&self) -> Vec<(Vec<String>, i64)> {
+        self.files.iter().zip(&self.padding).filter(|(_, pad)| !**pad).map(|(file, _)| file.clone()).collect()
+    }
+
+    /// A selection made over [`Self::visible_files`] as one over `files`: a
+    /// padding file is never selected in its own right. A piece is wanted
+    /// because a real file has bytes in it, and the padding in it comes along.
+    pub fn layout_mask(&self, visible: &[bool]) -> Vec<bool> {
+        let mut visible = visible.iter().copied();
+        self.padding.iter().map(|&pad| !pad && visible.next().unwrap_or(false)).collect()
+    }
+
+    /// The inverse of [`Self::layout_mask`]: the selection of the visible files.
+    pub fn visible_mask(&self, layout: &[bool]) -> Vec<bool> {
+        self.padding.iter().enumerate().filter(|(_, pad)| !**pad).map(|(i, _)| layout.get(i).copied().unwrap_or(false)).collect()
+    }
+
+    /// Whether `layout` (a mask over `files`) selects every file that is not padding.
+    pub fn selects_everything(&self, layout: &[bool]) -> bool {
+        self.padding.iter().enumerate().all(|(i, &pad)| pad || layout.get(i).copied().unwrap_or(false))
     }
 
     /// Sum of every file's length -- the total number of bytes the torrent
@@ -472,6 +511,52 @@ impl TorrentFile {
         } else {
             self.piece_length as u64
         }
+    }
+}
+
+/// A torrent with BEP 47 padding files, and its content, for the tests of the
+/// modules that must treat the padding as zeros no file holds.
+#[cfg(test)]
+pub(crate) mod padded_fixture {
+    use super::*;
+
+    /// The layout, in 4096-byte pieces: `a.bin` (3000 bytes), 1096 bytes of padding that
+    /// bring `b.bin` (5000) to the start of the second piece. Three pieces, the last short.
+    pub(crate) const PIECE_LENGTH: usize = 4096;
+
+    /// The bytes of `a.bin` and `b.bin`.
+    pub(crate) fn real_files() -> (Vec<u8>, Vec<u8>) {
+        ((0..3000u32).map(|i| (i % 251) as u8 + 1).collect(), (0..5000u32).map(|i| (i % 241) as u8 + 3).collect())
+    }
+
+    /// All of the torrent's bytes as its pieces are hashed: the files with the padding as zeros.
+    pub(crate) fn layout() -> Vec<u8> {
+        let (a, b) = real_files();
+        let mut all = a;
+        all.resize(4096, 0);
+        all.extend_from_slice(&b);
+        all
+    }
+
+    pub(crate) fn torrent() -> TorrentFile {
+        let content = layout();
+        let mut info = b"d5:filesl".to_vec();
+        for (attr, length, path) in [("", 3000, "5:a.bin"), ("1:p", 1096, "4:.pad4:1096"), ("", 5000, "5:b.bin")] {
+            info.extend_from_slice(b"d");
+            if !attr.is_empty() {
+                info.extend_from_slice(b"4:attr");
+                info.extend_from_slice(attr.as_bytes());
+            }
+            info.extend_from_slice(format!("6:lengthi{}e4:pathl{}ee", length, path).as_bytes());
+        }
+        let hashes: Vec<u8> = content.chunks(PIECE_LENGTH).flat_map(|piece| Sha1::digest(piece).to_vec()).collect();
+        info.extend_from_slice(format!("e4:name3:pad12:piece lengthi{}e6:pieces{}:", PIECE_LENGTH, hashes.len()).as_bytes());
+        info.extend_from_slice(&hashes);
+        info.push(b'e');
+        let mut file = b"d4:info".to_vec();
+        file.extend_from_slice(&info);
+        file.push(b'e');
+        parse_torrent_file(&file).expect("the padded fixture is a valid torrent")
     }
 }
 
@@ -977,5 +1062,78 @@ mod tests {
         assert!(torrent.is_v2_only() && !torrent.v2_ready(), "with no layers: they were not in the info dictionary");
         assert_eq!(torrent.missing_layers().len(), 1);
         assert!(matches!(from_info_dict_bytes(&raw_info, [0x11; 20], None, Vec::new()), Err(TorrentError::InfoHashMismatch)));
+    }
+
+    /// A file of a test torrent: path components, length, and `attr` if it has one.
+    type AttrFile<'a> = (&'a [&'a [u8]], i64, Option<&'a [u8]>);
+
+    /// A multi-file `.torrent` whose files carry an `attr` string where the
+    /// third element of the tuple is `Some`.
+    fn multi_attr(name: &[u8], files: &[AttrFile], piece_length: i64, pieces: usize) -> Vec<u8> {
+        let mut v = b"d4:infod5:filesl".to_vec();
+        for (path, length, attr) in files {
+            v.extend_from_slice(b"d");
+            if let Some(attr) = attr {
+                v.extend_from_slice(b"4:attr");
+                v.extend_from_slice(&bstr(attr));
+            }
+            v.extend_from_slice(format!("6:lengthi{}e4:pathl", length).as_bytes());
+            for part in *path {
+                v.extend_from_slice(&bstr(part));
+            }
+            v.extend_from_slice(b"ee");
+        }
+        v.extend_from_slice(b"e4:name");
+        v.extend_from_slice(&bstr(name));
+        v.extend_from_slice(format!("12:piece lengthi{}e6:pieces{}:", piece_length, pieces * 20).as_bytes());
+        v.extend_from_slice(&vec![0xAB; pieces * 20]);
+        v.extend_from_slice(b"ee");
+        v
+    }
+
+    /// Two real files, each followed by the padding that brings the next to a
+    /// piece boundary (`.pad/N` as libtorrent names them): 3000 + 1096 + 5000 + 3288
+    /// bytes with 4096-byte pieces, which is three pieces.
+    fn padded() -> TorrentFile {
+        let files: &[AttrFile] = &[(&[b"a.bin"], 3000, None), (&[b".pad", b"1096"], 1096, Some(b"p")), (&[b"b.bin"], 5000, Some(b"x")), (&[b".pad", b"3288"], 3288, Some(b"px"))];
+        parse_torrent_file(&multi_attr(b"t", files, 4096, 4)).unwrap()
+    }
+
+    #[test]
+    fn a_file_whose_attr_holds_p_is_a_padding_file_and_no_other_is() {
+        let t = padded();
+        assert_eq!(t.padding, vec![false, true, false, true], "`x` alone is an executable, `px` still padding, no attr is a file");
+        assert_eq!(t.files.len(), 4, "the padding is still in the layout: the piece hashes cover it");
+        assert_eq!(t.total_length(), 12384);
+        let single_file = parse_torrent_file(&single(b"f", 100, 16384, 1)).unwrap();
+        assert_eq!(single_file.padding, vec![false]);
+    }
+
+    #[test]
+    fn the_visible_files_leave_out_the_padding() {
+        let t = padded();
+        assert_eq!(t.visible_files(), vec![(vec!["a.bin".to_string()], 3000), (vec!["b.bin".to_string()], 5000)]);
+        let plain = parse_torrent_file(&multi(b"t", &[(&[b"a"], 1), (&[b"b"], 2)], 16384, 1)).unwrap();
+        assert_eq!(plain.visible_files(), plain.files, "no padding, nothing left out");
+    }
+
+    #[test]
+    fn a_selection_of_the_visible_files_is_one_of_the_layout_with_no_padding_selected() {
+        let t = padded();
+        assert_eq!(t.layout_mask(&[true, false]), vec![true, false, false, false]);
+        assert_eq!(t.layout_mask(&[false, true]), vec![false, false, true, false]);
+        assert_eq!(t.layout_mask(&[true, true]), vec![true, false, true, false], "padding is not selected even when every file is");
+        assert_eq!(t.visible_mask(&[true, false, false, false]), vec![true, false]);
+        assert_eq!(t.visible_mask(&t.layout_mask(&[false, true])), vec![false, true], "the two are inverses");
+        assert!(t.selects_everything(&[true, false, true, false]), "every file that is not padding");
+        assert!(!t.selects_everything(&[true, false, false, false]));
+        assert!(!t.selects_everything(&[]));
+    }
+
+    #[test]
+    fn the_spans_of_a_padded_torrent_mark_the_padding() {
+        let spans = padded().file_spans(std::path::Path::new("/out/t"));
+        let marked: Vec<(u64, u64, bool)> = spans.iter().map(|s| (s.start, s.end, s.padding)).collect();
+        assert_eq!(marked, vec![(0, 3000, false), (3000, 4096, true), (4096, 9096, false), (9096, 12384, true)]);
     }
 }
