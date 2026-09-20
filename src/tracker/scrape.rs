@@ -44,7 +44,7 @@ fn parse_scrape_body(body: &[u8], info_hash: &[u8; 20]) -> Result<ScrapeStats, T
         return Err(TrackerError::TrackerFailure(reason.to_string()));
     }
     let files = value.get("files").and_then(Bencode::as_dict).ok_or(TrackerError::MalformedResponse("scrape response has no files"))?;
-    let entry = files.get(info_hash.as_slice()).ok_or(TrackerError::MalformedResponse("the tracker does not know this torrent"))?;
+    let entry = files.get(info_hash.as_slice()).ok_or_else(|| TrackerError::TrackerFailure("it does not know this torrent".to_string()))?;
     // A tracker that leaves a count out has none to say: 0.
     let count = |key: &str| entry.get(key).and_then(Bencode::as_int).map_or(0, |n| n.clamp(0, i64::from(u32::MAX)) as u32);
     Ok(ScrapeStats { complete: count("complete"), downloaded: count("downloaded"), incomplete: count("incomplete") })
@@ -121,7 +121,7 @@ mod tests {
     fn a_tracker_that_does_not_know_the_torrent_or_fails_or_answers_nonsense_is_an_error_saying_so() {
         let hash = [0x11; 20];
         let other = [0x22; 20];
-        assert!(matches!(parse_scrape_body(&body(&other, "d8:completei1ee"), &hash), Err(TrackerError::MalformedResponse(m)) if m.contains("does not know")));
+        assert!(matches!(parse_scrape_body(&body(&other, "d8:completei1ee"), &hash), Err(TrackerError::TrackerFailure(m)) if m.contains("does not know")), "an answer, not a malformed one");
         assert!(matches!(parse_scrape_body(b"d14:failure reason4:nopee", &hash), Err(TrackerError::TrackerFailure(r)) if r == "nope"));
         assert!(parse_scrape_body(b"de", &hash).is_err(), "no files");
         assert!(parse_scrape_body(b"not bencode", &hash).is_err());
