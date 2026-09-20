@@ -110,8 +110,9 @@ impl HaveMap {
 /// What a download that is still going offers the listener: to take over the connection of a peer that came to be served, if the
 /// peer turns out to have a piece the download lacks. It is then downloaded from as well as served, over the connection it made.
 pub trait Adopter: Send + Sync {
-    /// Whether a peer that has these pieces (`has[i]` for piece `i`) is wanted: there is a piece among them still to be fetched, and room for it.
-    fn wants(&self, has: &[bool]) -> bool;
+    /// Whether the peer at `peer` that has these pieces (`has[i]` for piece `i`) is wanted: there is a piece among them still to be
+    /// fetched, room for it, and the address is not one that has sent bad data.
+    fn wants(&self, peer: std::net::IpAddr, has: &[bool]) -> bool;
     /// Takes the connection.
     fn adopt(&self, connection: Adopted);
 }
@@ -680,7 +681,7 @@ fn serve_loop(mut stream: Box<dyn PeerStream>, mut serving: Serving, shared: &Ar
             if said {
                 let adopter = lock(&shared.adopter).clone();
                 if let (Some(adopter), Some((peer, their_handshake))) = (adopter, adoption.as_ref()) {
-                    if adopter.wants(has) {
+                    if adopter.wants(peer.ip(), has) {
                         adopter.adopt(Adopted { stream, serving, peer: *peer, their_handshake: their_handshake.clone(), peer_has: std::mem::take(has) });
                         return Ok(()); // it is the download's now
                     }
@@ -2192,7 +2193,7 @@ mod tests {
     }
 
     impl Adopter for TestAdopter {
-        fn wants(&self, has: &[bool]) -> bool {
+        fn wants(&self, _peer: std::net::IpAddr, has: &[bool]) -> bool {
             has.get(self.wants).copied().unwrap_or(false)
         }
 
