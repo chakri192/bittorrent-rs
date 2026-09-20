@@ -98,15 +98,28 @@ return at once. A second signal skips all of this and exits with status 130.
 **The seeder** runs for the whole session, not only after completion: it
 serves what has been verified so far, tells connected peers of each new piece
 (`Have`), serves at most four peers at a time chosen by `choker` (three by
-how much they took, one optimistic), and offers the info dictionary to peers
-that have only a magnet link (BEP 9), saying `upload_only` once it has every
-piece (BEP 21).
+how much they gave us and then took, one optimistic), and offers the info
+dictionary to peers that have only a magnet link (BEP 9), saying `upload_only`
+once it has every piece (BEP 21).
+
+**Serving** (`serving.rs`) is one connection's upload side, and it is the
+same whoever made the connection and whatever else goes on over it. `Serving`
+says what there is to serve when the connection opens (bitfield, `have all`,
+`have none`, allowed-fast pieces), announces new pieces and changes of choke
+from `tick`, and answers what a peer asks in `handle`: blocks, the info
+dictionary, hashes. The seeder's loop owns connections that only serve. A
+download worker owns a connection that fetches pieces, and when the torrent has
+a listener it holds a `Serving` for the same connection, so that the peer it is
+fetching from is served too: `messages::take` gives each message to the upload
+side first and then to the download side's bookkeeping, and `keep_serving`
+runs between messages. What a peer gives the worker is counted in the same
+`choker` that ranks who is unchoked, which is what makes it tit-for-tat.
 
 **Connections are `PeerStream`s** (`peer/stream.rs`): anything that reads and
 writes and can be shut down from another thread. A worker or the seeder does
 not know whether it has a plain socket or an encrypted one (`peer/mse.rs`), so
 a transport is one more implementation of the trait. **The Fast Extension**
-(`peer/fast.rs`, and the choke handling in `worker/piece.rs` and `seeder.rs`)
+(`peer/fast.rs`, and the choke handling in `worker/piece.rs` and `serving.rs`)
 changes what "choked" means: a worker may still ask for the pieces a peer has
 allowed, and a peer that refuses a request says so instead of staying silent.
 
@@ -229,6 +242,6 @@ Four layers, each catching what the one below cannot.
 
 Deliberate, and the README's Limitations lists them: one thread per
 connection (fine for tens of peers, not thousands); choking is only the
-seeding half of tit-for-tat, since inbound peers are never downloaded from;
+tit-for-tat on the connections this client makes and not on those made to it (inbound peers are served, never downloaded from);
 a magnet link's trackers are asked concurrently, having no tiers, and `--tracker-mode concurrent` does the same for a torrent's; a piece
 interrupted part-way is handed to the next peer, and kept across a clean stop but not a crash (`downloader/partial.rs`); a connection fetches one piece at a time but asks ahead for up to eight more once the one in hand is fully asked for, and the queue it keeps full is bounded by the peer's `reqq` (so a piece is not a round trip on its own, and no more than that is held by one peer); local discovery is IPv4 only.

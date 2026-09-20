@@ -509,7 +509,7 @@ mod tests {
         let work = data.chunks(PIECE_LEN).enumerate().map(|(i, c)| PieceWork { index: i as u32, hash: Sha1::digest(c).into(), length: c.len() as u32, merkle: None }).collect();
         let queue = Arc::new(WorkQueue::new(work, PIECES));
         let spans = Arc::new(build_file_spans(dir, &[(vec!["f.bin".to_string()], data.len() as i64)]));
-        let config = Arc::new(WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(1), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default() });
+        let config = Arc::new(WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(1), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None });
         let log: Log = {
             let sink = Arc::clone(sink);
             Arc::new(move |m| sink.log(m))

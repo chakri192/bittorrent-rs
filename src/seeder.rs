@@ -22,13 +22,10 @@
 //! simplification).
 
 use crate::choker::{Choker, DEFAULT_SLOTS};
-use crate::downloader::file_writer::{read_block, FileSpan};
-use crate::metadata::{MetadataMessage, METADATA_PIECE_SIZE};
-use crate::peer::extension::{ExtendedHandshake, EXTENDED_HANDSHAKE_ID};
+use crate::serving::{wire_to_io, Serving};
+use crate::downloader::file_writer::FileSpan;
 use crate::peer::handshake::{Handshake, HANDSHAKE_LEN};
 use crate::peer::message::Message;
-use crate::peer::state::PeerState;
-use crate::peer::fast::allowed_fast_set;
 use crate::peer::mse::MseStream;
 use crate::peer::PeerStream;
 use std::io::{Read, Write};
@@ -41,20 +38,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Largest `Request.length` honored. BEP 3 clients conventionally use
-/// 16 KiB; anything above 128 KiB is either a very old client or an
-/// attempt to make us allocate absurd buffers -- those get the
-/// connection dropped, matching mainline behavior.
-const MAX_REQUEST_LEN: u32 = 128 * 1024;
 /// Concurrent inbound peers served at once; connections beyond this are
 /// accepted-and-closed immediately so the backlog doesn't grow unbounded.
 const MAX_INBOUND_PEERS: usize = 40;
 /// How many peers a seeder connects out to at once (see [`SeederHandle::dial`]).
 const MAX_DIALED_PEERS: usize = 10;
-/// The id peers send `ut_metadata` requests to us under.
-const SEEDER_UT_METADATA_ID: u8 = 1;
-/// How many pieces a peer using the Fast Extension may request while choked.
-const ALLOWED_FAST_PIECES: usize = 5;
 /// How often the choice of who to unchoke is made again.
 pub const RECHOKE_INTERVAL: Duration = Duration::from_secs(10);
 /// An inbound peer silent for this long gets dropped.
@@ -118,32 +106,33 @@ impl HaveMap {
     }
 }
 
-/// Everything the serve loop needs, shared across all inbound-peer threads.
-struct SeederShared {
-    info_hash: [u8; 20],
-    our_peer_id: [u8; 20],
-    spans: Arc<Vec<FileSpan>>,
-    piece_length: u64,
-    total_length: u64,
-    have: Arc<HaveMap>,
+/// Everything the serve loop needs, shared across all the threads that serve a torrent's peers: the
+/// seeder's own connections and the download workers' (see [`crate::serving`]).
+pub struct SeederShared {
+    pub(crate) info_hash: [u8; 20],
+    pub(crate) our_peer_id: [u8; 20],
+    pub(crate) spans: Arc<Vec<FileSpan>>,
+    pub(crate) piece_length: u64,
+    pub(crate) total_length: u64,
+    pub(crate) have: Arc<HaveMap>,
     /// Shared limit on the bytes uploaded across every peer (`--max-up`).
-    up_limit: Option<Arc<crate::ratelimit::RateLimiter>>,
+    pub(crate) up_limit: Option<Arc<crate::ratelimit::RateLimiter>>,
     /// Cleared when this torrent stops being served.
-    running: Arc<AtomicBool>,
-    uploaded: Arc<AtomicU64>,
+    pub(crate) running: Arc<AtomicBool>,
+    pub(crate) uploaded: Arc<AtomicU64>,
     /// Who is unchoked.
-    choker: Arc<Choker>,
+    pub(crate) choker: Arc<Choker>,
     /// The info dictionary, for peers that ask for it.
-    metadata: Option<Arc<Vec<u8>>>,
-    piece_lengths: Option<Arc<Vec<u32>>>,
+    pub(crate) metadata: Option<Arc<Vec<u8>>>,
+    pub(crate) piece_lengths: Option<Arc<Vec<u32>>>,
     /// What hash requests (BEP 52) are answered from, for a v2 torrent.
-    hash_source: Option<Arc<crate::v2::HashSource>>,
+    pub(crate) hash_source: Option<Arc<crate::v2::HashSource>>,
 }
 
 impl SeederShared {
     /// Actual byte length of `piece_index` (the final piece is usually
     /// shorter than `piece_length`).
-    fn piece_len(&self, piece_index: u32) -> u64 {
+    pub(crate) fn piece_len(&self, piece_index: u32) -> u64 {
         // In a v2 torrent every file's last piece is short.
         if let Some(lengths) = &self.piece_lengths {
             return lengths.get(piece_index as usize).map_or(0, |&length| u64::from(length));
@@ -355,6 +344,11 @@ impl SeederHandle {
         true
     }
 
+    /// What is served of this torrent, for a download's own connections to serve from too (see [`crate::serving`]).
+    pub fn upload(&self) -> Arc<SeederShared> {
+        Arc::clone(&self.torrent)
+    }
+
     /// How many peers this side has dialed and is still connected to (or connecting to).
     pub fn dialed_count(&self) -> usize {
         lock(&self.registry.dialed).len()
@@ -560,16 +554,15 @@ fn serve_peer(stream: Box<dyn PeerStream>, peer_ip: Option<std::net::IpAddr>, re
     let Some(shared) = registry.get(&their_hs.info_hash) else {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "inbound handshake for a torrent not being served"));
     };
-    let shared = &*shared;
-    // Extensions are offered only when there is something to offer through
+        // Extensions are offered only when there is something to offer through
     // them: the info dictionary, for a peer that has only a magnet link.
     let ours = Handshake::new(shared.info_hash, shared.our_peer_id, shared.metadata.is_some()).with_fast(true);
     stream.write_all(&ours.to_bytes())?;
-    serve_connection(stream, peer_ip, shared, &their_hs, false)
+    serve_connection(stream, peer_ip, &shared, &their_hs, false)
 }
 
 /// The dialing side of a connection to a peer that is to be served: connect, handshake first, then serve.
-fn serve_dialed(addr: std::net::SocketAddr, transport: &crate::peer::Transport, timeout: Duration, encryption: crate::peer::Encryption, shared: &SeederShared) -> std::io::Result<()> {
+fn serve_dialed(addr: std::net::SocketAddr, transport: &crate::peer::Transport, timeout: Duration, encryption: crate::peer::Encryption, shared: &Arc<SeederShared>) -> std::io::Result<()> {
     let to_io = |e: &dyn std::fmt::Display| std::io::Error::other(e.to_string());
     let stream = transport.open(addr, timeout).map_err(|e| to_io(&e))?;
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
@@ -597,66 +590,13 @@ fn serve_dialed(addr: std::net::SocketAddr, transport: &crate::peer::Transport, 
 /// Serves a peer whose handshake has been exchanged, until either side ends it. `dialed` says this
 /// side made the connection, in which case a peer that turns out to have every piece is let go of at
 /// once: two seeds have nothing to give each other.
-fn serve_connection(mut stream: MseStream, peer_ip: Option<std::net::IpAddr>, shared: &SeederShared, their_hs: &Handshake, dialed: bool) -> std::io::Result<()> {
-    // The Fast Extension (BEP 6) is in use only if both sides said so.
-    let fast = their_hs.supports_fast();
-    let speaks_extensions = shared.metadata.is_some() && their_hs.supports_extensions();
+fn serve_connection(mut stream: MseStream, peer_ip: Option<std::net::IpAddr>, shared: &Arc<SeederShared>, their_hs: &Handshake, dialed: bool) -> std::io::Result<()> {
     // From here the loop wakes often to check for a stop, new pieces and a
     // change of choke.
     stream.set_read_timeout(Some(SERVE_READ_TIMEOUT))?;
+    let mut serving = Serving::begin(shared, their_hs, peer_ip, &mut stream, true)?;
 
-    // What we can serve right now, honest at connect time as BEP 3
-    // requires. Pieces verified afterwards are announced with `Have` as
-    // they appear (see `announce_new_pieces`). The version is read first:
-    // a piece added between the two reads then shows up as a difference
-    // to announce, never as one that is missed.
-    let mut seen_version = shared.have.version();
-    let mut advertised = shared.have.snapshot();
-    let first = if !fast {
-        Message::Bitfield(PeerState::encode_bitfield(&advertised))
-    } else if advertised.iter().all(|&has| has) && !advertised.is_empty() {
-        Message::HaveAll
-    } else if advertised.iter().all(|&has| !has) {
-        Message::HaveNone
-    } else {
-        Message::Bitfield(PeerState::encode_bitfield(&advertised))
-    };
-    first.write_to(&mut stream).map_err(wire_to_io)?;
-    // Pieces this peer may request while choked: the BEP 6 recipe, from its
-    // address and the torrent, limited to what there is to serve.
-    let mut allowed_fast = std::collections::HashSet::new();
-    if let (true, Some(std::net::IpAddr::V4(ip))) = (fast, peer_ip) {
-        for piece in allowed_fast_set(ip, &shared.info_hash, advertised.len() as u32, ALLOWED_FAST_PIECES) {
-            if advertised[piece as usize] {
-                Message::AllowedFast { piece_index: piece }.write_to(&mut stream).map_err(wire_to_io)?;
-                allowed_fast.insert(piece);
-            }
-        }
-    }
-    if let (true, Some(metadata)) = (speaks_extensions, &shared.metadata) {
-        // A seed says so (BEP 21): nothing is to be gained by offering it pieces.
-        let seed = shared.have.count() == shared.have.total();
-        Message::Extended { id: EXTENDED_HANDSHAKE_ID, payload: ExtendedHandshake::build_for_seeding(SEEDER_UT_METADATA_ID, metadata.len(), seed) }.write_to(&mut stream).map_err(wire_to_io)?;
-    }
-    // The id the peer wants metadata requests answered under, once it has
-    // said, and how many it has made (bounded: see MAX_METADATA_REQUESTS).
-    let mut peer_metadata_id: Option<u8> = None;
-    let mut metadata_requests = 0usize;
-
-    let choker_id = shared.choker.register();
-    // Forgets the peer, freeing any slot it held, however this function ends.
-    struct Leaving<'a>(&'a Choker, crate::choker::PeerId);
-    impl Drop for Leaving<'_> {
-        fn drop(&mut self) {
-            self.0.unregister(self.1);
-        }
-    }
-    let _leaving = Leaving(&shared.choker, choker_id);
-    // Whether the peer has been told it is unchoked.
-    let mut told_unchoked = false;
     let mut last_heard = Instant::now();
-    let mut last_sent = Instant::now();
-
     loop {
         if !shared.running.load(Ordering::SeqCst) {
             return Ok(()); // seeder shutting down
@@ -664,22 +604,11 @@ fn serve_connection(mut stream: MseStream, peer_ip: Option<std::net::IpAddr>, sh
         if last_heard.elapsed() >= IDLE_DISCONNECT {
             return Ok(()); // peer wandered off
         }
-        if last_sent.elapsed() >= KEEPALIVE_INTERVAL {
+        if serving.last_sent.elapsed() >= KEEPALIVE_INTERVAL {
             Message::KeepAlive.write_to(&mut stream).map_err(wire_to_io)?;
-            last_sent = Instant::now();
+            serving.last_sent = Instant::now();
         }
-
-        if announce_new_pieces(&mut stream, &shared.have, &mut seen_version, &mut advertised)? {
-            last_sent = Instant::now();
-        }
-
-        // Tell the peer when the choker has changed its mind.
-        let allowed = shared.choker.is_unchoked(choker_id);
-        if allowed != told_unchoked {
-            (if allowed { Message::Unchoke } else { Message::Choke }).write_to(&mut stream).map_err(wire_to_io)?;
-            told_unchoked = allowed;
-            last_sent = Instant::now();
-        }
+        serving.tick(&mut stream)?;
 
         let msg = match Message::read_from(&mut stream) {
             Ok(m) => m,
@@ -691,102 +620,16 @@ fn serve_connection(mut stream: MseStream, peer_ip: Option<std::net::IpAddr>, sh
         };
         last_heard = Instant::now();
 
+        if serving.handle(&msg, &mut stream)? {
+            continue;
+        }
         match msg {
-            Message::Interested => {
-                shared.choker.set_interested(choker_id, true);
-                // A free slot is theirs at once; the loop tells them next time round.
-                shared.choker.grant_if_free(choker_id);
-            }
-            Message::NotInterested => shared.choker.set_interested(choker_id, false),
-            Message::Request { index, begin, length } => {
-                // Choked peers get nothing, except the pieces the Fast
-                // Extension lets them ask for anyway. A fast peer is told when
-                // a request will not be answered; others are left in silence
-                // (BEP 3).
-                let reject = |stream: &mut MseStream| -> std::io::Result<()> { if fast { Message::RejectRequest { index, begin, length }.write_to(stream).map_err(wire_to_io) } else { Ok(()) } };
-                if !shared.choker.is_unchoked(choker_id) && !allowed_fast.contains(&index) {
-                    reject(&mut stream)?;
-                    continue;
-                }
-                if length > MAX_REQUEST_LEN {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "oversized block request"));
-                }
-                let piece_len = shared.piece_len(index);
-                let in_bounds = shared.have.get(index) && (begin as u64).saturating_add(length as u64) <= piece_len;
-                if !in_bounds {
-                    reject(&mut stream)?; // data we don't have / can't have
-                    continue;
-                }
-                let block = read_block(&shared.spans, index, shared.piece_length, begin, length)?;
-                if let Some(limit) = &shared.up_limit {
-                    limit.acquire(length as usize);
-                }
-                Message::Piece { index, begin, block }.write_to(&mut stream).map_err(wire_to_io)?;
-                shared.uploaded.fetch_add(length as u64, Ordering::Relaxed);
-                shared.choker.record_upload(choker_id, length as u64);
-                last_sent = Instant::now();
-            }
-            Message::Extended { id: EXTENDED_HANDSHAKE_ID, payload } if speaks_extensions => {
-                peer_metadata_id = ExtendedHandshake::parse(&payload).ok().and_then(|hs| hs.peer_ut_metadata_id());
-            }
-            Message::Extended { id: SEEDER_UT_METADATA_ID, payload } if speaks_extensions => {
-                let (Some(metadata), Some(reply_id)) = (&shared.metadata, peer_metadata_id) else { continue };
-                let Ok(MetadataMessage::Request { piece }) = MetadataMessage::decode(&payload) else { continue };
-                metadata_requests += 1;
-                // The whole dictionary a few times over is plenty; more is a
-                // peer using us to move data for nothing.
-                if metadata_requests > 2 * metadata.len().div_ceil(METADATA_PIECE_SIZE) + 8 {
-                    return Ok(());
-                }
-                let start = piece as usize * METADATA_PIECE_SIZE;
-                let reply = if start < metadata.len() {
-                    let chunk = &metadata[start..(start + METADATA_PIECE_SIZE).min(metadata.len())];
-                    if let Some(limit) = &shared.up_limit {
-                        limit.acquire(chunk.len());
-                    }
-                    MetadataMessage::Data { piece, total_size: metadata.len() as u32, data: chunk.to_vec() }
-                } else {
-                    MetadataMessage::Reject { piece }
-                };
-                Message::Extended { id: reply_id, payload: reply.encode() }.write_to(&mut stream).map_err(wire_to_io)?;
-                last_sent = Instant::now();
-            }
-            Message::HashRequest(request) => {
-                // Answered with the hashes, and the uncles after them, or refused: a request must always be answered.
-                let answer = shared.hash_source.as_ref().and_then(|source| {
-                    // From the piece layers if that is where the layer is; the 16 KiB leaves are worked out from the pieces.
-                    source.answer(&request.root, request.base_layer, request.index, request.length, request.proof_layers).or_else(|| {
-                        (request.base_layer == 0)
-                            .then(|| {
-                                source.answer_leaves(&request.root, request.index, request.length, request.proof_layers, |piece| {
-                                    let held = shared.have.get(piece);
-                                    held.then(|| read_block(&shared.spans, piece, shared.piece_length, 0, shared.piece_len(piece) as u32).ok()).flatten()
-                                })
-                            })
-                            .flatten()
-                    })
-                });
-                let reply = match answer {
-                    Some(range) => Message::Hashes { request, hashes: range.hashes.into_iter().chain(range.uncles).collect() },
-                    None => Message::HashReject(request),
-                };
-                reply.write_to(&mut stream).map_err(wire_to_io)?;
-                last_sent = Instant::now();
-            }
-            Message::Hashes { .. } | Message::HashReject(_) => {}
             // A peer this side dialed that has everything has no use for us: let it go.
             Message::HaveAll if dialed => return Ok(()),
             Message::Bitfield(ref bits) if dialed && bitfield_is_full(bits, shared.have.total()) => return Ok(()),
-            // Piece-availability chatter from a fellow leecher; a pure
-            // serve loop has no use for it. Cancel is inherently
-            // best-effort (we serve synchronously, so there's never a
-            // queued request to cancel). Choke/Unchoke describe *their*
-            // upload policy toward us -- irrelevant, we request nothing.
-            Message::Have { .. } | Message::Bitfield(_) | Message::Cancel { .. } | Message::Choke | Message::Unchoke | Message::KeepAlive | Message::Piece { .. } | Message::Port(_) | Message::Extended { .. } => {}
-            // The Fast Extension's other messages describe the *peer's*
-            // side: what it has, what it will not send us, what it suggests
-            // we fetch. We request nothing from an inbound peer.
-            Message::Suggest { .. } | Message::HaveAll | Message::HaveNone | Message::RejectRequest { .. } | Message::AllowedFast { .. } => {}
+            // What is left describes the peer's side, which this loop has no use for: what it has, what it
+            // will not send us, what it suggests we fetch. We request nothing on this connection.
+            _ => {}
         }
     }
 }
@@ -796,39 +639,14 @@ fn bitfield_is_full(bits: &[u8], total: usize) -> bool {
     total > 0 && bits.len() >= total.div_ceil(8) && (0..total).all(|i| bits[i / 8] & (0x80 >> (i % 8)) != 0)
 }
 
-/// Tells a connected peer about pieces verified since it was last told: a
-/// `Have` for each. Without this a peer that connected early would never
-/// learn of what this client downloads afterwards, and a client that is
-/// still downloading would be a poor source. Returns whether it sent any.
-fn announce_new_pieces(stream: &mut dyn PeerStream, have: &HaveMap, seen_version: &mut u64, advertised: &mut [bool]) -> std::io::Result<bool> {
-    let version = have.version();
-    if version == *seen_version {
-        return Ok(false);
-    }
-    *seen_version = version;
-    let now = have.snapshot();
-    let mut sent = false;
-    for (index, (&has, told)) in now.iter().zip(advertised.iter_mut()).enumerate() {
-        if has && !*told {
-            Message::Have { piece_index: index as u32 }.write_to(stream).map_err(wire_to_io)?;
-            *told = true;
-            sent = true;
-        }
-    }
-    Ok(sent)
-}
-
-fn wire_to_io(e: crate::peer::message::WireError) -> std::io::Error {
-    match e {
-        crate::peer::message::WireError::Io(io) => io,
-        other => std::io::Error::new(std::io::ErrorKind::InvalidData, other.to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::downloader::file_writer::{build_file_spans, write_piece};
+    use crate::metadata::MetadataMessage;
+    use crate::peer::fast::allowed_fast_set;
+    use crate::peer::state::PeerState;
+    use crate::serving::ALLOWED_FAST_PIECES;
     use std::fs;
     use std::net::{SocketAddr, TcpStream};
 

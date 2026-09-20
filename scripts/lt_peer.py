@@ -4,6 +4,9 @@ torrent on loopback, with no DHT, no local discovery and no port mapping, and co
 
   lt_peer.py seed  TORRENT_OR_MAGNET SAVE_DIR LISTEN_PORT
   lt_peer.py leech TORRENT_OR_MAGNET SAVE_DIR LISTEN_PORT PEER_PORT [PEER_PORT...]   # exits 0 once it has it all
+  lt_peer.py wait  TORRENT_OR_MAGNET SAVE_DIR LISTEN_PORT   # takes connections, makes none, exits 0 once it has it all
+
+`wait` is for a peer that has only part of the torrent on disk and gets the rest from whoever connects to it.
 
 LT_TRANSPORT=tcp|utp|both (default both) picks what it speaks; LT_ENCRYPTION=forced|plain picks whether it uses MSE.
 
@@ -49,8 +52,8 @@ def main():
         for alert in ses.pop_alerts():
             if isinstance(alert, (lt.torrent_error_alert, lt.file_error_alert, lt.peer_error_alert, lt.peer_disconnected_alert)):
                 print("lt:", alert.message(), file=sys.stderr, flush=True)
-        if mode == "leech":
-            if time.time() - connected > 2:
+        if mode in ("leech", "wait"):
+            if mode == "leech" and time.time() - connected > 2:
                 for p in peers:
                     try:
                         handle.connect_peer(("127.0.0.1", p))
@@ -62,7 +65,7 @@ def main():
                 print("lt: complete")
                 return 0
         time.sleep(0.25)
-    if mode == "leech":
+    if mode in ("leech", "wait"):
         status = handle.status()
         print("lt: timed out at", status.progress, "state", status.state, file=sys.stderr)
         return 1

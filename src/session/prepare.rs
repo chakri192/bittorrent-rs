@@ -243,8 +243,10 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
         Some(network) => Ok(network.register(torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options)),
         None => seeder::start_with(options.port, torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options),
     };
+    let mut upload = None;
     match started {
         Ok(handle) => {
+            upload = Some(handle.upload());
             sink.log(format!("listening for inbound peers on port {}{}", handle.port, if handle.ipv6 { " (IPv4 and IPv6)" } else { "" }));
             if let Some(utp) = services.utp() {
                 let udp_port = utp.local_addr().map(|a| a.port()).unwrap_or(0);
@@ -332,7 +334,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
         }
         (false, _) => crate::peer::Transport::default(),
     };
-    let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: options.pipeline_depth, connect_timeout: options.connect_timeout, down_limit, interrupt: Default::default(), peers: Default::default(), encryption: options.encryption.unwrap_or_default(), transport: transport.clone() });
+    let config = Arc::new(WorkerConfig { info_hash: torrent.info_hash, our_peer_id, pipeline_depth: options.pipeline_depth, connect_timeout: options.connect_timeout, down_limit, interrupt: Default::default(), peers: Default::default(), encryption: options.encryption.unwrap_or_default(), transport: transport.clone(), upload });
     let mut workers = Workers::new(Arc::clone(&queue), Arc::clone(&spans), config, piece_length, options.max_peers, torrent.private, shared_log(sink));
 
     // Web-seed workers: one thread per url-list entry, draining the same

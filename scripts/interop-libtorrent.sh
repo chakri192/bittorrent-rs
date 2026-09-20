@@ -98,5 +98,27 @@ LT_TRANSPORT=tcp timeout 120 "$LT_PYTHON" "$ROOT/scripts/lt_peer.py" leech "$WOR
 check "padding: libtorrent downloads such a torrent from this client, the padding's zeros served in the pieces" same_tree "$WORK/lt-leech/pack" "$WORK/pack"
 ours_stop
 
+# ---- both ways on one connection -------------------------------------------------------------------------------------
+# Each side has one half of the torrent and wants the other. This client dials libtorrent, which makes no connection itself, and does
+# not seed: it leaves the moment it has what it wants (its download is held to 1 MiB/s so that this is not before libtorrent has had
+# time to fetch its half). What libtorrent gets from this client it gets over the connection this client made, on which this client
+# both downloads and uploads, or not at all.
+HALF=$((6 * 256 * 1024))
+python3 - "$WORK/data.bin" "$WORK/half-lt.bin" "$WORK/half-ours.bin" "$HALF" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read(); half = int(sys.argv[4])
+open(sys.argv[2], 'wb').write(data[:half] + bytes(len(data) - half))   # libtorrent has the first pieces
+open(sys.argv[3], 'wb').write(bytes(half) + data[half:])               # this client has the rest
+PY
+rm -rf "$WORK/x-lt" "$WORK/x-ours"; mkdir -p "$WORK/x-lt" "$WORK/x-ours"
+cp "$WORK/half-lt.bin" "$WORK/x-lt/data.bin"; cp "$WORK/half-ours.bin" "$WORK/x-ours/data.bin"
+LT_TRANSPORT=tcp timeout 60 "$LT_PYTHON" "$ROOT/scripts/lt_peer.py" wait "$WORK/v1.torrent" "$WORK/x-lt" "$LT_PORT" >/dev/null 2>&1 &
+LT_WAIT=$!; PIDS+=($LT_WAIT); sleep 3
+timeout 60 "$BIN/download" "$WORK/v1.torrent" --peer "127.0.0.1:$LT_PORT" --out "$WORK/x-ours" --no-dht --no-lsd --no-portmap --no-tui --no-config --no-log --max-down 1M --port "$OURS_PORT" >/dev/null 2>&1
+OURS_STATUS=$?
+wait "$LT_WAIT"; LT_STATUS=$?
+both_complete() { [ "$OURS_STATUS" -eq 0 ] && [ "$LT_STATUS" -eq 0 ] && same "$WORK/x-lt/data.bin" "$WORK/data.bin" && same "$WORK/x-ours/data.bin" "$WORK/data.bin"; }
+check "both ways: each of this client and libtorrent has half and gets the other's over the one connection this client made" both_complete
+
 echo "interop: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -167,6 +167,7 @@ enum Kind {
     ResumePartialPiece,
     PaddedTorrent,
     MagnetSelectOnly,
+    DialedPeerIsServed,
     /// BEP 12: a torrent whose announce list is [[a dead tracker, one that works], [another]] is
     /// announced to the first tier's working tracker and to no other, and that tracker alone hears
     /// `stopped`; with `--tracker-mode concurrent` every tracker is asked.
@@ -225,6 +226,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "resume-partial-piece", kind: Kind::ResumePartialPiece },
     Scenario { name: "padded-torrent", kind: Kind::PaddedTorrent },
     Scenario { name: "magnet-select-only", kind: Kind::MagnetSelectOnly },
+    Scenario { name: "dialed-peer-is-served", kind: Kind::DialedPeerIsServed },
     Scenario { name: "tracker-tiers", kind: Kind::TrackerTiers },
     Scenario { name: "daemon-two-torrents", kind: Kind::Daemon },
 ];
@@ -280,6 +282,7 @@ fn main() {
             Kind::ResumePartialPiece => run_resume_partial_piece(scenario.name),
             Kind::PaddedTorrent => run_padded_torrent(scenario.name),
             Kind::MagnetSelectOnly => run_magnet_select_only(scenario.name),
+            Kind::DialedPeerIsServed => run_dialed_peer_is_served(scenario.name),
             Kind::TrackerTiers => run_tracker_tiers(scenario.name),
             Kind::Daemon => run_daemon(scenario.name),
         };
@@ -565,6 +568,10 @@ struct PeerLog {
     metadata_pieces_served: usize,
     /// Connections the peer has accepted and handshaken.
     connections: usize,
+    /// The bitfield the client sent, if it did (the first thing it says when it has pieces to offer).
+    client_bitfield: Option<Vec<u8>>,
+    /// Blocks the client sent this peer: (piece, offset, bytes).
+    received: Vec<(u32, u32, Vec<u8>)>,
 }
 
 /// A latch one fake peer can open for another to wait on, to force an
@@ -624,6 +631,9 @@ enum Behavior {
     /// pieces, and no unchoke until they have all been served. A request for
     /// any other piece while choked is refused with `reject request`.
     Fast(BTreeSet<u32>),
+    /// Has only the pieces `has`, serves them, and wants piece `wants` *from the client*: it says it is interested,
+    /// and asks for the piece once the client unchokes it. A peer in a real swarm is a downloader too.
+    AlsoAsks { has: BTreeSet<u32>, wants: u32 },
 }
 
 /// How the fake tracker treats the client's announces.
@@ -834,7 +844,7 @@ fn serve_stream(stream: Box<dyn bittorrent_rs::peer::PeerStream>, over_utp: bool
 
     let mut bits = vec![0u8; cx.piece_count.div_ceil(8)];
     for i in 0..cx.piece_count {
-        if !matches!(behavior, Behavior::Partial(has) if !has.contains(&(i as u32))) {
+        if !matches!(behavior, Behavior::Partial(has) | Behavior::AlsoAsks { has, .. } if !has.contains(&(i as u32))) {
             bits[i / 8] |= 1 << (7 - (i % 8));
         }
     }
@@ -855,6 +865,10 @@ fn serve_stream(stream: Box<dyn bittorrent_rs::peer::PeerStream>, over_utp: bool
     }
     if let Behavior::UnchokeAfter(delay) = behavior {
         thread::sleep(*delay);
+    }
+    // An `AlsoAsks` peer wants something of the client, and says so before it unchokes it.
+    if matches!(behavior, Behavior::AlsoAsks { .. }) && Message::Interested.write_to(&mut stream).is_err() {
+        return;
     }
     // A `Fast` peer holds the client choked until it has served what it allowed.
     let mut choking = matches!(behavior, Behavior::Fast(_));
@@ -953,6 +967,18 @@ fn serve_stream(stream: Box<dyn bittorrent_rs::peer::PeerStream>, over_utp: bool
                     }
                 }
             }
+            Ok(Message::Bitfield(bits)) => log.lock().unwrap().client_bitfield = Some(bits),
+            // The client will serve us: ask for what we came for.
+            Ok(Message::Unchoke) => {
+                if let Behavior::AlsoAsks { wants, .. } = behavior {
+                    let start = *wants as usize * cx.piece_len;
+                    let length = (start + cx.piece_len).min(cx.data.len()).saturating_sub(start) as u32;
+                    if (Message::Request { index: *wants, begin: 0, length }).write_to(&mut stream).is_err() {
+                        return;
+                    }
+                }
+            }
+            Ok(Message::Piece { index, begin, block }) => log.lock().unwrap().received.push((index, begin, block)),
             Ok(Message::Extended { id: 0, payload }) => {
                 if let Ok(hs) = ExtendedHandshake::parse(&payload) {
                     log.lock().unwrap().pex_offered = Some(hs.peer_ut_pex_id().is_some());
@@ -3790,3 +3816,51 @@ fn run_magnet_select_only(name: &str) -> Result<String, String> {
     }
     Ok(ran.join("; "))
 }
+
+/// A peer the client connects to, and downloads from, is a downloader too: it has the pieces the client lacks and lacks the ones the
+/// client has, and it must be told what the client has, unchoked, and served what it asks for, all on the connection the client made.
+/// (A client that took what it was given and gave nothing back would be choked by every peer that reciprocates.)
+fn run_dialed_peer_is_served(name: &str) -> Result<String, String> {
+    let fx = Fixture::new(false);
+    let count = fx.piece_count;
+    // The client already has the first three pieces, on disk; the peer has the rest, and wants piece 1.
+    let mine: BTreeSet<u32> = (0..3).collect();
+    let theirs: BTreeSet<u32> = (3..count as u32).collect();
+    let swarm = spawn_swarm(&fx, vec![Behavior::AlsoAsks { has: theirs, wants: 1 }]);
+    let dir = scratch_dir(name);
+    let (torrent, out_dir, log_path) = (dir.join("e2e.torrent"), dir.join("out"), dir.join("client.log"));
+    fs::write(&torrent, fx.torrent_bytes(swarm.tracker_addr)).expect("write torrent file");
+    let mut on_disk = vec![0u8; fx.data.len()];
+    let kept = 3 * fx.piece_len;
+    on_disk[..kept].copy_from_slice(&fx.data[..kept]);
+    fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    fs::write(out_dir.join("e2e.bin"), &on_disk).map_err(|e| e.to_string())?;
+
+    // Held to a few hundred bytes a second so that the client is still there, and downloading, when the peer asks: what the peer
+    // is asking for takes milliseconds, and what the client is downloading takes seconds.
+    let mut child = client_command(&torrent, &out_dir, &log_path, 1).args(["--no-dht", "--max-down", "300"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("failed to spawn the client: {}", e))?;
+    let status = wait_or_kill(&mut child, RUN_LIMIT)?;
+    if !status.success() {
+        return Err(format!("download binary exited with {:?}", status.code()));
+    }
+    check_downloaded(&fx, &out_dir)?;
+
+    let log = swarm.logs[0].lock().unwrap();
+    let requested: BTreeSet<u32> = log.requested.iter().copied().collect();
+    let wanted: BTreeSet<u32> = (3..count as u32).collect();
+    if requested != wanted {
+        return Err(format!("the client asked the peer for pieces {:?}; expected {:?}, the ones it lacked", requested, wanted));
+    }
+    let bitfield = log.client_bitfield.as_ref().ok_or("the client never told the peer what it has")?;
+    let advertised: BTreeSet<u32> = (0..count as u32).filter(|&i| bitfield.get(i as usize / 8).is_some_and(|byte| byte & (0x80 >> (i % 8)) != 0)).collect();
+    if advertised != mine {
+        return Err(format!("the client said it had pieces {:?}; it had {:?}", advertised, mine));
+    }
+    let asked = &fx.data[fx.piece_len..2 * fx.piece_len];
+    match log.received.as_slice() {
+        [(1, 0, block)] if block == asked => {}
+        other => return Err(format!("the peer should have been sent piece 1 ({} bytes) once, and got {} block(s): {:?}", asked.len(), other.len(), other.iter().map(|(i, b, d)| (*i, *b, d.len())).collect::<Vec<_>>())),
+    }
+    Ok(format!("downloaded pieces {:?} from a peer that took piece 1 from the client on the same connection", wanted))
+}
+

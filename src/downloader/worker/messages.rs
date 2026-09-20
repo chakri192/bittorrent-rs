@@ -1,10 +1,11 @@
 //! What a worker does with each message a peer sends it.
 
-use super::PexSender;
+use super::{PexSender, WorkerError};
 use crate::downloader::queue::WorkQueue;
 use crate::peer::extension::{ExtendedHandshake, OUR_UT_PEX_ID};
 use crate::peer::pex::parse_ut_pex;
-use crate::peer::{ConnectionError, Message, PeerState, WireError};
+use crate::peer::{ConnectionError, Message, PeerState, PeerStream, WireError};
+use crate::serving::Serving;
 
 /// A read timeout on a blocking socket surfaces as `WouldBlock` on Unix
 /// (`SO_RCVTIMEO` semantics) and `TimedOut` on Windows. Either way it
@@ -63,6 +64,26 @@ pub(super) fn absorb(msg: &Message, state: &mut PeerState, queue: &WorkQueue, pe
         _ => {}
     }
     state.apply_message(msg)
+}
+
+/// What a peer sent, taken by both halves of the connection: the upload side answers what is asked of it
+/// (a block, the info dictionary, hashes) and hears of the peer's interest, and then the download side
+/// applies it. Says whether it showed the peer to be doing something. A connection with nothing to serve
+/// only does the second.
+pub(super) fn take(msg: &Message, state: &mut PeerState, queue: &WorkQueue, pex_tx: Option<&PexSender>, serving: &mut Option<Serving>, stream: &mut dyn PeerStream) -> Result<bool, WorkerError> {
+    let asked = match serving {
+        Some(serving) => serving.handle(msg, stream).map_err(|e| WorkerError::Connection { stage: "serve_peer", error: ConnectionError::Io(e) })?,
+        None => false,
+    };
+    Ok(absorb(msg, state, queue, pex_tx) || asked)
+}
+
+/// What the upload side has to say between messages: the pieces verified since, and a change of who is unchoked.
+pub(super) fn keep_serving(serving: &mut Option<Serving>, stream: &mut dyn PeerStream) -> Result<(), WorkerError> {
+    match serving {
+        Some(serving) => serving.tick(stream).map_err(|e| WorkerError::Connection { stage: "serve_peer", error: ConnectionError::Io(e) }),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

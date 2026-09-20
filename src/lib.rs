@@ -26,6 +26,7 @@ pub mod peer;
 pub mod portmap;
 pub mod ratelimit;
 pub mod seeder;
+pub mod serving;
 pub mod selection;
 pub mod session;
 pub mod sha256;

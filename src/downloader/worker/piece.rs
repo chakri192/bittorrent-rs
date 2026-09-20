@@ -4,7 +4,9 @@
 use super::connect::MAX_UNCHOKE_WAIT_TIMEOUTS;
 use super::peer_stats::{Activity, PeerStat};
 use super::pipeline::{depth_for, Throughput};
-use super::{absorb, is_read_timeout, PexSender, WorkerConfig, WorkerError};
+use super::messages::{keep_serving, take};
+use super::{is_read_timeout, PexSender, WorkerConfig, WorkerError};
+use crate::serving::Serving;
 use crate::downloader::piece_assembler::{PieceAssembler, PieceWork};
 use crate::downloader::queue::WorkQueue;
 use crate::peer::{Message, PeerState, PeerStream};
@@ -85,6 +87,7 @@ pub(super) fn download_one_piece(
     config: &WorkerConfig,
     meter: Meter,
     pex_tx: Option<&PexSender>,
+    serving: &mut Option<Serving>,
 ) -> Result<Downloaded, WorkerError> {
     let (assembler, resumed, in_flight) = match started {
         Some(la) => (la.assembler, la.resumed, la.in_flight),
@@ -93,7 +96,7 @@ pub(super) fn download_one_piece(
             (assembler, resumed, Vec::new())
         }
     };
-    let mut link = Link { stream, state, queue, config, meter, pex_tx, refused, ahead };
+    let mut link = Link { stream, state, queue, config, meter, pex_tx, refused, ahead, serving };
     match attempt(&mut link, assembler, in_flight)? {
         Attempt::Verified(data) => Ok(Downloaded::Verified(data)),
         Attempt::Abandoned => Ok(Downloaded::Abandoned),
@@ -127,6 +130,8 @@ struct Link<'a> {
     refused: &'a HashSet<u32>,
     /// The pieces after this one that have been taken, in order.
     ahead: &'a mut VecDeque<Lookahead>,
+    /// The upload side of the connection, if the peer may ask for pieces on it.
+    serving: &'a mut Option<Serving>,
 }
 
 /// How a try at a piece ended.
@@ -198,7 +203,7 @@ const MAX_REFUSALS_PER_PIECE: u32 = 8;
 
 /// Requests and receives blocks until `assembler` has them all.
 fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler, mut in_flight: Vec<(u32, u32)>) -> Result<Fetched, WorkerError> {
-    let Link { stream, state, queue, config, meter, pex_tx, refused, ahead } = link;
+    let Link { stream, state, queue, config, meter, pex_tx, refused, ahead, serving } = link;
     let piece_index = assembler.piece_index();
     let mut blocks_received = 0u32;
     // (`in_flight` -- the outstanding (begin, length) requests -- is what we'd need to Cancel (BEP 3) if this piece
@@ -210,6 +215,7 @@ fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler, mut in_flight: 
     let mut declined: HashSet<u32> = HashSet::new();
 
     loop {
+        keep_serving(serving, &mut **stream)?;
         // Endgame check: if a duplicate of this piece verified elsewhere,
         // stop asking for more of it and cancel what's still in flight so
         // the peer's upload slots go to blocks somebody actually needs.
@@ -324,6 +330,9 @@ fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler, mut in_flight: 
                 blocks_received += 1;
                 meter.throughput.record(Instant::now(), block.len());
                 meter.stat.add_bytes(block.len());
+                if let Some(serving) = serving.as_ref() {
+                    serving.record_download(block.len() as u64);
+                }
                 // Reading slowly is backpressure: the peer's window fills.
                 if let Some(limiter) = config.down_limit.as_deref() {
                     // Not past the point where the client is stopping.
@@ -363,7 +372,7 @@ fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler, mut in_flight: 
                 // the whole piece on a hash mismatch; drop it instead.
             }
             other => {
-                absorb(other, state, queue, *pex_tx);
+                take(other, state, queue, *pex_tx, serving, &mut **stream)?;
             }
         }
     }
