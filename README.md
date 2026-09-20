@@ -10,7 +10,7 @@ Every layer is written here — the bencode parser, the peer wire protocol, trac
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-1c1c1e?style=flat-square&logo=rust&logoColor=DEA584" />
   <img alt="Size" src="https://img.shields.io/badge/~10k-lines-1c1c1e?style=flat-square" />
   <img alt="Tests" src="https://img.shields.io/badge/tests-1239%20passing-1c1c1e?style=flat-square" />
-  <img alt="BEPs" src="https://img.shields.io/badge/BEP-3%20·%205%20·%206%20·%209%2F10%20·%2011%20·%2014%20·%2015%20·%2019%20·%2027%20·%2029%20·%2052-1c1c1e?style=flat-square" />
+  <img alt="BEPs" src="https://img.shields.io/badge/BEP-3%20·%205%20·%206%20·%209%2F10%20·%2011%20·%2012%20·%2014%20·%2015%20·%2019%20·%2021%20·%2027%20·%2029%20·%2032%20·%2047%20·%2048%20·%2052%20·%2053-1c1c1e?style=flat-square" />
   <img alt="Fuzzed" src="https://img.shields.io/badge/parsers-fuzzed-1c1c1e?style=flat-square" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-1c1c1e?style=flat-square" />
 </p>

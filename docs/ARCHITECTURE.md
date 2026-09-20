@@ -19,10 +19,11 @@ someone about to change the code.
    └───┬───────────────┬───────────────────┬────────────────┬──────────┘
        │               │                   │                │
        ▼               ▼                   ▼                ▼
-  downloader/       tracker/ +          dht/             seeder.rs + choker.rs
-  one worker        tracker_discovery   Kademlia node    inbound peers, a few
-  thread per peer   HTTP·HTTPS·UDP      (BEP 5)          unchoked at a time,
-                    (redirects followed)                 serves the info dict
+  downloader/       tracker/ +          dht/             seeder.rs + serving.rs
+  one worker        tracker_discovery   Kademlia node    + choker.rs: inbound peers, a
+  thread per peer   HTTP·HTTPS·UDP      (BEP 5)          few unchoked at a time, the
+  (also serves      (redirects followed,                 info dict; hands a peer with
+  what it can)      scrape: BEP 48)                      pieces we lack to a worker
        │
        ▼
   peer/  handshake · wire messages · extensions (BEP 10) · PEX (BEP 11)
@@ -46,7 +47,7 @@ behind locks.
 |---|---|---|
 | main | reads the terminal, refreshes the dashboard | the run ends or the user quits |
 | orchestration | `session::run`, then seeding | it returns |
-| one per peer | `downloader::worker::run_worker` | queue empty, connection fails, or interrupted |
+| one per peer (dialed, or one that connected and had a piece we lack) | `downloader::worker::run_worker` / `run_adopted` | queue empty, connection fails, or interrupted |
 | one per web seed | `webseed::run_web_worker` | queue empty or told to stop |
 | seeder accept, one per inbound peer and one per peer dialed while seeding (at most 10), and one for the choking rounds | `seeder` | `SeederHandle::stop` |
 | DHT, one for IPv4 and one for IPv6 (BEP 32) | `dht::service` | `Services::shutdown` |
