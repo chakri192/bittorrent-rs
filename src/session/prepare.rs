@@ -237,7 +237,7 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     };
     let piece_lengths = (!torrent.v2_pieces.is_empty()).then(|| Arc::new(torrent.v2_pieces.iter().map(|p| p.length).collect::<Vec<u32>>()));
     let hash_source = torrent.v2.as_ref().and_then(|meta| crate::v2::HashSource::new(&meta.files, &meta.layers, piece_length)).map(Arc::new);
-    let seeder_options = seeder::SeederOptions { metadata, encryption: options.encryption.unwrap_or(crate::peer::Encryption::Prefer), utp: services.utp(), piece_lengths, hash_source, ipv6: allow_ipv6, ..Default::default() };
+    let seeder_options = seeder::SeederOptions { metadata, encryption: options.encryption.unwrap_or(crate::peer::Encryption::Prefer), utp: services.utp(), utp6: services.utp6(), piece_lengths, hash_source, ipv6: allow_ipv6, ..Default::default() };
     let started = match services.network() {
         // Peers reach this torrent on the port everyone's share.
         Some(network) => Ok(network.register(torrent.info_hash, our_peer_id, Arc::clone(&spans), piece_length, total_length, Arc::clone(&have), up_limit, seeder_options)),
@@ -686,7 +686,7 @@ mod tests {
     fn with_a_utp_socket_the_listener_takes_utp_connections_too_and_warns_when_the_ports_differ() {
         let dir = tmp_dir("utp");
         let mut services = Services::new();
-        services.start_utp(0, |_| {});
+        services.start_utp(0, false, |_| {});
         let utp = services.utp().expect("running");
         let mut with_utp = options(&dir);
         with_utp.transport = crate::peer::TransportMode::Both;
@@ -705,6 +705,32 @@ mod tests {
 
         // Both ports were left to be chosen, so they differ, and that is said.
         assert!(log.logged("warning: uTP is on UDP port"), "{:?}", log.lines.lock().unwrap());
+    }
+
+    #[test]
+    fn with_an_ipv6_utp_socket_the_listener_takes_ipv6_utp_connections_too() {
+        if std::net::UdpSocket::bind("[::1]:0").is_err() {
+            eprintln!("no IPv6 here; skipped");
+            return;
+        }
+        let dir = tmp_dir("utp6");
+        let mut services = Services::new();
+        services.start_utp(0, true, |_| {});
+        let utp6 = services.utp6().expect("running");
+        let mut with_utp = options(&dir);
+        with_utp.transport = crate::peer::TransportMode::Both;
+
+        let (prepared, _) = run_prepare(&torrent(), &[true, true], vec![dead_addr()], &with_utp, &mut services);
+        assert_eq!(prepared.unwrap().workers.transport_mode(), crate::peer::TransportMode::Both, "and the workers dial the way it says");
+
+        // A uTP peer connects over IPv6 and completes the BitTorrent handshake.
+        let client = crate::utp::UtpSocket::bind(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0))).unwrap();
+        let mut stream = client.connect(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, utp6.local_addr().unwrap().port())), Duration::from_secs(5)).expect("the listener takes uTP over IPv6");
+        crate::peer::PeerStream::set_read_timeout(&stream, Some(Duration::from_secs(5))).unwrap();
+        std::io::Write::write_all(&mut stream, &crate::peer::Handshake::new(torrent().info_hash, [7; 20], false).to_bytes()).unwrap();
+        let mut answer = [0u8; crate::peer::handshake::HANDSHAKE_LEN];
+        std::io::Read::read_exact(&mut stream, &mut answer).unwrap();
+        assert_eq!(crate::peer::Handshake::from_bytes(&answer).unwrap().info_hash, torrent().info_hash);
     }
 
     #[test]
