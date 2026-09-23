@@ -91,6 +91,16 @@ impl RoutingTable {
         }
     }
 
+    /// Makes `new_id` the id this table is centred on -- a node that has learned where it is from moves to an id that says so -- and
+    /// puts every node it knew where it now belongs. Nodes that crowd a bucket now are the ones lost, as in [`insert`](Self::insert).
+    pub fn recentre(&mut self, new_id: NodeId) {
+        let known: Vec<Entry> = self.buckets.iter_mut().flat_map(std::mem::take).collect();
+        self.self_id = new_id;
+        for entry in known {
+            self.insert(entry.node.id, entry.node.addr);
+        }
+    }
+
     /// The up-to-`n` known nodes closest (XOR metric) to `target`.
     pub fn closest(&self, target: &NodeId, n: usize) -> Vec<CompactNode> {
         let mut all: Vec<&Entry> = self.buckets.iter().flatten().collect();
@@ -195,5 +205,21 @@ mod tests {
         rt.insert(nid(0x10), b); // the same id, from a new address
         assert_eq!(rt.len(), 2);
         assert_eq!(rt.closest(&nid(0x10), 1)[0].addr, b);
+    }
+
+    #[test]
+    fn recentring_keeps_the_nodes_and_files_them_by_distance_from_the_new_id() {
+        let mut rt = RoutingTable::new([0u8; 20]);
+        for first in [0x80u8, 0x40, 0x20, 0x10] {
+            rt.insert(nid(first), addr(first as u16));
+        }
+        assert_eq!(rt.buckets[0].len(), 1, "0x80 shares no bit with the zero id");
+        let new_id = nid(0x80);
+        rt.recentre(new_id);
+        assert_eq!(*rt.self_id(), new_id);
+        assert_eq!(rt.len(), 3, "the node that now IS this one's id is not kept; the others are");
+        assert_eq!(rt.buckets[0].len(), 3, "0x40, 0x20 and 0x10 differ from 0x80 at its first bit");
+        assert!(rt.buckets[0].iter().all(|e| bucket_index(&new_id, &e.node.id) == Some(0)));
+        assert_eq!(rt.closest(&nid(0x40), 1)[0].id, nid(0x40), "and they are still found");
     }
 }

@@ -60,6 +60,9 @@ pub struct Response {
     pub nodes: Vec<CompactNode>,
     pub values: Vec<SocketAddr>,
     pub token: Option<Vec<u8>>,
+    /// BEP 42: the address the answer's recipient was seen at, which is how a node behind a NAT learns its external one. It is
+    /// a key of the message, not of its `r` dict, in the same compact form as a peer.
+    pub ip: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,29 +186,39 @@ fn encode_peer(peer: &SocketAddr) -> Vec<u8> {
     out
 }
 
+/// A compact peer or `ip`: 6 bytes for IPv4, 18 for IPv6.
+fn parse_compact_addr(b: &[u8]) -> Option<SocketAddr> {
+    match b.len() {
+        6 => Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(b[0], b[1], b[2], b[3]), u16::from_be_bytes([b[4], b[5]])))),
+        18 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&b[..16]);
+            Some(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(octets), u16::from_be_bytes([b[16], b[17]]), 0, 0)))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a query says (BEP 43) that its sender is read-only: a node that cannot be reached, or does not answer, and so is not to
+/// be put in anyone's routing table. Any datagram that is not such a query is not.
+pub fn is_read_only(data: &[u8]) -> bool {
+    bencode::decode_lenient(data).ok().and_then(|value| value.get("ro").and_then(Bencode::as_int)) == Some(1)
+}
+
 fn parse_values(list: &[Bencode]) -> Vec<SocketAddr> {
     // Each value is a compact peer, 6 bytes (IPv4) or 18 (IPv6); entries that
     // are neither get skipped rather than failing the whole response (lenient
     // in what we accept -- some nodes pad or mix garbage in).
-    list.iter()
-        .filter_map(|v| {
-            let b = v.as_bytes()?;
-            let peer = match b.len() {
-                6 => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(b[0], b[1], b[2], b[3]), u16::from_be_bytes([b[4], b[5]]))),
-                18 => {
-                    let mut octets = [0u8; 16];
-                    octets.copy_from_slice(&b[..16]);
-                    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(octets), u16::from_be_bytes([b[16], b[17]]), 0, 0))
-                }
-                _ => return None,
-            };
-            (peer.port() != 0).then_some(peer)
-        })
-        .collect()
+    list.iter().filter_map(|v| parse_compact_addr(v.as_bytes()?)).filter(|peer| peer.port() != 0).collect()
 }
 
 impl KrpcMessage {
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_with(false)
+    }
+
+    /// [`encode`](Self::encode), with a query marked read-only (BEP 43) if `read_only` says so: the top-level key `ro` is 1.
+    pub fn encode_with(&self, read_only: bool) -> Vec<u8> {
         let mut top: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
         match self {
             KrpcMessage::Query { t, query } => {
@@ -227,6 +240,9 @@ impl KrpcMessage {
                     }
                 }
                 top.insert(b"a".to_vec(), Bencode::Dict(a));
+                if read_only {
+                    top.insert(b"ro".to_vec(), Bencode::Int(1));
+                }
                 top.insert(b"q".to_vec(), Bencode::Bytes(query.name().as_bytes().to_vec()));
                 top.insert(b"t".to_vec(), Bencode::Bytes(t.clone()));
                 top.insert(b"y".to_vec(), Bencode::Bytes(b"q".to_vec()));
@@ -249,6 +265,9 @@ impl KrpcMessage {
                     r.insert(b"values".to_vec(), Bencode::List(vals));
                 }
                 top.insert(b"r".to_vec(), Bencode::Dict(r));
+                if let Some(ip) = &response.ip {
+                    top.insert(b"ip".to_vec(), Bencode::Bytes(encode_peer(ip)));
+                }
                 top.insert(b"t".to_vec(), Bencode::Bytes(t.clone()));
                 top.insert(b"y".to_vec(), Bencode::Bytes(b"r".to_vec()));
             }
@@ -301,7 +320,8 @@ impl KrpcMessage {
                 }
                 let values = r.get(b"values".as_slice()).and_then(Bencode::as_list).map(parse_values).unwrap_or_default();
                 let token = r.get(b"token".as_slice()).and_then(Bencode::as_bytes).map(<[u8]>::to_vec);
-                Ok(KrpcMessage::Response { t, response: Response { id, nodes, values, token } })
+                let ip = dict.get(b"ip".as_slice()).and_then(Bencode::as_bytes).and_then(parse_compact_addr);
+                Ok(KrpcMessage::Response { t, response: Response { id, nodes, values, token, ip } })
             }
             b"e" => {
                 let e = dict.get(b"e".as_slice()).and_then(Bencode::as_list).ok_or(KrpcError::MissingField("e"))?;
@@ -541,5 +561,50 @@ mod tests {
             KrpcMessage::Query { query: Query::GetPeers { info_hash, .. }, .. } => assert_eq!(&info_hash, b"mnopqrstuvwxyz123456"),
             other => panic!("{:?}", other),
         }
+    }
+
+    // ---- BEP 42 and BEP 43 ----
+
+    #[test]
+    fn a_response_carries_the_address_it_saw_you_at_at_the_top_level_and_reads_it_back_for_both_families() {
+        for ip in ["203.0.113.9:6881", "[2001:db8::7]:6882"] {
+            let seen: SocketAddr = ip.parse().unwrap();
+            let msg = KrpcMessage::Response { t: b"aa".to_vec(), response: Response { id: [7; 20], ip: Some(seen), ..Default::default() } };
+            let encoded = msg.encode();
+            let dict = bencode::decode_lenient(&encoded).unwrap();
+            let top = dict.as_dict().unwrap();
+            assert!(top.contains_key(b"ip".as_slice()), "`ip` is a key of the message, beside `r`, not in it");
+            assert!(!dict.get("r").unwrap().as_dict().unwrap().contains_key(b"ip".as_slice()));
+            assert_eq!(KrpcMessage::decode(&encoded).unwrap(), msg);
+        }
+        let plain = KrpcMessage::Response { t: b"aa".to_vec(), response: Response { id: [7; 20], ..Default::default() } };
+        assert!(!String::from_utf8_lossy(&plain.encode()).contains("2:ip"), "no address seen, none said");
+    }
+
+    #[test]
+    fn a_response_ip_of_the_wrong_length_is_ignored_and_costs_nothing() {
+        let mut top: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+        let mut r: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+        r.insert(b"id".to_vec(), Bencode::Bytes(vec![1; 20]));
+        top.insert(b"r".to_vec(), Bencode::Dict(r));
+        top.insert(b"ip".to_vec(), Bencode::Bytes(vec![1, 2, 3]));
+        top.insert(b"t".to_vec(), Bencode::Bytes(b"aa".to_vec()));
+        top.insert(b"y".to_vec(), Bencode::Bytes(b"r".to_vec()));
+        let KrpcMessage::Response { response, .. } = KrpcMessage::decode(&bencode::encode(&Bencode::Dict(top))).unwrap() else { panic!("a response") };
+        assert_eq!(response.ip, None);
+    }
+
+    #[test]
+    fn a_query_says_it_is_read_only_at_the_top_level_and_only_when_it_is() {
+        let query = KrpcMessage::Query { t: b"aa".to_vec(), query: Query::Ping { id: [3; 20] } };
+        assert!(!is_read_only(&query.encode()));
+        assert!(!is_read_only(&query.encode_with(false)));
+        let marked = query.encode_with(true);
+        assert!(is_read_only(&marked), "{:?}", String::from_utf8_lossy(&marked));
+        assert_eq!(KrpcMessage::decode(&marked).unwrap(), query, "and it is the same query otherwise");
+        assert!(String::from_utf8_lossy(&marked).contains("2:roi1e"));
+        // Anything that is not a well-formed dict with `ro` 1 is not read-only.
+        assert!(!is_read_only(b"not bencode"));
+        assert!(!is_read_only(b"d2:roi0ee") && !is_read_only(b"d2:roi2ee") && !is_read_only(b"d2:ro1:1e"));
     }
 }

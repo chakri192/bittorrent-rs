@@ -25,6 +25,7 @@
 
 pub mod krpc;
 pub mod routing;
+pub mod secure_id;
 
 mod lookup;
 mod responder;
@@ -41,14 +42,21 @@ pub use transport::{SharedTransport, Transport, UdpTransport};
 use krpc::{KrpcMessage, NodeId, Query};
 use routing::RoutingTable;
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use token::TokenSecrets;
 
 /// Per-recv poll granularity inside lookups and idle serving.
 const RECV_TICK: Duration = Duration::from_millis(300);
+
+/// How many different nodes must say they see this node at the same address (BEP 42) before it believes it: one node can lie, or be
+/// wrong; several that share nothing but a query to us are hard to line up.
+const ADDRESS_REPORTS_NEEDED: usize = 5;
+
+/// The most different addresses nodes may say we are at that are kept while the votes are counted.
+const MAX_ADDRESS_CANDIDATES: usize = 32;
 
 pub fn random_node_id() -> NodeId {
     // The peer_id generator already mixes an atomic counter, wall clock,
@@ -70,6 +78,12 @@ pub struct Dht<T: Transport> {
     /// info_hash -> peers other nodes announced to us. Bounded per hash;
     /// this client is a downloader first, storage node second.
     peer_store: HashMap<NodeId, Vec<SocketAddr>>,
+    /// BEP 43: this node asks, and does not answer, and asks the nodes it asks not to remember it.
+    read_only: bool,
+    /// The address nodes agree they see this one at (BEP 42), once they have, which the node id is made from.
+    external_ip: Option<IpAddr>,
+    /// Who has said this node is at which address, until one is believed.
+    address_reports: HashMap<IpAddr, HashSet<IpAddr>>,
 }
 
 impl<T: Transport> Dht<T> {
@@ -83,6 +97,47 @@ impl<T: Transport> Dht<T> {
             txid_counter: 0,
             tokens: TokenSecrets::new(Instant::now()),
             peer_store: HashMap::new(),
+            read_only: false,
+            external_ip: None,
+            address_reports: HashMap::new(),
+        }
+    }
+
+    /// Makes this node read-only (BEP 43), as one that cannot be reached from outside should be: its queries say so, so that no one
+    /// puts it in a routing table, and it answers none.
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    /// The address nodes have told this one it is at (BEP 42), if enough have agreed.
+    pub fn external_ip(&self) -> Option<IpAddr> {
+        self.external_ip
+    }
+
+    /// A node has answered saying it sees this one at `reported` (BEP 42). Once [`ADDRESS_REPORTS_NEEDED`] different nodes agree,
+    /// the node's id is made anew from that address, so that it is one that others can check and will accept, and its routing
+    /// table is centred on it. An address that is not the internet's (a loopback answer, one from a node on the same network)
+    /// says nothing of where this node is on it, and is not counted.
+    pub(crate) fn note_reported_address(&mut self, reporter: IpAddr, reported: IpAddr) {
+        if reported.is_ipv6() != self.ipv6 || secure_id::is_local(reported) || self.external_ip == Some(reported) {
+            return;
+        }
+        if !self.address_reports.contains_key(&reported) && self.address_reports.len() >= MAX_ADDRESS_CANDIDATES {
+            self.address_reports.clear(); // a flood of made-up addresses is not to be kept
+        }
+        let count = {
+            let reporters = self.address_reports.entry(reported).or_default();
+            reporters.insert(reporter);
+            reporters.len()
+        };
+        // The first address that enough nodes agree on: a rival that has not got there first has fewer.
+        if count >= ADDRESS_REPORTS_NEEDED {
+            let mut rand = [0u8; 1];
+            let _ = getrandom::getrandom(&mut rand);
+            self.node_id = secure_id::node_id_for(reported, rand[0], random_node_id());
+            self.table.recentre(self.node_id);
+            self.external_ip = Some(reported);
+            self.address_reports.clear();
         }
     }
 
@@ -115,7 +170,7 @@ impl<T: Transport> Dht<T> {
     fn send_query(&mut self, query: Query, addr: SocketAddr) -> io::Result<Vec<u8>> {
         let t = self.next_txid();
         let msg = KrpcMessage::Query { t: t.clone(), query };
-        self.transport.send_to(&msg.encode(), addr)?;
+        self.transport.send_to(&msg.encode_with(self.read_only), addr)?;
         Ok(t)
     }
 }

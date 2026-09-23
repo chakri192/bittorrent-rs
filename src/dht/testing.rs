@@ -60,7 +60,7 @@ impl Transport for &MockTransport {
         if let Some(node) = self.script.lock().unwrap().get(&addr).cloned() {
             if let Ok(KrpcMessage::Query { t, query }) = KrpcMessage::decode(data) {
                 let response = match query {
-                    Query::GetPeers { .. } => Response { id: node.id, nodes: node.nodes.clone(), values: node.values.clone(), token: node.token.clone() },
+                    Query::GetPeers { .. } => Response { id: node.id, nodes: node.nodes.clone(), values: node.values.clone(), token: node.token.clone(), ip: None },
                     Query::FindNode { .. } => Response { id: node.id, nodes: node.nodes.clone(), ..Default::default() },
                     _ => Response { id: node.id, ..Default::default() },
                 };
