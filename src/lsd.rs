@@ -20,11 +20,22 @@
 //!
 //! What is heard is only ever a candidate to dial; nothing a datagram says is
 //! trusted beyond that, and it is bounded like every other thing read off a
-//! network. IPv4 only.
+//! network.
+//!
+//! IPv6 joins a second group, `ff15::efc0:988f` on the same port, an amendment
+//! most clients now honour: a service that wants it runs two sockets, one per
+//! family, sharing the cookie and the one channel of peers heard -- to the
+//! torrent it makes no difference which family found a peer on. Interface 0
+//! ("any") is refused for an IPv6 join on macOS/BSD, unlike Linux, so every up,
+//! multicast-capable interface is found and tried instead (`multicast_interfaces`);
+//! and one real machine's kernel was found to refuse outright to *send* to this
+//! group on any interface, a deprecated address class it may simply not route --
+//! joining still succeeds there, so a peer on a network that does route it would
+//! still be heard, but this client's own announcements never leave that machine.
 
 use std::collections::HashSet;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -33,6 +44,8 @@ use std::time::{Duration, Instant};
 
 /// The multicast group and port BEP 14 uses for IPv4.
 pub const GROUP: Ipv4Addr = Ipv4Addr::new(239, 192, 152, 143);
+/// The multicast group BEP 14's IPv6 amendment uses, on the same port.
+pub const GROUP6: Ipv6Addr = Ipv6Addr::new(0xff15, 0, 0, 0, 0, 0, 0xefc0, 0x988f);
 pub const PORT: u16 = 6771;
 
 /// How often a torrent is announced. BEP 14 asks for no more than once in
@@ -168,12 +181,15 @@ pub struct LsdConfig {
     /// such answer, not from the last announcement of any kind: a newcomer
     /// usually turns up soon after we began.)
     pub reply_interval: Duration,
+    /// Also join `GROUP6` on IPv6 and announce there too, on a socket of its own: a peer heard on either
+    /// family is reported the same way. Off for a loopback/unicast test config, which means one address alone.
+    pub ipv6: bool,
 }
 
 impl LsdConfig {
-    /// The real thing: BEP 14's group and port.
+    /// The real thing: BEP 14's group and port, and its IPv6 amendment.
     pub fn multicast() -> Self {
-        LsdConfig { send_to: SocketAddr::from((GROUP, PORT)), listen: SocketAddr::from((Ipv4Addr::UNSPECIFIED, PORT)), join: Some(GROUP), share_port: true, interval: ANNOUNCE_INTERVAL, reply_interval: REPLY_INTERVAL }
+        LsdConfig { send_to: SocketAddr::from((GROUP, PORT)), listen: SocketAddr::from((Ipv4Addr::UNSPECIFIED, PORT)), join: Some(GROUP), share_port: true, interval: ANNOUNCE_INTERVAL, reply_interval: REPLY_INTERVAL, ipv6: true }
     }
 }
 
@@ -182,17 +198,21 @@ impl LsdConfig {
 pub struct LsdService {
     /// Batches of peer addresses heard of, to be dialed.
     pub peers_rx: Receiver<Vec<SocketAddr>>,
-    /// Where it is listening.
+    /// Where it is listening (the IPv4 socket, if `ipv6` asked for both).
     pub listen_addr: SocketAddr,
+    /// Whether the IPv6 group was joined too (asked for, and the join succeeded).
+    pub ipv6_joined: bool,
     stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    handles: Vec<JoinHandle<()>>,
 }
 
 impl LsdService {
     /// Starts announcing `info_hash` (listening on TCP `tcp_port`) and
-    /// listening for others. Fails if the socket cannot be set up, which a
+    /// listening for others. Fails if the IPv4 socket cannot be set up, which a
     /// machine with no multicast route will do; the caller carries on
-    /// without.
+    /// without. A `config.ipv6` that cannot be joined (no IPv6, a stricter
+    /// sandbox) is not fatal: this is the one that failed, not the family
+    /// that did not.
     pub fn start(config: LsdConfig, info_hash: [u8; 20], tcp_port: u16) -> io::Result<LsdService> {
         let socket = bind(&config)?;
         let listen_addr = socket.local_addr()?;
@@ -205,15 +225,31 @@ impl LsdService {
         let cookie = new_cookie();
         let (tx, peers_rx) = channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
         let flag = Arc::clone(&stop);
-        let handle = thread::Builder::new().name("lsd".to_string()).spawn(move || run(&socket, &config, info_hash, tcp_port, &cookie, &tx, &flag))?;
-        Ok(LsdService { peers_rx, listen_addr, stop, handle: Some(handle) })
+        let (v4_cookie, v4_tx, v4_config) = (cookie.clone(), tx.clone(), config.clone());
+        handles.push(thread::Builder::new().name("lsd".to_string()).spawn(move || run(&socket, &v4_config, info_hash, tcp_port, &v4_cookie, &v4_tx, &flag))?);
+
+        let ipv6_joined = config.ipv6 && bind_v6(&config).is_ok_and(|socket6| {
+            let _ = socket6.set_read_timeout(Some(Duration::from_millis(250)));
+            let _ = socket6.set_multicast_loop_v6(true); // std has no per-socket hop-limit setter for IPv6 multicast; ff15::'s own scope bounds it
+            let config6 = LsdConfig { send_to: SocketAddr::from((GROUP6, PORT)), ..config.clone() };
+            let (flag, cookie, tx) = (Arc::clone(&stop), cookie.clone(), tx.clone());
+            match thread::Builder::new().name("lsd6".to_string()).spawn(move || run(&socket6, &config6, info_hash, tcp_port, &cookie, &tx, &flag)) {
+                Ok(handle) => {
+                    handles.push(handle);
+                    true
+                }
+                Err(_) => false,
+            }
+        });
+        Ok(LsdService { peers_rx, listen_addr, ipv6_joined, stop, handles })
     }
 
-    /// Stops the service and waits for its thread.
+    /// Stops the service and waits for its thread(s).
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
+        for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
     }
@@ -285,6 +321,110 @@ fn bind_shared(addr: std::net::SocketAddrV4) -> io::Result<UdpSocket> {
 
 #[cfg(not(unix))]
 fn bind_shared(_addr: std::net::SocketAddrV4) -> io::Result<UdpSocket> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "sharing the LSD port is only implemented on Unix"))
+}
+
+/// [`bind`] for the IPv6 group: always the real address and port (there is no loopback/unicast form of this one to test
+/// against, so a config that wants IPv6 gets exactly `GROUP6`), shared the same way `config.share_port` asks for on IPv4.
+fn bind_v6(config: &LsdConfig) -> io::Result<UdpSocket> {
+    let addr = std::net::SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, PORT, 0, 0);
+    let socket = if config.share_port { bind_shared_v6(addr)? } else { UdpSocket::bind(addr)? };
+    // Interface 0 ("any") is accepted for an IPv6 join on Linux, but not on macOS/BSD (`EADDRNOTAVAIL`): a real
+    // interface has to be named. Every interface that is up and says it can do multicast is tried, loopback
+    // included (so a machine with nothing else still finds another client on itself, as these tests want); the join
+    // stands if any one of them takes -- one that is flagged multicast-capable but cannot really join (a tunnel, an
+    // unconfigured bridge) is not this feature's problem, as long as some interface could.
+    let mut joined = false;
+    let mut last_err = None;
+    for index in multicast_interfaces() {
+        match socket.join_multicast_v6(&GROUP6, index) {
+            Ok(()) => joined = true,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if !joined {
+        return Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no network interface could join the IPv6 group")));
+    }
+    Ok(socket)
+}
+
+/// The interfaces this machine could plausibly join an IPv6 multicast group on: every one that is up and reports
+/// itself multicast-capable, loopback included. Empty (rather than an error) if none can be found, or on a
+/// platform this is not implemented for: [`bind_v6`] then simply finds no interface to join on.
+#[cfg(unix)]
+fn multicast_interfaces() -> Vec<u32> {
+    let mut indices = Vec::new();
+    // SAFETY: `getifaddrs` hands back a linked list it owns; it is only read here (never written through) and is
+    // freed exactly once, after the last node has been visited, on every path (the loop always runs to its end).
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 {
+            return indices;
+        }
+        let mut node = head;
+        while !node.is_null() {
+            let ifa = &*node;
+            let flags = ifa.ifa_flags as libc::c_int;
+            if !ifa.ifa_name.is_null() && flags & libc::IFF_UP != 0 && flags & libc::IFF_MULTICAST != 0 {
+                let index = libc::if_nametoindex(ifa.ifa_name as *const libc::c_char);
+                if index != 0 && !indices.contains(&index) {
+                    indices.push(index);
+                }
+            }
+            node = ifa.ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    indices
+}
+
+#[cfg(not(unix))]
+fn multicast_interfaces() -> Vec<u32> {
+    Vec::new()
+}
+
+/// [`bind_shared`] for IPv6: `IPV6_V6ONLY` (a wildcard IPv6 socket would otherwise also take IPv4, putting the IPv4
+/// service's traffic on this one) plus the same `SO_REUSEADDR`/`SO_REUSEPORT` sharing.
+#[cfg(unix)]
+fn bind_shared_v6(addr: std::net::SocketAddrV6) -> io::Result<UdpSocket> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain socket calls with valid arguments; the descriptor is
+    // closed on every failure path and otherwise handed to the UdpSocket.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fail = |fd: libc::c_int| {
+            let error = io::Error::last_os_error();
+            libc::close(fd);
+            Err(error)
+        };
+        let on: libc::c_int = 1;
+        if libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &on as *const libc::c_int as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t) < 0 {
+            return fail(fd);
+        }
+        for option in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+            if libc::setsockopt(fd, libc::SOL_SOCKET, option, &on as *const libc::c_int as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t) < 0 {
+                return fail(fd);
+            }
+        }
+        let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
+        sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        sa.sin6_port = addr.port().to_be();
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+        {
+            sa.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+        }
+        if libc::bind(fd, &sa as *const libc::sockaddr_in6 as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t) < 0 {
+            return fail(fd);
+        }
+        Ok(UdpSocket::from_raw_fd(fd))
+    }
+}
+
+#[cfg(not(unix))]
+fn bind_shared_v6(_addr: std::net::SocketAddrV6) -> io::Result<UdpSocket> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "sharing the LSD port is only implemented on Unix"))
 }
 
@@ -469,7 +609,7 @@ mod tests {
 
     /// A config that listens on an ephemeral loopback port and announces to `send_to`.
     fn loopback(send_to: SocketAddr, interval: Duration) -> LsdConfig {
-        LsdConfig { send_to, listen: SocketAddr::from(([127, 0, 0, 1], 0)), join: None, share_port: false, interval , reply_interval: Duration::from_secs(3600) }
+        LsdConfig { send_to, listen: SocketAddr::from(([127, 0, 0, 1], 0)), join: None, share_port: false, interval , reply_interval: Duration::from_secs(3600), ipv6: false }
     }
 
     /// Two sockets that each know the other's address are two clients on one link.
@@ -526,7 +666,7 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();
         drop(socket);
-        let mut service = LsdService::start(LsdConfig { send_to: addr, listen: addr, join: None, share_port: false, interval: Duration::from_millis(100), reply_interval: Duration::from_secs(3600) }, HASH, 6881).unwrap();
+        let mut service = LsdService::start(LsdConfig { send_to: addr, listen: addr, join: None, share_port: false, interval: Duration::from_millis(100), reply_interval: Duration::from_secs(3600), ipv6: false }, HASH, 6881).unwrap();
         thread::sleep(Duration::from_millis(700));
         assert!(service.peers_rx.try_recv().is_err(), "several announcements went round, none was taken for a peer");
         service.stop();
@@ -570,7 +710,7 @@ mod tests {
     #[test]
     fn two_services_with_a_shared_port_can_both_listen_on_it() {
         // As every client on one machine must, on the real port.
-        let config = |port: u16| LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen: SocketAddr::from(([127, 0, 0, 1], port)), join: None, share_port: true, interval: Duration::from_secs(60), reply_interval: Duration::from_secs(3600) };
+        let config = |port: u16| LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen: SocketAddr::from(([127, 0, 0, 1], port)), join: None, share_port: true, interval: Duration::from_secs(60), reply_interval: Duration::from_secs(3600), ipv6: false };
         let mut first = LsdService::start(config(0), HASH, 1).unwrap();
         let mut second = LsdService::start(config(first.listen_addr.port()), HASH, 2).expect("a second listener on the same port");
         first.stop();
@@ -619,6 +759,117 @@ mod tests {
         let second = bind_shared(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).expect("SO_REUSEPORT lets a second one in");
         assert_eq!(second.local_addr().unwrap().port(), port);
         assert!(UdpSocket::bind(("127.0.0.1", port)).is_err(), "where an ordinary bind would not");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_ipv6_sockets_can_share_the_port_on_unix_and_take_no_ipv4_traffic() {
+        let addr = |port| std::net::SocketAddrV6::new(std::net::Ipv6Addr::LOCALHOST, port, 0, 0);
+        let first = match bind_shared_v6(addr(0)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("no IPv6 loopback here ({:?}); not tested", e);
+                return;
+            }
+        };
+        let port = first.local_addr().unwrap().port();
+        let second = bind_shared_v6(addr(port)).expect("SO_REUSEPORT lets a second one in, as it does on IPv4");
+        assert_eq!(second.local_addr().unwrap().port(), port);
+        assert!(UdpSocket::bind(("::1", port)).is_err(), "where an ordinary bind would not");
+        assert!(UdpSocket::bind(("127.0.0.1", port)).is_ok(), "IPV6_V6ONLY: the same port number on IPv4 is a different socket, not a collision");
+    }
+
+    #[test]
+    fn the_ipv6_group_is_the_beps_amendment_address() {
+        assert_eq!(GROUP6.to_string(), "ff15::efc0:988f");
+    }
+
+    #[test]
+    fn a_config_that_does_not_ask_for_ipv6_never_reports_having_joined_it() {
+        let (listener, _) = pair();
+        listener.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut service = LsdService::start(loopback(listener.local_addr().unwrap(), Duration::from_secs(60)), HASH, 6881).unwrap();
+        assert!(!service.ipv6_joined);
+        service.stop();
+    }
+
+    #[test]
+    fn asking_for_ipv6_never_fails_the_service_whether_or_not_the_group_can_be_joined() {
+        // A loopback (IPv4) config that also asks for IPv6: whatever this machine can or cannot join on
+        // ff15::efc0:988f, the service as a whole must still start, on its IPv4 half alone if need be.
+        let (listener, _) = pair();
+        listener.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let config = LsdConfig { ipv6: true, ..loopback(listener.local_addr().unwrap(), Duration::from_secs(60)) };
+        let mut service = LsdService::start(config, HASH, 6881).unwrap();
+        let mut buf = [0u8; 2000];
+        assert!(listener.recv_from(&mut buf).is_ok(), "the IPv4 half still works");
+        service.stop();
+    }
+
+    /// A regression test for `bind_v6` itself, independent of whether this machine's kernel actually routes
+    /// packets to the site-local group once joined (a macOS box was found, empirically, to refuse to -- see
+    /// the module doc -- which no amount of interface selection works around, so that half is not asserted on
+    /// here; joining is a different, and reliably testable, question). With `join_multicast_v6(&GROUP6, 0)`
+    /// (interface "any") this failed outright on that machine, `EADDRNOTAVAIL`; enumerating real interfaces
+    /// and joining on each fixed it.
+    #[cfg(unix)]
+    #[test]
+    fn bind_v6_joins_at_least_one_real_interface() {
+        let config = LsdConfig { share_port: true, ..LsdConfig::multicast() };
+        match bind_v6(&config) {
+            Ok(_) => {} // joined
+            Err(e) => panic!("no interface could join GROUP6: {:?} (candidates were {:?})", e, multicast_interfaces()),
+        }
+    }
+
+    /// A service asked for IPv6 reports having it, on a machine `bind_v6_joins_at_least_one_real_interface` has just
+    /// shown can join the group -- deterministic on such a machine, unlike the full send/receive exchange below.
+    #[cfg(unix)]
+    #[test]
+    fn a_service_asked_for_ipv6_on_a_machine_that_can_join_reports_having_joined() {
+        let (listener, _) = pair();
+        let config = LsdConfig { ipv6: true, share_port: true, ..loopback(listener.local_addr().unwrap(), Duration::from_secs(60)) };
+        let mut service = LsdService::start(config, HASH, 6881).unwrap();
+        assert!(service.ipv6_joined);
+        service.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pair_on_the_real_ipv6_group_find_each_other() {
+        assert!(LsdConfig::multicast().ipv6, "the real thing wants both families");
+        // The IPv4 half of each is inert (a loopback config, `send_to` nobody in particular, as `loopback`'s
+        // usual idiom): only `ipv6: true` is exercised, over the real GROUP6, which `bind_v6` always joins
+        // regardless of `join`/`listen`. So a machine with IPv4 multicast but not IPv6 (or the other way
+        // about) cannot mask a real failure of the family this test is for.
+        // `share_port` is what lets two services in this one process both take the real port on the v6 side (there is no
+        // loopback/private form of it to test against instead, per `bind_v6`'s doc).
+        let config = |send_to| LsdConfig { ipv6: true, share_port: true, ..loopback(send_to, Duration::from_millis(200)) };
+        let nowhere = SocketAddr::from(([127, 0, 0, 1], 9));
+        let (mut a, mut b) = match (LsdService::start(config(nowhere), HASH, 3111), LsdService::start(config(nowhere), HASH, 3222)) {
+            (Ok(a), Ok(b)) if a.ipv6_joined && b.ipv6_joined => (a, b),
+            (a, b) => {
+                eprintln!("no IPv6 multicast here ({:?}, {:?} -- or one side did not join); the group is not tested", a.map(|s| s.ipv6_joined), b.map(|s| s.ipv6_joined));
+                return;
+            }
+        };
+        let until = Instant::now() + Duration::from_secs(15);
+        let (mut heard_by_a, mut heard_by_b) = (Vec::new(), Vec::new());
+        while (heard_by_a.is_empty() || heard_by_b.is_empty()) && Instant::now() < until {
+            heard_by_a.extend(a.peers_rx.try_iter().flatten().map(|p| p.port()));
+            heard_by_b.extend(b.peers_rx.try_iter().flatten().map(|p| p.port()));
+            thread::sleep(Duration::from_millis(50));
+        }
+        if heard_by_a.is_empty() && heard_by_b.is_empty() {
+            // Confirmed on one real machine: joining GROUP6 can succeed while the kernel still refuses to route a send to
+            // it at all (macOS, seemingly for every interface, for the whole deprecated site-local scope) -- not a bug
+            // this module can work around, so unlike the IPv4 version of this test, this is not cause to suspect one.
+            eprintln!("IPv6 group joined but nothing came back (no route to it here, or loopback of multicast off); the group is not tested");
+        } else {
+            assert!(heard_by_a.iter().all(|&p| p == 3222) && heard_by_b.iter().all(|&p| p == 3111), "A heard {:?}, B heard {:?}", heard_by_a, heard_by_b);
+        }
+        a.stop();
+        b.stop();
     }
 
     fn replying(send_to: SocketAddr, reply_interval: Duration) -> LsdConfig {

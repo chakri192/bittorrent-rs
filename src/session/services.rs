@@ -128,7 +128,7 @@ impl Services {
     pub fn start_lsd(&mut self, config: LsdConfig, info_hash: [u8; 20], tcp_port: u16, log: impl Fn(String)) {
         match LsdService::start(config, info_hash, tcp_port) {
             Ok(service) => {
-                log(format!("local service discovery running (announcing port {})", tcp_port));
+                log(format!("local service discovery running (announcing port {}{})", tcp_port, if service.ipv6_joined { ", IPv4 and IPv6" } else { "" }));
                 self.lsd = Some(service);
             }
             Err(e) => log(format!("local service discovery disabled: {}", e)),
@@ -312,7 +312,7 @@ mod tests {
     }
 
     fn loopback_lsd(listen_port: u16) -> LsdConfig {
-        LsdConfig { send_to: std::net::SocketAddr::from(([127, 0, 0, 1], 9)), listen: std::net::SocketAddr::from(([127, 0, 0, 1], listen_port)), join: None, share_port: false, interval: std::time::Duration::from_secs(3600), reply_interval: std::time::Duration::from_secs(3600) }
+        LsdConfig { send_to: std::net::SocketAddr::from(([127, 0, 0, 1], 9)), listen: std::net::SocketAddr::from(([127, 0, 0, 1], listen_port)), join: None, share_port: false, interval: std::time::Duration::from_secs(3600), reply_interval: std::time::Duration::from_secs(3600), ipv6: false }
     }
 
     #[test]
@@ -329,6 +329,22 @@ mod tests {
 
         assert!(s.lsd().is_none());
         assert!(std::net::UdpSocket::bind(addr).is_ok(), "shutdown released the socket");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_log_says_when_ipv6_is_joined_too() {
+        let mut s = Services::new();
+        let logged = std::sync::Mutex::new(Vec::new());
+        s.start_lsd(loopback_lsd(0), [0x11; 20], 6881, |m| logged.lock().unwrap().push(m));
+        assert!(!logged.lock().unwrap()[0].contains("IPv6"), "not asked for, not mentioned: {:?}", logged.lock().unwrap());
+        s.shutdown();
+
+        let logged6 = std::sync::Mutex::new(Vec::new());
+        let config = crate::lsd::LsdConfig { ipv6: true, share_port: true, ..loopback_lsd(0) };
+        s.start_lsd(config, [0x11; 20], 6882, |m| logged6.lock().unwrap().push(m));
+        assert!(logged6.lock().unwrap()[0].contains("IPv4 and IPv6"), "asked for, and this machine can join it: {:?}", logged6.lock().unwrap());
+        s.shutdown();
     }
 
     #[test]

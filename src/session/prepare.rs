@@ -265,7 +265,9 @@ pub fn prepare(torrent: &TorrentFile, mask: &[bool], bootstrap_peers: Vec<Socket
     // port, so it needs a listener.
     if let (Some(config), false, true) = (&options.lsd, torrent.private, services.has_seeder()) {
         let log = shared_log(sink);
-        services.start_lsd(config.clone(), torrent.info_hash, announce_port, move |m| log(m));
+        // The same choice of IPv6 as everything else in this run (`--ipv6` / `--no-ipv6` / the route probe), not the config's own default.
+        let config = crate::lsd::LsdConfig { ipv6: allow_ipv6, ..config.clone() };
+        services.start_lsd(config, torrent.info_hash, announce_port, move |m| log(m));
     }
 
     // Best-effort port forwarding (UPnP/NAT-PMP) so inbound peers and DHT
@@ -623,7 +625,7 @@ mod tests {
     /// Local discovery on loopback, as a test can have it.
     fn lsd_options(dir: &std::path::Path) -> Options {
         let mut with = options(dir);
-        with.lsd = Some(crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen: SocketAddr::from(([127, 0, 0, 1], 0)), join: None, share_port: false, interval: Duration::from_secs(3600), reply_interval: Duration::from_secs(3600) });
+        with.lsd = Some(crate::lsd::LsdConfig { send_to: SocketAddr::from(([127, 0, 0, 1], 9)), listen: SocketAddr::from(([127, 0, 0, 1], 0)), join: None, share_port: false, interval: Duration::from_secs(3600), reply_interval: Duration::from_secs(3600), ipv6: false });
         with
     }
 
@@ -636,6 +638,27 @@ mod tests {
         let port = services.announce_port(0);
         assert!(services.lsd().is_some());
         assert!(log.logged(&format!("local service discovery running (announcing port {})", port)), "{:?}", log.lines.lock().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_discoverys_ipv6_follows_the_runs_own_ipv6_choice_not_the_configs() {
+        let dir = tmp_dir("lsd-ipv6");
+        // The config says IPv6, but the run is --no-ipv6: the option overrides it, so nothing is even attempted.
+        let mut never = lsd_options(&dir);
+        never.lsd.as_mut().unwrap().ipv6 = true;
+        never.ipv6 = Ipv6Mode::Never;
+        let mut services = Services::new();
+        run_prepare(&torrent(), &[true, true], vec![dead_addr()], &never, &mut services).0.unwrap();
+        assert!(!services.lsd().unwrap().ipv6_joined, "--no-ipv6 turns it off even though the config asked for it");
+
+        // The other way about: the config says no IPv6, but the run is --ipv6.
+        let mut always = lsd_options(&dir);
+        always.lsd.as_mut().unwrap().share_port = true; // so it can bind the real port alongside `never`'s service above
+        always.ipv6 = Ipv6Mode::Always;
+        let mut services = Services::new();
+        run_prepare(&torrent(), &[true, true], vec![dead_addr()], &always, &mut services).0.unwrap();
+        assert!(services.lsd().unwrap().ipv6_joined, "--ipv6 turns it on even though the config did not ask for it");
     }
 
     #[test]
