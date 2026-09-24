@@ -28,10 +28,16 @@ impl<T: Transport> Dht<T> {
 
         match msg {
             KrpcMessage::Query { t, query } => {
+                if self.read_only {
+                    return None; // BEP 43: a read-only node answers no one
+                }
                 self.tokens.rotate_if_due(Instant::now());
                 // A node that queries us is alive at that address --
-                // exactly the freshness signal the routing table wants.
-                self.table.insert(*query.sender_id(), from);
+                // exactly the freshness signal the routing table wants. Unless it
+                // says (BEP 43) that it is not to be remembered: it cannot be reached.
+                if !super::krpc::is_read_only(data) {
+                    self.table.insert(*query.sender_id(), from);
+                }
                 let reply = match &query {
                     Query::Ping { .. } => Response { id: self.node_id, ..Default::default() },
                     Query::FindNode { target, .. } => Response { id: self.node_id, nodes: self.table.closest(target, K), ..Default::default() },
@@ -61,10 +67,17 @@ impl<T: Transport> Dht<T> {
                         Response { id: self.node_id, ..Default::default() }
                     }
                 };
+                // The address the query came from, which is what BEP 42 has a node tell the one it answers.
+                let reply = Response { ip: Some(from), ..reply };
                 let _ = self.transport.send_to(&KrpcMessage::Response { t, response: reply }.encode(), from);
                 None
             }
-            KrpcMessage::Response { t, response } => Some((t, response, from)),
+            KrpcMessage::Response { t, response } => {
+                if let Some(reported) = response.ip {
+                    self.note_reported_address(from.ip(), reported.ip());
+                }
+                Some((t, response, from))
+            }
             KrpcMessage::Error { .. } => None, // errors just mean that txid never resolves
         }
     }
@@ -416,5 +429,138 @@ mod tests {
         let mut dht = Dht::new(&transport);
         let token = harvest_token(&mut dht, &transport, v6("[2001:db8::5]:7000"), [0x77; 20]);
         assert!(!announce_accepted(&mut dht, &transport, v6("[2001:db8::6]:7000"), [0x77; 20], token), "bound to the requester's IPv6 address");
+    }
+
+    // ---- BEP 42: ids that say where they are from, and the address others see us at ----
+
+    fn ping() -> KrpcMessage {
+        KrpcMessage::Query { t: b"xy".to_vec(), query: Query::Ping { id: [0x01; 20] } }
+    }
+
+    /// A response to something we asked, from `from`, saying it sees us at `seen`.
+    fn told_we_are_at(dht: &mut Dht<&MockTransport>, from: &str, seen: &str) {
+        let response = Response { id: [0x0F; 20], ip: Some(v4(&format!("{}:6881", seen))), ..Default::default() };
+        let data = KrpcMessage::Response { t: b"zz".to_vec(), response }.encode();
+        let _ = dht.handle_inbound(&data, v4(&format!("{}:6881", from)));
+    }
+
+    #[test]
+    fn every_answer_says_the_address_the_query_came_from() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let asker = v4("203.0.113.9:6881");
+        deliver(&mut dht, asker, ping().encode());
+        assert_eq!(reply(&transport, asker).ip, Some(asker));
+        let v6_transport = MockTransport::new_v6();
+        let mut dht6 = Dht::new(&v6_transport);
+        let asker6 = v6("[2001:db8::9]:6881");
+        deliver(&mut dht6, asker6, ping().encode());
+        assert_eq!(reply(&v6_transport, asker6).ip, Some(asker6));
+    }
+
+    #[test]
+    fn a_query_that_says_it_is_read_only_is_answered_and_its_sender_left_out_of_the_table() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let (quiet, ordinary) = (v4("198.51.100.1:6881"), v4("198.51.100.2:6881"));
+        deliver(&mut dht, quiet, ping().encode_with(true));
+        assert_eq!(reply(&transport, quiet).id, *dht.node_id(), "it is answered like any other");
+        assert_eq!(dht.table_len(), 0, "and not remembered");
+        deliver(&mut dht, ordinary, ping().encode());
+        assert_eq!(dht.table_len(), 1, "one that is not read-only is");
+    }
+
+    #[test]
+    fn a_read_only_node_answers_no_query_and_marks_the_ones_it_sends() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        dht.set_read_only(true);
+        let asker = v4("198.51.100.1:6881");
+        deliver(&mut dht, asker, ping().encode());
+        assert!(transport.sent_to(asker).is_empty(), "BEP 43: it does not answer");
+        assert_eq!(dht.table_len(), 0);
+        let peer = v4("198.51.100.3:6881");
+        dht.send_query(Query::Ping { id: *dht.node_id() }, peer).unwrap();
+        assert!(crate::dht::krpc::is_read_only(&transport.sent_to(peer)[0]), "what it asks says it is read-only");
+        dht.set_read_only(false);
+        let other = v4("198.51.100.4:6881");
+        dht.send_query(Query::Ping { id: *dht.node_id() }, other).unwrap();
+        assert!(!crate::dht::krpc::is_read_only(&transport.sent_to(other)[0]));
+    }
+
+    #[test]
+    fn nodes_that_agree_where_this_one_is_give_it_an_id_made_from_that_address_and_it_keeps_its_table() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        for i in 0..6u8 {
+            dht.seed_node([0x40 + i * 0x10; 20], v4(&format!("198.51.100.{}:1", 100 + i)));
+        }
+        let before = (*dht.node_id(), dht.table_len());
+        let ours = "203.0.113.77";
+        for reporter in 1..=4 {
+            told_we_are_at(&mut dht, &format!("198.51.100.{}", reporter), ours);
+        }
+        assert_eq!((*dht.node_id(), dht.external_ip()), (before.0, None), "four nodes are not enough");
+        told_we_are_at(&mut dht, "198.51.100.5", ours);
+        let ip: std::net::IpAddr = ours.parse().unwrap();
+        assert_eq!(dht.external_ip(), Some(ip), "the fifth agrees");
+        assert_ne!(*dht.node_id(), before.0);
+        assert!(crate::dht::secure_id::is_valid(dht.node_id(), ip), "and the id is now one that the address makes");
+        assert_eq!(dht.table_len(), before.1, "the nodes it knew are still known");
+        assert_eq!(dht.table.self_id(), dht.node_id(), "and the table is centred on the new id, not the old one");
+    }
+
+    #[test]
+    fn the_same_node_saying_it_again_is_one_vote_and_a_scatter_of_answers_is_none() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let id = *dht.node_id();
+        for _ in 0..20 {
+            told_we_are_at(&mut dht, "198.51.100.1", "203.0.113.77");
+        }
+        assert_eq!(dht.external_ip(), None, "one node, twenty times");
+        for i in 1..=40 {
+            told_we_are_at(&mut dht, &format!("198.51.100.{}", i), &format!("203.0.113.{}", 100 + i));
+        }
+        assert_eq!((*dht.node_id(), dht.external_ip()), (id, None), "forty nodes and forty addresses: nothing agreed");
+        assert!(dht.address_reports.len() <= super::super::MAX_ADDRESS_CANDIDATES, "and not every address kept");
+    }
+
+    #[test]
+    fn an_answer_that_is_not_about_the_internet_or_this_family_is_not_counted() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        for reporter in 1..=10 {
+            for seen in ["192.168.1.5", "10.0.0.7", "127.0.0.1"] {
+                told_we_are_at(&mut dht, &format!("198.51.100.{}", reporter), seen);
+            }
+        }
+        assert_eq!(dht.external_ip(), None, "a private address says nothing of where this node is on the internet");
+        assert!(dht.address_reports.is_empty());
+        for reporter in 1..=10u8 {
+            dht.note_reported_address(format!("198.51.100.{}", reporter).parse().unwrap(), "2001:db8::1".parse().unwrap());
+        }
+        assert_eq!(dht.external_ip(), None, "an IPv6 address is of no use to an IPv4 node");
+    }
+
+    #[test]
+    fn the_first_address_that_five_agree_on_is_believed_and_four_and_four_decide_nothing() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        for reporter in 1..=4 {
+            told_we_are_at(&mut dht, &format!("198.51.100.{}", reporter), "203.0.113.50");
+        }
+        for reporter in 11..=14 {
+            told_we_are_at(&mut dht, &format!("198.51.100.{}", reporter), "203.0.113.60");
+        }
+        assert_eq!(dht.external_ip(), None, "four and four");
+        told_we_are_at(&mut dht, "198.51.100.15", "203.0.113.60");
+        assert_eq!(dht.external_ip(), Some("203.0.113.60".parse().unwrap()), "five to four");
+        // Once believed, further reports of the same address change nothing (the id is not made anew every time).
+        let id = *dht.node_id();
+        for reporter in 20..30 {
+            told_we_are_at(&mut dht, &format!("198.51.100.{}", reporter), "203.0.113.60");
+        }
+        assert_eq!(*dht.node_id(), id);
     }
 }

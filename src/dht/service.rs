@@ -4,7 +4,7 @@
 
 use super::{Dht, UdpTransport};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -48,6 +48,8 @@ pub struct DhtNode {
     pub nodes: Arc<AtomicUsize>,
     /// The same for the IPv6 node, if one runs.
     pub nodes6: Arc<AtomicUsize>,
+    /// The address other nodes have told each node (IPv4, then IPv6) they see it at (BEP 42), once enough have agreed.
+    addresses: [Arc<Mutex<Option<IpAddr>>>; 2],
     commands: Vec<mpsc::Sender<Command>>,
     stop: Arc<AtomicBool>,
     handles: Mutex<Vec<thread::JoinHandle<()>>>,
@@ -74,29 +76,36 @@ impl DhtNode {
     fn start_every<T: super::Transport + 'static>(transport: T, port: u16, bootstrap_nodes: Vec<String>, ipv6: bool, relookup: Duration, budget: Duration) -> io::Result<DhtNode> {
         let stop = Arc::new(AtomicBool::new(false));
         let (nodes, nodes6) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let addresses = [Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None))];
         let mut commands = Vec::new();
         let mut handles = Vec::new();
-        let mut spawn = |transport: Box<dyn super::Transport>, table_size: Arc<AtomicUsize>, bootstrap: Vec<String>| {
+        let mut spawn = |transport: Box<dyn super::Transport>, table_size: Arc<AtomicUsize>, bootstrap: Vec<String>, address: Arc<Mutex<Option<IpAddr>>>| {
             let (tx, rx) = mpsc::channel();
             commands.push(tx);
             let stop = Arc::clone(&stop);
-            handles.push(thread::spawn(move || run_node(Dht::new(transport), bootstrap, rx, table_size, stop, relookup, budget)));
+            handles.push(thread::spawn(move || run_node(Dht::new(transport), bootstrap, rx, table_size, address, stop, relookup, budget)));
         };
-        spawn(Box::new(transport), Arc::clone(&nodes), bootstrap_nodes.clone());
+        spawn(Box::new(transport), Arc::clone(&nodes), bootstrap_nodes.clone(), Arc::clone(&addresses[0]));
         let mut port6 = None;
         if ipv6 {
             // The IPv6 node prefers the same port number, as peers expect one number to do for both.
             if let Ok(transport6) = UdpTransport::bind_v6(port) {
                 port6 = Some(transport6.local_port());
-                spawn(Box::new(transport6), Arc::clone(&nodes6), bootstrap_nodes);
+                spawn(Box::new(transport6), Arc::clone(&nodes6), bootstrap_nodes, Arc::clone(&addresses[1]));
             }
         }
-        Ok(DhtNode { port, port6, nodes, nodes6, commands, stop, handles: Mutex::new(handles) })
+        Ok(DhtNode { port, port6, nodes, nodes6, addresses, commands, stop, handles: Mutex::new(handles) })
     }
 
     /// Nodes known, over both families.
     pub fn node_count(&self) -> usize {
         self.nodes.load(Ordering::SeqCst) + self.nodes6.load(Ordering::SeqCst)
+    }
+
+    /// The address other DHT nodes agree they see this one at (BEP 42), if they do: the IPv4 one, else the IPv6 one. The node ids are
+    /// made from it once it is known.
+    pub fn external_ip(&self) -> Option<IpAddr> {
+        self.addresses.iter().find_map(|address| *crate::sync::lock(address))
     }
 
     /// Starts looking up `info_hash` and announcing `announce_port` for it. `announce_port` is
@@ -140,7 +149,8 @@ struct Tracked {
 
 /// One DHT node, of whichever family its transport is, on a thread of its own: it serves the
 /// network, and between times looks up and announces each torrent it has been given.
-fn run_node<T: super::Transport>(mut dht: Dht<T>, bootstrap: Vec<String>, commands: mpsc::Receiver<Command>, table_size: Arc<AtomicUsize>, stop: Arc<AtomicBool>, relookup: Duration, budget: Duration) {
+#[allow(clippy::too_many_arguments)]
+fn run_node<T: super::Transport>(mut dht: Dht<T>, bootstrap: Vec<String>, commands: mpsc::Receiver<Command>, table_size: Arc<AtomicUsize>, address: Arc<Mutex<Option<IpAddr>>>, stop: Arc<AtomicBool>, relookup: Duration, budget: Duration) {
     dht.bootstrap(&bootstrap, &stop);
     table_size.store(dht.table_len(), Ordering::SeqCst);
     let mut torrents: Vec<Tracked> = Vec::new();
@@ -182,6 +192,7 @@ fn run_node<T: super::Transport>(mut dht: Dht<T>, bootstrap: Vec<String>, comman
         }
 
         table_size.store(dht.table_len(), Ordering::SeqCst);
+        *crate::sync::lock(&address) = dht.external_ip();
         // Serving, until there is something else to do.
         let wait = torrents.iter().map(|t| t.next_lookup.saturating_duration_since(Instant::now())).min().map_or(ANNOUNCE_POLL, |due| due.min(ANNOUNCE_POLL));
         dht.serve_for(wait.max(Duration::from_millis(10)), &stop);
@@ -208,6 +219,11 @@ impl DhtService {
     /// Nodes known, over both families.
     pub fn node_count(&self) -> usize {
         self.nodes.load(Ordering::SeqCst) + self.nodes6.load(Ordering::SeqCst)
+    }
+
+    /// The address other nodes agree they see this one at, if they do (BEP 42).
+    pub fn external_ip(&self) -> Option<IpAddr> {
+        self.node.external_ip()
     }
 
     /// Stops looking up this torrent; and, if the node was made for it alone, ends the node.

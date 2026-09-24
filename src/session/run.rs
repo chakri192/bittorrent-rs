@@ -88,6 +88,8 @@ pub struct Session<'a> {
     fresh_since_announce: usize,
     fruitless_rounds: u32,
     endgame_announced: bool,
+    /// The address the DHT's nodes have told this client it is at, once said in the log.
+    dht_address_told: Option<std::net::IpAddr>,
 }
 
 impl<'a> Session<'a> {
@@ -116,6 +118,7 @@ impl<'a> Session<'a> {
             fresh_since_announce: 0,
             fruitless_rounds: 0,
             endgame_announced: false,
+            dht_address_told: None,
         }
     }
 
@@ -232,6 +235,10 @@ impl<'a> Session<'a> {
                 sink.log(format!("DHT: {} new peer address(es)", dht_fresh));
             }
             self.fresh_since_announce += dht_fresh;
+            if let Some(ip) = dht.external_ip().filter(|ip| self.dht_address_told != Some(*ip)) {
+                self.dht_address_told = Some(ip);
+                sink.log(format!("DHT: other nodes see this client at {}; its node ids are made from that address (BEP 42)", ip));
+            }
         }
         if let Some(lsd) = self.services.lsd() {
             let lsd_fresh: usize = lsd.peers_rx.try_iter().map(|batch| self.pool.add(batch)).sum();

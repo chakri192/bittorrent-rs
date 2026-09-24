@@ -74,7 +74,7 @@ fn krpc_seeds() -> Vec<Vec<u8>> {
         KrpcMessage::Query { t: b"ab".to_vec(), query: Query::FindNode { id, target: [0x33; 20] } }.encode(),
         KrpcMessage::Query { t: b"ac".to_vec(), query: Query::GetPeers { id, info_hash: [0x44; 20] } }.encode(),
         KrpcMessage::Query { t: b"ad".to_vec(), query: Query::AnnouncePeer { id, info_hash: [0x44; 20], port: 6881, token: b"tok".to_vec(), implied_port: true } }.encode(),
-        KrpcMessage::Response { t: b"ae".to_vec(), response: Response { id, nodes: vec![node.clone(), node], values: vec![v4("1.2.3.4:5678")], token: Some(b"tok".to_vec()) } }.encode(),
+        KrpcMessage::Response { t: b"ae".to_vec(), response: Response { id, nodes: vec![node.clone(), node], values: vec![v4("1.2.3.4:5678")], token: Some(b"tok".to_vec()), ip: Some(v4("5.6.7.8:9012")) } }.encode(),
         KrpcMessage::Error { t: b"af".to_vec(), code: 203, message: "bad token".to_string() }.encode(),
         // BEP 32: nodes6, and values of both sizes.
         KrpcMessage::Response {
@@ -84,6 +84,7 @@ fn krpc_seeds() -> Vec<Vec<u8>> {
                 nodes: vec![CompactNode { id: [0x33; 20], addr: "[2001:db8::3]:6881".parse().unwrap() }, CompactNode { id: [0x22; 20], addr: v4("10.0.0.2:6881") }],
                 values: vec!["[2001:db8::4]:5678".parse().unwrap(), v4("1.2.3.4:5678")],
                 token: Some(b"tok".to_vec()),
+                ip: Some("[2001:db8::9]:6881".parse().unwrap()),
             },
         }
         .encode(),
