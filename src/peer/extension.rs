@@ -16,6 +16,12 @@ pub const UT_PEX: &str = "ut_pex";
 /// for PEX messages. (ut_metadata's local id is chosen by callers of
 /// `build`; 1 by convention in this codebase.)
 pub const OUR_UT_PEX_ID: u8 = 2;
+/// BEP 55 holepunch.
+pub const UT_HOLEPUNCH: &str = "ut_holepunch";
+/// The id *we* advertise for ut_holepunch -- peers send us `Extended { id: 3 }` for it. Advertised
+/// unconditionally, including on private torrents: unlike PEX/DHT it names no new peer, only helps
+/// two peers the tracker already gave both sides connect to each other.
+pub const OUR_UT_HOLEPUNCH_ID: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExtendedHandshake {
@@ -89,6 +95,10 @@ impl ExtendedHandshake {
         if advertise_pex {
             m.insert(UT_PEX.as_bytes().to_vec(), Bencode::Int(OUR_UT_PEX_ID as i64));
         }
+        // ut_holepunch is always offered, private torrent or not (BEP 27
+        // only restricts peer *discovery*; this only ever names a peer
+        // both sides are already connected to).
+        m.insert(UT_HOLEPUNCH.as_bytes().to_vec(), Bencode::Int(OUR_UT_HOLEPUNCH_ID as i64));
 
         let mut top = BTreeMap::new();
         top.insert(b"m".to_vec(), Bencode::Dict(m));
@@ -155,6 +165,11 @@ impl ExtendedHandshake {
     /// The peer's chosen id for `ut_pex`, if they advertised support.
     pub fn peer_ut_pex_id(&self) -> Option<u8> {
         self.m.get(UT_PEX).copied()
+    }
+
+    /// The peer's chosen id for `ut_holepunch` (BEP 55), if they advertised support.
+    pub fn peer_ut_holepunch_id(&self) -> Option<u8> {
+        self.m.get(UT_HOLEPUNCH).copied()
     }
 }
 
@@ -234,6 +249,26 @@ mod tests {
         let bytes = ExtendedHandshake::build(1, None);
         let parsed = ExtendedHandshake::parse(&bytes).unwrap();
         assert_eq!(parsed.peer_ut_pex_id(), Some(OUR_UT_PEX_ID));
+    }
+
+    #[test]
+    fn build_always_advertises_ut_holepunch_even_with_pex_withheld() {
+        let public = ExtendedHandshake::parse(&ExtendedHandshake::build(1, None)).unwrap();
+        assert_eq!(public.peer_ut_holepunch_id(), Some(OUR_UT_HOLEPUNCH_ID));
+
+        // A private torrent withholds ut_pex but still offers ut_holepunch: it names no new
+        // peer, it only helps peers the tracker already gave both sides reach each other.
+        let private = ExtendedHandshake::parse(&ExtendedHandshake::build_with_pex(1, None, false)).unwrap();
+        assert_eq!(private.peer_ut_holepunch_id(), Some(OUR_UT_HOLEPUNCH_ID));
+        assert_eq!(private.peer_ut_pex_id(), None);
+    }
+
+    #[test]
+    fn a_seeding_handshake_does_not_offer_holepunch() {
+        // build_for_seeding is for connections with nothing to download (serving.rs), which
+        // never react to ut_holepunch, so advertising it there would be a false claim.
+        let seed = ExtendedHandshake::parse(&ExtendedHandshake::build_for_seeding(4, 100, false)).unwrap();
+        assert_eq!(seed.peer_ut_holepunch_id(), None);
     }
 
     #[test]

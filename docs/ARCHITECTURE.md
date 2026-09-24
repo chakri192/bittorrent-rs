@@ -28,6 +28,8 @@ someone about to change the code.
        ▼
   peer/  handshake · wire messages · extensions (BEP 10) · PEX (BEP 11)
          Fast Extension (BEP 6) · message stream encryption · PeerStream
+         holepunch (BEP 55): a peer relays two others past a NAT that
+         blocks a direct connection between them
   utp/   packets · connection (a state machine on an injected clock) · socket
   bencode.rs · torrent.rs   the formats everything above reads
 ```

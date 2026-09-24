@@ -479,8 +479,18 @@ fn heard(datagram: &[u8], from: SocketAddr, info_hash: &[u8; 20], cookie: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     const HASH: [u8; 20] = [0xAB; 20];
+
+    /// The real multicast port (6771) is one number shared by every client on the machine, IPv4 and
+    /// IPv6 groups alike -- by design, so real clients can all hear each other. Two tests in this
+    /// suite each expect to hear *only* their own designated peer on it; run at the same moment (as
+    /// `cargo test`'s default parallelism can do), each also hears the other's announcements and
+    /// fails an assert that was never wrong about the code, only about running alone. Held for the
+    /// span of either of those two tests, never contended by anything else, so this costs nothing
+    /// but rules that crosstalk out.
+    static REAL_MULTICAST_PORT: Mutex<()> = Mutex::new(());
 
     fn host() -> SocketAddr {
         SocketAddr::from((GROUP, PORT))
@@ -722,6 +732,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn two_services_on_the_real_multicast_group_find_each_other() {
+        let _guard = crate::sync::lock(&REAL_MULTICAST_PORT);
         let config = LsdConfig { interval: Duration::from_millis(200), ..LsdConfig::multicast() };
         let (mut a, mut b) = match (LsdService::start(config.clone(), HASH, 1111), LsdService::start(config, HASH, 2222)) {
             (Ok(a), Ok(b)) => (a, b),
@@ -837,6 +848,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_pair_on_the_real_ipv6_group_find_each_other() {
+        let _guard = crate::sync::lock(&REAL_MULTICAST_PORT);
         assert!(LsdConfig::multicast().ipv6, "the real thing wants both families");
         // The IPv4 half of each is inert (a loopback config, `send_to` nobody in particular, as `loopback`'s
         // usual idiom): only `ipv6: true` is exercised, over the real GROUP6, which `bind_v6` always joins

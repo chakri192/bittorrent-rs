@@ -5,12 +5,13 @@ use super::connect::MAX_UNCHOKE_WAIT_TIMEOUTS;
 use super::peer_stats::{Activity, PeerStat};
 use super::pipeline::{depth_for, Throughput};
 use super::messages::{keep_serving, take};
-use super::{is_read_timeout, PexSender, WorkerConfig, WorkerError};
+use super::{is_read_timeout, Holepunch, PexSender, WorkerConfig, WorkerError};
 use crate::serving::Serving;
 use crate::downloader::piece_assembler::{PieceAssembler, PieceWork};
 use crate::downloader::queue::WorkQueue;
 use crate::peer::{Message, PeerState, PeerStream};
 use std::collections::{HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::time::Instant;
 
 /// How a piece download ended, short of the connection failing.
@@ -87,6 +88,8 @@ pub(super) fn download_one_piece(
     config: &WorkerConfig,
     meter: Meter,
     pex_tx: Option<&PexSender>,
+    peer_addr: SocketAddr,
+    holepunch: &mut Holepunch,
     serving: &mut Option<Serving>,
 ) -> Result<Downloaded, WorkerError> {
     let (assembler, resumed, in_flight) = match started {
@@ -96,7 +99,7 @@ pub(super) fn download_one_piece(
             (assembler, resumed, Vec::new())
         }
     };
-    let mut link = Link { stream, state, queue, config, meter, pex_tx, refused, ahead, serving };
+    let mut link = Link { stream, state, queue, config, meter, pex_tx, refused, ahead, peer_addr, holepunch, serving };
     match attempt(&mut link, assembler, in_flight)? {
         Attempt::Verified(data) => Ok(Downloaded::Verified(data)),
         Attempt::Abandoned => Ok(Downloaded::Abandoned),
@@ -119,7 +122,7 @@ pub(super) struct Meter<'a> {
 }
 
 /// The connection and the shared things a piece download works with.
-struct Link<'a> {
+struct Link<'a, 'h> {
     stream: &'a mut dyn PeerStream,
     state: &'a mut PeerState,
     queue: &'a WorkQueue,
@@ -130,6 +133,8 @@ struct Link<'a> {
     refused: &'a HashSet<u32>,
     /// The pieces after this one that have been taken, in order.
     ahead: &'a mut VecDeque<Lookahead>,
+    peer_addr: SocketAddr,
+    holepunch: &'a mut Holepunch<'h>,
     /// The upload side of the connection, if the peer may ask for pieces on it.
     serving: &'a mut Option<Serving>,
 }
@@ -144,7 +149,7 @@ enum Attempt {
 
 /// Fetches what `assembler` lacks and checks the result. If the connection
 /// fails first, the blocks that did arrive are left in the queue. `in_flight` is what has been asked for already.
-fn attempt(link: &mut Link, mut assembler: PieceAssembler, in_flight: Vec<(u32, u32)>) -> Result<Attempt, WorkerError> {
+fn attempt(link: &mut Link<'_, '_>, mut assembler: PieceAssembler, in_flight: Vec<(u32, u32)>) -> Result<Attempt, WorkerError> {
     let piece_index = assembler.piece_index();
     match fetch_blocks(link, &mut assembler, in_flight) {
         Ok(Fetched::Complete) => Ok(match assembler.finish() {
@@ -202,8 +207,8 @@ fn salvage_after_failed_write(stream: &mut dyn PeerStream, piece_index: u32, ass
 const MAX_REFUSALS_PER_PIECE: u32 = 8;
 
 /// Requests and receives blocks until `assembler` has them all.
-fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler, mut in_flight: Vec<(u32, u32)>) -> Result<Fetched, WorkerError> {
-    let Link { stream, state, queue, config, meter, pex_tx, refused, ahead, serving } = link;
+fn fetch_blocks(link: &mut Link<'_, '_>, assembler: &mut PieceAssembler, mut in_flight: Vec<(u32, u32)>) -> Result<Fetched, WorkerError> {
+    let Link { stream, state, queue, config, meter, pex_tx, refused, ahead, peer_addr, holepunch, serving } = link;
     let piece_index = assembler.piece_index();
     let mut blocks_received = 0u32;
     // (`in_flight` -- the outstanding (begin, length) requests -- is what we'd need to Cancel (BEP 3) if this piece
@@ -372,7 +377,7 @@ fn fetch_blocks(link: &mut Link, assembler: &mut PieceAssembler, mut in_flight: 
                 // the whole piece on a hash mismatch; drop it instead.
             }
             other => {
-                take(other, state, queue, *pex_tx, serving, &mut **stream)?;
+                take(other, state, queue, *pex_tx, config, *peer_addr, serving, holepunch, &mut **stream)?;
             }
         }
     }

@@ -182,6 +182,7 @@ impl Workers {
     /// nothing left to dial or fetch.
     pub fn spawn_peers(&mut self, pool: &mut PeerPool, now: Instant) {
         self.take_adopted();
+        self.spawn_holepunch_dials();
         while self.peers.len() < self.max_peers && !self.queue.is_empty() {
             let Some(addr) = pool.next_to_dial(now) else { break };
             let (queue, spans, config) = (Arc::clone(&self.queue), Arc::clone(&self.spans), Arc::clone(&self.config));
@@ -193,6 +194,50 @@ impl Workers {
                 let result = run_worker(addr, &config, &queue, &spans, piece_length, &tx, pex_tx.as_ref());
                 if let Err(e) = &result {
                     log(format!("peer {} disconnected: {:?}", addr, e));
+                    if let WorkerError::Connection { stage: "write_piece_to_disk", error } = e {
+                        lock(&disk_failure).get_or_insert(error.to_string());
+                    }
+                }
+                let outcome = classify(&result);
+                // BEP 55: a peer we could not reach directly may still be reachable through a
+                // connection we already have -- ask any one of them, if any advertised the
+                // extension, to introduce us. Best-effort: nothing is lost if none can.
+                if outcome == Outcome::Unreachable {
+                    if let Some(relay) = config.holepunch.any_supporting(addr) {
+                        config.holepunch.relay(relay, crate::peer::HolepunchMessage::Rendezvous { target: addr });
+                    }
+                }
+                let _ = outcomes.send((addr, outcome));
+            }));
+        }
+    }
+
+    /// Starts a worker, over uTP specifically, for every address a BEP 55 `connect` message has
+    /// named since the last call (see [`crate::peer::holepunch`]): the peer or address family may
+    /// have no matching uTP socket, in which case that target is silently given up on, consistent
+    /// with the rest of this client's best-effort treatment of uTP. Held to the same `max_peers`
+    /// cap as [`Self::spawn_peers`], since a swarm that keeps sending `connect` should not be able
+    /// to grow the connection count past it.
+    pub fn spawn_holepunch_dials(&mut self) {
+        for addr in self.config.holepunch.take_dial_targets() {
+            if self.peers.len() >= self.max_peers {
+                continue; // dropped, not queued: a reactive dial that comes too late is stale anyway
+            }
+            let socket = match addr {
+                SocketAddr::V4(_) => self.config.transport.utp.clone(),
+                SocketAddr::V6(_) => self.config.utp6.clone(),
+            };
+            let Some(socket) = socket else { continue };
+            let transport = crate::peer::Transport { mode: crate::peer::TransportMode::Utp, utp: Some(socket) };
+            let (queue, spans, config) = (Arc::clone(&self.queue), Arc::clone(&self.spans), Arc::clone(&self.config));
+            let (tx, pex_tx, log) = (self.results_tx.clone(), self.pex_tx.clone(), Arc::clone(&self.log));
+            let outcomes = self.outcomes_tx.clone();
+            let disk_failure = Arc::clone(&self.disk_failure);
+            let piece_length = self.piece_length;
+            self.peers.push(thread::spawn(move || {
+                let result = crate::downloader::run_worker_via(addr, &transport, &config, &queue, &spans, piece_length, &tx, pex_tx.as_ref());
+                if let Err(e) = &result {
+                    log(format!("peer {} (holepunch) disconnected: {:?}", addr, e));
                     if let WorkerError::Connection { stage: "write_piece_to_disk", error } = e {
                         lock(&disk_failure).get_or_insert(error.to_string());
                     }
@@ -301,7 +346,7 @@ mod tests {
     }
 
     fn workers(queue: Arc<WorkQueue>, max_peers: usize, private: bool, log: Log) -> Workers {
-        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None });
+        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None });
         Workers::new(queue, Arc::new(Vec::new()), config, 16, max_peers, private, log)
     }
 
@@ -311,6 +356,100 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {}", what);
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn holepunch_dials_with_no_matching_utp_socket_are_dropped_silently() {
+        let (log, _) = recording_log();
+        let mut w = workers(queue_with(1), 4, false, log);
+        w.config().holepunch.request_dial(dead_addr()); // no uTP socket configured at all
+        w.spawn_holepunch_dials();
+        assert_eq!(w.active_peers(), 0, "nothing to dial with, so nothing was spawned");
+        w.shutdown();
+    }
+
+    #[test]
+    fn holepunch_dials_respect_the_max_peers_cap() {
+        let (log, _) = recording_log();
+        let mut w = workers(queue_with(1), 1, false, log);
+        let mut pool = PeerPool::new(true);
+        pool.add([dead_addr()]);
+        w.spawn_peers(&mut pool, Instant::now()); // fills the one slot
+        assert_eq!(w.active_peers(), 1);
+
+        w.config().holepunch.request_dial(dead_addr());
+        w.spawn_holepunch_dials();
+
+        assert_eq!(w.active_peers(), 1, "the cap held: the reactive dial was dropped, not queued");
+        w.shutdown();
+    }
+
+    #[test]
+    fn a_holepunch_dial_with_a_real_matching_socket_is_still_capped() {
+        use crate::utp::UtpSocket;
+        let v4_server = Arc::new(UtpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap());
+        v4_server.listen();
+        let v4_addr = SocketAddr::from(([127, 0, 0, 1], v4_server.local_addr().unwrap().port()));
+        let v4_client = Arc::new(UtpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap());
+
+        let (log, _) = recording_log();
+        let config = Arc::new(WorkerConfig {
+            info_hash: [1; 20],
+            our_peer_id: [2; 20],
+            pipeline_depth: 5,
+            connect_timeout: Duration::from_secs(2),
+            down_limit: None,
+            interrupt: Default::default(),
+            peers: Default::default(),
+            encryption: Default::default(),
+            transport: crate::peer::Transport { mode: crate::peer::TransportMode::Utp, utp: Some(v4_client) },
+            upload: None,
+            holepunch: Default::default(),
+            utp6: None,
+        });
+        let mut w = Workers::new(queue_with(1), Arc::new(Vec::new()), config, 16, 1, false, log);
+        let mut pool = PeerPool::new(true);
+        pool.add([dead_addr()]);
+        w.spawn_peers(&mut pool, Instant::now()); // fills the one slot
+        assert_eq!(w.active_peers(), 1);
+
+        w.config().holepunch.request_dial(v4_addr);
+        w.spawn_holepunch_dials();
+
+        assert!(v4_server.accept(Duration::from_millis(300)).is_none(), "a socket existed for it, but the cap still held");
+        w.shutdown();
+    }
+
+    #[test]
+    fn holepunch_dials_pick_the_utp_socket_matching_the_targets_family() {
+        use crate::utp::UtpSocket;
+        let v4_server = Arc::new(UtpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap());
+        v4_server.listen();
+        let v4_addr = SocketAddr::from(([127, 0, 0, 1], v4_server.local_addr().unwrap().port()));
+        let v4_client = Arc::new(UtpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap());
+
+        let (log, _) = recording_log();
+        let config = Arc::new(WorkerConfig {
+            info_hash: [1; 20],
+            our_peer_id: [2; 20],
+            pipeline_depth: 5,
+            connect_timeout: Duration::from_secs(2),
+            down_limit: None,
+            interrupt: Default::default(),
+            peers: Default::default(),
+            encryption: Default::default(),
+            transport: crate::peer::Transport { mode: crate::peer::TransportMode::Utp, utp: Some(v4_client) },
+            upload: None,
+            holepunch: Default::default(),
+            utp6: None,
+        });
+        let mut w = Workers::new(queue_with(1), Arc::new(Vec::new()), config, 16, 4, false, log);
+
+        w.config().holepunch.request_dial(v4_addr);
+        w.spawn_holepunch_dials();
+
+        assert!(v4_server.accept(Duration::from_secs(5)).is_some(), "the v4 target was dialed on the v4 socket");
+        w.shutdown();
     }
 
     #[test]
@@ -449,6 +588,39 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_dialed_unreachable_is_asked_of_a_holepunch_capable_connection() {
+        let (log, _) = recording_log();
+        let mut w = workers(queue_with(1), 1, false, log);
+        let relay: SocketAddr = "10.9.9.9:1".parse().unwrap();
+        let config = Arc::clone(w.config());
+        let (entry, rx) = config.holepunch.enter(relay);
+        entry.supports.store(true, Ordering::Relaxed);
+
+        let mut pool = PeerPool::new(true);
+        let target = dead_addr();
+        pool.add([target]);
+        w.spawn_peers(&mut pool, Instant::now());
+        wait_until("the dial to fail and a rendezvous to be relayed", || rx.try_recv().is_ok_and(|m| m == crate::peer::HolepunchMessage::Rendezvous { target }));
+        drop(entry);
+    }
+
+    #[test]
+    fn a_peer_dialed_unreachable_with_nobody_capable_connected_asks_no_one_and_still_reports_its_outcome() {
+        let (log, _) = recording_log();
+        let mut w = workers(queue_with(1), 1, false, log);
+        let mut pool = PeerPool::new(true);
+        let target = dead_addr();
+        pool.add([target]);
+        w.spawn_peers(&mut pool, Instant::now());
+        let mut outcomes = Vec::new();
+        wait_until("the worker to report", || {
+            outcomes.extend(w.take_outcomes());
+            !outcomes.is_empty()
+        });
+        assert_eq!(outcomes, vec![(target, Outcome::Unreachable)], "the relay lookup finding nobody does not change the outcome reported");
+    }
+
+    #[test]
     fn a_web_seed_that_cannot_write_to_disk_is_reported_as_a_disk_failure() {
         use crate::downloader::build_file_spans;
         use crate::webseed::mirror::{spawn_mirror, Mode};
@@ -463,7 +635,7 @@ mod tests {
         let queue = Arc::new(WorkQueue::new(work, 3));
         let files = vec![(vec!["file.bin".to_string()], 3000i64)];
         let spans = Arc::new(build_file_spans(&dir, &files));
-        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None });
+        let config = Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None });
         let (log, _) = recording_log();
         let mut w = Workers::new(queue, spans, config, 1024, 1, false, log);
         assert_eq!(w.disk_failure(), None, "nothing has failed yet");
@@ -479,7 +651,7 @@ mod tests {
     const LOCAL: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
     fn adoptions_for(pieces: usize, max: usize) -> (Workers, Arc<dyn Adopter>) {
-        let workers = Workers::new(queue_with(pieces), Arc::new(Vec::new()), Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None }), 16, max, false, recording_log().0);
+        let workers = Workers::new(queue_with(pieces), Arc::new(Vec::new()), Arc::new(WorkerConfig { info_hash: [1; 20], our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None }), 16, max, false, recording_log().0);
         let adopter = workers.adopter();
         (workers, adopter)
     }
@@ -545,7 +717,7 @@ mod tests {
         let mut seeder = crate::seeder::start(0, info_hash, [7; 20], Arc::clone(&spans), 16384, 16384, have, None).unwrap();
         let hash: [u8; 20] = sha1::Sha1::digest(&good).into();
         let queue = Arc::new(WorkQueue::new(vec![PieceWork { index: 0, hash, length: 16384, merkle: None }], 1));
-        let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [2; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: Some(seeder.upload()) });
+        let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [2; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: Some(seeder.upload()) , holepunch: Default::default(), utp6: None });
         let mut workers = Workers::new(Arc::clone(&queue), spans, config, 16384, 4, false, recording_log().0);
         seeder.set_adopter(Some(workers.adopter()));
 
