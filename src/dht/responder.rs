@@ -3,10 +3,23 @@
 
 use super::krpc::{KrpcMessage, Query, Response};
 use super::routing::K;
+use super::store::PutError;
 use super::{Dht, Transport, RECV_TICK};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// The BEP 44 error code a rejected `put` is reported under.
+fn put_error_code(e: PutError) -> (i64, &'static str) {
+    match e {
+        PutError::ValueTooLarge => (205, "message (v field) too big"),
+        PutError::SaltTooLarge => (207, "salt (salt field) too big"),
+        PutError::BadSignature => (206, "invalid signature"),
+        PutError::CasMismatch => (301, "the CAS hash mismatched, re-read value and try again"),
+        PutError::SequenceTooLow => (302, "sequence number less than current"),
+        PutError::StoreFull => (201, "generic error: no room to store any more items"),
+    }
+}
 
 /// Peers remembered per info-hash. This client is a downloader first, a
 /// storage node second.
@@ -59,6 +72,48 @@ impl<T: Transport> Dht<T> {
                             }
                         }
                         Response { id: self.node_id, ..Default::default() }
+                    }
+                    Query::Get { target, seq, .. } => {
+                        let token = Some(self.tokens.issue(&from.ip()));
+                        match self.item_store.get(target, Instant::now()) {
+                            Some(item) => {
+                                // BEP 44: if the requester already has this sequence number or
+                                // newer, the value/key/signature are left out -- only worth
+                                // sending when it would tell them something new.
+                                let stale_to_them = matches!((item.mutable, seq), (Some((_, item_seq, _)), Some(their_seq)) if item_seq <= *their_seq);
+                                if stale_to_them {
+                                    Response { id: self.node_id, token, ..Default::default() }
+                                } else {
+                                    let (k, seq, sig) = match item.mutable {
+                                        Some((k, seq, sig)) => (Some(k), Some(seq), Some(sig)),
+                                        None => (None, None, None),
+                                    };
+                                    Response { id: self.node_id, token, v: Some(item.v), k, seq, sig, ..Default::default() }
+                                }
+                            }
+                            None => Response { id: self.node_id, token, nodes: self.table.closest(target, K), ..Default::default() },
+                        }
+                    }
+                    Query::Put { token, item, .. } => {
+                        if !self.tokens.accepts(&from.ip(), token) {
+                            let err = KrpcMessage::Error { t, code: 203, message: "bad token".to_string() };
+                            let _ = self.transport.send_to(&err.encode(), from);
+                            return None;
+                        }
+                        let now = Instant::now();
+                        let stored = match &item.mutable {
+                            None => self.item_store.put_immutable(item.v.clone(), now),
+                            Some(m) => self.item_store.put_mutable(m.k, m.salt.clone(), m.seq, m.sig, item.v.clone(), m.cas, now),
+                        };
+                        match stored {
+                            Ok(_) => Response { id: self.node_id, ..Default::default() },
+                            Err(e) => {
+                                let (code, message) = put_error_code(e);
+                                let err = KrpcMessage::Error { t, code, message: message.to_string() };
+                                let _ = self.transport.send_to(&err.encode(), from);
+                                return None;
+                            }
+                        }
                     }
                 };
                 let _ = self.transport.send_to(&KrpcMessage::Response { t, response: reply }.encode(), from);
@@ -416,5 +471,206 @@ mod tests {
         let mut dht = Dht::new(&transport);
         let token = harvest_token(&mut dht, &transport, v6("[2001:db8::5]:7000"), [0x77; 20]);
         assert!(!announce_accepted(&mut dht, &transport, v6("[2001:db8::6]:7000"), [0x77; 20], token), "bound to the requester's IPv6 address");
+    }
+
+    // ---- BEP 44: get / put ----
+
+    use super::super::krpc::{MutableFields, PutItem};
+    use super::super::store::{immutable_target, mutable_target, sign_mutable};
+    use crate::bencode::Bencode;
+    use ed25519_dalek::SigningKey;
+
+    /// Sends `get` for `target` from `asker` and returns the token in the reply.
+    fn harvest_get_token(dht: &mut Dht<&MockTransport>, transport: &MockTransport, asker: SocketAddr, target: [u8; 20]) -> Vec<u8> {
+        let stop = AtomicBool::new(false);
+        let q = KrpcMessage::Query { t: b"g".to_vec(), query: Query::Get { id: [0x02; 20], target, seq: None } };
+        transport.push_inbound(q.encode(), asker);
+        dht.serve_for(Duration::from_millis(1), &stop);
+        match KrpcMessage::decode(transport.sent_to(asker).last().unwrap()).unwrap() {
+            KrpcMessage::Response { response, .. } => response.token.expect("get response must carry a token"),
+            other => panic!("expected response, got {:?}", other),
+        }
+    }
+
+    fn immutable_put(dht: &mut Dht<&MockTransport>, transport: &MockTransport, asker: SocketAddr, token: Vec<u8>, v: Bencode) -> Response {
+        let stop = AtomicBool::new(false);
+        let q = KrpcMessage::Query { t: b"p".to_vec(), query: Query::Put { id: [0x02; 20], token, item: PutItem { v, mutable: None } } };
+        transport.push_inbound(q.encode(), asker);
+        dht.serve_for(Duration::from_millis(1), &stop);
+        match KrpcMessage::decode(transport.sent_to(asker).last().unwrap()).unwrap() {
+            KrpcMessage::Response { response, .. } => response,
+            other => panic!("expected response, got {:?}", other),
+        }
+    }
+
+    fn get(dht: &mut Dht<&MockTransport>, transport: &MockTransport, asker: SocketAddr, target: [u8; 20], seq: Option<i64>) -> Response {
+        let stop = AtomicBool::new(false);
+        let q = KrpcMessage::Query { t: b"g2".to_vec(), query: Query::Get { id: [0x03; 20], target, seq } };
+        transport.push_inbound(q.encode(), asker);
+        dht.serve_for(Duration::from_millis(1), &stop);
+        match KrpcMessage::decode(transport.sent_to(asker).last().unwrap()).unwrap() {
+            KrpcMessage::Response { response, .. } => response,
+            other => panic!("expected response, got {:?}", other),
+        }
+    }
+
+    fn error_code(dht: &mut Dht<&MockTransport>, transport: &MockTransport, asker: SocketAddr, msg: Vec<u8>) -> i64 {
+        let stop = AtomicBool::new(false);
+        transport.push_inbound(msg, asker);
+        dht.serve_for(Duration::from_millis(1), &stop);
+        match KrpcMessage::decode(transport.sent_to(asker).last().unwrap()).unwrap() {
+            KrpcMessage::Error { code, .. } => code,
+            other => panic!("expected an error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_get_for_something_not_stored_gets_a_token_and_nodes_not_a_value() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let asker = v4("10.5.5.5:7000");
+        let response = get(&mut dht, &transport, asker, [0x77; 20], None);
+        assert!(response.token.is_some());
+        assert!(response.v.is_none());
+    }
+
+    #[test]
+    fn an_immutable_item_is_stored_by_put_and_returned_by_a_later_get() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let value = Bencode::Bytes(b"Hello World!".to_vec());
+        let target = immutable_target(&crate::bencode::encode(&value));
+        let asker = v4("10.5.5.5:7000");
+
+        let token = harvest_get_token(&mut dht, &transport, asker, target);
+        let put_response = immutable_put(&mut dht, &transport, asker, token, value.clone());
+        assert_eq!(put_response.id, *dht.node_id());
+
+        let other = v4("10.6.6.6:7001");
+        let got = get(&mut dht, &transport, other, target, None);
+        assert_eq!(got.v, Some(value));
+    }
+
+    #[test]
+    fn a_put_with_a_bad_token_is_refused_with_error_203_and_nothing_is_stored() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let asker = v4("10.5.5.5:7000");
+        let value = Bencode::Bytes(b"x".to_vec());
+        let target = immutable_target(&crate::bencode::encode(&value));
+
+        let q = KrpcMessage::Query { t: b"p".to_vec(), query: Query::Put { id: [0x02; 20], token: b"forged".to_vec(), item: PutItem { v: value, mutable: None } } }.encode();
+        assert_eq!(error_code(&mut dht, &transport, asker, q), 203);
+        assert!(get(&mut dht, &transport, asker, target, None).v.is_none());
+    }
+
+    #[test]
+    fn a_put_larger_than_the_bep_allows_is_refused_with_error_205() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let asker = v4("10.5.5.5:7000");
+        let value = Bencode::Bytes(vec![b'x'; super::super::store::MAX_VALUE_LEN + 1]);
+        let target = immutable_target(&crate::bencode::encode(&value));
+        let token = harvest_get_token(&mut dht, &transport, asker, target);
+
+        let q = KrpcMessage::Query { t: b"p".to_vec(), query: Query::Put { id: [0x02; 20], token, item: PutItem { v: value, mutable: None } } }.encode();
+        assert_eq!(error_code(&mut dht, &transport, asker, q), 205);
+    }
+
+    fn signed_mutable_put(id: [u8; 20], token: Vec<u8>, key: &SigningKey, salt: Option<Vec<u8>>, seq: i64, v: Bencode, cas: Option<i64>) -> KrpcMessage {
+        let bencoded = crate::bencode::encode(&v);
+        let sig = sign_mutable(key, salt.as_deref(), seq, &bencoded);
+        KrpcMessage::Query { t: b"p".to_vec(), query: Query::Put { id, token, item: PutItem { v, mutable: Some(MutableFields { k: key.verifying_key().to_bytes(), salt, seq, sig, cas }) } } }
+    }
+
+    #[test]
+    fn a_mutable_item_is_stored_and_a_later_get_returns_its_key_seq_and_signature() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let key = SigningKey::from_bytes(&[0x33; 32]);
+        let target = mutable_target(&key.verifying_key().to_bytes(), None);
+        let asker = v4("10.5.5.5:7000");
+        let value = Bencode::Bytes(b"v1".to_vec());
+
+        let token = harvest_get_token(&mut dht, &transport, asker, target);
+        let q = signed_mutable_put([0x02; 20], token, &key, None, 1, value.clone(), None).encode();
+        transport.push_inbound(q, asker);
+        dht.serve_for(Duration::from_millis(1), &AtomicBool::new(false));
+
+        let got = get(&mut dht, &transport, v4("10.6.6.6:1"), target, None);
+        assert_eq!(got.v, Some(value));
+        assert_eq!(got.k, Some(key.verifying_key().to_bytes()));
+        assert_eq!(got.seq, Some(1));
+        assert!(got.sig.is_some());
+    }
+
+    #[test]
+    fn a_mutable_put_with_a_bad_signature_is_refused_with_error_206() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let key = SigningKey::from_bytes(&[0x33; 32]);
+        let target = mutable_target(&key.verifying_key().to_bytes(), None);
+        let asker = v4("10.5.5.5:7000");
+        let token = harvest_get_token(&mut dht, &transport, asker, target);
+
+        let mut msg = signed_mutable_put([0x02; 20], token, &key, None, 1, Bencode::Bytes(b"v1".to_vec()), None);
+        if let KrpcMessage::Query { query: Query::Put { item: PutItem { mutable: Some(m), .. }, .. }, .. } = &mut msg {
+            m.sig[0] ^= 0xff;
+        }
+        assert_eq!(error_code(&mut dht, &transport, asker, msg.encode()), 206);
+    }
+
+    #[test]
+    fn a_mutable_put_with_a_lower_seq_than_stored_is_refused_with_error_302() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let key = SigningKey::from_bytes(&[0x33; 32]);
+        let target = mutable_target(&key.verifying_key().to_bytes(), None);
+        let asker = v4("10.5.5.5:7000");
+
+        let token = harvest_get_token(&mut dht, &transport, asker, target);
+        let q1 = signed_mutable_put([0x02; 20], token.clone(), &key, None, 5, Bencode::Bytes(b"v5".to_vec()), None).encode();
+        transport.push_inbound(q1, asker);
+        dht.serve_for(Duration::from_millis(1), &AtomicBool::new(false));
+
+        let q2 = signed_mutable_put([0x02; 20], token, &key, None, 4, Bencode::Bytes(b"v4".to_vec()), None).encode();
+        assert_eq!(error_code(&mut dht, &transport, asker, q2), 302);
+    }
+
+    #[test]
+    fn a_mutable_put_with_a_mismatched_cas_is_refused_with_error_301() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let key = SigningKey::from_bytes(&[0x33; 32]);
+        let target = mutable_target(&key.verifying_key().to_bytes(), None);
+        let asker = v4("10.5.5.5:7000");
+
+        let token = harvest_get_token(&mut dht, &transport, asker, target);
+        let q1 = signed_mutable_put([0x02; 20], token.clone(), &key, None, 1, Bencode::Bytes(b"v1".to_vec()), None).encode();
+        transport.push_inbound(q1, asker);
+        dht.serve_for(Duration::from_millis(1), &AtomicBool::new(false));
+
+        let q2 = signed_mutable_put([0x02; 20], token, &key, None, 2, Bencode::Bytes(b"v2".to_vec()), Some(99)).encode();
+        assert_eq!(error_code(&mut dht, &transport, asker, q2), 301);
+    }
+
+    #[test]
+    fn a_get_with_seq_omits_the_value_when_the_stored_seq_is_no_newer() {
+        let transport = MockTransport::new();
+        let mut dht = Dht::new(&transport);
+        let key = SigningKey::from_bytes(&[0x33; 32]);
+        let target = mutable_target(&key.verifying_key().to_bytes(), None);
+        let asker = v4("10.5.5.5:7000");
+
+        let token = harvest_get_token(&mut dht, &transport, asker, target);
+        let q = signed_mutable_put([0x02; 20], token, &key, None, 5, Bencode::Bytes(b"v5".to_vec()), None).encode();
+        transport.push_inbound(q, asker);
+        dht.serve_for(Duration::from_millis(1), &AtomicBool::new(false));
+
+        let other = v4("10.6.6.6:1");
+        let stale = get(&mut dht, &transport, other, target, Some(5));
+        assert!(stale.v.is_none(), "the requester already has seq 5");
+        let fresh = get(&mut dht, &transport, other, target, Some(4));
+        assert!(fresh.v.is_some(), "seq 5 is newer than what the requester has");
     }
 }

@@ -21,9 +21,13 @@ someone about to change the code.
        ▼               ▼                   ▼                ▼
   downloader/       tracker/ +          dht/             seeder.rs + serving.rs
   one worker        tracker_discovery   Kademlia node    + choker.rs: inbound peers, a
-  thread per peer   HTTP·HTTPS·UDP      (BEP 5)          few unchoked at a time, the
-  (also serves      (redirects followed,                 info dict; hands a peer with
-  what it can)      scrape: BEP 48)                      pieces we lack to a worker
+  thread per peer   HTTP·HTTPS·UDP      (BEP 5), plus    few unchoked at a time, the
+  (also serves      (redirects followed,  dht/store.rs:  info dict; hands a peer with
+  what it can)      scrape: BEP 48)     BEP 44 storage   pieces we lack to a worker
+                                        (immutable and
+                                        mutable items,
+                                        BEP 46's torrent
+                                        pointers on top)
        │
        ▼
   peer/  handshake · wire messages · extensions (BEP 10) · PEX (BEP 11)

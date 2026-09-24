@@ -1,6 +1,7 @@
 //! A scripted in-memory transport shared by the DHT's tests.
 
 use super::krpc::{CompactNode, KrpcMessage, NodeId, Query, Response};
+use super::store::StoredItem;
 use super::Transport;
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -19,12 +20,14 @@ pub(super) struct MockTransport {
     ipv6: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct ScriptedNode {
     pub(super) id: NodeId,
     pub(super) nodes: Vec<CompactNode>,
     pub(super) values: Vec<SocketAddr>,
     pub(super) token: Option<Vec<u8>>,
+    /// What this node answers a BEP 44 `get` with, if scripted for one.
+    pub(super) item: Option<StoredItem>,
 }
 
 impl MockTransport {
@@ -60,8 +63,18 @@ impl Transport for &MockTransport {
         if let Some(node) = self.script.lock().unwrap().get(&addr).cloned() {
             if let Ok(KrpcMessage::Query { t, query }) = KrpcMessage::decode(data) {
                 let response = match query {
-                    Query::GetPeers { .. } => Response { id: node.id, nodes: node.nodes.clone(), values: node.values.clone(), token: node.token.clone() },
+                    Query::GetPeers { .. } => Response { id: node.id, nodes: node.nodes.clone(), values: node.values.clone(), token: node.token.clone(), ..Default::default() },
                     Query::FindNode { .. } => Response { id: node.id, nodes: node.nodes.clone(), ..Default::default() },
+                    Query::Get { .. } => match &node.item {
+                        Some(item) => {
+                            let (k, seq, sig) = match item.mutable {
+                                Some((k, seq, sig)) => (Some(k), Some(seq), Some(sig)),
+                                None => (None, None, None),
+                            };
+                            Response { id: node.id, token: node.token.clone(), v: Some(item.v.clone()), k, seq, sig, ..Default::default() }
+                        }
+                        None => Response { id: node.id, nodes: node.nodes.clone(), token: node.token.clone(), ..Default::default() },
+                    },
                     _ => Response { id: node.id, ..Default::default() },
                 };
                 let reply = KrpcMessage::Response { t, response };

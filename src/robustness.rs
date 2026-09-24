@@ -7,7 +7,7 @@
 //! same thing after being written out and read back.
 
 use crate::bencode::{self, Bencode};
-use crate::dht::krpc::{parse_compact_nodes, CompactNode, KrpcMessage, Query, Response};
+use crate::dht::krpc::{parse_compact_nodes, CompactNode, KrpcMessage, MutableFields, PutItem, Query, Response};
 use crate::downloader::{build_work_queue, PieceAssembler, PieceWork};
 use crate::fuzz::{hammer, Rng};
 use crate::magnet::parse_magnet_uri;
@@ -74,7 +74,7 @@ fn krpc_seeds() -> Vec<Vec<u8>> {
         KrpcMessage::Query { t: b"ab".to_vec(), query: Query::FindNode { id, target: [0x33; 20] } }.encode(),
         KrpcMessage::Query { t: b"ac".to_vec(), query: Query::GetPeers { id, info_hash: [0x44; 20] } }.encode(),
         KrpcMessage::Query { t: b"ad".to_vec(), query: Query::AnnouncePeer { id, info_hash: [0x44; 20], port: 6881, token: b"tok".to_vec(), implied_port: true } }.encode(),
-        KrpcMessage::Response { t: b"ae".to_vec(), response: Response { id, nodes: vec![node.clone(), node], values: vec![v4("1.2.3.4:5678")], token: Some(b"tok".to_vec()) } }.encode(),
+        KrpcMessage::Response { t: b"ae".to_vec(), response: Response { id, nodes: vec![node.clone(), node], values: vec![v4("1.2.3.4:5678")], token: Some(b"tok".to_vec()), ..Default::default() } }.encode(),
         KrpcMessage::Error { t: b"af".to_vec(), code: 203, message: "bad token".to_string() }.encode(),
         // BEP 32: nodes6, and values of both sizes.
         KrpcMessage::Response {
@@ -84,9 +84,19 @@ fn krpc_seeds() -> Vec<Vec<u8>> {
                 nodes: vec![CompactNode { id: [0x33; 20], addr: "[2001:db8::3]:6881".parse().unwrap() }, CompactNode { id: [0x22; 20], addr: v4("10.0.0.2:6881") }],
                 values: vec!["[2001:db8::4]:5678".parse().unwrap(), v4("1.2.3.4:5678")],
                 token: Some(b"tok".to_vec()),
+                ..Default::default()
             },
         }
         .encode(),
+        // BEP 44.
+        KrpcMessage::Query { t: b"ah".to_vec(), query: Query::Get { id, target: [0x55; 20], seq: Some(3) } }.encode(),
+        KrpcMessage::Query { t: b"ai".to_vec(), query: Query::Put { id, token: b"tok".to_vec(), item: PutItem { v: Bencode::Bytes(b"hi".to_vec()), mutable: None } } }.encode(),
+        KrpcMessage::Query {
+            t: b"aj".to_vec(),
+            query: Query::Put { id, token: b"tok".to_vec(), item: PutItem { v: Bencode::Bytes(b"hi".to_vec()), mutable: Some(MutableFields { k: [0x66; 32], salt: Some(b"s".to_vec()), seq: 1, sig: [0x77; 64], cas: Some(0) }) } },
+        }
+        .encode(),
+        KrpcMessage::Response { t: b"ak".to_vec(), response: Response { id, token: Some(b"tok".to_vec()), v: Some(Bencode::Bytes(b"hi".to_vec())), k: Some([0x66; 32]), seq: Some(1), sig: Some([0x77; 64]), ..Default::default() } }.encode(),
     ]
 }
 

@@ -25,6 +25,7 @@
 
 pub mod krpc;
 pub mod routing;
+pub mod store;
 
 mod lookup;
 mod responder;
@@ -70,6 +71,8 @@ pub struct Dht<T: Transport> {
     /// info_hash -> peers other nodes announced to us. Bounded per hash;
     /// this client is a downloader first, storage node second.
     peer_store: HashMap<NodeId, Vec<SocketAddr>>,
+    /// BEP 44 items (immutable and mutable) other nodes have `put` to us.
+    item_store: store::Store,
 }
 
 impl<T: Transport> Dht<T> {
@@ -83,6 +86,7 @@ impl<T: Transport> Dht<T> {
             txid_counter: 0,
             tokens: TokenSecrets::new(Instant::now()),
             peer_store: HashMap::new(),
+            item_store: store::Store::new(),
         }
     }
 
