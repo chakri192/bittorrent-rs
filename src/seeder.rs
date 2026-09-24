@@ -191,13 +191,15 @@ pub struct ListenerOptions {
     pub ipv6: bool,
     /// A uTP socket to take connections on as well as TCP ones (BEP 29).
     pub utp: Option<Arc<crate::utp::UtpSocket>>,
+    /// Its IPv6 counterpart, if there is one (takes inbound uTP connections from IPv6 peers).
+    pub utp6: Option<Arc<crate::utp::UtpSocket>>,
 }
 
 impl Default for ListenerOptions {
     fn default() -> Self {
         // Both kinds are accepted by default: a peer that offers encryption is
         // taken up on it, and one that does not is served all the same.
-        ListenerOptions { encryption: crate::peer::Encryption::Prefer, ipv6: false, utp: None }
+        ListenerOptions { encryption: crate::peer::Encryption::Prefer, ipv6: false, utp: None, utp6: None }
     }
 }
 
@@ -238,8 +240,9 @@ impl Listener {
             threads.push(thread::spawn(move || accept_loop(listener, accepting)));
         }
 
-        // uTP connections, if there is a socket for them: served just as TCP ones are.
-        if let Some(utp) = options.utp.clone() {
+        // uTP connections, if there is a socket for them: served just as TCP ones are. Its IPv6 counterpart, if
+        // there is one, the same way, on a thread of its own.
+        for utp in [options.utp.clone(), options.utp6.clone()].into_iter().flatten() {
             utp.listen();
             let accepting = Arc::clone(&registry);
             threads.push(thread::spawn(move || {
@@ -416,6 +419,8 @@ pub struct SeederOptions {
     pub metadata: Option<Arc<Vec<u8>>>,
     /// A uTP socket to take connections on as well as TCP ones (BEP 29).
     pub utp: Option<Arc<crate::utp::UtpSocket>>,
+    /// Its IPv6 counterpart, if there is one (takes inbound uTP connections from IPv6 peers).
+    pub utp6: Option<Arc<crate::utp::UtpSocket>>,
     /// The length of every piece, where they are not all `piece_length` but for
     /// the last (a v2 torrent, whose pieces never span files).
     pub piece_lengths: Option<Arc<Vec<u32>>>,
@@ -430,7 +435,7 @@ impl Default for SeederOptions {
     fn default() -> Self {
         // Both are accepted by default: a peer that offers encryption is
         // taken up on it, and one that does not is served all the same.
-        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL, encryption: crate::peer::Encryption::Prefer, metadata: None, utp: None, piece_lengths: None, hash_source: None, ipv6: false }
+        SeederOptions { unchoke_slots: DEFAULT_SLOTS, rechoke_interval: RECHOKE_INTERVAL, encryption: crate::peer::Encryption::Prefer, metadata: None, utp: None, utp6: None, piece_lengths: None, hash_source: None, ipv6: false }
     }
 }
 
@@ -462,7 +467,7 @@ pub fn start_with(
     options: SeederOptions,
 ) -> std::io::Result<SeederHandle> {
     // One listener, for this torrent alone: it goes when the torrent's seeder does.
-    let listener = Listener::start(preferred_port, ListenerOptions { encryption: options.encryption, ipv6: options.ipv6, utp: options.utp.clone() })?;
+    let listener = Listener::start(preferred_port, ListenerOptions { encryption: options.encryption, ipv6: options.ipv6, utp: options.utp.clone(), utp6: options.utp6.clone() })?;
     let mut handle = listener.register(info_hash, our_peer_id, spans, piece_length, total_length, have, up_limit, options);
     handle.owned = Some(listener);
     Ok(handle)
@@ -810,6 +815,51 @@ mod tests {
         };
         assert_eq!(block, pieces[1]);
         assert!(seeder.uploaded.load(Ordering::SeqCst) >= 256, "and it counts what it served");
+        drop(stream);
+        seeder.stop();
+    }
+
+    #[test]
+    fn a_peer_can_leech_from_the_seeder_over_utp_on_ipv6() {
+        use crate::utp::UtpSocket;
+        if std::net::UdpSocket::bind("[::1]:0").is_err() {
+            eprintln!("no IPv6 here; skipped");
+            return;
+        }
+        let dir = tmp_dir("utp6");
+        let pieces = [vec![0x44u8; 256], vec![0x55u8; 100]];
+        let total: i64 = pieces.iter().map(|p| p.len() as i64).sum();
+        let spans = Arc::new(build_file_spans(&dir, &[(vec!["seed6.bin".to_string()], total)]));
+        for (i, p) in pieces.iter().enumerate() {
+            write_piece(&spans, i as u32, 256, p).unwrap();
+        }
+        let have = Arc::new(HaveMap::new(2));
+        (0..2).for_each(|i| have.set(i));
+        let info_hash = [0x68; 20];
+        let socket6 = Arc::new(UtpSocket::bind(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0))).unwrap());
+        // No IPv4 uTP socket at all -- the IPv6 one alone still takes inbound connections.
+        let options = SeederOptions { utp6: Some(Arc::clone(&socket6)), ..Default::default() };
+        let mut seeder = start_with(0, info_hash, [0x22; 20], spans, 256, total as u64, have, None, options).unwrap();
+
+        let leech = Arc::new(UtpSocket::bind(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0))).unwrap());
+        let mut stream = leech.connect(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, socket6.local_addr().unwrap().port())), Duration::from_secs(5)).expect("the seeder takes uTP connections over IPv6");
+        crate::peer::PeerStream::set_read_timeout(&stream, Some(Duration::from_secs(5))).unwrap();
+        stream.write_all(&Handshake::new(info_hash, [0x23; 20], false).to_bytes()).unwrap();
+        let mut hs = [0u8; HANDSHAKE_LEN];
+        stream.read_exact(&mut hs).unwrap();
+        assert_eq!(Handshake::from_bytes(&hs).unwrap().info_hash, info_hash);
+        Message::Interested.write_to(&mut stream).unwrap();
+        let mut unchoked = false;
+        while !unchoked {
+            unchoked = matches!(Message::read_from(&mut stream).unwrap(), Message::Unchoke);
+        }
+        Message::Request { index: 0, begin: 0, length: 256 }.write_to(&mut stream).unwrap();
+        let block = loop {
+            if let Message::Piece { index: 0, block, .. } = Message::read_from(&mut stream).unwrap() {
+                break block;
+            }
+        };
+        assert_eq!(block, pieces[0]);
         drop(stream);
         seeder.stop();
     }

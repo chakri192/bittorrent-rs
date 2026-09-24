@@ -107,7 +107,7 @@ fn run_worker_downloads_all_pieces_from_mock_peer_and_writes_to_disk() {
     let spans = Arc::new(build_file_spans(&dir, &files));
 
     let (tx, rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     run_worker(addr, &config, &queue, &spans, 16384, &tx, None).unwrap();
     mock.join().unwrap();
@@ -146,7 +146,7 @@ fn run_worker_survives_a_peer_that_unchokes_slower_than_the_read_timeout() {
     let files = vec![(vec!["out.bin".to_string()], 16384i64)];
     let spans = Arc::new(build_file_spans(&dir, &files));
     let (tx, rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     run_worker(addr, &config, &queue, &spans, 16384, &tx, None).unwrap();
     mock.join().unwrap();
@@ -180,7 +180,7 @@ fn run_worker_gives_up_on_a_peer_that_never_unchokes() {
     let files = vec![(vec!["out.bin".to_string()], 100i64)];
     let spans = Arc::new(build_file_spans(&dir, &files));
     let (tx, _rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     let result = run_worker(addr, &config, &queue, &spans, 100, &tx, None);
     assert!(matches!(result, Err(WorkerError::Connection { stage: "peer_never_unchoked", .. })), "expected bounded give-up, got: {:?}", result);
@@ -219,7 +219,7 @@ fn run_worker_gives_up_on_peer_with_no_needed_pieces_instead_of_hanging() {
     // Short connect_timeout also governs the per-read timeout on the
     // stream, so this test doesn't take anywhere near 8 real seconds
     // despite the mock peer sleeping that long.
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     let result = run_worker(addr, &config, &queue, &spans, 100, &tx, None);
     assert!(matches!(result, Err(WorkerError::Connection { stage: "peer_has_no_needed_pieces", .. })), "expected bounded give-up, got: {:?}", result);
@@ -247,7 +247,7 @@ fn run_worker_requeues_piece_on_hash_mismatch_and_stops() {
     let spans = Arc::new(build_file_spans(&dir, &files));
 
     let (tx, _rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x22; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x22; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     let result = run_worker(addr, &config, &queue, &spans, 16384, &tx, None);
     assert!(matches!(result, Err(WorkerError::PieceHashMismatch)));
@@ -320,7 +320,7 @@ fn worker_reports_pex_peers_from_a_pex_sending_peer() {
     let spans = Arc::new(build_file_spans(&dir, &files));
     let (tx, _rx) = mpsc::channel();
     let (pex_tx, pex_rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     run_worker(addr, &config, &queue, &spans, 16384, &tx, Some(&pex_tx)).unwrap();
     let _ = mock.join();
@@ -345,7 +345,7 @@ fn a_download_limit_slows_the_worker_but_not_what_it_downloads() {
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 32768i64)]));
     let (tx, rx) = mpsc::channel();
     let limiter = Arc::new(crate::ratelimit::RateLimiter::new(20_000));
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: Some(limiter), interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: Some(limiter), interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     let started = std::time::Instant::now();
     run_worker(addr, &config, &queue, &spans, 16384, &tx, None).unwrap();
@@ -456,7 +456,7 @@ fn a_worker_waiting_on_a_silent_peer_stops_when_interrupted() {
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 16384i64)]));
     let (tx, _rx) = mpsc::channel();
     // A 30 s read timeout: only the interrupt can end this in time.
-    let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(30), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None });
+    let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(30), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None });
 
     let worker = {
         let (config, queue, spans) = (config.clone(), queue.clone(), spans.clone());
@@ -551,7 +551,7 @@ fn download_from_laggy_peer(name: &str, piece_count: usize, piece_len: usize, la
     let total = (piece_count * piece_len) as i64;
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], total)]));
     let (tx, _rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: min_depth, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: min_depth, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     let started = Instant::now();
     run_worker(addr, &config, &queue, &spans, piece_len as u64, &tx, None).unwrap();
@@ -653,7 +653,7 @@ fn a_peer_with_only_common_pieces_is_given_those_even_while_a_rarer_one_is_still
     let dir = tmp_dir("partial-peer");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 3 * 16384)]));
     let (tx, rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     let result = run_worker(addr, &config, &queue, &spans, 16384, &tx, None);
     peer.join().unwrap();
@@ -682,7 +682,7 @@ fn a_sequential_queue_is_downloaded_in_order_and_a_rarest_first_one_is_not() {
         let dir = tmp_dir(name);
         let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 4 * 16384)]));
         let (tx, rx) = mpsc::channel();
-        let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+        let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
         run_worker(addr, &config, &queue, &spans, 16384, &tx, None).unwrap();
         mock.join().unwrap();
@@ -773,7 +773,7 @@ fn download_through_a_choke(name: &str, serve_before_choke: usize, choked_for: D
     let dir = tmp_dir(name);
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 8 * 16384)]));
     let (tx, rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: read_timeout, down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: read_timeout, down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     let result = run_worker(addr, &config, &queue, &spans, 4 * 16384, &tx, None);
     drop(tx);
@@ -813,7 +813,7 @@ fn a_peer_that_chokes_and_never_unchokes_is_given_up_on_and_the_piece_goes_back(
     let dir = tmp_dir("choked-for-good");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 4 * 16384)]));
     let (tx, _rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     // Run it where a failure to give up shows as a failed test, not a hung one.
     let (done_tx, done_rx) = mpsc::channel();
@@ -841,7 +841,7 @@ fn stopping_does_not_wait_for_a_worker_held_back_by_the_download_limit() {
     let dir = tmp_dir("limit-interrupt");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 16384)]));
     let (tx, _rx) = mpsc::channel();
-    let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: Some(Arc::new(RateLimiter::new(10))), interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None });
+    let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: Some(Arc::new(RateLimiter::new(10))), interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None });
 
     let (done_tx, done_rx) = mpsc::channel();
     let worker_config = Arc::clone(&config);
@@ -931,7 +931,7 @@ fn hand_a_piece_over(name: &str, first_serves: usize, first_fault: Fault, second
     let (tx, rx) = mpsc::channel();
     // Four requests at once, so that whatever the first peer serves is a
     // known prefix of the piece.
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     let run = |hang_up_after: Option<usize>, fault: Fault| {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1009,7 +1009,7 @@ fn a_worker_is_listed_while_it_runs_with_its_bytes_and_removed_when_it_ends() {
     let dir = tmp_dir("peer-table");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 128 * 1024)]));
     let (tx, _rx) = mpsc::channel();
-    let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None });
+    let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None });
 
     let worker = {
         let (config, queue, spans) = (Arc::clone(&config), Arc::clone(&queue), Arc::clone(&spans));
@@ -1046,7 +1046,7 @@ fn a_worker_whose_peer_has_us_choked_is_listed_as_choked() {
     let dir = tmp_dir("peer-table-choked");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], piece.len() as i64)]));
     let (tx, _rx) = mpsc::channel();
-    let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: Duration::from_millis(300), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None });
+    let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: Duration::from_millis(300), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None });
     let worker = {
         let (config, queue, spans) = (Arc::clone(&config), Arc::clone(&queue), Arc::clone(&spans));
         thread::spawn(move || run_worker(addr, &config, &queue, &spans, piece.len() as u64, &tx, None))
@@ -1080,7 +1080,7 @@ fn a_worker_with_nothing_to_fetch_from_its_peer_is_listed_as_idle() {
     let dir = tmp_dir("peer-table-idle");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 32768)]));
     let (tx, _rx) = mpsc::channel();
-    let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: Duration::from_millis(300), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None });
+    let config = Arc::new(WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 4, connect_timeout: Duration::from_millis(300), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None });
     let worker = {
         let (config, queue, spans) = (Arc::clone(&config), Arc::clone(&queue), Arc::clone(&spans));
         thread::spawn(move || run_worker(addr, &config, &queue, &spans, 16384, &tx, None))
@@ -1117,7 +1117,7 @@ fn download_with_encryption(name: &str, peer_takes: crate::peer::Encryption, wor
     let dir = tmp_dir(name);
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 32768)]));
     let (tx, rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: worker_uses, transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: worker_uses, transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     let result = run_worker(addr, &config, &queue, &spans, 16384, &tx, None);
     let _ = mock.join();
@@ -1153,7 +1153,7 @@ fn a_worker_that_prefers_encryption_downloads_from_a_peer_that_only_speaks_plain
     let dir = tmp_dir("mse-fallback");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 16384)]));
     let (tx, rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: crate::peer::Encryption::Prefer, transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: crate::peer::Encryption::Prefer, transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     run_worker(addr, &config, &queue, &spans, 16384, &tx, None).expect("fell back to a plain connection");
     plain_peer.join().unwrap();
@@ -1213,7 +1213,7 @@ fn run_fast_worker(name: &str, addr: std::net::SocketAddr, info_hash: [u8; 20], 
     let dir = tmp_dir(name);
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], total as i64)]));
     let (tx, rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth, connect_timeout: Duration::from_millis(100), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
     let result = run_worker(addr, &config, &queue, &spans, piece_length as u64, &tx, None);
     drop(tx);
     (result, queue, rx.try_iter().collect())
@@ -1458,6 +1458,8 @@ fn download_over_utp(name: &str, mode: crate::peer::TransportMode, encryption: c
         encryption,
         transport: crate::peer::Transport { mode, utp: Some(Arc::clone(&client)) },
         upload: None,
+        holepunch: Default::default(),
+        utp6: None,
     };
     let result = run_worker(addr, &config, &queue, &spans, 16384, &tx, None);
     drop(tx);
@@ -1523,7 +1525,7 @@ fn a_worker_downloads_the_pieces_of_a_v2_torrent_and_checks_each_by_its_merkle_t
     let files = vec![(vec!["a".to_string()], 20_000i64), (vec!["b".to_string()], 100)];
     let spans = Arc::new(crate::downloader::file_writer::build_file_spans_aligned(&dir, &files, piece_length as u64));
     let (tx, rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     run_worker(addr, &config, &queue, &spans, piece_length as u64, &tx, None).unwrap();
     mock.join().unwrap();
@@ -1546,7 +1548,7 @@ fn a_v2_piece_that_does_not_come_to_its_root_is_refused_like_a_v1_one_that_fails
     let dir = tmp_dir("v2-worker-bad");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["f".to_string()], 16384)]));
     let (tx, rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     let result = run_worker(addr, &config, &queue, &spans, 16384, &tx, None);
 
@@ -1588,7 +1590,7 @@ fn a_piece_asked_for_ahead_goes_back_to_the_queue_when_the_one_before_it_fails()
     let dir = tmp_dir("ahead-released");
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], 16 * 16384)]));
     let (tx, _rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 16, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 16, connect_timeout: Duration::from_secs(5), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None };
 
     let result = run_worker(addr, &config, &queue, &spans, 4 * 16384, &tx, None);
     drop(config);
@@ -1696,7 +1698,7 @@ fn run_uploading_worker_for(name: &str, addr: std::net::SocketAddr, info_hash: [
     let dir = tmp_dir(name);
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], (pieces.len() * piece_len) as i64)]));
     let (tx, _rx) = mpsc::channel();
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: read_timeout, down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: read_timeout, down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload , holepunch: Default::default(), utp6: None };
     run_worker(addr, &config, &queue, &spans, piece_len as u64, &tx, None)
 }
 
@@ -2022,7 +2024,7 @@ fn adopt_from(name: &str, info_hash: [u8; 20], pieces: &[Vec<u8>], have: &[u32],
     let queue = Arc::new(WorkQueue::new(work, pieces.len()));
     let dir = tmp_dir(&format!("{}-out", name));
     let spans = Arc::new(build_file_spans(&dir, &[(vec!["out.bin".to_string()], (pieces.len() * piece_len) as i64)]));
-    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: read_timeout, down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: Some(upload) };
+    let config = WorkerConfig { info_hash, our_peer_id: [0x11; 20], pipeline_depth: 2, connect_timeout: read_timeout, down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: Some(upload) , holepunch: Default::default(), utp6: None };
     let adopted = Adopted { stream: Box::new(ours), serving, peer: theirs.local_addr().unwrap(), their_handshake, peer_has };
     (adopted, theirs, seeder, queue, spans, config)
 }
@@ -2122,5 +2124,63 @@ fn an_adopted_connection_that_fails_is_over() {
     assert!(matches!(outcome, Adoption::Ended(Err(_))), "nothing to serve on");
     assert_eq!(queue.len(), 1, "the piece is back for another peer");
     seeder.stop();
+}
+
+// ---- BEP 55: relay_pending_holepunch (the delivery side of the hub) ----
+
+fn tcp_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    client.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    server.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    (client, server)
+}
+
+#[test]
+fn a_message_queued_before_the_peers_id_is_known_is_kept_for_a_later_pass() {
+    let hub = HolepunchHub::default();
+    let addr: SocketAddr = "10.0.0.1:1".parse().unwrap();
+    let (entry, rx) = hub.enter(addr);
+    entry.supports.store(true, std::sync::atomic::Ordering::Relaxed);
+    let target: SocketAddr = "10.0.0.2:2".parse().unwrap();
+    assert!(hub.relay(addr, crate::peer::HolepunchMessage::Connect { endpoint: target }));
+
+    // `their_id` built as still unknown: in practice it and `supports` are always set together on
+    // the owning connection's own thread (see `absorb`'s doc comment), but `relay_pending_holepunch`
+    // must not lose the message even in this defensive, otherwise-unreachable state.
+    let mut holepunch = Holepunch { their_id: None, supports: entry.supports.clone(), rx, _entry: entry };
+    let (mut client, mut server) = tcp_pair();
+    relay_pending_holepunch(&mut client, &mut holepunch).unwrap();
+    client.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut buf = Vec::new();
+    server.read_to_end(&mut buf).unwrap();
+    assert!(buf.is_empty(), "their_id is still unknown, so nothing was sent yet");
+
+    // Once the id becomes known, the same still-queued message gets through.
+    holepunch.their_id = Some(5);
+    let (mut client2, mut server2) = tcp_pair();
+    relay_pending_holepunch(&mut client2, &mut holepunch).unwrap();
+    let WireMessage::Extended { id, payload } = WireMessage::read_from(&mut server2).unwrap() else { panic!("not an extended message") };
+    assert_eq!(id, 5);
+    assert_eq!(crate::peer::HolepunchMessage::decode(&payload).unwrap(), crate::peer::HolepunchMessage::Connect { endpoint: target });
+}
+
+#[test]
+fn a_relayed_message_is_written_to_the_wire_once_the_peers_id_is_known() {
+    let hub = HolepunchHub::default();
+    let addr: SocketAddr = "10.0.0.3:3".parse().unwrap();
+    let (entry, rx) = hub.enter(addr);
+    entry.supports.store(true, std::sync::atomic::Ordering::Relaxed);
+    let target: SocketAddr = "10.0.0.4:4".parse().unwrap();
+    assert!(hub.relay(addr, crate::peer::HolepunchMessage::Connect { endpoint: target }));
+
+    let mut holepunch = Holepunch { their_id: Some(9), supports: entry.supports.clone(), rx, _entry: entry };
+    let (mut client, mut server) = tcp_pair();
+    relay_pending_holepunch(&mut client, &mut holepunch).unwrap();
+
+    let WireMessage::Extended { id, payload } = WireMessage::read_from(&mut server).unwrap() else { panic!("not an extended message") };
+    assert_eq!(id, 9, "tagged with this peer's own chosen id, not ours");
+    assert_eq!(crate::peer::HolepunchMessage::decode(&payload).unwrap(), crate::peer::HolepunchMessage::Connect { endpoint: target });
 }
 

@@ -505,9 +505,10 @@ fn scrape_trackers(args: &Args, ui: &Ui) -> Result<String, String> {
     Ok(text)
 }
 
-/// Whether the DHT gets an IPv6 node (BEP 32): when peers over IPv6 are wanted,
-/// as `--ipv6` and `--no-ipv6` and a probe for a route decide.
-fn dht_ipv6(args: &Args) -> bool {
+/// Whether IPv6 is wanted at all: the DHT node (BEP 32), and uTP's IPv6 socket, both
+/// follow this -- `--ipv6` and `--no-ipv6` decide it outright, and `--ipv6 auto` (the
+/// default) probes for a route.
+fn wants_ipv6(args: &Args) -> bool {
     match args.ipv6 {
         bittorrent_rs::session::Ipv6Mode::Always => true,
         bittorrent_rs::session::Ipv6Mode::Never => false,
@@ -543,10 +544,10 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         let mut magnet = parse_magnet_uri(&args.source).map_err(|e| finish_err(ui, format!("parsing magnet uri: {}", e)))?;
         magnet.peers.extend(args.peers_hint.iter().copied());
         if args.transport.wants_utp() {
-            services.start_utp(args.port, |m| ui.log(m));
+            services.start_utp(args.port, wants_ipv6(&args), |m| ui.log(m));
         }
         if !args.no_dht {
-            services.start_dht(args.port, magnet.info_hash, dht_ipv6(&args), dht_bootstrap(), |m| ui.log(m));
+            services.start_dht(args.port, magnet.info_hash, wants_ipv6(&args), dht_bootstrap(), |m| ui.log(m));
         }
         if magnet.trackers.is_empty() && magnet.peers.is_empty() && services.dht().is_none() {
             return Err(finish_err(ui, "magnet link has no trackers or peers and DHT is disabled (--no-dht) -- no way to find any peer".to_string()));
@@ -571,10 +572,10 @@ fn orchestrate(args: Args, ui: &Ui, stop: &AtomicBool) -> Result<String, String>
         // A `.torrent` already carries the file list, so `--list` needs no
         // network at all.
         if args.transport.wants_utp() && !args.list && !args.verify {
-            services.start_utp(args.port, |m| ui.log(m));
+            services.start_utp(args.port, wants_ipv6(&args), |m| ui.log(m));
         }
         if !args.no_dht && !args.list && !args.verify && !torrent.private {
-            services.start_dht(args.port, torrent.info_hash, dht_ipv6(&args), dht_bootstrap(), |m| ui.log(m));
+            services.start_dht(args.port, torrent.info_hash, wants_ipv6(&args), dht_bootstrap(), |m| ui.log(m));
         }
         (torrent, args.peers_hint.clone(), Vec::new())
     };

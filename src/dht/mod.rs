@@ -26,6 +26,7 @@
 pub mod krpc;
 pub mod routing;
 pub mod secure_id;
+pub mod store;
 
 mod lookup;
 mod responder;
@@ -84,6 +85,8 @@ pub struct Dht<T: Transport> {
     external_ip: Option<IpAddr>,
     /// Who has said this node is at which address, until one is believed.
     address_reports: HashMap<IpAddr, HashSet<IpAddr>>,
+    /// BEP 44 items (immutable and mutable) other nodes have `put` to us.
+    item_store: store::Store,
 }
 
 impl<T: Transport> Dht<T> {
@@ -100,6 +103,7 @@ impl<T: Transport> Dht<T> {
             read_only: false,
             external_ip: None,
             address_reports: HashMap::new(),
+            item_store: store::Store::new(),
         }
     }
 

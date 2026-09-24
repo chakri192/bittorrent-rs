@@ -11,6 +11,12 @@ default-run = "download"
 
 [dependencies]
 sha1 = "0.10"
+# Ed25519 signatures for BEP 44 mutable DHT items. The one crypto primitive in this
+# project not hand-rolled from the spec: unlike SHA-1/SHA-256/RC4, getting elliptic-curve
+# signature verification wrong is a real security hazard, not just a correctness bug, so
+# this uses a vetted implementation instead (verified against BEP 44's own published test
+# vectors in src/dht/store.rs, the same way everything hand-rolled here is verified).
+ed25519-dalek = "2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "0.26"
 # Terminal UI for the `download` binary's live dashboard. Pulls in
@@ -32,6 +38,13 @@ ureq = "2"
 # Signal handling on Unix (already in the tree via sha1 and crossterm).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# hazmat's raw_sign lets a test reproduce BEP 44's own published signature test vectors exactly,
+# whose "private key" is given in the pre-expanded (scalar||prefix) form those vectors use rather
+# than the ordinary 32-byte seed `SigningKey` takes; production code never touches this module.
+ed25519-dalek = { version = "2", features = ["hazmat"] }
+sha2 = "0.10"
 
 [lib]
 name = "bittorrent_rs"

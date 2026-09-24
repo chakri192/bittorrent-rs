@@ -144,6 +144,11 @@ impl PeerRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Whether a connection to `addr` is currently registered.
+    pub fn contains(&self, addr: &SocketAddr) -> bool {
+        lock(&self.peers).contains_key(addr)
+    }
 }
 
 #[cfg(test)]
@@ -165,9 +170,12 @@ mod tests {
         let rows = registry.rows(t0);
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].addr.as_str(), rows[0].activity, rows[0].bytes), ("10.0.0.1:6881", "connecting", 0));
+        assert!(registry.contains(&addr(1)));
+        assert!(!registry.contains(&addr(2)));
 
         drop(entry);
         assert!(registry.is_empty(), "the connection ended, so does its row");
+        assert!(!registry.contains(&addr(1)));
     }
 
     #[test]

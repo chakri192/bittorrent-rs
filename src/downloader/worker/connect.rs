@@ -1,10 +1,10 @@
 //! Getting a connection ready to download from.
 
 use super::messages::{keep_serving, take};
-use super::{is_read_timeout, PexSender, Registration, WorkerConfig, WorkerError};
+use super::{is_read_timeout, Holepunch, PexSender, Registration, WorkerConfig, WorkerError};
 use crate::serving::Serving;
 use crate::downloader::queue::WorkQueue;
-use crate::peer::{connect_and_handshake_with, ConnectionError, ExtendedHandshake, Message, PeerState, WireError};
+use crate::peer::{connect_and_handshake_with, ConnectionError, ExtendedHandshake, Message, PeerState, Transport, WireError};
 use crate::peer::PeerStream;
 use std::net::SocketAddr;
 
@@ -35,8 +35,13 @@ pub(super) struct Established<'a> {
 /// The connection is registered with the config's interrupt, so stopping
 /// the client can end the wait; the returned [`Registration`] must be kept
 /// as long as the connection is used.
-pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, queue: &WorkQueue, pex_tx: Option<&PexSender>) -> Result<Established<'a>, WorkerError> {
-    let (mut stream, peer_handshake) = connect_and_handshake_with(peer_addr, config.info_hash, config.our_peer_id, true, true, config.connect_timeout, config.encryption, &config.transport)
+///
+/// `transport_override`, when given, is dialed with instead of `config.transport` -- BEP 55's
+/// reactive dial needs uTP specifically, regardless of what `--transport` says for ordinary peers.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, queue: &WorkQueue, pex_tx: Option<&PexSender>, holepunch: &mut Holepunch, transport_override: Option<&Transport>) -> Result<Established<'a>, WorkerError> {
+    let transport = transport_override.unwrap_or(&config.transport);
+    let (mut stream, peer_handshake) = connect_and_handshake_with(peer_addr, config.info_hash, config.our_peer_id, true, true, config.connect_timeout, config.encryption, transport)
         .map_err(|e| WorkerError::Connection { stage: "connect_and_handshake", error: e })?;
 
     // Registered before anything else is read, so that stopping the client
@@ -70,7 +75,7 @@ pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, que
     crate::peer::connection::send_message(&mut stream, &Message::Interested).map_err(|e| WorkerError::Connection { stage: "send_interested", error: e })?;
     state.am_interested = true;
 
-    wait_for_unchoke(&mut *stream, &mut state, queue, pex_tx, &mut serving)?;
+    wait_for_unchoke(&mut *stream, &mut state, queue, pex_tx, config, peer_addr, &mut serving, holepunch)?;
 
     Ok(Established { stream, state, serving, registration })
 }
@@ -88,13 +93,14 @@ pub(super) fn establish<'a>(peer_addr: SocketAddr, config: &'a WorkerConfig, que
 ///
 /// With the Fast Extension the wait can end early: a peer that names a
 /// piece as allowed-fast is one we can start on while still choked.
-pub(super) fn wait_for_unchoke(stream: &mut dyn PeerStream, state: &mut PeerState, queue: &WorkQueue, pex_tx: Option<&PexSender>, serving: &mut Option<Serving>) -> Result<(), WorkerError> {
+#[allow(clippy::too_many_arguments)]
+pub(super) fn wait_for_unchoke(stream: &mut dyn PeerStream, state: &mut PeerState, queue: &WorkQueue, pex_tx: Option<&PexSender>, config: &WorkerConfig, peer_addr: SocketAddr, serving: &mut Option<Serving>, holepunch: &mut Holepunch) -> Result<(), WorkerError> {
     let mut unchoke_timeouts = 0u32;
     while state.peer_choking && !state.has_allowed_pieces() {
         keep_serving(serving, &mut *stream)?;
         match crate::peer::connection::read_message(&mut *stream) {
             Ok(msg) => {
-                take(&msg, state, queue, pex_tx, serving, &mut *stream)?;
+                take(&msg, state, queue, pex_tx, config, peer_addr, serving, holepunch, &mut *stream)?;
             }
             Err(ref e) if is_read_timeout(e) => {
                 unchoke_timeouts += 1;
@@ -129,7 +135,7 @@ mod tests {
     const INFO_HASH: [u8; 20] = [0x42; 20];
 
     fn config() -> WorkerConfig {
-        WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None }
+        WorkerConfig { info_hash: INFO_HASH, our_peer_id: [2; 20], pipeline_depth: 5, connect_timeout: Duration::from_secs(2), down_limit: None, interrupt: Default::default(), peers: Default::default(), encryption: Default::default(), transport: Default::default(), upload: None , holepunch: Default::default(), utp6: None }
     }
 
     fn queue(pieces: usize) -> WorkQueue {
@@ -173,7 +179,8 @@ mod tests {
         });
 
         let config = config();
-        let Established { state, .. } = establish(addr, &config, &queue(1), None).expect("connected and unchoked");
+        let mut holepunch = Holepunch::register(&config.holepunch, addr);
+        let Established { state, .. } = establish(addr, &config, &queue(1), None, &mut holepunch, None).expect("connected and unchoked");
 
         seen_rx.try_recv().expect("the peer received Interested before it unchoked us");
         assert!(!state.peer_choking);
@@ -193,7 +200,8 @@ mod tests {
             thread::sleep(Duration::from_millis(200));
         });
         let config = config();
-        establish(addr, &config, &queue(1), channel.as_ref()).expect("connected and unchoked");
+        let mut holepunch = Holepunch::register(&config.holepunch, addr);
+        establish(addr, &config, &queue(1), channel.as_ref(), &mut holepunch, None).expect("connected and unchoked");
         rx.recv_timeout(Duration::from_secs(2)).expect("the peer saw an extended handshake")
     }
 
@@ -213,7 +221,8 @@ mod tests {
         });
 
         let config = config();
-        let Established { state, .. } = establish(addr, &config, &queue(4), None).unwrap();
+        let mut holepunch = Holepunch::register(&config.holepunch, addr);
+        let Established { state, .. } = establish(addr, &config, &queue(4), None, &mut holepunch, None).unwrap();
 
         assert_eq!(&state.peer_has_pieces[..4], &[false, true, true, false], "the bitfield sent before the unchoke was kept");
     }
@@ -223,7 +232,8 @@ mod tests {
         let addr = fake_peer(false, |_stream| {}); // handshake, then close
 
         let config = config();
-        let err = establish(addr, &config, &queue(1), None).expect_err("no unchoke ever comes");
+        let mut holepunch = Holepunch::register(&config.holepunch, addr);
+        let err = establish(addr, &config, &queue(1), None, &mut holepunch, None).expect_err("no unchoke ever comes");
 
         // Depending on timing the client notices on its write or on its read.
         assert!(matches!(err, WorkerError::Connection { stage, .. } if stage == "wait_for_unchoke" || stage == "send_interested"), "got {:?}", err);
@@ -233,7 +243,8 @@ mod tests {
     fn an_unreachable_peer_fails_at_the_connect_stage() {
         let dead = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         let config = config();
-        let err = establish(dead, &config, &queue(1), None).expect_err("nothing is listening");
+        let mut holepunch = Holepunch::register(&config.holepunch, dead);
+        let err = establish(dead, &config, &queue(1), None, &mut holepunch, None).expect_err("nothing is listening");
         assert!(matches!(err, WorkerError::Connection { stage: "connect_and_handshake", .. }), "got {:?}", err);
     }
 
@@ -247,7 +258,8 @@ mod tests {
         });
 
         let config = config();
-        let Established { state, .. } = establish(addr, &config, &queue(4), None).unwrap();
+        let mut holepunch = Holepunch::register(&config.holepunch, addr);
+        let Established { state, .. } = establish(addr, &config, &queue(4), None, &mut holepunch, None).unwrap();
 
         assert_eq!(state.peer_has_pieces.len(), 4, "the torrent has 4 pieces, whatever the peer claims");
     }

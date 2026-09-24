@@ -11,6 +11,7 @@
 //! are in `tests`.
 
 mod connect;
+mod holepunch_hub;
 mod messages;
 mod piece;
 mod peer_stats;
@@ -21,16 +22,19 @@ mod tests;
 use crate::downloader::file_writer::{write_piece, FileSpan};
 use crate::downloader::queue::{PieceResult, Take, WorkQueue};
 use crate::ratelimit::RateLimiter;
-use crate::peer::{ConnectionError, Message, WireError};
+use crate::peer::{ConnectionError, HolepunchMessage, Message, Transport, WireError};
 use connect::{establish, Established};
+pub use holepunch_hub::HolepunchHub;
+use holepunch_hub::HolepunchEntry;
 use messages::{is_read_timeout, keep_serving, take};
 use piece::{download_one_piece, Downloaded, Lookahead, Meter};
 pub use peer_stats::{Activity, PeerRegistry, PeerRow, PeerStat};
 use pipeline::Throughput;
 use crate::peer::{Closer, PeerStream};
+use crate::utp::UtpSocket;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use crate::sync::lock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -62,6 +66,32 @@ pub struct WorkerConfig {
     /// worker makes as on those the seeder takes, if there is a listener for the torrent. A peer that is
     /// asked for pieces and gives nothing is choked by every client that reciprocates (BEP 3's tit-for-tat).
     pub upload: Option<Arc<crate::seeder::SeederShared>>,
+    /// BEP 55: the relay registry every worker connection enters, and how a `connect` message's
+    /// reactive dial finds its way back to the coordinator (see [`crate::session::workers::Workers`]).
+    pub holepunch: HolepunchHub,
+    /// A second uTP socket for IPv6 targets, used only for BEP 55's reactive dial (which the spec
+    /// requires to go over uTP specifically): separate from `transport.utp` so that ordinary dialing
+    /// stays exactly as `--transport`/`--ipv6` say, whatever family a holepunch `connect` happens to name.
+    pub utp6: Option<Arc<UtpSocket>>,
+}
+
+/// One connection's BEP 55 bookkeeping: the id to reach its peer's `ut_holepunch` with (learned from
+/// its extended handshake, so `None` until then or if it never supports it), the shared flag other
+/// connections see through [`HolepunchHub::is_unsupported`]/`relay`, and the channel a relayed
+/// message arrives on. Held for the connection's whole life (its `_entry` field is the hub's RAII
+/// registration); [`fetch_from`]'s loop drains `rx` once a pass to relay anything queued for it.
+pub(super) struct Holepunch<'a> {
+    pub their_id: Option<u8>,
+    pub supports: Arc<AtomicBool>,
+    pub rx: Receiver<HolepunchMessage>,
+    _entry: HolepunchEntry<'a>,
+}
+
+impl<'a> Holepunch<'a> {
+    fn register(hub: &'a HolepunchHub, addr: SocketAddr) -> Holepunch<'a> {
+        let (entry, rx) = hub.enter(addr);
+        Holepunch { their_id: None, supports: Arc::clone(&entry.supports), rx, _entry: entry }
+    }
 }
 
 /// A way to end workers that are blocked reading from a peer.
@@ -173,10 +203,23 @@ pub fn run_worker(
 ) -> Result<(), WorkerError> {
     // Listed on the dashboard for as long as the connection lasts.
     let entry = config.peers.enter(peer_addr, std::time::Instant::now());
+    let mut holepunch = Holepunch::register(&config.holepunch, peer_addr);
     // The registration is held to the end of the run: dropping it is what lets the connection close.
-    let Established { mut stream, mut state, mut serving, registration: _registration } = establish(peer_addr, config, queue, pex_tx)?;
+    let Established { mut stream, mut state, mut serving, registration: _registration } = establish(peer_addr, config, queue, pex_tx, &mut holepunch, None)?;
     entry.stat.set(Activity::Downloading);
-    fetch_from(&mut stream, &mut state, &mut serving, &entry.stat, config, queue, spans, piece_length, results_tx, pex_tx)
+    fetch_from(&mut stream, &mut state, &mut serving, &entry.stat, config, queue, spans, piece_length, results_tx, pex_tx, peer_addr, &mut holepunch)
+}
+
+/// As [`run_worker`], but the connection is opened over `transport` specifically instead of
+/// `config.transport` -- used for BEP 55's reactive dial, which the spec requires to go over uTP
+/// regardless of what `--transport` says for ordinary dialing.
+#[allow(clippy::too_many_arguments)]
+pub fn run_worker_via(peer_addr: SocketAddr, transport: &Transport, config: &WorkerConfig, queue: &Arc<WorkQueue>, spans: &Arc<Vec<FileSpan>>, piece_length: u64, results_tx: &Sender<PieceResult>, pex_tx: Option<&PexSender>) -> Result<(), WorkerError> {
+    let entry = config.peers.enter(peer_addr, std::time::Instant::now());
+    let mut holepunch = Holepunch::register(&config.holepunch, peer_addr);
+    let Established { mut stream, mut state, mut serving, registration: _registration } = establish(peer_addr, config, queue, pex_tx, &mut holepunch, Some(transport))?;
+    entry.stat.set(Activity::Downloading);
+    fetch_from(&mut stream, &mut state, &mut serving, &entry.stat, config, queue, spans, piece_length, results_tx, pex_tx, peer_addr, &mut holepunch)
 }
 
 /// A connection a peer made to us, and that is to be downloaded from as well as served because the peer has pieces we still need.
@@ -206,6 +249,7 @@ pub fn run_adopted(adopted: Adopted, config: &WorkerConfig, queue: &Arc<WorkQueu
     let Adopted { mut stream, serving, peer, their_handshake, peer_has } = adopted;
     let mut serving = Some(serving);
     let entry = config.peers.enter(peer, std::time::Instant::now());
+    let mut holepunch = Holepunch::register(&config.holepunch, peer);
     let _registration = config.interrupt.register(&*stream);
     let result = (|| {
         stream.set_read_timeout(Some(config.connect_timeout)).map_err(|e| WorkerError::Connection { stage: "set_read_timeout", error: ConnectionError::Io(e) })?;
@@ -218,9 +262,9 @@ pub fn run_adopted(adopted: Adopted, config: &WorkerConfig, queue: &Arc<WorkQueu
         queue.note_bitfield(&state.peer_has_pieces);
         crate::peer::connection::send_message(&mut stream, &Message::Interested).map_err(|e| WorkerError::Connection { stage: "send_interested", error: e })?;
         state.am_interested = true;
-        connect::wait_for_unchoke(&mut *stream, &mut state, queue, pex_tx, &mut serving)?;
+        connect::wait_for_unchoke(&mut *stream, &mut state, queue, pex_tx, config, peer, &mut serving, &mut holepunch)?;
         entry.stat.set(Activity::Downloading);
-        fetch_from(&mut stream, &mut state, &mut serving, &entry.stat, config, queue, spans, piece_length, results_tx, pex_tx)
+        fetch_from(&mut stream, &mut state, &mut serving, &entry.stat, config, queue, spans, piece_length, results_tx, pex_tx, peer, &mut holepunch)
     })();
     match (result, serving) {
         // Nothing more to fetch from it, for now or ever: it still may want what we have.
@@ -244,6 +288,8 @@ fn fetch_from(
     piece_length: u64,
     results_tx: &Sender<PieceResult>,
     pex_tx: Option<&PexSender>,
+    peer_addr: SocketAddr,
+    holepunch: &mut Holepunch,
 ) -> Result<(), WorkerError> {
     let mut irrelevant_cycles = 0u32;
     // How fast this peer delivers, which sets how many requests to queue.
@@ -256,6 +302,7 @@ fn fetch_from(
 
     loop {
         keep_serving(serving, &mut **stream)?;
+        relay_pending_holepunch(&mut **stream, holepunch)?;
         // The piece already looked ahead to, if there is one; else the rarest piece *this peer has* and will send now: one
         // it lacks is no use to it, nor is one it will not send while it has us choked.
         let (work, started) = match ahead.pop_front() {
@@ -265,7 +312,7 @@ fn fetch_from(
                 Take::Done => break,
                 Take::NothingForThisPeer => {
                     stat.set(Activity::Idle);
-                    wait_for_a_piece_it_has(&mut **stream, state, queue, pex_tx, serving, &mut irrelevant_cycles)?;
+                    wait_for_a_piece_it_has(&mut **stream, state, queue, pex_tx, config, peer_addr, serving, holepunch, &mut irrelevant_cycles)?;
                     continue;
                 }
             },
@@ -274,7 +321,7 @@ fn fetch_from(
         stat.set(Activity::Downloading);
         let piece_index = work.index;
 
-        match download_one_piece(&mut **stream, state, queue, work.clone(), started, &refused, &mut ahead, config, Meter { throughput: &mut throughput, stat }, pex_tx, serving) {
+        match download_one_piece(&mut **stream, state, queue, work.clone(), started, &refused, &mut ahead, config, Meter { throughput: &mut throughput, stat }, pex_tx, peer_addr, holepunch, serving) {
             Ok(Downloaded::Verified(data)) => {
                 if let Err(e) = write_piece(spans, piece_index, piece_length, &data) {
                     // Disk failure isn't the peer's fault; requeue and bail
@@ -321,6 +368,19 @@ fn release_all(ahead: &mut VecDeque<Lookahead>, queue: &WorkQueue) {
     }
 }
 
+/// Sends this peer whatever another connection has relayed to it (BEP 55: a `connect` telling it
+/// to try the initiator, or a `connect`/`error` this client's own relay role produced), if there is
+/// one waiting and the peer's own id for `ut_holepunch` is known. The id check comes first and
+/// leaves the message on the channel when it fails, rather than reading and discarding it: nothing
+/// is ever relayed to a peer before `their_id` is known, so this is only ever hit by a message that
+/// arrived in the brief window before this connection's own extended handshake was parsed, and it
+/// is delivered on a later pass once that catches up.
+fn relay_pending_holepunch(stream: &mut dyn PeerStream, holepunch: &mut Holepunch) -> Result<(), WorkerError> {
+    let Some(id) = holepunch.their_id else { return Ok(()) };
+    let Ok(msg) = holepunch.rx.try_recv() else { return Ok(()) };
+    crate::peer::connection::send_message(stream, &Message::Extended { id, payload: msg.encode() }).map_err(|e| WorkerError::Connection { stage: "relay_holepunch", error: e })
+}
+
 /// Pieces remain, but this peer has none of them. Rather than
 /// busy-looping, reads whatever the peer sends next: a Have or Bitfield
 /// might be exactly what is being waited for, and updates `state` as a side
@@ -329,14 +389,15 @@ fn release_all(ahead: &mut VecDeque<Lookahead>, queue: &WorkQueue) {
 /// connection is given up rather than holding its slot for good: a peer
 /// that is alive but useless (or silent without formally disconnecting)
 /// would otherwise never free it for the coordinator to try someone else.
-fn wait_for_a_piece_it_has(stream: &mut dyn PeerStream, state: &mut crate::peer::PeerState, queue: &WorkQueue, pex_tx: Option<&PexSender>, serving: &mut Option<crate::serving::Serving>, irrelevant_cycles: &mut u32) -> Result<(), WorkerError> {
+#[allow(clippy::too_many_arguments)]
+fn wait_for_a_piece_it_has(stream: &mut dyn PeerStream, state: &mut crate::peer::PeerState, queue: &WorkQueue, pex_tx: Option<&PexSender>, config: &WorkerConfig, peer_addr: SocketAddr, serving: &mut Option<crate::serving::Serving>, holepunch: &mut Holepunch, irrelevant_cycles: &mut u32) -> Result<(), WorkerError> {
     match crate::peer::connection::read_message(stream) {
         Ok(msg) => {
             // `absorb` returns true for any state-affecting message
             // (Choke/Unchoke/Have/Bitfield/...), an approximation of
             // "this peer is still doing something" that is good enough for
             // a stuck-connection safety net.
-            let peer_is_active = take(&msg, state, queue, pex_tx, serving, stream)?;
+            let peer_is_active = take(&msg, state, queue, pex_tx, config, peer_addr, serving, holepunch, stream)?;
             *irrelevant_cycles = if peer_is_active { 0 } else { *irrelevant_cycles + 1 };
         }
         Err(ref e) if is_read_timeout(e) => {

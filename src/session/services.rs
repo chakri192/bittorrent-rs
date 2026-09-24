@@ -30,6 +30,8 @@ pub struct Services {
     lsd: Option<LsdService>,
     /// The uTP socket (BEP 29), which the DHT shares if there is one.
     utp: Option<Arc<UtpSocket>>,
+    /// Its IPv6 counterpart, if there is one: inbound connections only (see [`super::network::open_utp`]).
+    utp6: Option<Arc<UtpSocket>>,
     /// The datagrams on that socket that are not uTP, until the DHT takes them.
     utp_foreign: Option<std::sync::mpsc::Receiver<Foreign>>,
     seeder: Option<SeederHandle>,
@@ -91,16 +93,18 @@ impl Services {
         }
     }
 
-    /// Opens the UDP port for uTP connections (BEP 29), `port` if it is free.
+    /// Opens the UDP port for uTP connections (BEP 29), `port` if it is free. With `ipv6`, a second
+    /// socket takes inbound uTP connections from IPv6 peers too (outbound uTP dialing stays IPv4 alone).
     /// Failure is not fatal: `log` says so and connections are made over TCP.
-    pub fn start_utp(&mut self, port: u16, log: impl Fn(String)) {
+    pub fn start_utp(&mut self, port: u16, ipv6: bool, log: impl Fn(String)) {
         if self.network.is_some() {
             return; // the network's
         }
-        match super::network::open_utp(port) {
-            Ok((socket, rx)) => {
-                log(format!("uTP running on UDP port {}", socket.local_addr().map(|a| a.port()).unwrap_or(0)));
+        match super::network::open_utp(port, ipv6) {
+            Ok((socket, rx, socket6)) => {
+                log(format!("uTP running on UDP port {}{}", socket.local_addr().map(|a| a.port()).unwrap_or(0), if socket6.is_some() { " (IPv4 and IPv6)" } else { "" }));
                 self.utp = Some(socket);
+                self.utp6 = socket6;
                 self.utp_foreign = Some(rx);
             }
             Err(e) => log(format!("uTP disabled (couldn't bind UDP socket): {}", e)),
@@ -121,6 +125,11 @@ impl Services {
         self.utp.clone().or_else(|| self.network.as_ref().and_then(|n| n.utp()))
     }
 
+    /// Its IPv6 counterpart, if one joined.
+    pub fn utp6(&self) -> Option<Arc<UtpSocket>> {
+        self.utp6.clone().or_else(|| self.network.as_ref().and_then(|n| n.utp6()))
+    }
+
     /// Starts announcing the torrent on the local network (BEP 14) and
     /// listening for others doing the same. Failure to set up the socket
     /// (no multicast route, say) is not fatal: `log` says so and the session
@@ -128,7 +137,7 @@ impl Services {
     pub fn start_lsd(&mut self, config: LsdConfig, info_hash: [u8; 20], tcp_port: u16, log: impl Fn(String)) {
         match LsdService::start(config, info_hash, tcp_port) {
             Ok(service) => {
-                log(format!("local service discovery running (announcing port {})", tcp_port));
+                log(format!("local service discovery running (announcing port {}{})", tcp_port, if service.ipv6_joined { ", IPv4 and IPv6" } else { "" }));
                 self.lsd = Some(service);
             }
             Err(e) => log(format!("local service discovery disabled: {}", e)),
@@ -217,6 +226,9 @@ impl Services {
         }
         if let Some(utp) = self.utp.take() {
             utp.shutdown();
+        }
+        if let Some(utp6) = self.utp6.take() {
+            utp6.shutdown();
         }
     }
 }
@@ -312,7 +324,7 @@ mod tests {
     }
 
     fn loopback_lsd(listen_port: u16) -> LsdConfig {
-        LsdConfig { send_to: std::net::SocketAddr::from(([127, 0, 0, 1], 9)), listen: std::net::SocketAddr::from(([127, 0, 0, 1], listen_port)), join: None, share_port: false, interval: std::time::Duration::from_secs(3600), reply_interval: std::time::Duration::from_secs(3600) }
+        LsdConfig { send_to: std::net::SocketAddr::from(([127, 0, 0, 1], 9)), listen: std::net::SocketAddr::from(([127, 0, 0, 1], listen_port)), join: None, share_port: false, interval: std::time::Duration::from_secs(3600), reply_interval: std::time::Duration::from_secs(3600), ipv6: false }
     }
 
     #[test]
@@ -331,6 +343,22 @@ mod tests {
         assert!(std::net::UdpSocket::bind(addr).is_ok(), "shutdown released the socket");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn the_log_says_when_ipv6_is_joined_too() {
+        let mut s = Services::new();
+        let logged = std::sync::Mutex::new(Vec::new());
+        s.start_lsd(loopback_lsd(0), [0x11; 20], 6881, |m| logged.lock().unwrap().push(m));
+        assert!(!logged.lock().unwrap()[0].contains("IPv6"), "not asked for, not mentioned: {:?}", logged.lock().unwrap());
+        s.shutdown();
+
+        let logged6 = std::sync::Mutex::new(Vec::new());
+        let config = crate::lsd::LsdConfig { ipv6: true, share_port: true, ..loopback_lsd(0) };
+        s.start_lsd(config, [0x11; 20], 6882, |m| logged6.lock().unwrap().push(m));
+        assert!(logged6.lock().unwrap()[0].contains("IPv4 and IPv6"), "asked for, and this machine can join it: {:?}", logged6.lock().unwrap());
+        s.shutdown();
+    }
+
     #[test]
     fn local_discovery_that_cannot_start_is_reported_and_the_session_goes_on_without_it() {
         // The address is taken, and this config does not share.
@@ -347,7 +375,7 @@ mod tests {
         let mut s = Services::new();
         assert!(s.utp().is_none());
         let logged = std::sync::Mutex::new(Vec::new());
-        s.start_utp(0, |m| logged.lock().unwrap().push(m));
+        s.start_utp(0, false, |m| logged.lock().unwrap().push(m));
         let utp = s.utp().expect("started");
         let port = utp.local_addr().unwrap().port();
         assert!(logged.lock().unwrap()[0].contains(&port.to_string()), "it says which port: {:?}", logged.lock().unwrap());
@@ -364,16 +392,42 @@ mod tests {
         let taken = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let taken_port = taken.local_addr().unwrap().port();
         let mut s = Services::new();
-        s.start_utp(taken_port, |_| {});
+        s.start_utp(taken_port, false, |_| {});
         let port = s.utp().expect("still started").local_addr().unwrap().port();
         assert_ne!(port, taken_port);
+    }
+
+    #[test]
+    fn asking_for_ipv6_gives_a_second_utp_socket_and_the_log_says_so() {
+        if std::net::UdpSocket::bind("[::1]:0").is_err() {
+            eprintln!("no IPv6 here; skipped");
+            return;
+        }
+        let mut s = Services::new();
+        assert!(s.utp6().is_none());
+        let logged = std::sync::Mutex::new(Vec::new());
+        s.start_utp(0, true, |m| logged.lock().unwrap().push(m));
+        assert!(s.utp().is_some(), "the IPv4 socket still runs");
+        assert!(s.utp6().is_some(), "and now the IPv6 one too");
+        assert!(logged.lock().unwrap()[0].contains("IPv4 and IPv6"), "{:?}", logged.lock().unwrap());
+        s.shutdown();
+        assert!(s.utp6().is_none());
+    }
+
+    #[test]
+    fn without_ipv6_asked_for_there_is_no_second_utp_socket_and_the_log_does_not_mention_it() {
+        let mut s = Services::new();
+        let logged = std::sync::Mutex::new(Vec::new());
+        s.start_utp(0, false, |m| logged.lock().unwrap().push(m));
+        assert!(s.utp6().is_none());
+        assert!(!logged.lock().unwrap()[0].contains("IPv6"), "{:?}", logged.lock().unwrap());
     }
 
     #[test]
     fn the_dht_takes_the_utp_sockets_port_once_and_only_when_there_is_a_socket() {
         let mut s = Services::new();
         assert!(s.shared_dht_transport().is_none(), "no socket, nothing to share");
-        s.start_utp(0, |_| {});
+        s.start_utp(0, false, |_| {});
         let port = s.utp().unwrap().local_addr().unwrap().port();
         let (_, shared_port) = s.shared_dht_transport().expect("the DHT can have it");
         assert_eq!(shared_port, port, "the same port, so one number serves TCP peers' uTP and the DHT");
@@ -438,7 +492,7 @@ mod tests {
     fn shared_services_use_the_networks_utp_socket_and_do_not_open_or_close_one() {
         let network = quiet_network(NetworkConfig { transport: crate::peer::TransportMode::Both, ..no_dht() });
         let mut services = Services::shared(Arc::clone(&network));
-        services.start_utp(0, |_| panic!("no socket of its own to log about"));
+        services.start_utp(0, false, |_| panic!("no socket of its own to log about"));
         let socket = services.utp().expect("the network's");
         assert!(Arc::ptr_eq(&socket, &network.utp().unwrap()));
         let port = socket.local_addr().unwrap().port();
@@ -449,6 +503,19 @@ mod tests {
         assert!(UdpSocket::bind(("0.0.0.0", port)).is_err(), "and open");
         network.shutdown();
         assert!(!socket.is_running(), "until the network ends it");
+    }
+
+    #[test]
+    fn shared_services_use_the_networks_ipv6_utp_socket_too() {
+        if std::net::UdpSocket::bind("[::1]:0").is_err() {
+            eprintln!("no IPv6 here; skipped");
+            return;
+        }
+        let network = quiet_network(NetworkConfig { transport: crate::peer::TransportMode::Both, ipv6: true, ..no_dht() });
+        let services = Services::shared(Arc::clone(&network));
+        let socket6 = services.utp6().expect("the network's IPv6 socket");
+        assert!(Arc::ptr_eq(&socket6, &network.utp6().unwrap()));
+        network.shutdown();
     }
 
     #[test]

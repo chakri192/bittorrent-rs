@@ -255,6 +255,73 @@ fn percent_decode(s: &str) -> Result<String, MagnetError> {
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
+/// BEP 46: `xs=urn:btpk:<64 hex chars>` names a mutable DHT pointer to a torrent's current
+/// version -- an ed25519 public key, with an optional hex `s`alt -- rather than a fixed info
+/// hash. `magnet:?xs=urn:btpk:[Public Key (Hex)]&s=[Salt (Hex)]` is the link form the BEP gives.
+/// A separate parse from [`parse_magnet_uri`], and not folded into [`MagnetLink`], because
+/// resolving one needs a DHT round trip (`dht::Dht::get_item` on `dht::store::mutable_target`)
+/// before there is an info hash to build an ordinary `MagnetLink` from at all -- the two have
+/// different shapes for a reason, not by oversight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutablePointer {
+    pub public_key: [u8; 32],
+    /// `s`, hex-decoded. `None` when the link gives no salt at all; empty and absent are the
+    /// same target either way (see `dht::store::mutable_target`).
+    pub salt: Option<Vec<u8>>,
+}
+
+/// Parses a `magnet:?xs=urn:btpk:...` link. `None` for anything else: not a magnet URI at all,
+/// no `xs` in the `urn:btpk:` namespace, a public key of the wrong length, or an `s` that is not
+/// valid hex -- a malformed pointer is nothing to resolve, not a torrent to fall back to.
+pub fn parse_mutable_pointer(uri: &str) -> Option<MutablePointer> {
+    let query = uri.strip_prefix("magnet:?")?;
+    let mut public_key: Option<[u8; 32]> = None;
+    let mut salt: Option<Vec<u8>> = None;
+
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let value = percent_decode(raw_value).ok()?;
+        match key {
+            "xs" if public_key.is_none() => {
+                let hex = value.to_ascii_lowercase();
+                let digits = hex.strip_prefix("urn:btpk:")?;
+                if digits.len() != 64 {
+                    return None;
+                }
+                public_key = Some(decode_hex_32(digits)?);
+            }
+            "s" if salt.is_none() => salt = Some(decode_hex_bytes(&value)?),
+            _ => {}
+        }
+    }
+    Some(MutablePointer { public_key: public_key?, salt })
+}
+
+fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
+    let bytes = decode_hex_bytes(s)?;
+    bytes.try_into().ok()
+}
+
+// `is_multiple_of` needs a very recent stdlib; keep buildable on older toolchains (same stance
+// as krpc.rs's parse_compact_nodes).
+#[allow(clippy::manual_is_multiple_of)]
+fn decode_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for i in (0..bytes.len()).step_by(2) {
+        let hi = hex_nibble(bytes[i] as char).ok()?;
+        let lo = hex_nibble(bytes[i + 1] as char).ok()?;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +496,66 @@ mod tests {
         let link = parse_magnet_uri(&format!("magnet:?xt=urn:btih:{}&tr.extra=http%3A%2F%2Fx&x.pe.a=10.0.0.1%3A1&trx=http%3A%2F%2Fy", HASH)).unwrap();
         assert!(link.trackers.is_empty(), "tr.extra and trx are other parameters");
         assert!(link.peers.is_empty(), "x.pe.a is not a numbered x.pe");
+    }
+
+    // ---- BEP 46: mutable-pointer magnet links ----
+
+    // BEP 46's own published test vectors (bittorrent.org/beps/bep_0046.html).
+    const BEP46_PUBKEY: &str = "8543d3e6115f0f98c944077a4493dcd543e49c739fd998550a1f614ab36ed63e";
+
+    #[test]
+    fn a_mutable_pointer_link_without_salt_parses() {
+        let uri = format!("magnet:?xs=urn:btpk:{}", BEP46_PUBKEY);
+        let pointer = parse_mutable_pointer(&uri).unwrap();
+        assert_eq!(pointer.public_key, decode_hex_32(BEP46_PUBKEY).unwrap());
+        assert!(pointer.salt.is_none());
+    }
+
+    #[test]
+    fn a_mutable_pointer_link_with_a_hex_salt_parses() {
+        let uri = format!("magnet:?xs=urn:btpk:{}&s=6e", BEP46_PUBKEY);
+        let pointer = parse_mutable_pointer(&uri).unwrap();
+        assert_eq!(pointer.salt, Some(vec![0x6e]));
+    }
+
+    #[test]
+    fn the_bep46_pubkey_and_salt_hash_to_the_beps_own_published_target_ids() {
+        // These are the same target-ID vectors BEP 44's mutable_target is tested against
+        // (BEP 46 reuses it wholesale); pinned here too since it is this parser's own field
+        // that must feed the right bytes into it.
+        let pk = decode_hex_32(BEP46_PUBKEY).unwrap();
+        let without_salt = parse_mutable_pointer(&format!("magnet:?xs=urn:btpk:{}", BEP46_PUBKEY)).unwrap();
+        assert_eq!(hex_20(crate::dht::store::mutable_target(&pk, without_salt.salt.as_deref())), "cc3f9d90b572172053626f9980ce261a850d050b");
+
+        let with_salt = parse_mutable_pointer(&format!("magnet:?xs=urn:btpk:{}&s=6e", BEP46_PUBKEY)).unwrap();
+        assert_eq!(hex_20(crate::dht::store::mutable_target(&pk, with_salt.salt.as_deref())), "59ee7c2cb9b4f7eb1986ee2d18fd2fdb8a56554f");
+    }
+
+    fn hex_20(bytes: [u8; 20]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    #[test]
+    fn xs_in_a_different_namespace_is_not_a_mutable_pointer() {
+        assert!(parse_mutable_pointer(&format!("magnet:?xt=urn:btih:{}&xs=http%3A%2F%2Fmirror%2Fx.torrent", HASH)).is_none());
+    }
+
+    #[test]
+    fn a_public_key_of_the_wrong_length_is_refused() {
+        assert!(parse_mutable_pointer("magnet:?xs=urn:btpk:aabb").is_none());
+    }
+
+    #[test]
+    fn not_a_magnet_uri_at_all_is_refused() {
+        assert!(parse_mutable_pointer("https://example.com/").is_none());
+    }
+
+    #[test]
+    fn the_first_xs_and_first_s_win_when_repeated() {
+        let other_key = "0".repeat(64);
+        let uri = format!("magnet:?xs=urn:btpk:{}&xs=urn:btpk:{}&s=01&s=02", BEP46_PUBKEY, other_key);
+        let pointer = parse_mutable_pointer(&uri).unwrap();
+        assert_eq!(pointer.public_key, decode_hex_32(BEP46_PUBKEY).unwrap());
+        assert_eq!(pointer.salt, Some(vec![0x01]));
     }
 }

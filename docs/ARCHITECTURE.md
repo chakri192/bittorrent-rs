@@ -21,13 +21,19 @@ someone about to change the code.
        ▼               ▼                   ▼                ▼
   downloader/       tracker/ +          dht/             seeder.rs + serving.rs
   one worker        tracker_discovery   Kademlia node    + choker.rs: inbound peers, a
-  thread per peer   HTTP·HTTPS·UDP      (BEP 5)          few unchoked at a time, the
-  (also serves      (redirects followed,                 info dict; hands a peer with
-  what it can)      scrape: BEP 48)                      pieces we lack to a worker
+  thread per peer   HTTP·HTTPS·UDP      (BEP 5), plus    few unchoked at a time, the
+  (also serves      (redirects followed,  dht/store.rs:  info dict; hands a peer with
+  what it can)      scrape: BEP 48)     BEP 44 storage   pieces we lack to a worker
+                                        (immutable and
+                                        mutable items,
+                                        BEP 46's torrent
+                                        pointers on top)
        │
        ▼
   peer/  handshake · wire messages · extensions (BEP 10) · PEX (BEP 11)
          Fast Extension (BEP 6) · message stream encryption · PeerStream
+         holepunch (BEP 55): a peer relays two others past a NAT that
+         blocks a direct connection between them
   utp/   packets · connection (a state machine on an injected clock) · socket
   bencode.rs · torrent.rs   the formats everything above reads
 ```
@@ -259,4 +265,4 @@ Deliberate, and the README's Limitations lists them: one thread per
 connection (fine for tens of peers, not thousands); choking is only the
 choking that rewards what a peer gives is tested against one other client (libtorrent) and not on a real swarm;
 a magnet link's trackers are asked concurrently, having no tiers, and `--tracker-mode concurrent` does the same for a torrent's; a piece
-interrupted part-way is handed to the next peer, and kept across a clean stop but not a crash (`downloader/partial.rs`); a connection fetches one piece at a time but asks ahead for up to eight more once the one in hand is fully asked for, and the queue it keeps full is bounded by the peer's `reqq` (so a piece is not a round trip on its own, and no more than that is held by one peer); local discovery is IPv4 only.
+interrupted part-way is handed to the next peer, and kept across a clean stop but not a crash (`downloader/partial.rs`); a connection fetches one piece at a time but asks ahead for up to eight more once the one in hand is fully asked for, and the queue it keeps full is bounded by the peer's `reqq` (so a piece is not a round trip on its own, and no more than that is held by one peer); local discovery's IPv6 half (`ff15::efc0:988f`) has been seen to join but not be able to send on at least one real machine, a routing limitation of that machine's kernel for the address class, not the client.

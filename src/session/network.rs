@@ -52,6 +52,9 @@ pub struct SharedNetwork {
     pub ipv6: bool,
     listener: Mutex<Listener>,
     utp: Option<Arc<UtpSocket>>,
+    /// A second uTP socket on the IPv6 group, if `config.ipv6` asked for one and it could be bound: takes
+    /// inbound uTP connections from IPv6 peers. Outbound uTP dialing still goes over `utp` alone (IPv4).
+    utp6: Option<Arc<UtpSocket>>,
     dht: Option<Arc<DhtNode>>,
     portmap: Mutex<Option<PortMap>>,
     up_limit: Option<Arc<RateLimiter>>,
@@ -65,11 +68,13 @@ impl SharedNetwork {
         let log = Arc::new(log);
 
         let mut utp_rx = None;
+        let mut utp6 = None;
         let utp = if config.transport.wants_utp() {
-            match open_utp(config.port) {
-                Ok((socket, foreign)) => {
-                    log(format!("uTP running on UDP port {}", socket.local_addr().map(|a| a.port()).unwrap_or(0)));
+            match open_utp(config.port, config.ipv6) {
+                Ok((socket, foreign, socket6)) => {
+                    log(format!("uTP running on UDP port {}{}", socket.local_addr().map(|a| a.port()).unwrap_or(0), if socket6.is_some() { " (IPv4 and IPv6)" } else { "" }));
                     utp_rx = Some(foreign);
+                    utp6 = socket6;
                     Some(socket)
                 }
                 Err(e) => {
@@ -109,7 +114,7 @@ impl SharedNetwork {
             None
         };
 
-        let listener = match Listener::start(config.port, ListenerOptions { encryption: config.encryption.unwrap_or(Encryption::Prefer), ipv6: config.ipv6, utp: utp.clone() }) {
+        let listener = match Listener::start(config.port, ListenerOptions { encryption: config.encryption.unwrap_or(Encryption::Prefer), ipv6: config.ipv6, utp: utp.clone(), utp6: utp6.clone() }) {
             Ok(listener) => listener,
             Err(e) => {
                 // Not left running with nobody to serve.
@@ -118,6 +123,9 @@ impl SharedNetwork {
                 }
                 if let Some(utp) = &utp {
                     utp.shutdown();
+                }
+                if let Some(utp6) = &utp6 {
+                    utp6.shutdown();
                 }
                 return Err(e);
             }
@@ -133,12 +141,17 @@ impl SharedNetwork {
         } else {
             None
         };
-        Ok(SharedNetwork { port, ipv6, listener: Mutex::new(listener), utp, dht, portmap: Mutex::new(portmap), up_limit: config.max_up.map(|rate| Arc::new(RateLimiter::new(rate))), down_limit: config.max_down.map(|rate| Arc::new(RateLimiter::new(rate))) })
+        Ok(SharedNetwork { port, ipv6, listener: Mutex::new(listener), utp, utp6, dht, portmap: Mutex::new(portmap), up_limit: config.max_up.map(|rate| Arc::new(RateLimiter::new(rate))), down_limit: config.max_down.map(|rate| Arc::new(RateLimiter::new(rate))) })
     }
 
     /// The uTP socket, if one is running.
     pub fn utp(&self) -> Option<Arc<UtpSocket>> {
         self.utp.clone()
+    }
+
+    /// Its IPv6 counterpart (takes inbound connections only; outbound uTP dialing is IPv4 alone), if one joined.
+    pub fn utp6(&self) -> Option<Arc<UtpSocket>> {
+        self.utp6.clone()
     }
 
     /// The DHT node, if one is running.
@@ -181,6 +194,9 @@ impl SharedNetwork {
         if let Some(utp) = &self.utp {
             utp.shutdown();
         }
+        if let Some(utp6) = &self.utp6 {
+            utp6.shutdown();
+        }
     }
 }
 
@@ -194,19 +210,68 @@ pub fn layered(shared: Option<Arc<RateLimiter>>, own: Option<u64>) -> Option<Arc
     }
 }
 
-/// Opens the UDP socket for uTP, `port` if it is free, with the channel the datagrams that are
-/// not uTP arrive on.
-pub(super) fn open_utp(port: u16) -> io::Result<(Arc<UtpSocket>, std::sync::mpsc::Receiver<crate::utp::socket::Foreign>)> {
+/// The IPv4 uTP socket, the channel its non-uTP datagrams arrive on, and its IPv6 counterpart if there is one.
+type UtpOpened = (Arc<UtpSocket>, std::sync::mpsc::Receiver<crate::utp::socket::Foreign>, Option<Arc<UtpSocket>>);
+
+/// Opens the UDP socket for uTP, `port` if it is free, with the channel the datagrams that are not uTP
+/// arrive on. With `ipv6`, a second uTP socket is opened on the IPv6 group too, on the same port number
+/// where it can be had (peers expect uTP on the port announced for TCP) -- best-effort, `None` rather than
+/// failing the whole call if it cannot be bound (no local IPv6, the port taken there). It takes inbound
+/// connections only: outbound uTP dialing is not family-aware and stays on the IPv4 socket alone.
+pub(super) fn open_utp(port: u16, ipv6: bool) -> io::Result<UtpOpened> {
     let socket = UdpSocket::bind(("0.0.0.0", port)).or_else(|_| UdpSocket::bind(("0.0.0.0", 0)))?;
+    let bound_port = socket.local_addr()?.port();
     let (tx, rx) = std::sync::mpsc::channel();
-    Ok((Arc::new(UtpSocket::with_socket(socket, Some(tx))?), rx))
+    let socket6 = ipv6.then(|| bind_utp_v6(bound_port).and_then(|s| UtpSocket::with_socket(s, None)).ok()).flatten().map(Arc::new);
+    Ok((Arc::new(UtpSocket::with_socket(socket, Some(tx))?), rx, socket6))
+}
+
+/// A UDP socket bound to `[::]:port` for IPv6 only (as [`crate::dht::transport::UdpTransport::bind_v6`] does
+/// for the DHT): left to the system, a wildcard IPv6 socket may also take IPv4, which would put the IPv4
+/// uTP socket's traffic on this one.
+#[cfg(unix)]
+fn bind_utp_v6(port: u16) -> io::Result<UdpSocket> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain socket calls with valid arguments; the descriptor is closed
+    // on every failure path and otherwise handed to the UdpSocket.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fail = |fd: libc::c_int| {
+            let error = io::Error::last_os_error();
+            libc::close(fd);
+            Err(error)
+        };
+        let on: libc::c_int = 1;
+        if libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &on as *const libc::c_int as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t) < 0 {
+            return fail(fd);
+        }
+        let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
+        sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        sa.sin6_port = port.to_be();
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+        {
+            sa.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+        }
+        if libc::bind(fd, &sa as *const libc::sockaddr_in6 as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t) < 0 {
+            return fail(fd);
+        }
+        Ok(UdpSocket::from_raw_fd(fd))
+    }
+}
+
+#[cfg(not(unix))]
+fn bind_utp_v6(port: u16) -> io::Result<UdpSocket> {
+    UdpSocket::bind(("::", port))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpStream;
+    use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
 
     /// A configuration that reaches nowhere beyond the machine: no DHT, no port mapping.
@@ -339,6 +404,52 @@ pub(crate) mod tests {
     fn without_them_asked_for_neither_utp_nor_the_dht_runs() {
         let network = quiet_network(no_dht());
         assert!(network.utp().is_none() && network.dht().is_none());
+        network.shutdown();
+    }
+
+    /// Whether this machine has IPv6 on loopback, without which the IPv6 uTP tests say so and pass.
+    fn has_ipv6_loopback() -> bool {
+        UdpSocket::bind("[::1]:0").is_ok()
+    }
+
+    #[test]
+    fn bind_utp_v6_is_v6_only_and_does_not_take_ipv4_traffic() {
+        if !has_ipv6_loopback() {
+            eprintln!("no IPv6 here; skipped");
+            return;
+        }
+        let six = bind_utp_v6(0).unwrap();
+        let port = six.local_addr().unwrap().port();
+        let four = UdpSocket::bind("127.0.0.1:0").unwrap();
+        four.send_to(b"v4", ("127.0.0.1", port)).unwrap();
+        six.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut buf = [0u8; 8];
+        assert!(six.recv_from(&mut buf).is_err(), "nothing arrives from the IPv4 side");
+        // (And the port is free for an IPv4 socket, which is what lets both families use one number.)
+        assert!(UdpSocket::bind(("0.0.0.0", port)).is_ok());
+    }
+
+    #[test]
+    fn asking_for_ipv6_gives_the_shared_network_a_second_utp_socket_that_takes_inbound_connections() {
+        if !has_ipv6_loopback() {
+            eprintln!("no IPv6 here; skipped");
+            return;
+        }
+        let network = quiet_network(NetworkConfig { transport: TransportMode::Both, ipv6: true, ..no_dht() });
+        let utp6 = network.utp6().expect("the IPv6 socket bound");
+        let port6 = utp6.local_addr().unwrap().port();
+        utp6.listen();
+
+        let peer = crate::utp::UtpSocket::bind(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0))).unwrap();
+        let _stream = peer.connect(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port6)), Duration::from_secs(5)).expect("the network's IPv6 uTP socket takes the connection");
+        network.shutdown();
+    }
+
+    #[test]
+    fn without_ipv6_asked_for_the_shared_network_has_no_second_utp_socket() {
+        let network = quiet_network(NetworkConfig { transport: TransportMode::Both, ipv6: false, ..no_dht() });
+        assert!(network.utp().is_some(), "the IPv4 one still runs");
+        assert!(network.utp6().is_none());
         network.shutdown();
     }
 }

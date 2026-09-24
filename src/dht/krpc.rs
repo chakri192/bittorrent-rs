@@ -25,12 +25,37 @@ pub struct CompactNode {
     pub addr: SocketAddr,
 }
 
+/// One `put` request's payload: the `v` value, and, for a mutable item, the public key,
+/// optional salt, sequence number, signature and optional CAS precondition (BEP 44).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutItem {
+    pub v: Bencode,
+    pub mutable: Option<MutableFields>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutableFields {
+    pub k: [u8; 32],
+    pub salt: Option<Vec<u8>>,
+    pub seq: i64,
+    pub sig: [u8; 64],
+    /// `cas`: only performed if the value currently stored has this sequence number.
+    pub cas: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
     Ping { id: NodeId },
     FindNode { id: NodeId, target: NodeId },
     GetPeers { id: NodeId, info_hash: NodeId },
     AnnouncePeer { id: NodeId, info_hash: NodeId, port: u16, token: Vec<u8>, implied_port: bool },
+    /// BEP 44: `target` is the SHA-1 hash of an immutable item's value, or of a mutable item's
+    /// public key (and salt, if any). `seq`, if given, asks that `k`/`v`/`sig` be left out of
+    /// the response unless the stored item's own sequence number is greater.
+    Get { id: NodeId, target: NodeId, seq: Option<i64> },
+    /// BEP 44: stores `item` under the write-token `token` (issued by a prior `get` from the
+    /// same node), immutable or mutable depending on `item.mutable`.
+    Put { id: NodeId, token: Vec<u8>, item: PutItem },
 }
 
 impl Query {
@@ -40,20 +65,23 @@ impl Query {
             Query::FindNode { .. } => "find_node",
             Query::GetPeers { .. } => "get_peers",
             Query::AnnouncePeer { .. } => "announce_peer",
+            Query::Get { .. } => "get",
+            Query::Put { .. } => "put",
         }
     }
 
     /// The querying node's own id, present in every query's `a` dict.
     pub fn sender_id(&self) -> &NodeId {
         match self {
-            Query::Ping { id } | Query::FindNode { id, .. } | Query::GetPeers { id, .. } | Query::AnnouncePeer { id, .. } => id,
+            Query::Ping { id } | Query::FindNode { id, .. } | Query::GetPeers { id, .. } | Query::AnnouncePeer { id, .. } | Query::Get { id, .. } | Query::Put { id, .. } => id,
         }
     }
 }
 
 /// A response's `r` dict, flattened: which fields are present depends on
 /// the query it answers (ping -> just `id`; find_node -> `nodes`;
-/// get_peers -> `token` + either `values` or `nodes`).
+/// get_peers -> `token` + either `values` or `nodes`; BEP 44 `get` ->
+/// `token` + `v` (and, for a mutable item, `k`/`seq`/`sig`)).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Response {
     pub id: NodeId,
@@ -63,6 +91,12 @@ pub struct Response {
     /// BEP 42: the address the answer's recipient was seen at, which is how a node behind a NAT learns its external one. It is
     /// a key of the message, not of its `r` dict, in the same compact form as a peer.
     pub ip: Option<SocketAddr>,
+    /// BEP 44 `get`: the stored value, whatever bencoded type it is.
+    pub v: Option<Bencode>,
+    /// BEP 44 `get` on a mutable item: its public key, sequence number and signature.
+    pub k: Option<[u8; 32]>,
+    pub seq: Option<i64>,
+    pub sig: Option<[u8; 64]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +134,16 @@ impl std::error::Error for KrpcError {}
 fn bytes20(value: Option<&Bencode>, field: &'static str) -> Result<NodeId, KrpcError> {
     let b = value.and_then(Bencode::as_bytes).ok_or(KrpcError::MissingField(field))?;
     b.try_into().map_err(|_| KrpcError::MalformedCompact("id/hash not 20 bytes"))
+}
+
+fn bytes32(value: Option<&Bencode>, field: &'static str) -> Result<[u8; 32], KrpcError> {
+    let b = value.and_then(Bencode::as_bytes).ok_or(KrpcError::MissingField(field))?;
+    b.try_into().map_err(|_| KrpcError::MalformedCompact("public key not 32 bytes"))
+}
+
+fn bytes64(value: Option<&Bencode>, field: &'static str) -> Result<[u8; 64], KrpcError> {
+    let b = value.and_then(Bencode::as_bytes).ok_or(KrpcError::MissingField(field))?;
+    b.try_into().map_err(|_| KrpcError::MalformedCompact("signature not 64 bytes"))
 }
 
 /// Bytes in one compact IPv4 node (`nodes`) and one compact IPv6 node (`nodes6`).
@@ -238,6 +282,27 @@ impl KrpcMessage {
                         a.insert(b"port".to_vec(), Bencode::Int(*port as i64));
                         a.insert(b"token".to_vec(), Bencode::Bytes(token.clone()));
                     }
+                    Query::Get { target, seq, .. } => {
+                        a.insert(b"target".to_vec(), Bencode::Bytes(target.to_vec()));
+                        if let Some(seq) = seq {
+                            a.insert(b"seq".to_vec(), Bencode::Int(*seq));
+                        }
+                    }
+                    Query::Put { token, item, .. } => {
+                        a.insert(b"token".to_vec(), Bencode::Bytes(token.clone()));
+                        a.insert(b"v".to_vec(), item.v.clone());
+                        if let Some(m) = &item.mutable {
+                            a.insert(b"k".to_vec(), Bencode::Bytes(m.k.to_vec()));
+                            if let Some(salt) = &m.salt {
+                                a.insert(b"salt".to_vec(), Bencode::Bytes(salt.clone()));
+                            }
+                            a.insert(b"seq".to_vec(), Bencode::Int(m.seq));
+                            a.insert(b"sig".to_vec(), Bencode::Bytes(m.sig.to_vec()));
+                            if let Some(cas) = m.cas {
+                                a.insert(b"cas".to_vec(), Bencode::Int(cas));
+                            }
+                        }
+                    }
                 }
                 top.insert(b"a".to_vec(), Bencode::Dict(a));
                 if read_only {
@@ -263,6 +328,18 @@ impl KrpcMessage {
                 if !response.values.is_empty() {
                     let vals = response.values.iter().map(|p| Bencode::Bytes(encode_peer(p))).collect();
                     r.insert(b"values".to_vec(), Bencode::List(vals));
+                }
+                if let Some(v) = &response.v {
+                    r.insert(b"v".to_vec(), v.clone());
+                }
+                if let Some(k) = &response.k {
+                    r.insert(b"k".to_vec(), Bencode::Bytes(k.to_vec()));
+                }
+                if let Some(seq) = response.seq {
+                    r.insert(b"seq".to_vec(), Bencode::Int(seq));
+                }
+                if let Some(sig) = &response.sig {
+                    r.insert(b"sig".to_vec(), Bencode::Bytes(sig.to_vec()));
                 }
                 top.insert(b"r".to_vec(), Bencode::Dict(r));
                 if let Some(ip) = &response.ip {
@@ -304,6 +381,23 @@ impl KrpcMessage {
                         token: a.get(b"token".as_slice()).and_then(Bencode::as_bytes).unwrap_or_default().to_vec(),
                         implied_port: a.get(b"implied_port".as_slice()).and_then(Bencode::as_int).unwrap_or(0) == 1,
                     },
+                    "get" => Query::Get { id, target: bytes20(a.get(b"target".as_slice()), "a.target")?, seq: a.get(b"seq".as_slice()).and_then(Bencode::as_int) },
+                    "put" => {
+                        let v = a.get(b"v".as_slice()).cloned().ok_or(KrpcError::MissingField("a.v"))?;
+                        let token = a.get(b"token".as_slice()).and_then(Bencode::as_bytes).unwrap_or_default().to_vec();
+                        // Mutable iff a `k` (public key) is present -- BEP 44's own way of telling the two apart.
+                        let mutable = match a.get(b"k".as_slice()) {
+                            Some(_) => Some(MutableFields {
+                                k: bytes32(a.get(b"k".as_slice()), "a.k")?,
+                                salt: a.get(b"salt".as_slice()).and_then(Bencode::as_bytes).map(<[u8]>::to_vec),
+                                seq: a.get(b"seq".as_slice()).and_then(Bencode::as_int).ok_or(KrpcError::MissingField("a.seq"))?,
+                                sig: bytes64(a.get(b"sig".as_slice()), "a.sig")?,
+                                cas: a.get(b"cas".as_slice()).and_then(Bencode::as_int),
+                            }),
+                            None => None,
+                        };
+                        Query::Put { id, token, item: PutItem { v, mutable } }
+                    }
                     other => return Err(KrpcError::UnknownQuery(other.to_string())),
                 };
                 Ok(KrpcMessage::Query { t, query })
@@ -321,7 +415,11 @@ impl KrpcMessage {
                 let values = r.get(b"values".as_slice()).and_then(Bencode::as_list).map(parse_values).unwrap_or_default();
                 let token = r.get(b"token".as_slice()).and_then(Bencode::as_bytes).map(<[u8]>::to_vec);
                 let ip = dict.get(b"ip".as_slice()).and_then(Bencode::as_bytes).and_then(parse_compact_addr);
-                Ok(KrpcMessage::Response { t, response: Response { id, nodes, values, token, ip } })
+                let v = r.get(b"v".as_slice()).cloned();
+                let k = r.get(b"k".as_slice()).and_then(Bencode::as_bytes).and_then(|b| b.try_into().ok());
+                let seq = r.get(b"seq".as_slice()).and_then(Bencode::as_int);
+                let sig = r.get(b"sig".as_slice()).and_then(Bencode::as_bytes).and_then(|b| b.try_into().ok());
+                Ok(KrpcMessage::Response { t, response: Response { id, nodes, values, token, ip, v, k, seq, sig } })
             }
             b"e" => {
                 let e = dict.get(b"e".as_slice()).and_then(Bencode::as_list).ok_or(KrpcError::MissingField("e"))?;
@@ -606,5 +704,87 @@ mod tests {
         // Anything that is not a well-formed dict with `ro` 1 is not read-only.
         assert!(!is_read_only(b"not bencode"));
         assert!(!is_read_only(b"d2:roi0ee") && !is_read_only(b"d2:roi2ee") && !is_read_only(b"d2:ro1:1e"));
+    }
+
+    // ---- BEP 44: get / put ----
+
+    #[test]
+    fn get_query_without_seq_encodes_and_decodes_exactly() {
+        let msg = KrpcMessage::Query { t: b"aa".to_vec(), query: Query::Get { id: id(b"abcdefghij0123456789"), target: id(b"mnopqrstuvwxyz123456"), seq: None } };
+        let encoded = msg.encode();
+        assert_eq!(encoded, b"d1:ad2:id20:abcdefghij01234567896:target20:mnopqrstuvwxyz123456e1:q3:get1:t2:aa1:y1:qe".to_vec());
+        assert_eq!(KrpcMessage::decode(&encoded).unwrap(), msg);
+    }
+
+    #[test]
+    fn get_query_with_seq_encodes_and_decodes_exactly() {
+        let msg = KrpcMessage::Query { t: b"aa".to_vec(), query: Query::Get { id: id(b"abcdefghij0123456789"), target: id(b"mnopqrstuvwxyz123456"), seq: Some(3) } };
+        let encoded = msg.encode();
+        assert_eq!(encoded, b"d1:ad2:id20:abcdefghij01234567893:seqi3e6:target20:mnopqrstuvwxyz123456e1:q3:get1:t2:aa1:y1:qe".to_vec());
+        assert_eq!(KrpcMessage::decode(&encoded).unwrap(), msg);
+    }
+
+    #[test]
+    fn get_response_for_an_immutable_item_round_trips() {
+        let msg = KrpcMessage::Response { t: b"aa".to_vec(), response: Response { id: id(b"mnopqrstuvwxyz123456"), token: Some(b"tok".to_vec()), v: Some(Bencode::Bytes(b"Hello World!".to_vec())), ..Default::default() } };
+        let encoded = msg.encode();
+        assert_eq!(KrpcMessage::decode(&encoded).unwrap(), msg);
+        assert!(String::from_utf8_lossy(&encoded).contains("1:v12:Hello World!"));
+    }
+
+    #[test]
+    fn get_response_for_a_mutable_item_round_trips_with_k_seq_and_sig() {
+        let msg = KrpcMessage::Response {
+            t: b"aa".to_vec(),
+            response: Response { id: id(b"mnopqrstuvwxyz123456"), token: Some(b"tok".to_vec()), v: Some(Bencode::Bytes(b"Hello World!".to_vec())), k: Some([0x11; 32]), seq: Some(4), sig: Some([0x22; 64]), ..Default::default() },
+        };
+        let encoded = msg.encode();
+        assert_eq!(KrpcMessage::decode(&encoded).unwrap(), msg);
+    }
+
+    #[test]
+    fn put_query_for_an_immutable_item_round_trips() {
+        let msg = KrpcMessage::Query { t: b"aa".to_vec(), query: Query::Put { id: id(b"abcdefghij0123456789"), token: b"tok".to_vec(), item: PutItem { v: Bencode::Bytes(b"Hello World!".to_vec()), mutable: None } } };
+        let encoded = msg.encode();
+        assert_eq!(KrpcMessage::decode(&encoded).unwrap(), msg);
+        assert!(!String::from_utf8_lossy(&encoded).contains("1:k32:"), "no k field for an immutable put");
+    }
+
+    #[test]
+    fn put_query_for_a_mutable_item_round_trips_with_every_field() {
+        let msg = KrpcMessage::Query {
+            t: b"aa".to_vec(),
+            query: Query::Put {
+                id: id(b"abcdefghij0123456789"),
+                token: b"tok".to_vec(),
+                item: PutItem { v: Bencode::Bytes(b"Hello World!".to_vec()), mutable: Some(MutableFields { k: [0x11; 32], salt: Some(b"foobar".to_vec()), seq: 4, sig: [0x22; 64], cas: Some(3) }) },
+            },
+        };
+        let encoded = msg.encode();
+        assert_eq!(KrpcMessage::decode(&encoded).unwrap(), msg);
+        let text = String::from_utf8_lossy(&encoded);
+        assert!(text.contains("3:cas") && text.contains("4:salt6:foobar") && text.contains("3:seqi4e"));
+    }
+
+    #[test]
+    fn put_query_for_a_mutable_item_without_salt_or_cas_omits_them() {
+        let msg = KrpcMessage::Query {
+            t: b"aa".to_vec(),
+            query: Query::Put { id: id(b"abcdefghij0123456789"), token: b"tok".to_vec(), item: PutItem { v: Bencode::Bytes(b"x".to_vec()), mutable: Some(MutableFields { k: [0x11; 32], salt: None, seq: 1, sig: [0x22; 64], cas: None }) } },
+        };
+        let encoded = msg.encode();
+        assert_eq!(KrpcMessage::decode(&encoded).unwrap(), msg);
+        let text = String::from_utf8_lossy(&encoded);
+        assert!(!text.contains("salt") && !text.contains("cas"));
+    }
+
+    #[test]
+    fn a_put_query_is_told_apart_from_an_immutable_one_by_the_presence_of_k() {
+        // BEP 44's own way of telling the two kinds apart on decode: no other field does it.
+        let raw = b"d1:ad2:id20:abcdefghij01234567895:token3:tok1:v1:xe1:q3:put1:t2:aa1:y1:qe";
+        match KrpcMessage::decode(raw).unwrap() {
+            KrpcMessage::Query { query: Query::Put { item, .. }, .. } => assert!(item.mutable.is_none()),
+            other => panic!("{:?}", other),
+        }
     }
 }
