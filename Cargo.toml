@@ -2,6 +2,7 @@
 name = "bittorrent-rs"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 # Floor set by the locked dependency graph (darling 0.23 and instability
 # 0.3, pulled in by ratatui, need 1.88); CI's `msrv` job builds with it.
 rust-version = "1.88"
