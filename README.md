@@ -14,7 +14,13 @@ cd bittorrent-rs
 cargo build --release
 ```
 
-This builds `download`, `daemon`, and `create_torrent` in `target/release/`.
+This builds `download`, `daemon`, and `create_torrent` in `target/release/`. The examples below use those paths.
+
+To run them by name from anywhere instead, install them to `~/.cargo/bin`:
+
+```sh
+cargo install --path .
+```
 
 ## Download a torrent
 
@@ -28,11 +34,11 @@ Files are saved to `~/Downloads`. A live dashboard shows progress, speed, and pe
 More examples:
 
 ```sh
-download foo.torrent --list              # list the files
-download foo.torrent --only .mkv         # download only matching files
-download foo.torrent --seed              # keep seeding when done
-download foo.torrent --verify            # check downloaded files are complete
-download foo.torrent --max-down 2M       # limit download speed
+./target/release/download foo.torrent --list              # list the files
+./target/release/download foo.torrent --only .mkv         # download only matching files
+./target/release/download foo.torrent --seed              # keep seeding when done
+./target/release/download foo.torrent --verify            # check downloaded files are complete
+./target/release/download foo.torrent --max-down 2M       # limit download speed
 ```
 
 Press Ctrl-C to stop. Running the same command again resumes where it left off.
@@ -76,14 +82,14 @@ encryption = "prefer"
 The daemon runs in the background and handles any number of torrents.
 
 ```sh
-daemon run &                                   # start
-daemon add ubuntu.torrent --out ~/Downloads    # add a torrent or magnet link
-daemon list                                    # show all torrents
-daemon status 3f2a                             # details for one (first few characters of its ID)
-daemon pause 3f2a
-daemon resume 3f2a
-daemon remove 3f2a                             # stop it; downloaded files are kept
-daemon stop                                    # shut down
+./target/release/daemon run &                                   # start
+./target/release/daemon add ubuntu.torrent --out ~/Downloads    # add a torrent or magnet link
+./target/release/daemon list                                    # show all torrents
+./target/release/daemon status 3f2a                             # details for one (first few characters of its ID)
+./target/release/daemon pause 3f2a
+./target/release/daemon resume 3f2a
+./target/release/daemon remove 3f2a                             # stop it; downloaded files are kept
+./target/release/daemon stop                                    # shut down
 ```
 
 Torrents are remembered across restarts. `daemon run` accepts the same speed, port, and seeding options as `download`.
@@ -91,8 +97,8 @@ Torrents are remembered across restarts. `daemon run` accepts the same speed, po
 ## Create a torrent
 
 ```sh
-create_torrent ~/Videos/holiday --announce http://tracker.example/announce
-create_torrent ./album --announce udp://tracker.example:1337 --private --comment "for the group"
+./target/release/create_torrent ~/Videos/holiday --announce http://tracker.example/announce
+./target/release/create_torrent ./album --announce udp://tracker.example:1337 --private --comment "for the group"
 ```
 
 | Option | |
